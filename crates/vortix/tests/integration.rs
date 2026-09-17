@@ -222,6 +222,20 @@ mod canonical_control_projection {
 mod profile_import {
     use super::*;
 
+    /// Every test in this binary shares one config dir: `init_test_env` sets it
+    /// through a `Once`, and `set_config_dir` is first-write-wins, so there is no
+    /// per-test directory to fall back on. Imports therefore contend for a single
+    /// profile-storage lock, and on a loaded CI runner the losers time out with
+    /// "profile storage is busy". Serialising them removes the contention.
+    static IMPORT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn import_serialised(path: &std::path::Path) -> Result<vortix::state::VpnProfile, String> {
+        let _guard = IMPORT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        vortix::vpn::import_profile(path)
+    }
+
     fn create_temp_profile(
         dir: &std::path::Path,
         name: &str,
@@ -246,7 +260,7 @@ mod profile_import {
             "[Interface]\nPrivateKey = abc123=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz789=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
             "conf",
         );
-        let result = vortix::vpn::import_profile(&path);
+        let result = import_serialised(&path);
         assert!(
             result.is_ok(),
             "Valid WireGuard config should import: {:?}",
@@ -268,7 +282,7 @@ mod profile_import {
             "client\ndev tun\nproto udp\nremote vpn.example.com 1194\n<ca>\n-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n</ca>\n",
             "ovpn",
         );
-        let result = vortix::vpn::import_profile(&path);
+        let result = import_serialised(&path);
         assert!(
             result.is_ok(),
             "Valid OpenVPN config should import: {:?}",
@@ -281,7 +295,7 @@ mod profile_import {
     fn import_nonexistent_file() {
         init_test_env();
         let path = std::path::PathBuf::from("/tmp/vortix_no_such_file_12345.conf");
-        let result = vortix::vpn::import_profile(&path);
+        let result = import_serialised(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -294,7 +308,7 @@ mod profile_import {
             .tempdir()
             .unwrap();
         let path = create_temp_profile(tmp.path(), "empty", "", "conf");
-        let result = vortix::vpn::import_profile(&path);
+        let result = import_serialised(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("empty"));
     }
@@ -307,7 +321,7 @@ mod profile_import {
             .tempdir()
             .unwrap();
         let path = create_temp_profile(tmp.path(), "bad-ext", "some content", "txt");
-        let result = vortix::vpn::import_profile(&path);
+        let result = import_serialised(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unsupported"));
     }
@@ -325,7 +339,7 @@ mod profile_import {
             "[Peer]\nPublicKey = xyz789=\nEndpoint = 1.2.3.4:51820\n",
             "conf",
         );
-        let result = vortix::vpn::import_profile(&path);
+        let result = import_serialised(&path);
         assert!(result.is_err(), "Missing [Interface] should fail");
     }
 
@@ -342,7 +356,7 @@ mod profile_import {
             "remote vpn.example.com 1194\n",
             "ovpn",
         );
-        let result = vortix::vpn::import_profile(&path);
+        let result = import_serialised(&path);
         assert!(
             result.is_err(),
             "OpenVPN with only 'remote' should fail validation"
