@@ -1008,13 +1008,16 @@ impl App {
         // header reads `NO EXIT`, and Security Guard reports
         // `split-route — no exit` while the kernel routes everything
         // through it.
-        self.registry.feed_default_route_interface(
-            snapshot
-                .observed
-                .default_route
-                .as_ref()
-                .and_then(|route| route.interface_name.clone()),
-        );
+        let default_route_interface = snapshot
+            .observed
+            .default_route
+            .as_ref()
+            .and_then(|route| route.interface_name.clone());
+        self.runtime
+            .default_route_interface
+            .clone_from(&default_route_interface);
+        self.registry
+            .feed_default_route_interface(default_route_interface);
         self.runtime.last_kernel_session_count = snapshot
             .observed
             .tunnels

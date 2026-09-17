@@ -4659,6 +4659,40 @@ fn a_control_snapshot_establishes_the_real_ip_cache_gates() {
     );
 }
 
+/// The real-IP gate proved only that *Vortix* owned no tunnel. A VPN started
+/// outside Vortix still carries the egress, so the probe returned that VPN's
+/// exit address and the gate — scanner ticked, no managed session, registry
+/// disconnected — cached it as the user's real IP. Security Guard then showed
+/// Real IP equal to Exit IP and flagged a leak that was its own bookkeeping.
+#[test]
+fn an_unmanaged_tunnel_on_the_default_route_blocks_real_ip_caching() {
+    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
+
+    for (interface, cacheable) in [
+        ("en0", true),
+        ("eth0", true),
+        ("utun4", false),
+        ("wg0", false),
+        ("tun0", false),
+    ] {
+        let mut app = test_app();
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.observed.default_route = Some(ObservedDefaultRoute {
+            interface_name: Some(interface.to_string()),
+            observed_at_millis: 1,
+            received_at_millis: 1,
+        });
+        app.apply_control_snapshot(snapshot);
+
+        assert_eq!(
+            !app.default_route_is_tunnel(),
+            cacheable,
+            "default route via {interface} must {} caching the real address",
+            if cacheable { "allow" } else { "block" }
+        );
+    }
+}
+
 /// `TunnelRegistry::recompute_primary` reads the default-route interface from
 /// the registry's own cache, and `feed_default_route_interface` is its only
 /// production write path. Nothing called it: every caller was a test. So the

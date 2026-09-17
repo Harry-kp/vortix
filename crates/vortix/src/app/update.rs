@@ -965,7 +965,8 @@ impl App {
                 let is_connected = self.has_active_connection();
                 let disconnect_safe = self.runtime.scanner_first_tick_done
                     && self.runtime.last_kernel_session_count == 0
-                    && !is_connected;
+                    && !is_connected
+                    && !self.default_route_is_tunnel();
                 let no_tunnel_routes_v6 = is_connected
                     && !self.registry.snapshot_all().into_iter().any(|snap| {
                         use crate::vortix_core::engine::{Connection, Role};
@@ -1073,11 +1074,12 @@ impl App {
             }
         }
 
-        // Cache the real address only after both scanner and registry prove
-        // that no tunnel owns the egress path.
+        // Cache the real address only after the scanner, the registry and the
+        // kernel's own default route all agree no tunnel owns the egress path.
         let safe_to_cache = self.runtime.scanner_first_tick_done
             && self.runtime.last_kernel_session_count == 0
-            && !is_connected;
+            && !is_connected
+            && !self.default_route_is_tunnel();
         if safe_to_cache {
             let first_detection = self.runtime.real_ip.is_none();
             let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());
@@ -1220,4 +1222,30 @@ fn background_diagnostic_log_lines(
         )
     }));
     lines
+}
+
+/// Whether an interface name is a tunnel device.
+///
+/// The real-IP gate proves Vortix owns no tunnel, which is not the same as
+/// there being none: a VPN started outside Vortix still carries the egress,
+/// and caching then records that VPN's exit as the user's real address.
+/// Naming is the only signal available here, and it is the same vocabulary
+/// the platform layer creates these devices with.
+fn interface_is_tunnel(name: &str) -> bool {
+    const TUNNEL_PREFIXES: [&str; 6] = ["utun", "tun", "tap", "wg", "ipsec", "ppp"];
+    let name = name.trim();
+    TUNNEL_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+impl App {
+    /// Whether the kernel's last observed default route leaves through a
+    /// tunnel device, managed by Vortix or not.
+    pub(crate) fn default_route_is_tunnel(&self) -> bool {
+        self.runtime
+            .default_route_interface
+            .as_deref()
+            .is_some_and(interface_is_tunnel)
+    }
 }

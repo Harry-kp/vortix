@@ -110,6 +110,10 @@ pub struct VpnRuntime {
     /// adoption needs the lsof Method A probe to attribute the
     /// iface to the PID. Real-IP caching requires this to be zero.
     pub last_kernel_session_count: usize,
+    /// Interface the kernel's default route currently uses, as last observed.
+    /// The real-IP gate needs this because a tunnel Vortix does not manage
+    /// still carries the egress it would otherwise record as the real address.
+    pub default_route_interface: Option<String>,
 
     // === Configuration ===
     pub config: AppConfig,
@@ -199,6 +203,7 @@ impl VpnRuntime {
             last_connected_profile: None,
             scanner_first_tick_done: false,
             last_kernel_session_count: 0,
+            default_route_interface: None,
 
             config,
             config_dir,
@@ -289,6 +294,7 @@ impl VpnRuntime {
             last_connected_profile: None,
             scanner_first_tick_done: false,
             last_kernel_session_count: 0,
+            default_route_interface: None,
 
             config,
             config_dir,
@@ -375,6 +381,7 @@ impl VpnRuntime {
             last_connected_profile: None,
             scanner_first_tick_done: false,
             last_kernel_session_count: 0,
+            default_route_interface: None,
             config: AppConfig::default(),
             config_dir: std::env::temp_dir().join("vortix_test"),
             is_root: false,

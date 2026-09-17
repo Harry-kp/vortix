@@ -1129,6 +1129,15 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     } else {
         app.runtime.public_ip.clone()
     };
+    // "No tunnel" is Vortix's own bookkeeping, and the kernel can disagree: a
+    // VPN started outside Vortix still carries the egress, which made this
+    // panel present that VPN's exit address as the reader's real IP. The
+    // equality is only an alarm when it is genuinely unmasked traffic.
+    let exposed_ip = if app.default_route_is_tunnel() {
+        "checking…".to_string()
+    } else {
+        exposed_ip
+    };
 
     let v6_ip = app
         .runtime
