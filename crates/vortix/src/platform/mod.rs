@@ -324,7 +324,7 @@ pub fn install_hint(pkg: &str) -> String {
 /// The install command for this machine's package manager.
 ///
 /// Read from `/etc/os-release`: `ID` first, then `ID_LIKE`, so derivatives
-/// resolve to the family they are built on -- CachyOS and EndeavourOS report
+/// resolve to the family they are built on -- `CachyOS` and `EndeavourOS` report
 /// `ID_LIKE=arch`, Nobara reports `fedora`, Mint reports `debian`. A distro
 /// that matches nothing falls back to listing every family, which is what
 /// this function used to print unconditionally.
