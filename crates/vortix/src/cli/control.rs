@@ -1757,8 +1757,16 @@ impl LocalProfileMutationSession {
         );
         let scan = crate::core::scanner::gather_system_state(profiles);
         if !scan.tunnel_observation_complete {
+            // Reading tunnel state needs administrator access, so an
+            // unprivileged command lands here and cannot tell whether the
+            // profile it was asked to change is in use. The privileged path
+            // says "Cannot rename active profile … — disconnect first"; this
+            // one used to answer with its own internals.
             return Err(LocalControlError::Observation(
-                "tunnel observation failed; active-profile safety is unverified".into(),
+                "could not check whether a VPN is connected, which needs administrator \
+                 access, so Vortix will not risk changing a profile that may be in use. \
+                 Try again with sudo"
+                    .into(),
             ));
         }
         let sessions = scan.sessions;
