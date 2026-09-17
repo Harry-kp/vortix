@@ -1209,6 +1209,12 @@ pub struct TopologyPolicy {
     /// "we are still trying", which `block-on-drop` needs before it can
     /// stand its barrier down.
     pub target_tunnels_observed: bool,
+    /// When this transition was captured. An unexpected drop opens its
+    /// recovery in the same convergence pass that the loss is noticed, so the
+    /// newest tunnel fact at that instant was still taken while the tunnel was
+    /// up. Anything older than this is a reading from before the drop and
+    /// cannot say the tunnel is back.
+    pub captured_at_millis: u64,
     pub stage: PolicyStage,
 }
 
