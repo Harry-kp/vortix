@@ -1052,6 +1052,7 @@ impl PolicyExecutor for PolicyRecorder {
 }
 fn policy(generation: u64, digest: &str) -> TopologyPolicy {
     TopologyPolicy {
+        target_tunnels_observed: true,
         generation,
         authority_epoch: AuthorityEpoch(1),
         digest: PolicyDigest(digest.into()),

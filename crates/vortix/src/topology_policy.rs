@@ -933,8 +933,24 @@ impl CanonicalPolicyExecutor {
                 )
             }
             KillSwitchMode::Auto => {
-                crate::core::killswitch::disable_blocking().map_err(|error| error.to_string())?;
-                (KillSwitchState::Armed, None)
+                // An unexpected drop opens a recovery that installs a
+                // pre-tunnel barrier. This stage used to take it straight
+                // back off, so the mode engaged and un-engaged inside one
+                // transition and the real address flowed for the whole
+                // reconnect window. Stand down only once the kernel agrees
+                // the tunnel is back; `release-killswitch` and switching the
+                // mode to off are the other two ways out, and both take their
+                // own path.
+                if policy.required_blocking && !policy.target_tunnels_observed {
+                    let verification = crate::core::killswitch::verify_blocking(&active)
+                        .is_ok()
+                        .then(|| crate::core::killswitch::local_verification(&active));
+                    (KillSwitchState::Blocking, verification)
+                } else {
+                    crate::core::killswitch::disable_blocking()
+                        .map_err(|error| error.to_string())?;
+                    (KillSwitchState::Armed, None)
+                }
             }
             KillSwitchMode::Off => {
                 crate::core::killswitch::disable_blocking().map_err(|error| error.to_string())?;
@@ -956,6 +972,10 @@ impl CanonicalPolicyExecutor {
         }
         match policy.target.kill_switch {
             KillSwitchMode::AlwaysOn => {
+                let active = self.final_firewall_tunnels(policy)?;
+                crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
+            }
+            KillSwitchMode::Auto if policy.required_blocking && !policy.target_tunnels_observed => {
                 let active = self.final_firewall_tunnels(policy)?;
                 crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
             }
@@ -1159,6 +1179,7 @@ mod tests {
 
     fn policy(prior: TopologyState, target: TopologyState) -> TopologyPolicy {
         TopologyPolicy {
+            target_tunnels_observed: true,
             generation: 1,
             authority_epoch: AuthorityEpoch(1),
             digest: PolicyDigest("policy".into()),
@@ -1208,6 +1229,35 @@ mod tests {
         assert_eq!(
             active[0].server_ips,
             vec!["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    /// `block-on-drop` installs a pre-tunnel barrier when a drop opens a
+    /// recovery, and the final stage of that same transition used to call
+    /// `disable_blocking` unconditionally — so the mode engaged and
+    /// un-engaged within one transition and the real address flowed for the
+    /// whole reconnect window. The barrier now stands down only once the
+    /// kernel agrees the tunnel is back.
+    ///
+    /// The second case is the one that locks people out: a recovery that
+    /// *succeeded* must release. `seal_final_topology_policy` recomputes the
+    /// flag against the current scan for exactly this reason.
+    #[test]
+    fn block_on_drop_holds_its_barrier_only_while_the_tunnel_is_still_gone() {
+        let hold = |required_blocking: bool, observed: bool| required_blocking && !observed;
+
+        assert!(
+            hold(true, false),
+            "a recovery whose tunnel is still absent must keep blocking"
+        );
+        assert!(
+            !hold(true, true),
+            "a recovery that restored the tunnel must release, or the user is \
+             locked out of a working connection"
+        );
+        assert!(
+            !hold(false, false),
+            "without a required pre-block there is no barrier to hold"
         );
     }
 

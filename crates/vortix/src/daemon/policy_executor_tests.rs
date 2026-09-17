@@ -488,6 +488,7 @@ fn policy(required_blocking: bool) -> TopologyPolicy {
         BTreeMap::new()
     };
     TopologyPolicy {
+        target_tunnels_observed: true,
         generation: 7,
         authority_epoch: AuthorityEpoch(3),
         digest: PolicyDigest("canonical-policy".into()),
