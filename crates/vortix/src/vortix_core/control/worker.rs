@@ -1202,13 +1202,6 @@ pub struct TopologyPolicy {
     pub tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     pub transition: TopologyTransitionKind,
     pub required_blocking: bool,
-    /// Whether every profile this policy wants connected is currently
-    /// observed active. `target` is built from desired state, so during a
-    /// recovery it names the profile and its interface while the tunnel is
-    /// still handshaking — this is what separates "the VPN is back" from
-    /// "we are still trying", which `block-on-drop` needs before it can
-    /// stand its barrier down.
-    pub target_tunnels_observed: bool,
     pub stage: PolicyStage,
 }
 
