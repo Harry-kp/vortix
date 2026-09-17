@@ -801,6 +801,19 @@ impl CanonicalPolicyExecutor {
                 pending.into_iter().collect(),
             ));
         }
+        // With nothing to allow, this barrier is a deny-all that permits only
+        // loopback, RFC1918 and DHCP — it cannot protect a tunnel, and the
+        // handshake it is supposed to cover is the first thing it blocks.
+        // Arming block-on-drop and then connecting installed exactly that,
+        // failed the connect on a handshake that never left the host, and
+        // left the machine with no egress. Refuse it: an error aborts the
+        // operation before anything is installed.
+        if active.is_empty() {
+            return Err(
+                "pre-tunnel blocking has no tunnel or endpoint to allow; refusing a                  barrier that would block the connection it protects"
+                    .into(),
+            );
+        }
         Ok(active)
     }
 
