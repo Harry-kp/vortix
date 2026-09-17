@@ -1141,14 +1141,9 @@ fn firewall_compensation_target(
     policy: &TopologyPolicy,
     barrier: PolicyBarrier,
 ) -> FirewallCompensationTarget {
-    // A recovery that required a pre-tunnel barrier and has not got its tunnel
-    // back must not fail open, whichever barrier tripped. Restoring `prior`
-    // there runs `disable_blocking` for block-on-drop, which is how a drop
-    // ended up engaging and un-engaging within one transition and leaving the
-    // real address exposed for the whole reconnect window.
-    if policy.required_blocking
-        && (matches!(barrier, PolicyBarrier::EffectivePublication)
-            || !policy.target_tunnels_observed)
+    if policy.stage == PolicyStage::Final
+        && policy.required_blocking
+        && matches!(barrier, PolicyBarrier::EffectivePublication)
     {
         FirewallCompensationTarget::PreTunnelBlocking
     } else {
