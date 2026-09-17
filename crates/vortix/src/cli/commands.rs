@@ -265,8 +265,8 @@ fn handle_background_setup(
     }
 
     let mut preview = vec![
-        "Runs persistent Vortix processes for live CLI/TUI sync, automatic drop recovery, boot connections, and continuous policy verification.".into(),
-        "Uses a narrower privileged helper after one trusted package bootstrap; Standard mode keeps its existing root-assisted client boundary.".into(),
+        "Would keep Vortix running in the background so the CLI and TUI stay in sync, dropped tunnels reconnect on their own, chosen profiles connect at boot, and firewall rules are re-checked continuously.".into(),
+        "Would run VPN commands through a small privileged helper installed once, so day-to-day use no longer needs sudo. Standard mode keeps asking for sudo instead.".into(),
     ];
     if !boot_profiles.is_empty() {
         preview.push(format!(

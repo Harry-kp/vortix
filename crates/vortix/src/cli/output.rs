@@ -233,7 +233,7 @@ pub fn print_background_view(
                 println!("- {line}");
             }
             if !view.activation_available {
-                println!("Activation: unavailable until the enrolled authority release");
+                println!("Background mode cannot be enabled in this release.");
             }
         }
     }
@@ -245,8 +245,8 @@ pub fn print_background_view(
 pub fn print_background_unavailable(mode: OutputMode, command: &str) -> ExitCode {
     let error = CliError {
         code: "background_activation_unavailable",
-        message: "Background authority enrollment is not enabled in this release; no privileged process or state transition ran.".into(),
-        hint: Some("Continue using Standard mode and retry after installing an enrollment-capable release.".into()),
+        message: "Background mode is not available in this release. Nothing was changed and no privileged process ran.".into(),
+        hint: Some("Standard mode gives you full VPN control; nothing needs to be enabled.".into()),
     };
     print_error(mode, command, error, false);
     ExitCode::StateConflict

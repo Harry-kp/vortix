@@ -209,7 +209,7 @@ impl BackgroundWorkflow {
     pub const fn cancelled_preview(self) -> &'static str {
         match self {
             Self::Setup => {
-                "Setup cancelled before elevation; Standard mode is unchanged. Re-run with --yes when you are ready."
+                "Setup stopped before changing anything; Standard mode is unchanged."
             }
             Self::Status => {
                 "Manual CLI/TUI VPN control remains available; Background capabilities require enrollment."

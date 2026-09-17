@@ -771,8 +771,14 @@ fn confirmed_prepared_background_mutations_have_nonzero_refusal_contract() {
         );
 
         for (flag, expected_stderr) in [
-            (None, "error: Background authority enrollment"),
-            (Some("--quiet"), "error: Background authority enrollment"),
+            (
+                None,
+                "error: Background mode is not available in this release",
+            ),
+            (
+                Some("--quiet"),
+                "error: Background mode is not available in this release",
+            ),
         ] {
             let config = tempfile::tempdir().unwrap();
             let mut process = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")); // xtask:allow-subprocess: black-box CLI refusal contract
