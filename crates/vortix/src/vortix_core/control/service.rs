@@ -4406,14 +4406,13 @@ fn seal_final_topology_policy(
     // interface back by now, and block-on-drop reads this to decide whether
     // it may stand its barrier down — carrying the stale "not observed"
     // forward would hold the barrier over a healthy tunnel.
-    let captured_at = final_policy.captured_at_millis;
     final_policy.target_tunnels_observed = !final_policy.target.profiles.is_empty()
         && final_policy.target.profiles.iter().all(|profile| {
             snapshot
                 .observed
                 .tunnels
                 .get(profile)
-                .is_some_and(|fact| fact.active && fact.received_at_millis >= captured_at)
+                .is_some_and(|fact| fact.active)
         });
     for (profile_id, protocol) in &final_policy.target.protocols {
         if *protocol != crate::vortix_core::profile::ProtocolKind::OpenVpn {
@@ -4510,7 +4509,7 @@ fn capture_topology_policy(
                 .observed
                 .tunnels
                 .get(profile)
-                .is_some_and(|fact| fact.active && fact.received_at_millis >= now)
+                .is_some_and(|fact| fact.active)
         });
     let mut target = build_topology_state(
         target_profiles.clone(),
@@ -4565,7 +4564,6 @@ fn capture_topology_policy(
         transition,
         required_blocking,
         target_tunnels_observed,
-        captured_at_millis: now,
         stage: PolicyStage::Final,
     })
 }
@@ -7770,7 +7768,6 @@ mod target_profiles_tests {
         );
         let stale_policy = TopologyPolicy {
             target_tunnels_observed: true,
-            captured_at_millis: 0,
             generation: 11,
             authority_epoch: AuthorityEpoch(7),
             digest: PolicyDigest("stale-policy".into()),
@@ -7814,7 +7811,6 @@ mod target_profiles_tests {
 
         let current_policy = TopologyPolicy {
             target_tunnels_observed: true,
-            captured_at_millis: 0,
             generation: 12,
             digest: PolicyDigest("newer-policy".into()),
             operation_id: OperationId::from_parts(AuthorityEpoch(7), 12),
@@ -8546,7 +8542,6 @@ mod target_profiles_tests {
         let operation_id = OperationId::from_parts(AuthorityEpoch(7), 1);
         let policy = TopologyPolicy {
             target_tunnels_observed: true,
-            captured_at_millis: 0,
             generation: snapshot.desired.generation,
             authority_epoch: snapshot.desired.authority_epoch,
             digest: snapshot.desired.policy_digest.clone(),
@@ -8621,7 +8616,6 @@ mod target_profiles_tests {
         let operation_id = OperationId::from_parts(AuthorityEpoch(9), 1);
         let policy = TopologyPolicy {
             target_tunnels_observed: true,
-            captured_at_millis: 0,
             generation: snapshot.desired.generation,
             authority_epoch: snapshot.desired.authority_epoch,
             digest: snapshot.desired.policy_digest.clone(),
