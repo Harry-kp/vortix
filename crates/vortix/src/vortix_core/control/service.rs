@@ -3102,6 +3102,9 @@ fn drive_supervision(
         if let Some((operation_id, generation, failure, failure_detail, policy)) =
             failed_transaction
         {
+            let recovered_conflict = failure_detail.as_deref().and_then(|detail| {
+                route_conflict_from_verification_detail(detail, snapshot, &policy)
+            });
             fail_policy_transaction(
                 &operation_id,
                 generation,
@@ -3116,6 +3119,15 @@ fn drive_supervision(
                 config,
                 events,
             );
+            if let Some((target, conflict)) = recovered_conflict {
+                snapshot
+                    .pending_route_conflicts
+                    .insert(target.clone(), conflict.clone());
+                events.push(ControlEvent::ConnectAttemptBlockedByConflict {
+                    conflict,
+                    profile_id: target,
+                });
+            }
         }
         if !matches!(
             effective_outcome,
@@ -4392,6 +4404,70 @@ const fn operation_failure_for_policy_result(
     } else {
         operation_failure_for_work(policy_outcome_failure(outcome))
     }
+}
+
+/// Pull the contended network and the interface that actually carries it out of
+/// a route verification failure.
+///
+/// That message is the only place this evidence survives, so the shapes it
+/// accepts are pinned by tests; anything else yields `None` and the failure is
+/// reported exactly as it was before.
+fn parse_route_ownership_detail(detail: &str) -> Option<(crate::vortix_core::cidr::Cidr, String)> {
+    let (claim, rest) = detail.split_once(" should route through ")?;
+    let (_expected, observed) = rest.split_once(", but the system routes it through ")?;
+    let observed = observed.trim().trim_end_matches('.').trim();
+    if observed.is_empty() {
+        return None;
+    }
+    let cidr = claim
+        .trim()
+        .parse::<crate::vortix_core::cidr::Cidr>()
+        .ok()?;
+    Some((cidr, observed.to_string()))
+}
+
+/// Recognise a route-ownership refusal and name the tunnel that holds the route.
+///
+/// Route collisions are meant to reach the user as a takeover offer, not an
+/// error: the executor reports `WorkFailure::RouteConflict`, the service records
+/// it in `pending_route_conflicts`, and the dashboard asks whether to switch.
+/// A collision discovered by the final route read-back never took that path.
+/// `refine_openvpn_reservation` classifies conflicts from a *successful*
+/// receipt and returns early when the attempt already failed, so a policy that
+/// fails verification is reported as a bare failure and the offer is lost.
+///
+/// The verification message is the evidence that survives, and the snapshot
+/// knows which profile owns the interface it names, so the conflict can be
+/// reconstructed here and handed to the machinery that was always waiting for
+/// it.
+fn route_conflict_from_verification_detail(
+    detail: &str,
+    snapshot: &ControlSnapshot,
+    policy: &crate::vortix_core::control::worker::TopologyPolicy,
+) -> Option<(ProfileId, crate::vortix_core::engine::Conflict)> {
+    let (cidr, observed) = parse_route_ownership_detail(detail)?;
+    let observed = observed.as_str();
+
+    let holder = snapshot
+        .observed
+        .tunnel_details
+        .iter()
+        .find(|(_, seen)| seen.details.interface == observed)
+        .map(|(profile_id, _)| profile_id.clone())?;
+
+    let target = policy
+        .tunnel_revisions
+        .keys()
+        .find(|profile_id| **profile_id != holder)
+        .cloned()?;
+
+    Some((
+        target,
+        crate::vortix_core::engine::Conflict::RouteOverlap {
+            with: holder,
+            overlapping_cidrs: vec![cidr],
+        },
+    ))
 }
 
 fn seal_final_topology_policy(
@@ -7654,6 +7730,39 @@ mod target_profiles_tests {
     };
     use crate::vortix_core::control::DnsSecurityStatus;
     use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
+
+    #[test]
+    fn route_ownership_detail_yields_the_network_and_the_interface_holding_it() {
+        let (cidr, observed) = super::parse_route_ownership_detail(
+            "10.250.0.0/24 should route through utun5, but the system routes it through utun4",
+        )
+        .expect("a route-ownership refusal is recognised");
+        assert_eq!(cidr.to_string(), "10.250.0.0/24");
+        assert_eq!(observed, "utun4");
+    }
+
+    #[test]
+    fn route_verification_failures_without_a_holder_are_left_alone() {
+        // No interface to disconnect, so there is no takeover to offer and the
+        // failure must be reported as it always was.
+        assert!(super::parse_route_ownership_detail(
+            "10.250.0.0/24 should route through utun5, but the system has no route for it",
+        )
+        .is_none());
+        assert!(super::parse_route_ownership_detail(
+            "could not read which interface carries 10.250.0.0/24; utun5 is unverified",
+        )
+        .is_none());
+        assert!(super::parse_route_ownership_detail(
+            "route verification deadline expired after 1 of 3 probes",
+        )
+        .is_none());
+        // A claim that is not a network cannot name a conflict.
+        assert!(super::parse_route_ownership_detail(
+            "everything should route through utun5, but the system routes it through utun4",
+        )
+        .is_none());
+    }
 
     #[test]
     fn restart_caps_client_deadline_without_shortening_service_recovery() {
