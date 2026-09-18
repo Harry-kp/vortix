@@ -1111,6 +1111,14 @@ fn operation_failure(
                 "{action} did not finish within its deadline. Vortix is still reconciling it, so check `vortix status` before retrying — the tunnel may yet come up or be rolled back (operation {operation})."
             ),
         ),
+        (_, Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed))) => (
+            "dns_policy_failed",
+            ExitCode::GeneralError,
+            format!(
+                "Vortix could not take ownership of DNS for this profile, so it put your previous network settings back — you are on the connection you started with. The usual cause is another VPN or network service holding a more specific route to the resolver the profile asks for, which would send DNS outside the tunnel. Disconnect it and retry; `{}` shows which interface currently owns a resolver's route (operation {operation}).",
+                crate::platform::dns_route_inspect_hint()
+            ),
+        ),
         (_, Some(OperationResult::Failed(OperationFailure::HandshakeFailed))) => (
             "connect_failed",
             ExitCode::GeneralError,

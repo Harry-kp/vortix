@@ -314,6 +314,20 @@ pub fn firewall_inspect_hint() -> &'static str {
     "(no firewall inspection command on this platform)"
 }
 
+/// The command that shows which interface owns the route to a resolver.
+///
+/// `core::dns_protection` builds the same command for a specific server when
+/// it can name one. This is the shape to print when the failure is reported
+/// after the resolver address is no longer in hand.
+#[must_use]
+pub fn dns_route_inspect_hint() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "route -n get -inet <resolver>",
+        "linux" => "ip route get <resolver>",
+        _ => "inspect the system route to the resolver",
+    }
+}
+
 /// Platform-appropriate install hint for a package.
 #[cfg(target_os = "macos")]
 #[must_use]
