@@ -123,6 +123,25 @@ impl PendingControlSubject {
     }
 }
 
+/// Turn a route-ownership refusal into something the user can act on.
+///
+/// The control layer reports a failed topology verification as `Internal`, and
+/// the generic text for that says Vortix hit an internal error. Nothing
+/// internal broke: another tunnel already owns a route this profile needs, and
+/// the profile cannot have it until that tunnel goes. Two `OpenVPN` profiles
+/// whose servers push the same subnet collide exactly this way, and neither
+/// config mentions the subnet, so the pushed route is the only place it shows.
+fn friendly_route_conflict_explanation(detail: Option<&str>) -> Option<String> {
+    let detail = detail?;
+    let lowered = detail.to_ascii_lowercase();
+    if !lowered.contains("should route through") || !lowered.contains("but the system routes it") {
+        return None;
+    }
+    Some(format!(
+        "Another active tunnel already owns a route this profile needs, so Vortix stopped rather than report protection it does not have. {detail}. Disconnect the tunnel that holds that route and connect this profile again."
+    ))
+}
+
 fn friendly_dns_failure_explanation(detail: Option<&str>) -> Option<&'static str> {
     let detail = detail?.to_ascii_lowercase();
     if detail.contains("another vpn or network service") || detail.contains("instead of this vpn") {
@@ -510,6 +529,12 @@ fn terminal_control_notification(
                 .to_string(),
             ToastType::Warning,
         )),
+        (OperationStatus::Failed, Some(OperationResult::Failed(OperationFailure::Internal)))
+            if friendly_route_conflict_explanation(failure_detail).is_some() =>
+        {
+            friendly_route_conflict_explanation(failure_detail)
+                .map(|message| (message, ToastType::Error))
+        }
         (OperationStatus::Failed, Some(OperationResult::Failed(failure))) => {
             Some((subject.failure_message(failure), ToastType::Error))
         }
