@@ -464,12 +464,28 @@ pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_i
             .open(entry.path().join(".lease"));
         match lease {
             Ok(file) => {
-                // SAFETY: `file` is an owned valid descriptor. A failed
+                // SAFETY: `file` is an owned valid descriptor. A refused
                 // nonblocking lock means a live process still owns it.
-                #[allow(unsafe_code)]
-                let result =
-                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                if result != 0 {
+                //
+                // Only a refusal means that. `flock` can also fail with EINTR
+                // when a signal lands mid-call, which says nothing about
+                // ownership, and treating it as ownership silently abandons a
+                // real orphan. The test for this sweep failed intermittently
+                // under a loaded parallel run for exactly that reason. Retry an
+                // interrupt; treat anything else as owned and leave it alone.
+                let refused = loop {
+                    #[allow(unsafe_code)]
+                    let result =
+                        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                    if result == 0 {
+                        break false;
+                    }
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break true;
+                };
+                if refused {
                     continue;
                 }
                 remove_swept_session(&entry.path());
@@ -479,7 +495,18 @@ pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_i
                     remove_swept_session(&entry.path());
                 }
             }
-            Err(_) => {}
+            Err(error) => {
+                // Anything other than a missing lease is unexpected, and
+                // skipping in silence leaves scratch configuration behind with
+                // no trace of why -- the same gap `remove_swept_session`
+                // already closes for removal failures.
+                tracing::warn!(
+                    target: "vortix::process",
+                    session = %name,
+                    %error,
+                    "could not read an orphan session lease; leaving it alone"
+                );
+            }
         }
     }
 }

@@ -1085,6 +1085,18 @@ fn local_control_error_category(
     }
 }
 
+/// The reason the control layer recorded for a terminal operation.
+///
+/// The snapshot returned with the outcome carries the operation record, and
+/// that record is where a route or DNS ownership refusal explains itself.
+fn failure_detail(outcome: &crate::cli::control::ClientOperationOutcome) -> Option<String> {
+    outcome
+        .snapshot
+        .operations
+        .get(&outcome.operation_id)
+        .and_then(|operation| operation.failure_detail.clone())
+}
+
 fn operation_failure(
     action: &str,
     outcome: &crate::cli::control::ClientOperationOutcome,
@@ -1111,14 +1123,6 @@ fn operation_failure(
                 "{action} did not finish within its deadline. Vortix is still reconciling it, so check `vortix status` before retrying — the tunnel may yet come up or be rolled back (operation {operation})."
             ),
         ),
-        (_, Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed))) => (
-            "dns_policy_failed",
-            ExitCode::GeneralError,
-            format!(
-                "Vortix could not take ownership of DNS for this profile, so it put your previous network settings back — you are on the connection you started with. The usual cause is another VPN or network service holding a more specific route to the resolver the profile asks for, which would send DNS outside the tunnel. Disconnect it and retry; `{}` shows which interface currently owns a resolver's route (operation {operation}).",
-                crate::platform::dns_route_inspect_hint()
-            ),
-        ),
         (_, Some(OperationResult::Failed(OperationFailure::HandshakeFailed))) => (
             "connect_failed",
             ExitCode::GeneralError,
@@ -1143,20 +1147,30 @@ fn operation_failure(
             ExitCode::GeneralError,
             "That profile is not usable. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -, and the file must contain an [Interface] and a [Peer] section.".to_owned(),
         ),
-        _ => (
-            if action == "disconnect" {
+        _ => {
+            let code = if action == "disconnect" {
                 "disconnect_failed"
             } else {
                 "connect_failed"
-            },
-            ExitCode::GeneralError,
-            // The operation id means nothing to the reader, so lead with what
-            // happened and where to look. It cannot promise the previous state
-            // survived: a failed reconnect, for one, can leave the tunnel down.
-            format!(
-                "The {action} did not succeed. Run `vortix status` to see what state it left behind — it may not be the state you started in (operation {operation})."
-            ),
-        ),
+            };
+            // The control layer records why a terminal operation failed, and
+            // the dashboard has always shown it. The CLI used to drop it and
+            // print this arm's generic sentence, so a connect refused because
+            // another interface held a route the tunnel needed said only that
+            // it "did not succeed". The operation id means nothing to the
+            // reader, so lead with the recorded reason when there is one. It
+            // still cannot promise the previous state survived: a failed
+            // reconnect, for one, can leave the tunnel down.
+            let message = failure_detail(outcome).map_or_else(
+                || format!(
+                    "The {action} did not succeed. Run `vortix status` to see what state it left behind — it may not be the state you started in (operation {operation})."
+                ),
+                |detail| format!(
+                    "The {action} did not succeed: {detail}. Run `vortix status` to see what state it left behind — it may not be the state you started in (operation {operation})."
+                ),
+            );
+            (code, ExitCode::GeneralError, message)
+        }
     }
 }
 

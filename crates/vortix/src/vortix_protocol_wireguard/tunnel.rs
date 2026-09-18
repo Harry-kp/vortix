@@ -2204,11 +2204,18 @@ mod tests {
         let prior_id = "2025-01-01T000000Z-9999";
         let prior = config_dir.join("tmp").join(prior_id);
         let current = config_dir.join("tmp").join("2026-05-28T120000Z-1234");
-        let prior_lease = crate::utils::acquire_temp_session_lease(config_dir, prior_id).unwrap();
+        // A session whose process died leaves its directory and an unlocked
+        // `.lease` behind -- that is what the sweep exists to collect. Taking a
+        // real lease and dropping it models the same end state but depends on
+        // this process's own `flock` being visible as released to the `flock`
+        // the sweep takes moments later, and under a loaded parallel run it
+        // intermittently was not, which failed the assertion below rather than
+        // any behaviour. Write the file the dead session would have left.
+        std::fs::create_dir_all(&prior).unwrap();
+        std::fs::write(prior.join(".lease"), b"").unwrap();
         std::fs::create_dir_all(&current).unwrap();
         std::fs::write(prior.join("corp.conf"), "stale").unwrap();
         std::fs::write(current.join("vpn.conf"), "live").unwrap();
-        drop(prior_lease);
 
         crate::utils::sweep_orphan_temp_configs(config_dir, "2026-05-28T120000Z-1234");
 
