@@ -186,10 +186,7 @@ fn render_animated_panel(
     render_fn(frame, app, area);
 }
 
-#[allow(clippy::too_many_lines)]
 fn render_overlays(frame: &mut Frame, app: &mut App) {
-    use super::overlays::confirm_dialog::{self, ConfirmDialogConfig};
-
     match &app.input_mode {
         InputMode::DependencyError { protocol, missing } => {
             super::overlays::dependency_alert::render(frame, *protocol, missing);
@@ -207,39 +204,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             name,
             confirm_selected,
             ..
-        } => {
-            let dialog_w: u16 = 50;
-            let prefix = "Are you sure you want to delete ";
-            let name_budget = usize::from(dialog_w)
-                .saturating_sub(4 + prefix.len() + 1)
-                .max(3);
-            let truncated = utils::truncate(name, name_budget);
-
-            confirm_dialog::render(
-                frame,
-                ConfirmDialogConfig {
-                    title: " Confirm Deletion ",
-                    body: vec![
-                        Line::from(""),
-                        Line::from(vec![
-                            Span::raw(prefix),
-                            Span::styled(
-                                truncated,
-                                Style::default()
-                                    .fg(theme::current().accent_primary)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw("?"),
-                        ]),
-                    ],
-                    border_color: theme::current().error,
-                    confirm_selected: *confirm_selected,
-                    confirm_label: "Delete",
-                    width: dialog_w,
-                    height: 7,
-                },
-            );
-        }
+        } => render_delete_confirm(frame, name, *confirm_selected),
         InputMode::AuthPrompt {
             profile_name,
             username,
@@ -299,41 +264,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
         InputMode::ConfirmDisconnectAll {
             count,
             confirm_selected,
-        } => {
-            // Shift+D from the sidebar
-            // with N>1 active tunnels opens this confirm dialog before
-            // tearing them all down.
-            confirm_dialog::render(
-                frame,
-                ConfirmDialogConfig {
-                    title: " Disconnect All ",
-                    body: vec![
-                        Line::from(""),
-                        Line::from(vec![
-                            Span::styled(
-                                "Disconnect all ",
-                                Style::default().fg(theme::current().text_secondary),
-                            ),
-                            Span::styled(
-                                count.to_string(),
-                                Style::default()
-                                    .fg(theme::current().warning)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                " tunnels?",
-                                Style::default().fg(theme::current().text_secondary),
-                            ),
-                        ]),
-                    ],
-                    border_color: theme::current().warning,
-                    confirm_selected: *confirm_selected,
-                    confirm_label: "Disconnect all",
-                    width: 50,
-                    height: 7,
-                },
-            );
-        }
+        } => render_disconnect_all_confirm(frame, *count, *confirm_selected),
         InputMode::Normal => {}
     }
 
@@ -350,6 +281,82 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
 
         super::overlays::action_menu::render(frame, &actions, &mut app.action_menu_state, title);
     }
+}
+
+/// The overlay confirming a profile deletion.
+fn render_delete_confirm(frame: &mut Frame, name: &str, confirm_selected: bool) {
+    use super::overlays::confirm_dialog::{self, ConfirmDialogConfig};
+
+    let dialog_w: u16 = 50;
+    let prefix = "Are you sure you want to delete ";
+    let name_budget = usize::from(dialog_w)
+        .saturating_sub(4 + prefix.len() + 1)
+        .max(3);
+    let truncated = utils::truncate(name, name_budget);
+
+    confirm_dialog::render(
+        frame,
+        ConfirmDialogConfig {
+            title: " Confirm Deletion ",
+            body: vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(
+                        truncated,
+                        Style::default()
+                            .fg(theme::current().accent_primary)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("?"),
+                ]),
+            ],
+            border_color: theme::current().error,
+            confirm_selected,
+            confirm_label: "Delete",
+            width: dialog_w,
+            height: 7,
+        },
+    );
+}
+
+/// The overlay confirming that every active tunnel should come down.
+fn render_disconnect_all_confirm(frame: &mut Frame, count: usize, confirm_selected: bool) {
+    use super::overlays::confirm_dialog::{self, ConfirmDialogConfig};
+
+    // Shift+D from the sidebar
+    // with N>1 active tunnels opens this confirm dialog before
+    // tearing them all down.
+    confirm_dialog::render(
+        frame,
+        ConfirmDialogConfig {
+            title: " Disconnect All ",
+            body: vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        "Disconnect all ",
+                        Style::default().fg(theme::current().text_secondary),
+                    ),
+                    Span::styled(
+                        count.to_string(),
+                        Style::default()
+                            .fg(theme::current().warning)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " tunnels?",
+                        Style::default().fg(theme::current().text_secondary),
+                    ),
+                ]),
+            ],
+            border_color: theme::current().warning,
+            confirm_selected,
+            confirm_label: "Disconnect all",
+            width: 50,
+            height: 7,
+        },
+    );
 }
 
 /// The overlay offering to hand the default route to another profile.
