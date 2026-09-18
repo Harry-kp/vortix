@@ -3450,13 +3450,19 @@ fn remote_tui_capacity_includes_completed_but_undrained_results() {
             )
             .unwrap();
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while transport
         .submitted
         .load(std::sync::atomic::Ordering::SeqCst)
         < 8
     {
-        assert!(std::time::Instant::now() < deadline);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} of 8 commands reached the transport",
+            transport
+                .submitted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
         std::thread::yield_now();
     }
     assert!(matches!(
@@ -3468,7 +3474,21 @@ fn remote_tui_capacity_includes_completed_but_undrained_results() {
         Err(crate::cli::control::LocalControlError::Busy)
     ));
 
-    let completed = session.take_tui_admission_results();
+    // `submitted` counts handoffs to the transport, and the admission result is
+    // recorded after that, so reaching 8 submissions does not mean 8 results
+    // exist yet. Draining once raced the worker on a loaded runner and returned
+    // 7. Collect until all 8 arrive, which is the condition the assertion means.
+    let mut completed = Vec::new();
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while completed.len() < 8 {
+        completed.extend(session.take_tui_admission_results());
+        assert!(
+            std::time::Instant::now() < drain_deadline,
+            "only {} of 8 admission results were recorded",
+            completed.len()
+        );
+        std::thread::yield_now();
+    }
     assert_eq!(completed.len(), 8);
     drop(completed);
     session
