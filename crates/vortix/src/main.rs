@@ -235,6 +235,21 @@ fn main() -> Result<()> {
     // VORTIX_SKIP_MIGRATION=<anything> bypasses the startup backfill for
     // users who need to disable it (see docs/MIGRATION.md).
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
+    // A profile directory that disagrees with the inventory must not be acted
+    // on: a profile's stable id is what binds it to its saved credentials, and
+    // re-deriving one from a name could hand a profile someone else's secret.
+    // That is a reason to refuse profile work, not a reason to strand a live
+    // tunnel. Disconnecting everything, reading status and releasing the kill
+    // switch resolve no profile identity, so they stay reachable -- otherwise a
+    // stray file leaves a connected user unable to close their own tunnel.
+    let identity_free_command = matches!(
+        args.command,
+        Some(
+            cli::args::Commands::Status { .. }
+                | cli::args::Commands::ReleaseKillSwitch
+                | cli::args::Commands::Down { profile: None, .. }
+        )
+    );
     if std::env::var_os("VORTIX_SKIP_MIGRATION").is_some() {
         eprintln!("VORTIX_SKIP_MIGRATION set — skipping startup sidecar backfill.");
     } else {
@@ -317,14 +332,21 @@ fn main() -> Result<()> {
                             code: "profile_migration_refused",
                             message: format!("Vortix could not prepare the profile directory: {e}"),
                             hint: Some(format!(
-                                "Vortix will not touch a profile directory whose contents disagree with its saved inventory. Check {} for files Vortix did not write, then add new profiles from outside it with `vortix import <path>`.",
-                                profiles_dir.display()
+                                "Vortix records the profiles it manages in {inventory}, and refuses to act on the directory while the files there disagree with it, because a profile's identity is what binds it to its saved credentials. This usually means a profile file was removed or replaced outside Vortix. Put the missing file back if you have it; otherwise delete {inventory} and Vortix will rebuild it from the files that remain. `vortix down` and `vortix status` keep working meanwhile, so a connected tunnel can still be closed.",
+                                inventory = profiles_dir.join(".vortix-profile-inventory-v1.toml").display()
                             )),
                         },
                         cli::output::ExitCode::GeneralError,
                     )
                 };
-                cli::output::print_error_and_exit(mode, "startup", err, exit);
+                if identity_free_command {
+                    eprintln!("warning: {}", err.message);
+                    if let Some(hint) = &err.hint {
+                        eprintln!("  hint: {hint}");
+                    }
+                } else {
+                    cli::output::print_error_and_exit(mode, "startup", err, exit);
+                }
             }
         }
     }
