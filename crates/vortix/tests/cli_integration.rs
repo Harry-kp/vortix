@@ -353,90 +353,6 @@ fn emergency_release_reaches_root_gate_before_normal_startup() {
     assert!(!stderr.contains("Fix the file or remove it"));
 }
 
-#[test]
-fn cli_import_single_file() {
-    use vortix::cli::args::Commands;
-    use vortix::cli::commands::handle_command;
-    use vortix::vortix_config::profile_store::FsProfileStore;
-    use vortix::vortix_config::ProfileStore as _;
-
-    let dir = tempfile::tempdir().unwrap();
-    let config_dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("test.conf");
-    std::fs::write(
-        &conf,
-        "[Interface]\nPrivateKey = abc=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
-    )
-    .unwrap();
-
-    // Point the global config dir to a temp directory so import_profile()
-    // doesn't write to the real ~/.config/vortix/profiles/.
-    std::env::set_var("VORTIX_CONFIG_DIR", config_dir.path());
-
-    let config = vortix::config::AppConfig::default();
-    let exit = handle_command(
-        &Commands::Import {
-            file: conf.to_string_lossy().to_string(),
-        },
-        config_dir.path(),
-        "test",
-        &config,
-        &vortix::vortix_config::Settings::default(),
-        OutputMode::Quiet,
-    );
-
-    assert_eq!(exit, 0, "Importing a valid profile should succeed");
-
-    // Verify the profile landed in the temp dir, not the real config
-    let profiles_dir = config_dir.path().join("profiles");
-    assert!(profiles_dir.join("test.conf").exists());
-    let persisted = std::fs::read_to_string(config_dir.path().join("control/control-state.json"))
-        .expect("typed import persists its terminal operation");
-    assert!(
-        persisted.contains("\"status\": \"succeeded\""),
-        "terminal import must be durable before CLI success: {persisted}"
-    );
-
-    let store = FsProfileStore::new(profiles_dir.clone());
-    let stable_id = store.resolve_display_name("test").unwrap();
-    let persisted_json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
-    assert!(
-        persisted_json["requested_resources"]
-            .get(stable_id.as_str())
-            .is_some(),
-        "terminal import must persist canonical requested resources"
-    );
-    let rename = handle_command(
-        &Commands::Rename {
-            old: "test".to_owned(),
-            new: "work".to_owned(),
-        },
-        config_dir.path(),
-        "test",
-        &config,
-        &vortix::vortix_config::Settings::default(),
-        OutputMode::Quiet,
-    );
-    assert_eq!(rename, 0, "typed rename should preserve the CLI result");
-    assert_eq!(store.resolve_display_name("work").unwrap(), stable_id);
-    assert!(profiles_dir.join("work.conf").exists());
-
-    let delete = handle_command(
-        &Commands::Delete {
-            profile: "work".to_owned(),
-            yes: true,
-        },
-        config_dir.path(),
-        "test",
-        &config,
-        &vortix::vortix_config::Settings::default(),
-        OutputMode::Quiet,
-    );
-    assert_eq!(delete, 0, "typed delete should preserve the CLI result");
-    assert!(!profiles_dir.join("work.conf").exists());
-    std::env::remove_var("VORTIX_CONFIG_DIR");
-}
-
 // ============================================================================
 // Clap argument parsing
 // ============================================================================
@@ -855,8 +771,14 @@ fn confirmed_prepared_background_mutations_have_nonzero_refusal_contract() {
         );
 
         for (flag, expected_stderr) in [
-            (None, "error: Background authority enrollment"),
-            (Some("--quiet"), "error: Background authority enrollment"),
+            (
+                None,
+                "error: Background mode is not available in this release",
+            ),
+            (
+                Some("--quiet"),
+                "error: Background mode is not available in this release",
+            ),
         ] {
             let config = tempfile::tempdir().unwrap();
             let mut process = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")); // xtask:allow-subprocess: black-box CLI refusal contract

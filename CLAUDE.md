@@ -1,4 +1,5 @@
 # Context for Claude Code sessions
+## VERY IMPORTANT: Read the STOPOVERENGINEERING.md
 
 Hard-won knowledge from prior sessions. Read these before you ship anything.
 
@@ -45,7 +46,7 @@ Two rules from it that bite silently:
 
 ## Manual testing convention
 
-Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. Manual scenarios live in [`docs/manual-testing/backlog.md`](docs/manual-testing/backlog.md) — one table of rows ordered by risk. When you ship a feature with observable runtime behavior, add a row that names the scenario, the setup, and the pass/fail signal.
+Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. The release gate lives in [`docs/manual-testing/P0.md`](docs/manual-testing/P0.md) — numbered workflows an agent can execute against a live TUI on macOS and Linux. When you ship a feature with observable runtime behavior, add a workflow only if no automated test can answer it, and write its pass signal as something visible in a captured frame.
 
 ## Multi-tunnel: registry is the truth
 
@@ -68,6 +69,53 @@ One vocabulary, used identically on every surface — CLI input verb, CLI output
 There are **no aliases**. `vortix killswitch auto` and `vortix killswitch always` are not accepted — the parser returns the "Use: off, block-on-drop, vpn-only" error. If you're touching killswitch I/O, route through the helpers; never hardcode a string.
 
 The header bar uses short abbreviations of the same labels (`KS:Off` / `KS:Watch` / `KS:VPN-only` / `KS:DROPPED`) because of the 80-col budget. The display-name labels (`Off` / `Block on drop` / `VPN-only`) are the long-form rendering of the same three slugs — just title-cased for prose. Slug everywhere, prose only in the long-form Security Guard / `vortix killswitch` output.
+
+## Background mode is built but dormant — do not re-derive this
+
+Roughly 19,000 lines across 15 files are a complete, unit-tested,
+privilege-separated execution path that **nothing reaches from any shipped
+binary's `main()`**. It is staged for a future "Background mode" (running
+without root via an enrolled helper). It is not dead code to delete, and it
+is not a bug to fix.
+
+What is dormant: all of `helper/`, and in `daemon/` the control host,
+remote session, both helper-backed executors, tunnel material and helper
+client — plus `vortix_protocol_{openvpn,wireguard}/execution.rs`, which only
+the helper renders through.
+
+Four gates keep it dormant. Check these before concluding anything is
+reachable:
+
+| Gate | Where |
+|---|---|
+| `DaemonServer::bind` hardcodes `control: ControlEndpoint::Disabled` | `daemon/server.rs` |
+| `RemoteMutationGate::production()` returns `Self::Disabled` | `daemon/service.rs` |
+| `HelperBackedPolicyExecutor::new` is private; its only wrapper is `#[cfg(test)]` | `daemon/policy_executor.rs` |
+| The CLI enrollment command refuses unconditionally | `cli/commands.rs` |
+
+`ControlAuthorityHost`'s only constructor is `new_for_test`. Nothing in this
+repo's packaging runs `vortix-bootstrap`, so no enrollment record is ever
+written.
+
+Consequences for anyone working here:
+
+- Its files carry a file-level `#![allow(dead_code, reason = ...)]`. That is
+  deliberate. Do not delete items to silence it, and do not count those lines
+  as live in an audit.
+- A change there cannot be validated by running Vortix, because it does not
+  execute. Tests are the only signal.
+- If you are tracing why something does not happen at runtime, this is the
+  first thing to rule out — two separate audits in one session each spent
+  hours rediscovering it.
+
+Comments and `reason =` attributes in that code cite plan units — `U11`
+platform verification, `U12` the execution slice, `U13` enrollment. They are
+stages of the same unshipped feature, in that order. They should not be in
+runtime code at all, but rewriting 92 of them across 33 files would bury more
+diffs than it saves; decoding them here is the cheaper fix. Do not add more.
+
+Deleting it is a product decision about whether Background mode ships, not a
+cleanup. Ask before proposing it.
 
 ## Planning artifacts
 

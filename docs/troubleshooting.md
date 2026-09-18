@@ -21,6 +21,7 @@ vortix report
 | Connected tunnel cannot resolve names | DNS application, read-back, or resolver routing failed | Inspect the DNS section below |
 | Kill switch blocks all traffic | `vpn-only` is active without an effective tunnel | Connect a VPN or use `release-killswitch` in an emergency |
 | Full-tunnel WireGuard fails on Linux | Missing kernel networking/firewall capability | Check nftables and kernel support |
+| Desktop popup "Activation of network connection failed" | NetworkManager adopted the tunnel interface, then saw it removed | Nothing to fix; see the WireGuard section to silence it |
 
 ## Installation and privileges
 
@@ -146,6 +147,54 @@ sudo wg show
 ```
 
 Check the endpoint, peer public key, local private key, preshared key, and UDP reachability. A configured interface without a recent handshake is not considered connected.
+
+### Desktop reports "Activation of network connection failed"
+
+On a NetworkManager desktop, connecting or disconnecting a WireGuard tunnel can
+raise a system notification reading "Connection failed — Activation of network
+connection failed", while Vortix reports success and the tunnel works normally.
+
+Nothing has failed. NetworkManager adopts any interface it did not create as an
+"external" connection and marks it activated. When the interface is removed
+again, NM ends that assumed connection and the desktop shell presents it as a
+failed activation.
+
+This is not specific to Vortix. Reproduce it with the tools alone, no Vortix
+involved:
+
+```bash
+sudo cp your-profile.conf /etc/wireguard/nmtest.conf
+sudo wg-quick up nmtest
+sudo wg-quick down nmtest
+```
+
+The same notification appears. Confirm what actually happened from the journal
+rather than from the popup:
+
+```bash
+journalctl -u NetworkManager -n 40 | grep -E 'wg|assumed|unmanaged'
+```
+
+`connection-assumed` followed by `unmanaged` is an ordinary adopt-and-release
+cycle, not an error. Vortix's own view of the tunnel is authoritative — check
+`vortix status` and the Event Log.
+
+To silence it, tell NetworkManager not to adopt WireGuard interfaces at all:
+
+```ini
+# /etc/NetworkManager/conf.d/99-wireguard-unmanaged.conf
+[keyfile]
+unmanaged-devices=interface-name:wg*
+```
+
+```bash
+sudo systemctl reload NetworkManager
+```
+
+Vortix does not install this for you. It is a system-wide change that also
+covers WireGuard interfaces Vortix does not manage, so it is yours to make
+deliberately. Interfaces already marked unmanaged are unaffected by it, and
+NetworkManager still manages every other device.
 
 ### `AllowedIPs` behavior
 

@@ -396,18 +396,19 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     || format!("ProfileMissing:{with_profile_id}"),
                     |profile| profile.name.clone(),
                 );
-            let with_t = crate::ui::helpers::truncate_to_width(
+            // Both names now share the first line as "<new> and <current>",
+            // so they split one budget rather than each owning a line.
+            let name_budget = inner_width.saturating_sub(" and ".width()) / 2;
+            let with_t = crate::ui::helpers::truncate_to_width(&with_name, name_budget);
+            let with_t2 = crate::ui::helpers::truncate_to_width(
                 &with_name,
-                inner_width.saturating_sub("Overlaps with ".width()),
+                inner_width.saturating_sub("connecting disconnects .".width()),
             );
-            let to_t = crate::ui::helpers::truncate_to_width(
-                to_name,
-                inner_width.saturating_sub("Connect ".width()),
-            );
+            let to_t = crate::ui::helpers::truncate_to_width(to_name, name_budget);
             // Display up to two overlapping CIDRs inline; the rest collapse
             // into a "+N more" tail so a wide AllowedIPs set doesn't blow
             // the dialog height.
-            let cidr_budget = inner_width.saturating_sub("on ".width() + "?".width());
+            let cidr_budget = inner_width.saturating_sub("both want to carry ".width());
             let cidr_summary = if overlapping_cidrs.is_empty() {
                 String::from("(unknown)")
             } else if overlapping_cidrs.len() > 2 {
@@ -437,18 +438,18 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             confirm_dialog::render(
                 frame,
                 ConfirmDialogConfig {
-                    title: " Route Overlap ",
+                    // "Route Overlap" named the internal conflict kind, not
+                    // the user's situation, and the three fragments below it
+                    // never said what pressing Connect would do. The takeover
+                    // dialog next door already speaks plainly; this one says
+                    // the same three things it does — who is contending, over
+                    // what, and what happens next.
+                    title: " Already connected ",
                     body: vec![
                         Line::from(vec![
-                            Span::styled(
-                                "Connect ",
-                                Style::default().fg(theme::current().text_secondary),
-                            ),
                             Span::styled(to_t, Style::default().fg(theme::current().success)),
-                        ]),
-                        Line::from(vec![
                             Span::styled(
-                                "Overlaps with ",
+                                " and ",
                                 Style::default().fg(theme::current().text_secondary),
                             ),
                             Span::styled(
@@ -458,21 +459,36 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                         ]),
                         Line::from(vec![
                             Span::styled(
-                                "on ",
+                                "both want to carry ",
                                 Style::default().fg(theme::current().text_secondary),
                             ),
                             Span::styled(
                                 cidr_summary,
                                 Style::default().fg(theme::current().warning),
                             ),
-                            Span::styled("?", Style::default().fg(theme::current().text_secondary)),
+                        ]),
+                        Line::from(""),
+                        Line::from(vec![Span::styled(
+                            "Only one tunnel can carry a network, so",
+                            Style::default().fg(theme::current().text_secondary),
+                        )]),
+                        Line::from(vec![
+                            Span::styled(
+                                "connecting disconnects ",
+                                Style::default().fg(theme::current().text_secondary),
+                            ),
+                            Span::styled(
+                                with_t2,
+                                Style::default().fg(theme::current().accent_primary),
+                            ),
+                            Span::styled(".", Style::default().fg(theme::current().text_secondary)),
                         ]),
                     ],
                     border_color: theme::current().warning,
                     confirm_selected: *confirm_selected,
                     confirm_label: "Connect",
                     width: 56,
-                    height: 8,
+                    height: 10,
                 },
             );
         }
@@ -563,6 +579,55 @@ mod overlay_tests {
         assert!(output.contains("[Y] Switch — disconnect"), "{output}");
         assert!(output.contains("[B] Keep both"), "{output}");
         assert!(output.contains("[N] Cancel"), "{output}");
+    }
+
+    /// The overlap dialog used to read "Route Overlap / Connect X / Overlaps
+    /// with Y / on 10.250.0.0/24?" — the internal conflict kind as a title,
+    /// three fragments, and no statement of what confirming would do. The one
+    /// fact that distinguishes it from a default-route takeover is that both
+    /// VPNs stay connected, and it never said so.
+    #[test]
+    fn the_overlap_dialog_says_what_confirming_does() {
+        let mut app = App::new_test();
+        app.input_mode = InputMode::ConfirmRouteOverlap {
+            with_profile_id: crate::vortix_core::profile::ProfileId::new("held"),
+            overlapping_cidrs: vec!["10.250.0.0/24".parse().unwrap()],
+            to_profile_id: crate::vortix_core::profile::ProfileId::new("incoming"),
+            to_name: "wg07".to_string(),
+            confirm_selected: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_overlays(frame, &mut app))
+            .unwrap();
+        let output = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(
+            !output.contains("Route Overlap"),
+            "the title named an internal conflict kind, not the situation: {output}"
+        );
+        assert!(
+            output.contains("both want to carry"),
+            "the dialog must name what is actually contended: {output}"
+        );
+        assert!(
+            output.contains("10.250.0.0/24"),
+            "the contended network must be shown: {output}"
+        );
+        assert!(
+            output.contains("connecting disconnects"),
+            "the dialog must say the other tunnel stops: {output}"
+        );
+        assert!(
+            !output.contains("Both stay connected"),
+            "two profiles cannot carry the same network, so nothing may promise they do: {output}"
+        );
     }
 
     #[test]

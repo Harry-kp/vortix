@@ -36,6 +36,11 @@ impl ScanEvidence {
     pub const fn is_fresh_absence(self) -> bool {
         matches!(self, Self::ConfirmedAbsent)
     }
+
+    #[must_use]
+    pub const fn is_present(self) -> bool {
+        matches!(self, Self::ConfirmedPresent)
+    }
 }
 
 /// One complete observer fact for a profile.
@@ -159,7 +164,20 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
                     profile_id,
                     revision: tombstone.revision,
                 });
-            } else if tombstone.teardown_failed && in_flight.is_none() {
+            } else if in_flight.is_none()
+                && (tombstone.teardown_failed
+                    || observed.is_some_and(|fact| fact.evidence.is_present()))
+            {
+                // A fence only clears on proven absence, and the scan that
+                // proves it never arrives while the last fact still says
+                // present: the profile is gone, so no fresh fact is emitted
+                // for it and the stale one is never replaced. With the
+                // teardown already reported successful, neither branch above
+                // fired and the operation spun to its deadline — leaving a
+                // reconnect with the tunnel down and nothing in flight.
+                // Re-dispatching teardown is idempotent on an interface that
+                // is already gone, and it produces the observation the fence
+                // is waiting for. It never asserts absence.
                 actions.push(ReconcileAction::Disconnect {
                     profile_id,
                     revision: target_revision,

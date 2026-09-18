@@ -137,6 +137,19 @@ fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
     {
         match crate::vortix_protocol_wireguard::WgTunnel::observe_all_interfaces() {
             Ok(statuses) => (statuses, true),
+            // An absent `wg` is not an ambiguous observation. Vortix brings
+            // WireGuard up through wg-quick, so without the userspace tools
+            // it cannot have created a tunnel here — zero interfaces is the
+            // complete and correct answer, and a missing dependency should
+            // only bite when the user actually connects. Treating this as a
+            // failed observation made the control service report an error on
+            // every poll, which buried the one startup warning that named the
+            // package to install.
+            Err(_) if !crate::utils::binary_exists("wg") => {
+                (std::collections::BTreeMap::new(), true)
+            }
+            // A `wg` that exists and failed leaves tunnel state genuinely
+            // unknown, so that still fails closed.
             Err(_) => (std::collections::BTreeMap::new(), false),
         }
     } else {

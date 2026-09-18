@@ -5,7 +5,7 @@
 //! File format: `<ip>\n<unix-timestamp>\n`. Mode 0600 on Unix.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::constants::{REAL_IPV6_CACHE_FILE, REAL_IP_CACHE_FILE};
 
@@ -20,9 +20,42 @@ pub struct CachedRealIp {
     pub captured_at: Option<u64>,
 }
 
+impl CachedRealIp {
+    /// Whether this record was written within `max_age`.
+    ///
+    /// An untimestamped record and a record from the future both answer
+    /// `false`: neither can be shown to be recent.
+    #[must_use]
+    pub fn is_newer_than(&self, max_age: Duration) -> bool {
+        let Some(captured_at) = self.captured_at else {
+            return false;
+        };
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return false;
+        };
+        let now = now.as_secs();
+        now >= captured_at && now - captured_at <= max_age.as_secs()
+    }
+}
+
 #[must_use]
 pub fn load(config_dir: &Path) -> Option<CachedRealIp> {
     load_from(config_dir, REAL_IP_CACHE_FILE)
+}
+
+/// Load the cached IPv4 only while it is recent enough to mean anything.
+///
+/// A record with no timestamp predates the timestamped format; its age is
+/// unknowable, so it is not trusted.
+#[must_use]
+pub fn load_recent(config_dir: &Path, max_age: Duration) -> Option<CachedRealIp> {
+    load(config_dir).filter(|cached| cached.is_newer_than(max_age))
+}
+
+/// Load the cached IPv6 only while it is recent enough to mean anything.
+#[must_use]
+pub fn load_recent_ipv6(config_dir: &Path, max_age: Duration) -> Option<CachedRealIp> {
+    load_ipv6(config_dir).filter(|cached| cached.is_newer_than(max_age))
 }
 
 pub fn save(config_dir: &Path, ip: &str) {
@@ -114,6 +147,61 @@ mod tests {
         let loaded = load(&dir).expect("cache must load after save");
         assert_eq!(loaded.ip, "203.0.113.5");
         assert!(loaded.captured_at.is_some(), "timestamp must be written");
+    }
+
+    /// The timestamp is written for a reason: an address last seen a long
+    /// time ago is not evidence about the network the host is on today.
+    #[test]
+    fn an_old_record_is_not_returned_as_recent() {
+        let dir = scratch_dir("expiry");
+        let path = dir.join(REAL_IP_CACHE_FILE);
+        let two_days_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 2 * 24 * 60 * 60;
+        std::fs::write(&path, format!("203.0.113.5\n{two_days_ago}\n")).unwrap();
+
+        assert!(
+            load(&dir).is_some(),
+            "the raw record is still readable on disk"
+        );
+        assert_eq!(
+            load_recent(&dir, Duration::from_secs(24 * 60 * 60)),
+            None,
+            "a two-day-old address must not be offered as recent"
+        );
+        assert!(
+            load_recent(&dir, Duration::from_secs(7 * 24 * 60 * 60)).is_some(),
+            "a wider window must still accept it"
+        );
+    }
+
+    /// A record from before the timestamped format has an unknowable age.
+    #[test]
+    fn an_untimestamped_record_is_never_recent() {
+        let dir = scratch_dir("legacy");
+        std::fs::write(dir.join(REAL_IP_CACHE_FILE), "203.0.113.5\n").unwrap();
+
+        assert!(load(&dir).is_some());
+        assert_eq!(load_recent(&dir, Duration::from_secs(24 * 60 * 60)), None);
+    }
+
+    #[test]
+    fn a_just_written_record_is_recent() {
+        let dir = scratch_dir("fresh");
+        save(&dir, "203.0.113.5");
+        save_ipv6(&dir, "2001:db8::1");
+        let window = Duration::from_secs(60);
+
+        assert_eq!(
+            load_recent(&dir, window).map(|c| c.ip),
+            Some("203.0.113.5".to_string())
+        );
+        assert_eq!(
+            load_recent_ipv6(&dir, window).map(|c| c.ip),
+            Some("2001:db8::1".to_string())
+        );
     }
 
     #[test]

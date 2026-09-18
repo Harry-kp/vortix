@@ -64,6 +64,15 @@ share is required by the endpoints in `constants.rs`. Neither is a lever.
 | `s` | 8,017,312 | 9,287,024 |
 | `z` | **6,039,184** | **7,178,832** |
 
+**These settings cost build memory, not runtime.** `opt-level = "z"` with
+`codegen-units = 1` and linker-plugin LTO compiles the `vortix` lib crate in one
+codegen unit, and that single `rustc` needs more than 2 GB. Measured in clean VMs:
+a 2 GB Arch guest is OOM-killed (`signal: 9, SIGKILL`) partway through the lib
+crate, and the same guest at 4 GB finishes in 3m51s. Fedora 44 completed at 2 GB
+but only just. Anyone building from source — which is how `cargo install vortix`
+works — wants 4 GB or a swap file; the failure is a bare SIGKILL with no
+diagnostic pointing at memory.
+
 Runtime-neutral, measured as an interleaved A/B against `main` on an idle machine (3 reps,
 40/25 invocations each). Vortix has no sustained compute: a 1-second TUI tick, 25 ms flip
 animation frames, and a VPN data plane that lives in `wg-quick`/`openvpn` subprocesses.

@@ -1830,6 +1830,10 @@ impl PolicyExecutor for HelperBackedPolicyExecutor {
         }
     }
 
+    /// One bundled verdict across all four gates: the helper audits routes,
+    /// DNS, the final projection, and tunnels inside a single session whose
+    /// phase order cannot be rearranged, so a partial read-back is not
+    /// available here the way it is for the in-process executor.
     fn audit(&self, policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
         if policy.stage != PolicyStage::Final {
             return Err("only a final topology policy can be audited".into());

@@ -257,6 +257,58 @@ fn live_disconnect_tombstone_waits_for_worker_completion_before_clearing() {
         .expect("completed teardown fence clears from exact absence");
 }
 
+/// A teardown receipt that arrives after the profile entry moved on cannot
+/// settle its own fence. Left at its dispatch-time truth the fence is invisible
+/// to both recovery arms, so it never clears and every later operation blocks
+/// behind it and times out.
+#[test]
+fn superseded_teardown_receipt_leaves_its_fence_retryable() {
+    let target = profile("superseded-teardown");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(BarrierExecutor {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        Arc::new(OkPolicy),
+        2,
+        4,
+    );
+    let first = supervisor
+        .reserve_disconnect(&target)
+        .expect("teardown capacity reserved");
+    let second = supervisor
+        .reserve_tunnel(&target, std::iter::empty::<String>())
+        .expect("reconnect capacity reserved");
+    supervisor
+        .dispatch_reserved_tunnel(
+            work(target.clone(), 4, 9, TunnelMutation::Disconnect),
+            first,
+        )
+        .expect("teardown dispatched");
+    entered.wait();
+    // Recovery re-admitted the same profile before the teardown receipt came
+    // back. Its connect takes over the profile entry, so nothing will ever
+    // produce a receipt that matches the teardown's own fence again.
+    supervisor
+        .dispatch_reserved_tunnel(work(target.clone(), 5, 10, TunnelMutation::Connect), second)
+        .expect("superseding connect dispatched");
+
+    release.wait();
+    assert!(wait_until(Duration::from_secs(1), || supervisor.poll_tunnel()).is_some());
+
+    assert_eq!(
+        supervisor
+            .tombstones()
+            .get(&target)
+            .map(|entry| entry.truth),
+        Some(SupervisedTruth::OutcomeUnknown),
+        "a superseded teardown must leave its fence retryable, not stuck"
+    );
+}
+
 struct BarrierExecutor {
     entered: Arc<Barrier>,
     release: Arc<Barrier>,
@@ -1000,6 +1052,8 @@ impl PolicyExecutor for PolicyRecorder {
 }
 fn policy(generation: u64, digest: &str) -> TopologyPolicy {
     TopologyPolicy {
+        target_tunnels_observed: true,
+        captured_at_millis: 0,
         generation,
         authority_epoch: AuthorityEpoch(1),
         digest: PolicyDigest(digest.into()),
@@ -1299,6 +1353,120 @@ fn supervisor_rejects_same_generation_different_digest_verification() {
         Err(WorkFailure::EffectFailed)
     );
     assert_eq!(supervisor.protected_generation(), None);
+}
+
+/// The mechanism behind "connect a VPN and the kill switch goes straight to
+/// Degraded, permanently".
+///
+/// Re-verification used to be anchored on the last *proof*. One unprovable
+/// gate cleared `protected`, which made every later audit ineligible, so the
+/// snapshot could not recover on its own: protection stayed degraded until the
+/// user's next connect, disconnect or mode change.
+#[test]
+fn losing_the_protection_proof_does_not_stop_re_verification() {
+    let recorder = Arc::new(AuditPolicyRecorder::default());
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(OkExecutor),
+        recorder.clone(),
+        2,
+        4,
+    );
+    let mut policy_only = policy(7, "expected");
+    policy_only.target.profiles.clear();
+    policy_only.required_blocking = false;
+    supervisor.submit_policy(&policy_only).unwrap();
+    let applied = wait_until(Duration::from_secs(1), || supervisor.poll_policy()).unwrap();
+    assert_eq!(applied.outcome, PolicyOutcome::Applied);
+
+    let verified = PolicyVerification {
+        revision: revision(7, "expected"),
+        operation_id: operation(7),
+        observed_at_millis: 10,
+        received_at_millis: 10,
+        interface_verified: true,
+        route_verified: true,
+        dns_verified: true,
+        firewall_verified: true,
+    };
+    supervisor.verify_policy(&verified, 10).unwrap();
+    assert_eq!(supervisor.protected_generation(), Some(7));
+
+    assert!(
+        !supervisor.submit_policy_audit_if_due(10).unwrap(),
+        "a proof that was just taken is not due for refresh"
+    );
+    assert!(supervisor.submit_policy_audit_if_due(2_600).unwrap());
+    let refresh = wait_until(Duration::from_secs(1), || supervisor.poll_policy_audit()).unwrap();
+    assert!(refresh.result.is_ok());
+
+    let incomplete = PolicyVerification {
+        dns_verified: false,
+        ..verified
+    };
+    assert_eq!(
+        supervisor.verify_policy(&incomplete, 2_700),
+        Err(WorkFailure::EffectFailed)
+    );
+    assert_eq!(supervisor.protected_generation(), None);
+
+    // `submit_policy_audit_if_due` folds `Err(Busy)` into `Ok(false)`, so a
+    // worker still holding the previous audit is indistinguishable from "not
+    // due" at this call site. Asserting the bare boolean made this test fail
+    // under parallel load — on a loaded CI runner and in a full local suite —
+    // while passing in isolation. Retry until the worker frees: what is under
+    // test is that the audit becomes due again after the proof is lost, not
+    // that the queue happens to be empty on the first poll.
+    assert!(
+        wait_until(Duration::from_secs(2), || supervisor
+            .submit_policy_audit_if_due(5_200)
+            .unwrap()
+            .then_some(()))
+        .is_some(),
+        "losing the proof must not stop the very audit that could restore it"
+    );
+    let recovery = wait_until(Duration::from_secs(1), || supervisor.poll_policy_audit()).unwrap();
+    assert!(recovery.result.is_ok());
+    assert_eq!(recorder.audit_calls.load(Ordering::SeqCst), 2);
+}
+
+/// A read-back that overran the audit budget still describes the moment it
+/// observed, and freshness is enforced downstream on `observed_at_millis`.
+/// Discarding it here meant a platform whose resolver reads cost more than the
+/// budget could never re-prove protection at all.
+#[test]
+fn audit_readback_survives_a_budget_overrun() {
+    struct SlowAudit;
+    impl PolicyExecutor for SlowAudit {
+        fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
+        fn audit(&self, _: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+            std::thread::sleep(Duration::from_millis(60));
+            Ok(PolicyExecutionEvidence {
+                observed_at_millis: 10,
+                interface_verified: true,
+                route_verified: true,
+                dns_verified: true,
+                firewall_verified: true,
+            })
+        }
+    }
+
+    let worker = PolicyWorker::start(Arc::new(SlowAudit), 4);
+    let mut audited = policy(1, "slow-audit");
+    audited.deadline = Instant::now() + Duration::from_millis(20);
+    worker.submit_audit(audited).unwrap();
+    let result = wait_until(Duration::from_secs(2), || worker.try_audit_result()).unwrap();
+
+    assert!(
+        result.result.is_ok(),
+        "a slow but successful read-back must not be thrown away: {:?}",
+        result.result
+    );
 }
 
 #[test]
@@ -1771,6 +1939,46 @@ async fn set_killswitch_and_settle(
         "kill-switch policy did not settle",
     )
     .await;
+}
+
+fn topology_service_claiming(
+    profiles: BTreeSet<ProfileId>,
+    routes: &BTreeSet<String>,
+) -> (ControlService, Arc<Supervisor>, Arc<TopologyCapture>) {
+    let capture = Arc::new(TopologyCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        profiles.len().max(1),
+        8,
+    ));
+    let profile_topologies = profiles
+        .iter()
+        .cloned()
+        .map(|profile_id| {
+            (
+                profile_id,
+                ProfileTopology {
+                    routes: routes.clone(),
+                    ..ProfileTopology::default()
+                },
+            )
+        })
+        .collect();
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: profiles,
+            profile_topologies,
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    (service, supervisor, capture)
 }
 
 fn topology_service(
@@ -3457,6 +3665,191 @@ async fn disconnecting_one_of_two_profiles_reaches_terminal_truth_without_restar
     ));
 }
 
+/// Reproduces the field report: connect a second profile, disconnect it before
+/// its tunnel ever came up, and the disconnect sits until its deadline and
+/// reports "disconnection timed out" while nothing is left to tear down.
+#[tokio::test]
+async fn disconnecting_a_profile_whose_connect_never_came_up_completes() {
+    let settled = profile("stalled-peer-settled");
+    let pending = profile("stalled-peer-pending");
+    let (service, supervisor, capture) =
+        topology_service(BTreeSet::from([settled.clone(), pending.clone()]));
+    capture.publish_readback();
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &settled,
+        "stalled-peer-connect-settled",
+    )
+    .await;
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: pending.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("stalled-peer-connect-pending"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &pending && *mutation == TunnelMutation::Connect
+                })
+        },
+        "connect effect was not dispatched",
+    )
+    .await;
+
+    // The tunnel never comes up, so no observation is ever published for it.
+    let disconnect = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(pending.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("stalled-peer-disconnect-pending"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &pending && *mutation == TunnelMutation::Disconnect
+                })
+        },
+        "disconnect effect was not dispatched",
+    )
+    .await;
+    observe_disconnected(&service, &pending).await;
+
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&disconnect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "disconnecting a tunnel that never came up never completed",
+    )
+    .await;
+}
+
+/// The field report: two split-tunnel profiles claim the same subnets, the
+/// overlap is acknowledged at connect, and disconnecting the second one then
+/// reports "disconnection timed out" with nothing left to tear down.
+#[tokio::test]
+async fn disconnecting_an_overlapping_profile_completes() {
+    let first = profile("overlap-teardown-first");
+    let second = profile("overlap-teardown-second");
+    let routes = BTreeSet::from(["10.200.0.0/24".to_owned(), "10.250.0.0/24".to_owned()]);
+    let (service, supervisor, capture) =
+        topology_service_claiming(BTreeSet::from([first.clone(), second.clone()]), &routes);
+    capture.publish_readback();
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &first,
+        "overlap-teardown-connect-first",
+    )
+    .await;
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: second.clone(),
+                conflict_acknowledgement: Some(
+                    vortix::vortix_core::engine::registry::Conflict::RouteOverlap {
+                        with: first.clone(),
+                        overlapping_cidrs: routes
+                            .iter()
+                            .map(|route| route.parse().expect("test route parses"))
+                            .collect(),
+                    },
+                ),
+            },
+            idempotency_key: IdempotencyKey::new("overlap-teardown-connect-second"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("acknowledged overlap admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &second && *mutation == TunnelMutation::Connect
+                })
+        },
+        "second connect effect was not dispatched",
+    )
+    .await;
+    observe_connected(&service, &second, &format!("tun-{second}")).await;
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&second)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::ObservedPresent)
+        },
+        "second tunnel did not settle",
+    )
+    .await;
+
+    let disconnect = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(second.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("overlap-teardown-disconnect-second"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &second && *mutation == TunnelMutation::Disconnect
+                })
+        },
+        "disconnect effect was not dispatched",
+    )
+    .await;
+
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&disconnect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "disconnecting an overlapping tunnel never completed",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn kill_switch_change_preserves_settled_tunnel_revision() {
     let target = profile("stable-policy");
@@ -4036,6 +4429,188 @@ async fn unanswered_interactive_challenge_fails_closed_without_recovery_connect(
                     .all(|operation| operation.status.is_terminal())
         },
         "challenge failure did not roll back connected intent",
+    )
+    .await;
+}
+
+/// Refusing the credential prompt is as definitive as a rejected password,
+/// so it must release supervisor ownership the same way. It did not: the
+/// profile stayed `Degraded(ChallengeFailed)` for good, and a profile that is
+/// desired-absent yet still supervised is the one state the tunnel barrier
+/// refuses to pass — so no policy could publish for any profile afterwards.
+/// The sibling test above covers the intent rollback; only ownership was
+/// unchecked, which is exactly where the defect lived.
+/// Reproduction, not yet a fix. Disconnecting a profile while its own connect
+/// is still in flight leaves BOTH operations stuck at `WaitingForObservation`,
+/// which the user sees as "disconnection timed out" ~32s later.
+///
+/// Measured state at the point of failure:
+///   disconnect and connect both `WaitingForObservation`,
+///   supervised truth `DisconnectedTombstone`, desired `Disconnected`
+///
+/// Mechanism, as far as it is established: submitting the disconnect finds the
+/// connect's entry in flight with a different revision, so `submit_tunnel`
+/// cancels it and returns `Busy` without submitting. `poll_tunnel` then sees
+/// the cancelled connect's result is no longer exact — the entry has been
+/// replaced — and rewrites it to `Err(Stale)`. The result chain in
+/// `drive_supervision` has no `Stale` arm, so it matches nothing and the
+/// operation never terminalises.
+///
+/// A fix aimed at `WorkFailure::Cancelled` does NOT work: that variant never
+/// arrives on this path. Left `#[ignore]`d rather than shipping a third guess
+/// into the control plane.
+#[ignore = "reproduction for the superseded-connect disconnect timeout; no fix yet"]
+/// Disconnecting a profile while its own connect is still in flight cancels
+/// that connect. Nothing handled a cancelled tunnel result, so it fell past
+/// every arm of the result chain: the operation never terminalised and the
+/// supervisor kept owning the profile — supervised while desired-absent,
+/// which the tunnel barrier refuses to pass. The disconnect that superseded
+/// it then could not converge and timed out at its deadline.
+///
+/// The executor must genuinely block until its token fires; an instant
+/// executor finishes the connect before the disconnect lands and never
+/// exercises the cancel path at all.
+#[tokio::test]
+async fn a_disconnect_superseding_its_own_connect_settles() {
+    struct BlockUntilCancelled;
+    impl TunnelExecutor for BlockUntilCancelled {
+        fn execute(
+            &self,
+            work: &TunnelWork,
+            cancellation: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            if work.mutation == TunnelMutation::Connect {
+                while !cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                return Err("connect was cancelled".into());
+            }
+            Ok(TunnelExecutionReceipt::default())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::Cancelled
+        }
+    }
+
+    let target = profile("superseded-connect");
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(BlockUntilCancelled),
+        Arc::new(OkPolicy),
+        2,
+        8,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(target.clone(), ProfileTopology::default())]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    let client = service.client();
+
+    client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("superseded-connect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || supervisor.profile_truth(&target).is_some(),
+        "connect never reached the worker",
+    )
+    .await;
+
+    let disconnect = client
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(target.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("superseding-disconnect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("disconnect admitted");
+
+    wait_for_condition(
+        || {
+            client.snapshot().operations[&disconnect.operation_id]
+                .status
+                .is_terminal()
+        },
+        "the superseding disconnect never settled",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_refused_challenge_releases_supervisor_ownership() {
+    struct ChallengeFailure;
+    impl TunnelExecutor for ChallengeFailure {
+        fn execute(
+            &self,
+            _: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            Err("interactive challenge was cancelled or expired".into())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::ChallengeFailed
+        }
+    }
+
+    let target = profile("refused-challenge-ownership");
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(ChallengeFailure),
+        Arc::new(OkPolicy),
+        2,
+        4,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(target.clone(), ProfileTopology::default())]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    let client = service.client();
+    let admitted = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("refused-challenge-ownership"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+
+    wait_for_condition(
+        || {
+            let snapshot = client.snapshot();
+            snapshot.operations[&admitted.operation_id].status == OperationStatus::Failed
+                && supervisor.profile_truth(&target).is_none()
+        },
+        "a refused challenge left the profile supervised, which blocks the policy barrier",
     )
     .await;
 }

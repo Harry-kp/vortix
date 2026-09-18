@@ -491,27 +491,36 @@ fn find_route_conflict(
         if Some(*lease_id) == excluded || lease.profile_id == *profile_id {
             continue;
         }
-        let overlapping = routes
-            .iter()
-            .filter(|route| {
-                lease
-                    .routes
-                    .iter()
-                    .any(|existing| existing.overlaps(**route))
-            })
-            .copied()
-            .collect::<Vec<_>>();
-        if overlapping.is_empty() {
-            continue;
-        }
-        let conflict = if overlapping.iter().any(|route| route.is_default())
-            && lease.routes.iter().any(|route| route.is_default())
-        {
+        // Two defaults are a takeover: only one tunnel can carry everything.
+        // Anything else is about specific destinations, and a default route
+        // must not be compared there — it overlaps every route by definition,
+        // so a full tunnel joining a split tunnel looked like a collision on
+        // `0.0.0.0/0` when nothing was contended. `ControlSnapshot::
+        // topology_conflict` answers the same question for the confirmation
+        // overlay and has to agree with this, or admission refuses a connect
+        // the overlay will not offer to confirm.
+        let requested_default = routes.iter().any(|route| route.is_default());
+        let existing_default = lease.routes.iter().any(|route| route.is_default());
+        let conflict = if requested_default && existing_default {
             Conflict::DefaultRouteTakeover {
                 current: lease.profile_id.clone(),
                 new: profile_id.clone(),
             }
         } else {
+            let overlapping = routes
+                .iter()
+                .filter(|route| !route.is_default())
+                .filter(|route| {
+                    lease
+                        .routes
+                        .iter()
+                        .any(|existing| !existing.is_default() && existing.overlaps(**route))
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if overlapping.is_empty() {
+                continue;
+            }
             Conflict::RouteOverlap {
                 with: lease.profile_id.clone(),
                 overlapping_cidrs: overlapping
@@ -1193,6 +1202,17 @@ pub struct TopologyPolicy {
     pub tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     pub transition: TopologyTransitionKind,
     pub required_blocking: bool,
+    /// Whether every profile this policy wants connected is currently
+    /// observed active. `target` is built from desired state, so during a
+    /// recovery it names the profile and its interface while the tunnel is
+    /// still handshaking — this is what separates "the VPN is back" from
+    /// "we are still trying", which `block-on-drop` needs before it can
+    /// stand its barrier down.
+    pub target_tunnels_observed: bool,
+    /// When this transition was captured. A drop opens its recovery in the
+    /// same convergence pass that notices the loss, so the newest tunnel fact
+    /// at that instant was still taken while the tunnel was up.
+    pub captured_at_millis: u64,
     pub stage: PolicyStage,
 }
 
@@ -1257,15 +1277,21 @@ pub trait PolicyExecutor: Send + Sync + 'static {
         self.audit(policy)
     }
 
-    /// Return fresh platform read-back produced by the exact final policy.
-    /// Implementations that cannot prove every gate return `None`; worker
-    /// completion alone is never protection truth.
+    /// Return fresh platform read-back produced by the exact policy that was
+    /// just applied. Implementations that cannot prove the gates that stage
+    /// is able to prove return `None`; worker completion alone is never
+    /// protection truth.
+    ///
+    /// A [`PolicyStage::Final`] policy must prove all four gates. A
+    /// [`PolicyStage::PreTunnelBlocking`] policy can only prove the firewall:
+    /// while the emergency barrier is the only thing installed there is no
+    /// tunnel, route or resolver left to read back.
     fn verification(&self, _policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         None
     }
 }
 
-/// Platform read-back attached only to an exact successful final policy.
+/// Platform read-back attached only to an exact successful policy stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // Explicit gates are an auditable proof bit-set.
 pub struct PolicyExecutionEvidence {
@@ -1274,6 +1300,34 @@ pub struct PolicyExecutionEvidence {
     pub route_verified: bool,
     pub dns_verified: bool,
     pub firewall_verified: bool,
+}
+
+/// Fold one gate read-back into a proof bit, logging the platform reason when
+/// it cannot be proven.
+///
+/// Auditing the gates independently is deliberate. Collapsing them into one
+/// pass/fail let an unverifiable resolver or route report the *firewall* as
+/// broken, and lost the reason on the way out of the worker.
+#[must_use]
+pub fn gate_verified(
+    policy: &TopologyPolicy,
+    gate: &'static str,
+    readback: Result<(), String>,
+) -> bool {
+    match readback {
+        Ok(()) => true,
+        Err(reason) => {
+            tracing::warn!(
+                target: "vortix::control::policy",
+                operation = %policy.operation_id,
+                generation = policy.generation,
+                gate,
+                reason = %reason,
+                "protection gate read-back could not be verified"
+            );
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1318,6 +1372,7 @@ pub struct PolicyResult {
 pub struct PolicyAuditResult {
     pub revision: ControlRevision,
     pub operation_id: OperationId,
+    pub stage: PolicyStage,
     pub result: Result<PolicyExecutionEvidence, WorkFailure>,
 }
 
@@ -1584,6 +1639,7 @@ fn run_policy_audit(
 ) -> PolicyAuditResult {
     let revision = policy.revision();
     let operation_id = policy.operation_id.clone();
+    let stage = policy.stage;
     let result = if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
         Err(WorkFailure::Cancelled)
     } else if Instant::now() >= policy.deadline {
@@ -1595,10 +1651,13 @@ fn run_policy_audit(
         .map_err(|_| WorkFailure::Panicked)
         .and_then(|result| result.map_err(|_| WorkFailure::EffectFailed))
         .and_then(|evidence| {
+            // A read-back that overran the audit budget is still true about
+            // the moment it observed, and freshness is enforced downstream on
+            // `observed_at_millis`. Discarding it here meant a platform whose
+            // resolver reads cost more than the budget could never re-prove
+            // protection at all: the snapshot stayed degraded for good.
             if cancellation.is_cancelled() {
                 Err(WorkFailure::Cancelled)
-            } else if Instant::now() >= policy.deadline {
-                Err(WorkFailure::TimedOut)
             } else {
                 Ok(evidence)
             }
@@ -1607,6 +1666,7 @@ fn run_policy_audit(
     PolicyAuditResult {
         revision,
         operation_id,
+        stage,
         result,
     }
 }
@@ -1732,7 +1792,11 @@ fn run_policy(
             }
         }
     }
-    let verification = (outcome == PolicyOutcome::Applied && policy.stage == PolicyStage::Final)
+    // Every applied stage offers its read-back, not only the final one. The
+    // emergency pre-tunnel barrier is a real firewall the user is relying on;
+    // withholding its proof left the kill-switch row reporting `Degraded`
+    // during the exact window the block was in force.
+    let verification = (outcome == PolicyOutcome::Applied)
         .then(|| executor.verification(&policy))
         .flatten();
     PolicyResult {
@@ -1829,4 +1893,62 @@ pub fn wait_until<T>(timeout: Duration, mut poll: impl FnMut() -> Option<T>) -> 
         thread::yield_now();
     }
     None
+}
+
+#[cfg(test)]
+mod reservation_conflict_tests {
+    use super::*;
+
+    /// wg07 is a split tunnel (`10.200.0.0/24`, `10.250.0.0/24`); wg08 is a
+    /// full tunnel (`0.0.0.0/0`). A default route overlaps every route by
+    /// definition, so admission refused the second connect as a collision on
+    /// `0.0.0.0/0` — with nothing actually contended. The refusal had no
+    /// confirmation behind it either, so the user got "Another tunnel claimed
+    /// these routes first" and no way forward.
+    #[test]
+    fn a_full_tunnel_may_join_a_split_tunnel() {
+        let book = ReservationBook::default();
+        let split = ProfileId::new("wg07");
+        let full = ProfileId::new("wg08");
+
+        let _held = book
+            .reserve(
+                &split,
+                ["10.200.0.0/24".to_string(), "10.250.0.0/24".to_string()],
+            )
+            .expect("split tunnel reserves its own prefixes");
+
+        book.reserve(&full, ["0.0.0.0/0".to_string()])
+            .expect("a full tunnel claims nothing the split tunnel holds");
+    }
+
+    /// Scoped to default routes only: real collisions must still be refused.
+    #[test]
+    fn contended_claims_are_still_refused() {
+        let book = ReservationBook::default();
+        let held = ProfileId::new("holder");
+        let candidate = ProfileId::new("candidate");
+
+        let _held = book
+            .reserve(&held, ["10.250.0.0/24".to_string()])
+            .expect("first claim succeeds");
+        assert_eq!(
+            book.reserve(&candidate, ["10.250.0.0/24".to_string()])
+                .err(),
+            Some(WorkFailure::RouteConflict),
+            "two profiles claiming the same specific prefix still collide"
+        );
+
+        let defaults = ReservationBook::default();
+        let first = ProfileId::new("full-one");
+        let second = ProfileId::new("full-two");
+        let _first = defaults
+            .reserve(&first, ["0.0.0.0/0".to_string()])
+            .expect("first full tunnel reserves the default route");
+        assert_eq!(
+            defaults.reserve(&second, ["0.0.0.0/0".to_string()]).err(),
+            Some(WorkFailure::RouteConflict),
+            "two full tunnels still contend for the default route"
+        );
+    }
 }

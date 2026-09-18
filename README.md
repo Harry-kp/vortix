@@ -67,9 +67,16 @@ brew install wireguard-tools openvpn
 # Ubuntu / Debian
 sudo apt install wireguard-tools openvpn
 
+# Arch / CachyOS / Manjaro
+sudo pacman -S wireguard-tools openvpn
+
 # Fedora
 sudo dnf install wireguard-tools openvpn
 ```
+
+Installing Vortix does not pull these in, whichever channel you use — Vortix drives
+`wg-quick` and `openvpn` as subprocesses, so without them a profile imports but cannot
+connect. `vortix up` names the missing package and the install command for your distro.
 
 Then install Vortix using your preferred channel:
 
@@ -177,7 +184,7 @@ Common TUI keys:
 | [Configuration](https://github.com/Harry-kp/vortix/blob/main/docs/configuration.md) | Paths, files, themes, settings, DNS integration, and precedence |
 | [Troubleshooting](https://github.com/Harry-kp/vortix/blob/main/docs/troubleshooting.md) | Startup, permissions, DNS, WireGuard, OpenVPN, firewall, and reporting |
 | [Migration](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) | Upgrade and profile-storage changes |
-| [Manual test backlog](https://github.com/Harry-kp/vortix/blob/main/docs/manual-testing/backlog.md) | Real-kernel and real-terminal checks not covered by automation |
+| [P0 release gate](https://github.com/Harry-kp/vortix/blob/main/docs/manual-testing/P0.md) | Real-kernel and real-terminal checks that must pass before every release |
 
 ### For contributors and agents
 
@@ -194,7 +201,7 @@ Common TUI keys:
 Contributions and real-world testing are welcome:
 
 - Start with a [good first issue](https://github.com/Harry-kp/vortix/labels/good%20first%20issue).
-- Run a scenario from the [manual-testing backlog](https://github.com/Harry-kp/vortix/blob/main/docs/manual-testing/backlog.md).
+- Run a scenario from the [P0 release gate](https://github.com/Harry-kp/vortix/blob/main/docs/manual-testing/P0.md).
 - Share Linux results in the [Linux tester discussion](https://github.com/Harry-kp/vortix/discussions/184).
 - Use [Discussions](https://github.com/Harry-kp/vortix/discussions) for questions and ideas.
 

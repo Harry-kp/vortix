@@ -12,8 +12,8 @@ use crate::state::{Protocol, VpnProfile};
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::service::ProfileTopology;
 use crate::vortix_core::control::worker::{
-    PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage, TopologyPolicy,
-    TopologyState,
+    gate_verified, PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage,
+    TopologyPolicy, TopologyState,
 };
 use crate::vortix_core::control::BootEligibility;
 use crate::vortix_core::control::PolicyDigest;
@@ -619,14 +619,24 @@ impl CanonicalPolicyExecutor {
                 DefaultRouteObservation::Interface(observed)
                     if observed == &expectation.interface
             ) {
-                let (profile, claim) = expectation
+                let (_, claim) = expectation
                     .claims
                     .first()
                     .expect("route probe expectation has at least one claim");
-                return Err(format!(
-                    "route {claim} for profile {profile} did not resolve through {}: {observation:?}",
-                    expectation.interface
-                ));
+                // Profile ids are 64-character digests. The interface names
+                // the tunnel in the same words the user sees everywhere else.
+                let expected = &expectation.interface;
+                return Err(match &observation {
+                    DefaultRouteObservation::Interface(observed) => format!(
+                        "{claim} should route through {expected}, but the system routes it through {observed}"
+                    ),
+                    DefaultRouteObservation::NoDefaultRoute => format!(
+                        "{claim} should route through {expected}, but the system has no route for it"
+                    ),
+                    DefaultRouteObservation::ProbeFailed => format!(
+                        "could not read which interface carries {claim}; {expected} is unverified"
+                    ),
+                });
             }
         }
         Ok(())
@@ -791,6 +801,19 @@ impl CanonicalPolicyExecutor {
                 pending.into_iter().collect(),
             ));
         }
+        // With nothing to allow, this barrier is a deny-all that permits only
+        // loopback, RFC1918 and DHCP — it cannot protect a tunnel, and the
+        // handshake it is supposed to cover is the first thing it blocks.
+        // Arming block-on-drop and then connecting installed exactly that,
+        // failed the connect on a handshake that never left the host, and
+        // left the machine with no egress. Refuse it: an error aborts the
+        // operation before anything is installed.
+        if active.is_empty() {
+            return Err(
+                "pre-tunnel blocking has no tunnel or endpoint to allow; refusing a                  barrier that would block the connection it protects"
+                    .into(),
+            );
+        }
         Ok(active)
     }
 
@@ -887,6 +910,14 @@ impl CanonicalPolicyExecutor {
         Ok(())
     }
 
+    /// Read the emergency barrier back out of the kernel without mutating
+    /// it. This is the one gate a pre-tunnel block can prove, and the only
+    /// evidence that lets the kill-switch row claim the block it engaged.
+    fn verify_pre_tunnel_blocking(&self, policy: &TopologyPolicy) -> Result<(), String> {
+        let active = self.pre_block_tunnels(policy)?;
+        crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
+    }
+
     fn apply_final_firewall(&self, policy: &TopologyPolicy) -> Result<(), String> {
         if firewall_transition_requires_authority(policy.target.kill_switch) {
             self.require_global_authority()?;
@@ -902,8 +933,24 @@ impl CanonicalPolicyExecutor {
                 )
             }
             KillSwitchMode::Auto => {
-                crate::core::killswitch::disable_blocking().map_err(|error| error.to_string())?;
-                (KillSwitchState::Armed, None)
+                // An unexpected drop opens a recovery that installs a
+                // pre-tunnel barrier. This stage used to take it straight
+                // back off, so the mode engaged and un-engaged inside one
+                // transition and the real address flowed for the whole
+                // reconnect window. Stand down only once the kernel agrees
+                // the tunnel is back; `release-killswitch` and switching the
+                // mode to off are the other two ways out, and both take their
+                // own path.
+                if policy.required_blocking && !policy.target_tunnels_observed {
+                    let verification = crate::core::killswitch::verify_blocking(&active)
+                        .is_ok()
+                        .then(|| crate::core::killswitch::local_verification(&active));
+                    (KillSwitchState::Blocking, verification)
+                } else {
+                    crate::core::killswitch::disable_blocking()
+                        .map_err(|error| error.to_string())?;
+                    (KillSwitchState::Armed, None)
+                }
             }
             KillSwitchMode::Off => {
                 crate::core::killswitch::disable_blocking().map_err(|error| error.to_string())?;
@@ -925,6 +972,10 @@ impl CanonicalPolicyExecutor {
         }
         match policy.target.kill_switch {
             KillSwitchMode::AlwaysOn => {
+                let active = self.final_firewall_tunnels(policy)?;
+                crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
+            }
+            KillSwitchMode::Auto if policy.required_blocking && !policy.target_tunnels_observed => {
                 let active = self.final_firewall_tunnels(policy)?;
                 crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
             }
@@ -961,7 +1012,20 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
         self.with_readback(policy, |_| {});
         match barrier {
             PolicyBarrier::Blocking if policy.stage == PolicyStage::PreTunnelBlocking => {
-                self.install_pre_tunnel_blocking(policy)
+                self.install_pre_tunnel_blocking(policy)?;
+                let observed_at_millis = crate::utils::boot_elapsed_millis().ok_or_else(|| {
+                    "OS boot clock is unavailable for policy evidence".to_string()
+                })?;
+                // An unprovable read-back does not undo the barrier — the
+                // kernel already holds it and rolling back here would be
+                // fail-open. It only means the block cannot be reported.
+                let firewall_verified =
+                    gate_verified(policy, "firewall", self.verify_pre_tunnel_blocking(policy));
+                self.with_readback(policy, |evidence| {
+                    evidence.firewall_verified = firewall_verified;
+                    evidence.observed_at_millis = observed_at_millis;
+                });
+                Ok(())
             }
             PolicyBarrier::Blocking => {
                 self.apply_final_firewall(policy)?;
@@ -1026,33 +1090,57 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
     }
 
     fn audit(&self, policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
-        if policy.stage != PolicyStage::Final {
-            return Err("only a final topology policy can be audited".into());
-        }
-        self.verify_tunnels(policy)?;
-        self.verify_routes(policy)?;
-        self.verify_dns(policy)?;
-        self.verify_final_firewall(policy)?;
         let observed_at_millis = crate::utils::boot_elapsed_millis()
             .ok_or_else(|| "OS boot clock is unavailable for policy evidence".to_string())?;
+        if policy.stage == PolicyStage::PreTunnelBlocking {
+            // The emergency barrier has exactly one gate. Re-proving it on
+            // the audit cadence is what keeps a reported block from ageing
+            // out into `Degraded` while it is still installed.
+            return Ok(PolicyExecutionEvidence {
+                observed_at_millis,
+                firewall_verified: gate_verified(
+                    policy,
+                    "firewall",
+                    self.verify_pre_tunnel_blocking(policy),
+                ),
+                interface_verified: false,
+                route_verified: false,
+                dns_verified: false,
+            });
+        }
+        // Every gate is read back independently, firewall first. Bailing at the
+        // first failure meant one unverifiable resolver reported the firewall as
+        // broken, and the cheapest, most safety-critical read-back was last in
+        // line for the audit budget.
         Ok(PolicyExecutionEvidence {
             observed_at_millis,
-            interface_verified: true,
-            route_verified: true,
-            dns_verified: true,
-            firewall_verified: true,
+            firewall_verified: gate_verified(
+                policy,
+                "firewall",
+                self.verify_final_firewall(policy),
+            ),
+            interface_verified: gate_verified(policy, "interface", self.verify_tunnels(policy)),
+            route_verified: gate_verified(policy, "route", self.verify_routes(policy)),
+            dns_verified: gate_verified(policy, "dns", self.verify_dns(policy)),
         })
     }
 
     fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         let state = self.readback.lock().ok()?;
         let readback = state.as_ref()?;
-        (readback.key == Self::key(policy)
-            && readback.evidence.interface_verified
-            && readback.evidence.route_verified
-            && readback.evidence.dns_verified
-            && readback.evidence.firewall_verified)
-            .then_some(readback.evidence)
+        if readback.key != Self::key(policy) {
+            return None;
+        }
+        let proven = match policy.stage {
+            PolicyStage::PreTunnelBlocking => readback.evidence.firewall_verified,
+            PolicyStage::Final => {
+                readback.evidence.interface_verified
+                    && readback.evidence.route_verified
+                    && readback.evidence.dns_verified
+                    && readback.evidence.firewall_verified
+            }
+        };
+        proven.then_some(readback.evidence)
     }
 }
 
@@ -1066,9 +1154,14 @@ fn firewall_compensation_target(
     policy: &TopologyPolicy,
     barrier: PolicyBarrier,
 ) -> FirewallCompensationTarget {
-    if policy.stage == PolicyStage::Final
-        && policy.required_blocking
-        && matches!(barrier, PolicyBarrier::EffectivePublication)
+    // A recovery that required a pre-tunnel barrier and has not got its tunnel
+    // back must not fail open, whichever barrier tripped. Restoring `prior`
+    // there runs `disable_blocking` for block-on-drop, which is how a drop
+    // ended up engaging and un-engaging within one transition and leaving the
+    // real address exposed for the whole reconnect window.
+    if policy.required_blocking
+        && (matches!(barrier, PolicyBarrier::EffectivePublication)
+            || !policy.target_tunnels_observed)
     {
         FirewallCompensationTarget::PreTunnelBlocking
     } else {
@@ -1091,6 +1184,8 @@ mod tests {
 
     fn policy(prior: TopologyState, target: TopologyState) -> TopologyPolicy {
         TopologyPolicy {
+            target_tunnels_observed: true,
+            captured_at_millis: 0,
             generation: 1,
             authority_epoch: AuthorityEpoch(1),
             digest: PolicyDigest("policy".into()),
@@ -1140,6 +1235,35 @@ mod tests {
         assert_eq!(
             active[0].server_ips,
             vec!["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    /// `block-on-drop` installs a pre-tunnel barrier when a drop opens a
+    /// recovery, and the final stage of that same transition used to call
+    /// `disable_blocking` unconditionally — so the mode engaged and
+    /// un-engaged within one transition and the real address flowed for the
+    /// whole reconnect window. The barrier now stands down only once the
+    /// kernel agrees the tunnel is back.
+    ///
+    /// The second case is the one that locks people out: a recovery that
+    /// *succeeded* must release. `seal_final_topology_policy` recomputes the
+    /// flag against the current scan for exactly this reason.
+    #[test]
+    fn block_on_drop_holds_its_barrier_only_while_the_tunnel_is_still_gone() {
+        let hold = |required_blocking: bool, observed: bool| required_blocking && !observed;
+
+        assert!(
+            hold(true, false),
+            "a recovery whose tunnel is still absent must keep blocking"
+        );
+        assert!(
+            !hold(true, true),
+            "a recovery that restored the tunnel must release, or the user is \
+             locked out of a working connection"
+        );
+        assert!(
+            !hold(false, false),
+            "without a required pre-block there is no barrier to hold"
         );
     }
 

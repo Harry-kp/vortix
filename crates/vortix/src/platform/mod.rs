@@ -133,6 +133,28 @@ pub fn current_platform() -> &'static Platform {
     GLOBAL_PLATFORM.get_or_init(Platform::for_test)
 }
 
+/// Directory a confined `wg-quick` is permitted to read configs from, when
+/// the platform confines it at all.
+///
+/// Debian and Ubuntu ship an `AppArmor` profile for wg-quick granting no read
+/// access outside `/etc/wireguard`, so a lifecycle copy staged anywhere else
+/// is refused by the kernel before wg-quick even runs. The profile's rule is
+/// `file rw @{etc_rw}/wireguard/{,**}` — the `{,**}` covers the tree
+/// recursively, so Vortix takes its own subdirectory rather than writing
+/// beside configs the user manages. Nothing there is ever theirs, so there is
+/// no file to avoid clobbering and none of its contents outlive a teardown.
+///
+/// `None` means the platform does not confine wg-quick and the caller may
+/// stage wherever it likes.
+pub(crate) fn wireguard_staging_dir() -> Option<&'static std::path::Path> {
+    #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: AppArmor confines wg-quick on Linux only
+    const STAGING_DIR: Option<&str> = Some("/etc/wireguard/vortix");
+    #[cfg(not(target_os = "linux"))] // xtask:allow-platform-cfg: see above
+    const STAGING_DIR: Option<&str> = None;
+
+    STAGING_DIR.map(std::path::Path::new)
+}
+
 pub(crate) fn observe_process_identity(
     pid: u32,
 ) -> std::io::Result<Option<crate::vortix_core::ports::process::KernelProcessIdentity>> {
@@ -272,6 +294,26 @@ pub(crate) fn supplementary_groups_for_user(
     }
 }
 
+/// The command that shows this platform's Vortix-owned firewall rules, so a
+/// reader who is told Vortix cannot confirm them can look for themselves.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn firewall_inspect_hint() -> &'static str {
+    "sudo pfctl -a com.apple/vortix.killswitch -sr"
+}
+
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn firewall_inspect_hint() -> &'static str {
+    "sudo nft list table inet vortix_killswitch"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[must_use]
+pub fn firewall_inspect_hint() -> &'static str {
+    "(no firewall inspection command on this platform)"
+}
+
 /// Platform-appropriate install hint for a package.
 #[cfg(target_os = "macos")]
 #[must_use]
@@ -279,9 +321,57 @@ pub fn install_hint(pkg: &str) -> String {
     format!("brew install {pkg}")
 }
 
+/// The install command for this machine's package manager.
+///
+/// Read from `/etc/os-release`: `ID` first, then `ID_LIKE`, so derivatives
+/// resolve to the family they are built on -- `CachyOS` and `EndeavourOS` report
+/// `ID_LIKE=arch`, Nobara reports `fedora`, Mint reports `debian`. A distro
+/// that matches nothing falls back to listing every family, which is what
+/// this function used to print unconditionally.
+#[cfg(target_os = "linux")]
+fn install_command(pkg: &str) -> Option<String> {
+    let release = std::fs::read_to_string("/etc/os-release").ok()?;
+    let field = |key: &str| -> Option<String> {
+        release.lines().find_map(|line| {
+            let value = line.strip_prefix(key)?.strip_prefix('=')?;
+            Some(value.trim_matches('"').to_lowercase())
+        })
+    };
+    let ids = [field("ID"), field("ID_LIKE")];
+    let families = ids.iter().flatten().flat_map(|v| {
+        v.split_whitespace()
+            .map(std::borrow::ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    });
+    for family in families {
+        match family.as_str() {
+            "debian" | "ubuntu" => return Some(format!("sudo apt install {pkg}")),
+            "arch" | "archlinux" | "cachyos" | "manjaro" => {
+                return Some(format!("sudo pacman -S {pkg}"))
+            }
+            "fedora" | "rhel" | "centos" => return Some(format!("sudo dnf install {pkg}")),
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn install_hint(pkg: &str) -> String {
+    // A package whose name differs per family, or which is not a package at
+    // all, keeps its hand-written block below.
+    let uniform = matches!(pkg, "wg" | "wg-quick" | "wireguard-tools" | "openvpn");
+    if uniform {
+        let package = if pkg == "openvpn" {
+            "openvpn"
+        } else {
+            "wireguard-tools"
+        };
+        if let Some(command) = install_command(package) {
+            return command;
+        }
+    }
     match pkg {
         // systemd-resolved is managing DNS — need the systemd-provided shim.
         // `openresolv` will NOT work here (causes "signature mismatch").

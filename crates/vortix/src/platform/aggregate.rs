@@ -519,9 +519,29 @@ impl RouteTableKind {
         }
     }
 
-    /// Tri-state default-route observation, preserving probe failures.
+    /// Which interface actually carries public traffic, preserving probe
+    /// failures.
+    ///
+    /// `redirect-gateway def1` installs `0.0.0.0/1` and `128.0.0.0/1` instead
+    /// of replacing the default route, so reading the `default` entry names
+    /// the ISP link while every packet leaves through the tunnel. Vortix then
+    /// reported a fully tunnelled `OpenVPN` session as "no exit". Ask the kernel
+    /// to select a route instead, which is the question being asked.
     #[must_use]
     pub fn default_route_observation(
+        &self,
+    ) -> crate::vortix_core::ports::route_table::DefaultRouteObservation {
+        use crate::vortix_core::ports::route_table::DefaultRouteObservation;
+        match self.route_interface_for(INTERNET_ROUTE_PROBE) {
+            DefaultRouteObservation::ProbeFailed => self.declared_default_route(),
+            selected => selected,
+        }
+    }
+
+    /// The literal `default` route entry. Only a fallback: it misses the `/1`
+    /// pair above and any policy-routing rule.
+    #[must_use]
+    fn declared_default_route(
         &self,
     ) -> crate::vortix_core::ports::route_table::DefaultRouteObservation {
         use crate::vortix_core::ports::route_table::RouteTable;
@@ -574,6 +594,10 @@ impl RouteTableKind {
         }
     }
 }
+
+/// Address used to ask the kernel which interface carries public traffic.
+const INTERNET_ROUTE_PROBE: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
 
 /// Scriptable mock for the `SocketAudit` port.
 #[derive(Debug, Default, Clone)]

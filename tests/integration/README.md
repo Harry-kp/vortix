@@ -46,7 +46,7 @@ either script is safe.
 `openvpn` and the netns topology would support it, but no script drives it —
 every kernel-level OpenVPN result this project has came from
 `scripts/vpn-lab.sh` against a real server, recorded by hand in
-`docs/manual-testing/backlog.md`. Treat that as the source of truth for
+`docs/manual-testing/P0.md`. Treat that as the source of truth for
 OpenVPN until a script lands here.
 
 Failure-path coverage (auth-failed, unreachable peer, daemon-died-mid-session)
@@ -80,7 +80,7 @@ block merge.
 GitHub Actions macOS runners don't support `ip netns` or sandboxed
 `wg-quick` easily, so kernel-level macOS parity — PF kill-switch,
 `scutil` DNS, real utun tunnels — is still deferred and still needs
-`docs/manual-testing/backlog.md`.
+`docs/manual-testing/P0.md`.
 
 What is covered there is the profile itself. `release_smoke.sh` runs on
 `macos-latest` and is the only job anywhere that executes a macOS release

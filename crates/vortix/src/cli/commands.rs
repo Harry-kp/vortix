@@ -33,8 +33,13 @@ fn lifecycle_progress_message(
         return None;
     }
     let protocol = protocol.map_or_else(String::new, |value| format!(" ({value})"));
+    // Nothing here installs a SIGINT handler, so Ctrl-C only stops this
+    // process waiting — the admitted operation carries on and can still
+    // bring the tunnel up. Saying "cancels" left people believing an
+    // interrupted connect had been called off while it was completing.
     Some(format!(
-        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s (Ctrl-C cancels)…"
+        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s (Ctrl-C stops waiting, not the {action_lower})…",
+        action_lower = action.to_lowercase()
     ))
 }
 
@@ -260,8 +265,8 @@ fn handle_background_setup(
     }
 
     let mut preview = vec![
-        "Runs persistent Vortix processes for live CLI/TUI sync, automatic drop recovery, boot connections, and continuous policy verification.".into(),
-        "Uses a narrower privileged helper after one trusted package bootstrap; Standard mode keeps its existing root-assisted client boundary.".into(),
+        "Would keep Vortix running in the background so the CLI and TUI stay in sync, dropped tunnels reconnect on their own, chosen profiles connect at boot, and firewall rules are re-checked continuously.".into(),
+        "Would run VPN commands through a small privileged helper installed once, so day-to-day use no longer needs sudo. Standard mode keeps asking for sudo instead.".into(),
     ];
     if !boot_profiles.is_empty() {
         preview.push(format!(
@@ -544,7 +549,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
                     code: "platform_unsupported",
                     message: "Socket audit is not available on this platform yet".to_string(),
                     hint: Some(
-                        "Linux + macOS are supported in v0.3.0; Windows support is on the roadmap"
+                        "Linux and macOS are supported; Windows support is on the roadmap"
                             .to_string(),
                     ),
                 },
@@ -582,10 +587,24 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
         OutputMode::Human => {
             println!("PID    COMMAND          PROTO   LOCAL                            REMOTE                           IFACE");
             for s in &snapshots {
+                // An unresolved owner came out as a bare `0`, which reads as
+                // the kernel rather than "not known" — and stays 0 for many
+                // sockets even under sudo. `-` matches the IFACE column's
+                // existing convention for the same situation.
+                let pid = if s.pid == 0 {
+                    "-".to_string()
+                } else {
+                    s.pid.to_string()
+                };
+                let command = if s.command.is_empty() {
+                    "-"
+                } else {
+                    s.command.as_str()
+                };
                 println!(
                     "{:<6} {:<16} {:<7} {:<32} {:<32} {}",
-                    s.pid,
-                    s.command,
+                    pid,
+                    command,
                     s.protocol,
                     s.local,
                     s.remote.map_or_else(|| "*".to_string(), |r| r.to_string()),
@@ -804,14 +823,21 @@ fn handle_up(
     // up. `--yes` bypasses the gate for scripted callers.
     if !yes {
         if let Some(conflict) = detect_conflict_for_cli(&engine, &profile_name) {
+            // Conflicts carry opaque profile IDs; the reader needs the name
+            // they typed, so resolve through the catalog before formatting.
+            let named = |id: &crate::vortix_core::profile::ProfileId| {
+                engine
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .map_or_else(|| id.to_string(), |profile| profile.name.clone())
+            };
             let (code, message) = match &conflict {
-                crate::vortix_core::engine::Conflict::DefaultRouteTakeover {
-                    current,
-                    new: _,
-                } => (
+                crate::vortix_core::engine::Conflict::DefaultRouteTakeover { current, new: _ } => (
                     "state_conflict_default_route",
                     format!(
-                        "Profile '{profile_name}' would take over the default route from '{current}'"
+                        "Profile '{profile_name}' would take over the default route from '{}'",
+                        named(current)
                     ),
                 ),
                 crate::vortix_core::engine::Conflict::RouteOverlap {
@@ -820,7 +846,8 @@ fn handle_up(
                 } => (
                     "state_conflict_route_overlap",
                     format!(
-                        "Profile '{profile_name}' overlaps with '{with}' on {} CIDR(s)",
+                        "Profile '{profile_name}' overlaps with '{}' on {} CIDR(s)",
+                        named(with),
                         overlapping_cidrs.len()
                     ),
                 ),
@@ -1058,6 +1085,18 @@ fn local_control_error_category(
     }
 }
 
+/// The reason the control layer recorded for a terminal operation.
+///
+/// The snapshot returned with the outcome carries the operation record, and
+/// that record is where a route or DNS ownership refusal explains itself.
+fn failure_detail(outcome: &crate::cli::control::ClientOperationOutcome) -> Option<String> {
+    outcome
+        .snapshot
+        .operations
+        .get(&outcome.operation_id)
+        .and_then(|operation| operation.failure_detail.clone())
+}
+
 fn operation_failure(
     action: &str,
     outcome: &crate::cli::control::ClientOperationOutcome,
@@ -1081,13 +1120,15 @@ fn operation_failure(
             "timeout",
             ExitCode::Timeout,
             format!(
-                "{action} timed out; operation {operation} remains recorded for reconciliation"
+                "{action} did not finish within its deadline. Vortix is still reconciling it, so check `vortix status` before retrying — the tunnel may yet come up or be rolled back (operation {operation})."
             ),
         ),
         (_, Some(OperationResult::Failed(OperationFailure::HandshakeFailed))) => (
             "connect_failed",
             ExitCode::GeneralError,
-            format!("WireGuard handshake failed for operation {operation}"),
+            format!(
+                "The WireGuard peer never completed a handshake. Usually the endpoint host or port is unreachable, UDP is blocked on this network, or the peer key does not match the server (operation {operation})."
+            ),
         ),
         (_, Some(OperationResult::Failed(OperationFailure::AuthenticationFailed))) => (
             "authentication_failed",
@@ -1101,15 +1142,35 @@ fn operation_failure(
             ExitCode::GeneralError,
             format!("{action} operation {operation} was cancelled"),
         ),
-        _ => (
-            if action == "disconnect" {
+        (_, Some(OperationResult::Failed(OperationFailure::InvalidProfile))) => (
+            "invalid_profile",
+            ExitCode::GeneralError,
+            "That profile is not usable. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -, and the file must contain an [Interface] and a [Peer] section.".to_owned(),
+        ),
+        _ => {
+            let code = if action == "disconnect" {
                 "disconnect_failed"
             } else {
                 "connect_failed"
-            },
-            ExitCode::GeneralError,
-            format!("{action} operation {operation} failed"),
-        ),
+            };
+            // The control layer records why a terminal operation failed, and
+            // the dashboard has always shown it. The CLI used to drop it and
+            // print this arm's generic sentence, so a connect refused because
+            // another interface held a route the tunnel needed said only that
+            // it "did not succeed". The operation id means nothing to the
+            // reader, so lead with the recorded reason when there is one. It
+            // still cannot promise the previous state survived: a failed
+            // reconnect, for one, can leave the tunnel down.
+            let message = failure_detail(outcome).map_or_else(
+                || format!(
+                    "The {action} did not succeed. Run `vortix status` to see what state it left behind — it may not be the state you started in (operation {operation})."
+                ),
+                |detail| format!(
+                    "The {action} did not succeed: {detail}. Run `vortix status` to see what state it left behind — it may not be the state you started in (operation {operation})."
+                ),
+            );
+            (code, ExitCode::GeneralError, message)
+        }
     }
 }
 
@@ -2093,7 +2154,7 @@ mod handshake_status_tests {
                 Some("WireGuard"),
                 60,
             ),
-            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C cancels)…".into())
+            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C stops waiting, not the connecting)…".into())
         );
         assert_eq!(
             lifecycle_progress_message(
@@ -2103,7 +2164,7 @@ mod handshake_status_tests {
                 None,
                 30,
             ),
-            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s (Ctrl-C cancels)…".into())
+            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s (Ctrl-C stops waiting, not the disconnecting)…".into())
         );
         assert!(lifecycle_progress_message(
             OutputMode::Json,
@@ -3136,12 +3197,27 @@ fn handle_rename(
                 ExitCode::StateConflict,
             );
         }
-        result => print_error_and_exit(
+        Some(Err(failure)) => {
+            let (code, message) = rename_failure_text(failure, trimmed);
+            print_error_and_exit(
+                mode,
+                "rename",
+                CliError {
+                    code,
+                    message,
+                    hint: None,
+                },
+                ExitCode::GeneralError,
+            );
+        }
+        _ => print_error_and_exit(
             mode,
             "rename",
             CliError {
                 code: "io_error",
-                message: format!("Rename failed: {result:?}"),
+                message: format!(
+                    "Could not rename '{old}' to '{trimmed}'. The profile was left unchanged."
+                ),
                 hint: None,
             },
             ExitCode::GeneralError,
@@ -3167,6 +3243,100 @@ fn handle_rename(
 struct KsData {
     mode: String,
     state: String,
+}
+
+/// Print the active mode, what it is doing right now, and the other choices.
+/// Turn a rename refusal into something the reader can act on. The raw
+/// variant used to reach the terminal as `Some(Err(InvalidName))`.
+fn rename_failure_text(
+    failure: crate::vortix_core::control::ProfileMutationFailure,
+    requested: &str,
+) -> (&'static str, String) {
+    use crate::vortix_core::control::ProfileMutationFailure as Failure;
+    match failure {
+        Failure::InvalidName => (
+            "invalid_name",
+            format!(
+                "'{requested}' is not a usable profile name. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -."
+            ),
+        ),
+        Failure::NotFound => (
+            "not_found",
+            "That profile no longer exists. Run `vortix list` to see what is there.".to_owned(),
+        ),
+        Failure::AlreadyExists => (
+            "already_exists",
+            format!("A profile named '{requested}' already exists"),
+        ),
+        Failure::Busy => (
+            "busy",
+            "Another change to this profile is still running. Try again in a moment.".to_owned(),
+        ),
+        Failure::DeadlineExpired => (
+            "timeout",
+            "The rename did not finish in time. The profile was left unchanged.".to_owned(),
+        ),
+        Failure::Storage => (
+            "storage",
+            "The profile directory could not be written. Check its permissions and free space."
+                .to_owned(),
+        ),
+        Failure::Internal => (
+            "internal",
+            "Vortix stopped the rename rather than leave the profile half-renamed.".to_owned(),
+        ),
+    }
+}
+
+fn print_killswitch_status(
+    mode: crate::state::KillSwitchMode,
+    state: crate::state::KillSwitchState,
+) {
+    println!(
+        "Kill Switch: {} — currently {}",
+        mode.display_name(),
+        state.display_status()
+    );
+    // Degraded means this mode's rules are not in place. Printing the mode's
+    // behaviour here read as a description of what is happening, so "no
+    // internet at all" appeared over a working connection.
+    if state == crate::state::KillSwitchState::Degraded {
+        // Degraded is "this process cannot prove the rules are in place",
+        // which is not the same as "they are not". Proof is bound to the
+        // process that applied it, so a separate CLI invocation reaches
+        // this branch even while the policy is installed and enforcing.
+        // Claiming the rules were missing sent readers to re-apply a
+        // working kill switch.
+        println!("  Vortix cannot confirm this mode's firewall rules from here,");
+        println!("  so it will not claim you are protected. Traffic may or may not");
+        println!("  be blocked — check the rules directly to be sure:");
+        println!("    {}", crate::platform::firewall_inspect_hint());
+        println!(
+            "  Re-apply with `vortix killswitch {}`, or clear it with `vortix release-killswitch`.",
+            mode.cli_verb()
+        );
+    } else {
+        let (up, down) = mode.behavior_lines();
+        println!("  {up}");
+        println!("  {down}");
+    }
+    println!();
+    println!("Other modes:");
+    for other in [
+        crate::state::KillSwitchMode::Off,
+        crate::state::KillSwitchMode::Auto,
+        crate::state::KillSwitchMode::AlwaysOn,
+    ] {
+        if other == mode {
+            continue;
+        }
+        println!(
+            "  vortix killswitch {:<14}  {} — {}",
+            other.cli_verb(),
+            other.display_name(),
+            other.one_liner()
+        );
+    }
 }
 
 fn handle_killswitch(
@@ -3246,32 +3416,7 @@ fn handle_killswitch(
 
     match output_mode {
         OutputMode::Human => {
-            let mode = engine.killswitch_mode;
-            let (up, down) = mode.behavior_lines();
-            println!(
-                "Kill Switch: {} — currently {}",
-                mode.display_name(),
-                engine.killswitch_state.display_status()
-            );
-            println!("  {up}");
-            println!("  {down}");
-            println!();
-            println!("Other modes:");
-            for other in [
-                crate::state::KillSwitchMode::Off,
-                crate::state::KillSwitchMode::Auto,
-                crate::state::KillSwitchMode::AlwaysOn,
-            ] {
-                if other == mode {
-                    continue;
-                }
-                println!(
-                    "  vortix killswitch {:<14}  {} — {}",
-                    other.cli_verb(),
-                    other.display_name(),
-                    other.one_liner()
-                );
-            }
+            print_killswitch_status(engine.killswitch_mode, engine.killswitch_state);
         }
         OutputMode::Json => print_success(output_mode, "killswitch", &data, vec![]),
         OutputMode::Quiet => {}
@@ -3279,6 +3424,13 @@ fn handle_killswitch(
     0
 }
 
+/// Take post-operation kill-switch truth from the control snapshot the
+/// service just published, falling back to the durable record.
+///
+/// The snapshot's effective state is derived from firewall read-back under the
+/// service's own freshness fence, so it is the better answer whenever it
+/// exists. The durable record is the fallback, and it only reads back as
+/// `Blocking` while it still carries proof this process can use.
 fn refresh_killswitch_after_operation(
     engine: &mut VpnRuntime,
     outcome: &crate::cli::control::ClientOperationOutcome,
@@ -3286,10 +3438,17 @@ fn refresh_killswitch_after_operation(
     match crate::core::killswitch::load_state_checked() {
         Ok(Some(persisted)) => {
             engine.killswitch_mode = persisted.mode;
-            engine.killswitch_state = persisted.effective_state.unwrap_or(persisted.state);
+            engine.killswitch_state = outcome
+                .snapshot
+                .effective
+                .kill_switch
+                .unwrap_or_else(|| persisted.recovered_state());
         }
         Ok(None) => {
             engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
+            if let Some(state) = outcome.snapshot.effective.kill_switch {
+                engine.killswitch_state = state;
+            }
         }
         Err(error) => {
             engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
@@ -3569,6 +3728,15 @@ fn handle_completions(shell: clap_complete::Shell) {
 }
 
 /// Counts VPN profiles in a directory by extension.
+/// The protocol a profile's metadata sidecar declares, when it has one.
+fn sidecar_protocol(config: &Path) -> Option<String> {
+    let sidecar = config.with_extension("meta.toml");
+    let text = std::fs::read_to_string(sidecar).ok()?;
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("protocol = "))
+        .map(|value| value.trim().trim_matches('"').to_owned())
+}
+
 pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
     if !profiles_dir.is_dir() {
         return (0, 0);
@@ -3578,12 +3746,32 @@ pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
     if let Ok(entries) = std::fs::read_dir(profiles_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("conf") => wg += 1,
-                    Some("ovpn") => ovpn += 1,
-                    _ => {}
+            // Rendered tunnel configs are staged beside the profiles as
+            // dotfiles. The profile list already skips them; counting them
+            // here reported more profiles than the user has.
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            match path.extension().and_then(|e| e.to_str()) {
+                // An OpenVPN profile may be imported as `.conf`, so the
+                // extension alone put it in the WireGuard column. The sidecar
+                // records what it actually is.
+                Some("conf") => {
+                    if sidecar_protocol(&path).as_deref() == Some("OpenVpn") {
+                        ovpn += 1;
+                    } else {
+                        wg += 1;
+                    }
                 }
+                Some("ovpn") => ovpn += 1,
+                _ => {}
             }
         }
     }

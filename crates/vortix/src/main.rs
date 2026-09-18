@@ -113,10 +113,17 @@ fn main() -> Result<()> {
                 std::process::exit(cli::output::ExitCode::StateConflict.code());
             }
             Err(error) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "{}",
-                    vortix::utils::lifecycle_lock_user_message(&error)
-                ));
+                // The neighbouring WouldBlock arm already prints and exits
+                // cleanly; this one returned an eyre error, so a lock the
+                // user simply could not open came with a source location and
+                // backtrace hints attached.
+                eprintln!("{}", vortix::utils::lifecycle_lock_user_message(&error));
+                let exit = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    cli::output::ExitCode::PermissionDenied
+                } else {
+                    cli::output::ExitCode::GeneralError
+                };
+                std::process::exit(exit.code());
             }
         })
     } else {
@@ -133,6 +140,24 @@ fn main() -> Result<()> {
         eprintln!("Vortix needs administrator access to manage VPN connections.");
         eprintln!("Try again with: sudo vortix");
         std::process::exit(cli::output::ExitCode::PermissionDenied.code());
+    }
+
+    // `ratatui::init()` panics when there is no terminal to take over, and
+    // that surfaced as "Vortix crashed unexpectedly" followed by a ratatui
+    // source path — for the entirely ordinary case of no TTY: `ssh host
+    // vortix`, a cron entry, a pipe. Refuse here, before any state is
+    // touched, and point at the headless commands that do work. Both streams
+    // matter: the dashboard draws to stdout and reads keys from stdin, so a
+    // redirected stdin would leave it painted but unable to accept input.
+    if args.command.is_none() {
+        use std::io::IsTerminal as _;
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            eprintln!("The Vortix dashboard needs an interactive terminal.");
+            eprintln!(
+                "Run `vortix` directly in a terminal, or use the headless commands: vortix status, vortix list"
+            );
+            std::process::exit(cli::output::ExitCode::GeneralError.code());
+        }
     }
 
     // Settings use the same authoritative directory as profiles and
@@ -159,6 +184,11 @@ fn main() -> Result<()> {
                 disk: settings.journal.disk,
                 retention_days: settings.journal.retention_days,
                 retention_count: settings.journal.retention_count,
+                // The default resolves the XDG data dir from $HOME, which is
+                // /root under sudo, so session journals landed outside the
+                // user's home where they could neither find nor prune them.
+                // Keep them beside the logs, in the sudo-aware config dir.
+                journal_dir: Some(config_dir.join("sessions")),
                 ..Default::default()
             },
         ) {
@@ -205,6 +235,21 @@ fn main() -> Result<()> {
     // VORTIX_SKIP_MIGRATION=<anything> bypasses the startup backfill for
     // users who need to disable it (see docs/MIGRATION.md).
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
+    // A profile directory that disagrees with the inventory must not be acted
+    // on: a profile's stable id is what binds it to its saved credentials, and
+    // re-deriving one from a name could hand a profile someone else's secret.
+    // That is a reason to refuse profile work, not a reason to strand a live
+    // tunnel. Disconnecting everything, reading status and releasing the kill
+    // switch resolve no profile identity, so they stay reachable -- otherwise a
+    // stray file leaves a connected user unable to close their own tunnel.
+    let identity_free_command = matches!(
+        args.command,
+        Some(
+            cli::args::Commands::Status { .. }
+                | cli::args::Commands::ReleaseKillSwitch
+                | cli::args::Commands::Down { profile: None, .. }
+        )
+    );
     if std::env::var_os("VORTIX_SKIP_MIGRATION").is_some() {
         eprintln!("VORTIX_SKIP_MIGRATION set — skipping startup sidecar backfill.");
     } else {
@@ -230,9 +275,78 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "profile identity migration refused startup: {e}. Restore the managed profile directory to its saved inventory before managing tunnels; add new profiles from outside that directory with `vortix import <path>`"
-                ));
+                // Returning an eyre error here printed a source location and
+                // backtrace hints at the user, and gave one blanket
+                // "restore the inventory" instruction for every cause. A
+                // permission failure is a different problem with a different
+                // fix, and `--json` callers got an empty stdout instead of an
+                // envelope.
+                let mode = if args.json {
+                    cli::output::OutputMode::Json
+                } else if args.quiet {
+                    cli::output::OutputMode::Quiet
+                } else {
+                    cli::output::OutputMode::Human
+                };
+                let (err, exit) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (
+                        cli::output::CliError {
+                            code: "profiles_not_readable",
+                            message: format!(
+                                "Vortix cannot read its own profile directory: {}",
+                                profiles_dir.display()
+                            ),
+                            hint: Some(format!(
+                                "Some files there are owned by another user. Run: sudo chown -R $(id -u):$(id -g) {}",
+                                profiles_dir.display()
+                            )),
+                        },
+                        cli::output::ExitCode::PermissionDenied,
+                    )
+                } else if let Some(sidecar) =
+                    vortix::vortix_config::migration::unexplained_sidecar_cause(&e)
+                {
+                    // The blanket "restore the inventory" text told the user
+                    // neither which file was the problem nor how to clear it,
+                    // and this refusal stops every command — including
+                    // read-only ones — so it has to be answerable.
+                    let stray = profiles_dir.join(&sidecar.file_name);
+                    (
+                        cli::output::CliError {
+                            code: "profile_directory_has_unknown_file",
+                            message: format!(
+                                "Vortix found a profile metadata file it has no record of: {}",
+                                stray.display()
+                            ),
+                            hint: Some(format!(
+                                "Vortix tracks the profiles it manages in an inventory and will not touch the directory while a file there is missing from it, so no command can run until this is resolved. It is usually left over from an interrupted import or an older version. If you did not put it there, move it out and Vortix will start: mv {} {}",
+                                stray.display(),
+                                std::env::temp_dir().display()
+                            )),
+                        },
+                        cli::output::ExitCode::GeneralError,
+                    )
+                } else {
+                    (
+                        cli::output::CliError {
+                            code: "profile_migration_refused",
+                            message: format!("Vortix could not prepare the profile directory: {e}"),
+                            hint: Some(format!(
+                                "Vortix records the profiles it manages in {inventory}, and refuses to act on the directory while the files there disagree with it, because a profile's identity is what binds it to its saved credentials. This usually means a profile file was removed or replaced outside Vortix. Put the missing file back if you have it; otherwise delete {inventory} and Vortix will rebuild it from the files that remain. `vortix down` and `vortix status` keep working meanwhile, so a connected tunnel can still be closed.",
+                                inventory = profiles_dir.join(".vortix-profile-inventory-v1.toml").display()
+                            )),
+                        },
+                        cli::output::ExitCode::GeneralError,
+                    )
+                };
+                if identity_free_command {
+                    eprintln!("warning: {}", err.message);
+                    if let Some(hint) = &err.hint {
+                        eprintln!("  hint: {hint}");
+                    }
+                } else {
+                    cli::output::print_error_and_exit(mode, "startup", err, exit);
+                }
             }
         }
     }
@@ -247,6 +361,12 @@ fn main() -> Result<()> {
     // receipt belong to tracked sessions. A one-shot `up` deliberately leaves
     // those tunnels running, so process reparenting or CLI exit alone is not
     // evidence that they are orphans.
+    // Ownership receipts are root-owned, and resolving a WireGuard
+    // interface to its PID needs privilege too. An unprivileged process
+    // therefore cannot tell a tracked tunnel from an abandoned one, and
+    // reported every live managed tunnel as a possible orphan. Absence of
+    // evidence is not evidence of an orphan, so only scan where the
+    // evidence is readable.
     let mut tracked_pids = vortix::utils::tracked_openvpn_pids();
     tracked_pids.extend(vortix::core::managed_wireguard::tracked_wireguard_pids(
         &config_dir,
@@ -255,7 +375,7 @@ fn main() -> Result<()> {
         vortix::vortix_process::scan_orphans(),
         &tracked_pids,
     );
-    if !orphans.is_empty() {
+    if !orphans.is_empty() && vortix::utils::is_root() {
         eprintln!(
             "Warning: detected {} possible orphan VPN process(es) from a previous session:",
             orphans.len()

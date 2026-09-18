@@ -4,7 +4,6 @@
 //! is returned by [`current()`]. A render frame scopes its configured choice
 //! through [`with_choice`] so live switching cannot mix palettes.
 
-#![allow(dead_code)]
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;

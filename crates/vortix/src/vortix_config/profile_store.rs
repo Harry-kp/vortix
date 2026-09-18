@@ -52,7 +52,7 @@ pub(crate) fn acquire_profile_lock(
     if let Some(parent) = profiles_dir.parent() {
         reject_symlink(parent)?;
     }
-    std::fs::create_dir_all(profiles_dir)?;
+    crate::utils::create_user_dir(profiles_dir)?;
     let path = profiles_dir.join(PROFILE_LOCK);
     reject_symlink(&path)?;
     let mut options = OpenOptions::new();
@@ -62,7 +62,10 @@ pub(crate) fn acquire_profile_lock(
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(path)?;
+    let file = options.open(&path)?;
+    // Same reason as `write_atomic`: a lock created under `sudo` must not
+    // lock out the unprivileged CLI that runs next.
+    crate::config::fix_ownership(&path);
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
@@ -379,7 +382,7 @@ impl FsProfileStore {
         reject_symlink(&self.profiles_dir)?;
         let root = self.root_dir();
         reject_symlink(&root)?;
-        std::fs::create_dir_all(&self.profiles_dir)?;
+        crate::utils::create_user_dir(&self.profiles_dir)?;
         let auth = root.join("auth");
         if auth.exists() {
             reject_symlink(&auth)?;
@@ -1145,6 +1148,12 @@ fn reject_symlink_io(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Create the profile directory private to its owner.
+///
+/// `create_dir_all` applies the caller's umask, and 002 is the Debian-family
+/// default, which left this directory group-writable. The profiles and their
+/// sidecars are 0600, but a group-writable directory still allows renaming or
+/// replacing them.
 pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1174,6 +1183,12 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     file.write_all(body)?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
+    // The TUI requires root, so these 0600 files are born root-owned under
+    // `sudo vortix` and every later unprivileged CLI call then fails to read
+    // them. Hand them to the invoking user, same contract as the config dir.
+    // No-op when not root, and when invoked as direct root there is no user
+    // to hand them to.
+    crate::config::fix_ownership(path);
     sync_dir(parent)
 }
 

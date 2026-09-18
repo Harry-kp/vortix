@@ -75,10 +75,26 @@ impl PendingControlSubject {
         }
     }
 
+    /// Say what ran out of time, why it matters, and what to do — a bare
+    /// "timed out" left the user with no idea whether the tunnel was up.
+    const fn timeout_message(self) -> &'static str {
+        match self {
+            Self::Connection | Self::Reconnection => {
+                "Connection timed out. The VPN did not come up in time, so Vortix left it disconnected. Check the server endpoint and your network, then try again."
+            }
+            Self::Disconnection | Self::DisconnectAll => {
+                "Disconnection timed out. The tunnel was torn down but Vortix could not confirm the system settled. Check the tunnel list; if the profile is still shown, disconnect it again."
+            }
+            Self::KillSwitch => {
+                "Kill switch change timed out. The firewall rules were not confirmed, so protection may not match what is shown. Re-apply the mode from the Security Guard panel."
+            }
+        }
+    }
+
     fn failure_message(self, failure: crate::vortix_core::control::OperationFailure) -> String {
         use crate::vortix_core::control::OperationFailure;
         match failure {
-            OperationFailure::Timeout => format!("{} timed out", self.label()),
+            OperationFailure::Timeout => self.timeout_message().to_string(),
             OperationFailure::Rejected => format!(
                 "{} could not start because another action or route conflict is still active. Try again in a moment.",
                 self.label()
@@ -96,11 +112,11 @@ impl PendingControlSubject {
                     .to_string()
             }
             OperationFailure::ObservationFailed => format!(
-                "Vortix could not verify the system state after the {}. Check the Event Log and try again.",
+                "Vortix finished the {} but could not read back the system state to confirm it. The tunnel list may be out of date. Press [r] to refresh; if it stays wrong, disconnect and reconnect.",
                 self.label()
             ),
             OperationFailure::Internal => format!(
-                "Vortix could not complete the {}. Check the Event Log and try again.",
+                "Vortix hit an internal error during the {} and stopped rather than leave the tunnel half-configured. The Event Log line above this one names the step that failed.",
                 self.label()
             ),
         }
@@ -178,7 +194,12 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
             CONTROL_STARTING_MESSAGE.to_string()
         }
         LocalControlError::Admission(AdmissionError::RouteConflict) => {
-            "This VPN overlaps an active route. Review the confirmation and try again.".to_string()
+            // Reached only when the confirmation overlay could not be reopened
+            // - see `recover_route_conflict`. By that point the conflicting
+            // tunnel is no longer in our snapshot, so naming it would be a
+            // guess. Telling the user to "review the confirmation" was worse:
+            // there was no confirmation anywhere to review.
+            "Another tunnel claimed these routes first. Try connecting again.".to_string()
         }
         LocalControlError::Admission(AdmissionError::ProfileActive) => {
             "Disconnect this profile before changing it.".to_string()
@@ -204,6 +225,37 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
             reason.clone()
         }
         _ => "Vortix could not start this action. See Event Log for details.".to_string(),
+    }
+}
+
+/// Whether a refusal is the service saying "these routes are already claimed".
+///
+/// Both the in-process and the daemon-backed control paths can raise it, and
+/// the user's situation is identical either way, so both must be recognised.
+fn is_route_conflict(error: &crate::cli::control::LocalControlError) -> bool {
+    use crate::cli::control::LocalControlError;
+    use crate::vortix_core::control::AdmissionError;
+    matches!(
+        error,
+        LocalControlError::Admission(AdmissionError::RouteConflict)
+            | LocalControlError::Remote(crate::daemon::service::RemoteControlError::Admission(
+                AdmissionError::RouteConflict
+            ))
+    )
+}
+
+/// The profile a connect-shaped command targeted, if it was one.
+///
+/// Deliberately narrower than [`lifecycle_command_profile_id`]: only a connect
+/// can be refused for a route conflict, and recovering one means re-offering
+/// the *connect*.
+fn connect_target(command: Option<&crate::vortix_core::control::UserCommand>) -> Option<ProfileId> {
+    use crate::vortix_core::control::UserCommand;
+    match command? {
+        UserCommand::Connect { profile_id, .. } | UserCommand::ConnectExclusive { profile_id } => {
+            Some(profile_id.clone())
+        }
+        _ => None,
     }
 }
 
@@ -285,8 +337,48 @@ fn control_command_subject(
     }
 }
 
+/// Where the cursor starts in the credential overlay.
+///
+/// Jumping to the one-time code is right when the pair above it is already
+/// filled in — that is the only box left to type. With nothing saved it put
+/// the cursor in the third box of an empty form, so typing a username filled
+/// the one-time code instead.
+fn initial_auth_focus(
+    kind: &crate::vortix_core::control::ChallengeKind,
+    credentials_prefilled: bool,
+) -> crate::state::AuthField {
+    if matches!(
+        kind,
+        crate::vortix_core::control::ChallengeKind::TwoFactorCode
+    ) && credentials_prefilled
+    {
+        crate::state::AuthField::Otp
+    } else {
+        crate::state::AuthField::Username
+    }
+}
+
 #[cfg(test)]
 mod control_command_subject_tests {
+    use super::initial_auth_focus;
+    use crate::state::AuthField;
+    use crate::vortix_core::control::ChallengeKind;
+
+    #[test]
+    fn an_empty_two_factor_form_starts_at_the_username() {
+        assert_eq!(
+            initial_auth_focus(&ChallengeKind::TwoFactorCode, false),
+            AuthField::Username,
+            "with nothing saved the cursor must start at the top of the form, \
+             or the first thing typed lands in the one-time code box"
+        );
+        assert_eq!(
+            initial_auth_focus(&ChallengeKind::TwoFactorCode, true),
+            AuthField::Otp,
+            "with the pair already saved the code is the only box left to fill"
+        );
+    }
+
     use super::{control_command_subject, PendingControlSubject};
     use crate::vortix_core::control::UserCommand;
     use crate::vortix_core::profile::ProfileId;
@@ -425,7 +517,7 @@ fn terminal_control_notification(
             Some((format!("{} cancelled", subject.label()), ToastType::Info))
         }
         (OperationStatus::Expired, _) => {
-            Some((format!("{} timed out", subject.label()), ToastType::Error))
+            Some((subject.timeout_message().to_string(), ToastType::Error))
         }
         (OperationStatus::Succeeded, _)
             if matches!(subject, PendingControlSubject::DisconnectAll) =>
@@ -490,11 +582,26 @@ impl App {
     ) -> Option<()> {
         let wait = self.control_command_timeout(&command);
         let idempotency_key = self.next_control_request_key();
+        // Captured before `command` moves into the queue: a route-conflict
+        // refusal has to know which profile was asking in order to re-offer it.
+        let conflict_target = connect_target(Some(&command));
         let result = self
             .control_session
             .as_ref()
             .expect("control command requires an attached session")
             .enqueue_tui_command(command, wait, idempotency_key);
+        if let Err(error) = &result {
+            if is_route_conflict(error) {
+                if let Some(profile_id) = conflict_target {
+                    if self.recover_route_conflict(&profile_id) {
+                        self.log(
+                            "CONTROL: connect refused for a route conflict; reopened the confirmation",
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
         self.report_control_enqueue(result)
     }
 
@@ -654,6 +761,8 @@ impl App {
                     }
                 }
                 crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
+                    // Read before anything below can consume `result.command`.
+                    let conflict_target = connect_target(result.command.as_ref());
                     if let Some(request_key) = import_request_key.as_deref() {
                         self.reject_pending_profile_import(request_key);
                     }
@@ -669,6 +778,16 @@ impl App {
                         .as_deref()
                         .map_or_else(|| "command".to_owned(), |name| format!("import '{name}'"));
                     self.log(&format!("ERR: Control {subject} refused: {error}"));
+                    // A route conflict is a decision, not a failure. Offer the
+                    // takeover confirmation instead of a toast the user cannot
+                    // act on.
+                    if is_route_conflict(&error) {
+                        if let Some(profile_id) = conflict_target {
+                            if self.recover_route_conflict(&profile_id) {
+                                continue;
+                            }
+                        }
+                    }
                     self.show_toast(control_error_message(&error), ToastType::Error);
                 }
                 crate::cli::control::TuiControlCompletion::ChallengeResponse {
@@ -763,9 +882,23 @@ impl App {
         }
         self.registry
             .set_killswitch_mode(snapshot.desired.kill_switch);
+        // `effective.kill_switch` is None until the service publishes an
+        // observation. That is "not known yet", which is not the same as
+        // `Degraded` — documented as the no-claim state for when policy
+        // application or read-back cannot be proven. Rendering the gap as
+        // Degraded told users their kill switch was broken every time a
+        // change was in flight, including when the firewall was applied and
+        // correct.
+        //
+        // While a change is running, the last observed state is still the
+        // truth about the firewall, so it is held rather than replaced by an
+        // alarm. Only an unknown state with nothing running is a real
+        // no-claim, and that still reports Degraded.
         let kill_switch_state = snapshot.effective.kill_switch.unwrap_or_else(|| {
             if snapshot.desired.kill_switch == crate::state::KillSwitchMode::Off {
                 KillSwitchState::Disabled
+            } else if self.killswitch_change_in_flight() {
+                self.runtime.killswitch_state
             } else {
                 KillSwitchState::Degraded
             }
@@ -808,6 +941,7 @@ impl App {
                             Default::default()
                         }
                     };
+                    let credentials_prefilled = !username.is_empty() && !password.is_empty();
                     self.input_mode = InputMode::AuthPrompt {
                         profile_id,
                         profile_name,
@@ -817,14 +951,7 @@ impl App {
                         password,
                         otp: crate::state::SecretText::default(),
                         otp_cursor: 0,
-                        focused_field: if matches!(
-                            &challenge.kind,
-                            crate::vortix_core::control::ChallengeKind::TwoFactorCode
-                        ) {
-                            crate::state::AuthField::Otp
-                        } else {
-                            crate::state::AuthField::Username
-                        },
+                        focused_field: initial_auth_focus(&challenge.kind, credentials_prefilled),
                         save_credentials: true,
                         connect_after: true,
                         static_challenge_prompt: matches!(
@@ -863,6 +990,40 @@ impl App {
             _ => {}
         }
         self.report_terminal_control_operations(&snapshot);
+        // Both real-IP cache gates read these, and nothing wrote them: the
+        // writers went with `Message::SyncSystemState`, so
+        // `scanner_first_tick_done` was permanently false and the address was
+        // never cached at all. A published snapshot with a default-route
+        // observation is proof the scan ran, and `observed.tunnels` is the
+        // kernel's own count — which is what "no tunnel owns the egress path"
+        // was always meant to mean.
+        if snapshot.observed.default_route.is_some() {
+            self.runtime.scanner_first_tick_done = true;
+        }
+        // Primary election reads the default-route interface from the
+        // registry's cache, and this is the only place the canonical
+        // observation reaches the App. Without this feed the cache stays
+        // empty for the whole process lifetime, so no tunnel is ever
+        // elected primary: a full tunnel renders as `Split tunnel`, the
+        // header reads `NO EXIT`, and Security Guard reports
+        // `split-route — no exit` while the kernel routes everything
+        // through it.
+        let default_route_interface = snapshot
+            .observed
+            .default_route
+            .as_ref()
+            .and_then(|route| route.interface_name.clone());
+        self.runtime
+            .default_route_interface
+            .clone_from(&default_route_interface);
+        self.registry
+            .feed_default_route_interface(default_route_interface);
+        self.runtime.last_kernel_session_count = snapshot
+            .observed
+            .tunnels
+            .values()
+            .filter(|tunnel| tunnel.active)
+            .count();
         self.control_snapshot = snapshot;
         if egress_path_changed {
             self.refresh_telemetry();
@@ -926,6 +1087,16 @@ impl App {
         let target_name = self.runtime.profiles[idx].name.clone();
         self.fire_conflict_overlay(conflict, idx, profile_id, target_name);
         true
+    }
+
+    /// Whether a kill-switch change is still running.
+    pub(crate) fn killswitch_change_in_flight(&self) -> bool {
+        self.pending_control_operations.values().any(|pending| {
+            matches!(
+                pending.subject,
+                super::connection::PendingControlSubject::KillSwitch
+            )
+        })
     }
 
     /// Commit or discard held credentials once the server has judged them.
@@ -1131,6 +1302,9 @@ impl App {
         {
             self.pending_control_operations.remove(&operation_id);
             self.settle_credentials(subject, status, result, connect_profile.as_ref());
+            if matches!(subject, PendingControlSubject::KillSwitch) {
+                self.submit_queued_killswitch_target();
+            }
             if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
                 continue;
             }
@@ -1473,6 +1647,40 @@ impl App {
     /// Fire the appropriate confirm overlay for a registry-reported
     /// conflict. Logs an ACTION line so the activity panel
     /// reflects the blocked attempt.
+    /// Turn a route-conflict refusal into the confirmation the user can act on.
+    ///
+    /// `control_connect_profile` already opens this overlay when the *local*
+    /// snapshot shows a conflict. That snapshot can lag the service, though:
+    /// the peer tunnel may claim the route between our last snapshot and the
+    /// command landing, and a connect issued from anywhere that does not route
+    /// through `control_connect_profile` never consults it at all. Either way
+    /// the service refuses with `RouteConflict` and, before this, the user got
+    /// a dead-end toast telling them to review a confirmation that was never
+    /// shown.
+    ///
+    /// Re-resolve against the now-current snapshot and open the same overlay.
+    /// Returns whether it could - a caller that gets `false` must still report
+    /// the error, because the conflict has since cleared and there is nothing
+    /// to confirm.
+    pub(super) fn recover_route_conflict(&mut self, profile_id: &ProfileId) -> bool {
+        let Some(conflict) = self.control_snapshot.topology_conflict(profile_id) else {
+            return false;
+        };
+        let Some(idx) = self.profile_index(profile_id) else {
+            return false;
+        };
+        let Some(name) = self
+            .runtime
+            .profiles
+            .get(idx)
+            .map(|profile| profile.name.clone())
+        else {
+            return false;
+        };
+        self.fire_conflict_overlay(conflict, idx, profile_id.clone(), name);
+        true
+    }
+
     fn fire_conflict_overlay(
         &mut self,
         conflict: Conflict,
@@ -1482,15 +1690,7 @@ impl App {
     ) {
         match conflict {
             Conflict::DefaultRouteTakeover { current, new } => {
-                let current_name = self
-                    .runtime
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == current)
-                    .map_or_else(
-                        || format!("ProfileMissing:{current}"),
-                        |profile| profile.name.clone(),
-                    );
+                let current_name = self.profile_display_name(&current);
                 self.log(&format!(
                     "ACTION: Connect to '{target_name}' blocked by default-route takeover ('{current_name}' holds 0/0)"
                 ));
@@ -1506,7 +1706,8 @@ impl App {
                 overlapping_cidrs,
             } => {
                 self.log(&format!(
-                    "ACTION: Connect to '{target_name}' blocked by route-overlap with '{with}' ({} CIDR(s))",
+                    "ACTION: Connect to '{target_name}' blocked by route-overlap with '{}' ({} CIDR(s))",
+                    self.profile_display_name(&with),
                     overlapping_cidrs.len()
                 ));
                 self.input_mode = InputMode::ConfirmRouteOverlap {

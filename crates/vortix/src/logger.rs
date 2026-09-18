@@ -8,7 +8,7 @@
 //! `vortix_core::control::diagnostics`; arbitrary log text stays local.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use crate::constants;
@@ -142,11 +142,11 @@ impl Logger {
 }
 
 /// Global logger instance (thread-safe)
-static LOGGER: std::sync::OnceLock<Arc<Mutex<Logger>>> = std::sync::OnceLock::new();
+static LOGGER: std::sync::OnceLock<Mutex<Logger>> = std::sync::OnceLock::new();
 
 /// Get the global logger instance, initializing if needed
-fn get_logger() -> &'static Arc<Mutex<Logger>> {
-    LOGGER.get_or_init(|| Arc::new(Mutex::new(Logger::new())))
+fn get_logger() -> &'static Mutex<Logger> {
+    LOGGER.get_or_init(|| Mutex::new(Logger::new()))
 }
 
 /// Log a message with the specified level and category

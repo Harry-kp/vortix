@@ -335,6 +335,71 @@ fn write_managed_temp_config(
     user_conf_path: &Path,
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
+    // Debian and Ubuntu ship an AppArmor profile for wg-quick that permits no
+    // config path outside /etc/wireguard. Staging under the session tmp dir
+    // made the kernel deny the read — `apparmor="DENIED" operation="open"
+    // profile="wg-quick"` — and every WireGuard connect timed out with nothing
+    // in Vortix's own logs to explain it. The canonical directory is the only
+    // location a confined wg-quick can read, so on Linux that is where the
+    // lifecycle copy goes.
+    if let Some(directory) = crate::platform::wireguard_staging_dir() {
+        return write_managed_config_in_wireguard_dir(directory, user_conf_path, stripped_body);
+    }
+    write_managed_temp_config_unconfined(user_conf_path, stripped_body)
+}
+
+/// Stage the lifecycle copy inside the directory a confined `wg-quick` may
+/// read.
+///
+/// The platform hands back a Vortix-owned subdirectory, so nothing here
+/// belongs to the user and the write needs no ownership arbitration.
+fn write_managed_config_in_wireguard_dir(
+    directory: &Path,
+    user_conf_path: &Path,
+    stripped_body: &[u8],
+) -> Result<PathBuf, TunnelError> {
+    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
+
+    interface_name_from_path(user_conf_path)?;
+    let basename = user_conf_path
+        .file_name()
+        .ok_or_else(|| TunnelError::Subprocess("WireGuard config has no basename".into()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+            .map_err(|error| {
+                TunnelError::Subprocess(format!(
+                    "create {}: {error}. WireGuard needs this directory because wg-quick is confined to it.",
+                    directory.display()
+                ))
+            })?;
+    }
+
+    let staged = directory.join(basename);
+    // Best-effort unlink of a stale leaf from a same-session reconnect, as in
+    // the unconfined path.
+    let _ = std::fs::remove_file(&staged);
+
+    write_secret_file(&staged, stripped_body).map_err(|e| match e {
+        SecretFileError::Io(io) => {
+            TunnelError::Subprocess(format!("write managed WG config: {io}"))
+        }
+        other => TunnelError::Subprocess(format!("write managed WG config: {other}")),
+    })?;
+
+    Ok(staged)
+}
+
+/// Original staging behaviour, retained where `wg-quick` is unconfined.
+fn write_managed_temp_config_unconfined(
+    user_conf_path: &Path,
+    stripped_body: &[u8],
+) -> Result<PathBuf, TunnelError> {
     let session_id = resolve_session_id();
     let session_root = crate::utils::get_tmp_config_dir(&session_id).map_err(|e| {
         TunnelError::Subprocess(format!("failed to create per-session tmp dir: {e}"))
@@ -390,7 +455,9 @@ fn cleanup_managed_temp_config(temp_path: &Path) {
     if let Some(parent) = temp_path.parent() {
         // `remove_dir` only succeeds when the dir is empty — exactly the
         // condition we want. Other secondaries in the same session keep
-        // their own leaf and the dir survives.
+        // their own leaf and the dir survives. The name check gates only the
+        // session-root removal below, so an empty session dir is still
+        // collected here.
         let removed_lifecycle = std::fs::remove_dir(parent).is_ok()
             && parent
                 .file_name()
@@ -890,6 +957,7 @@ impl WgTunnel {
             || cleanup_managed_temp_config(&cleanup_path),
             || self.down(handle),
             || wait_for_interface_absence(&interface_name, Duration::from_secs(2)),
+            || wait_for_interface_presence(&interface_name, Duration::from_secs(2)),
         )
     }
 }
@@ -901,8 +969,12 @@ fn settle_failed_attempt(
     cleanup_absent: impl FnOnce(),
     teardown: impl FnOnce() -> Result<(), TunnelError>,
     confirm_absence: impl FnOnce() -> bool,
+    settle_presence: impl FnOnce() -> bool,
 ) -> TunnelError {
-    if !initially_exists {
+    // "Absent right now" is not "never created": the daemon behind the
+    // interface may still be starting after its launcher was killed. Give it
+    // a bounded moment before concluding there is nothing to tear down.
+    if !initially_exists && !settle_presence() {
         cleanup_absent();
         return original;
     }
@@ -1008,6 +1080,28 @@ fn send_handshake_probe(target: IpAddr, timeout: Duration) -> std::io::Result<()
     // Discard service: one byte is sufficient to cause route lookup and a
     // WireGuard handshake; no application response is read or interpreted.
     socket.send(&[0]).map(|_| ())
+}
+
+/// Wait briefly for an interface that may still be coming up.
+///
+/// `wg-quick` spawns `wireguard-go` and returns; killing `wg-quick` on a
+/// deadline does not kill that daemon. A failed attempt that probes for its
+/// interface the instant the command dies can therefore see nothing, skip
+/// teardown, and leave the daemon to finish starting — owning a `utun` with
+/// whatever routes it had installed, with no owner left to remove it.
+fn wait_for_interface_presence(interface_name: &str, timeout: Duration) -> bool {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    loop {
+        if WgTunnel::interface_exists(interface_name) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_for_interface_absence(interface_name: &str, timeout: Duration) -> bool {
@@ -1843,6 +1937,7 @@ mod tests {
             || panic!("present attempt must be torn down"),
             || Err(TunnelError::Subprocess("down timed out".into())),
             || false,
+            || panic!("a present interface must not wait for presence"),
         );
         assert!(matches!(error, TunnelError::OutcomeUnknown(_)));
         assert!(managed.exists(), "ambiguous attempt must retain its config");
@@ -1864,9 +1959,60 @@ mod tests {
                 Ok(())
             },
             || true,
+            || panic!("a present interface must not wait for presence"),
         );
         assert!(matches!(error, TunnelError::Subprocess(_)));
         assert!(!managed.exists());
+    }
+
+    #[test]
+    fn an_interface_that_appears_after_the_probe_is_still_torn_down() {
+        // `wg-quick` spawns `wireguard-go` and returns; killing `wg-quick` on a
+        // deadline leaves that daemon starting. Probing once the instant the
+        // command dies saw no interface, skipped teardown, and let the daemon
+        // finish — owning a utun with its routes and nothing left to remove it,
+        // which took a laptop off the network.
+        let scratch = tempfile::tempdir().unwrap();
+        let managed = scratch.path().join("corp.conf");
+        std::fs::write(&managed, "managed-attempt").unwrap();
+        let torn_down = std::cell::Cell::new(false);
+
+        let error = settle_failed_attempt(
+            TunnelError::Timeout(Duration::from_secs(1)),
+            "utun4",
+            false, // the probe at kill time saw nothing
+            || panic!("an interface that appeared must not be written off as absent"),
+            || {
+                torn_down.set(true);
+                Ok(())
+            },
+            || true,
+            || true, // …but it came up a moment later
+        );
+
+        assert!(torn_down.get(), "the late interface must be torn down");
+        assert!(matches!(error, TunnelError::Timeout(_)));
+    }
+
+    #[test]
+    fn nothing_created_still_skips_teardown() {
+        let scratch = tempfile::tempdir().unwrap();
+        let managed = scratch.path().join("corp.conf");
+        std::fs::write(&managed, "managed-attempt").unwrap();
+        let cleanup_path = managed.clone();
+
+        let error = settle_failed_attempt(
+            TunnelError::Timeout(Duration::from_secs(1)),
+            "utun4",
+            false,
+            || std::fs::remove_file(cleanup_path).unwrap(),
+            || panic!("an attempt that created nothing must not run teardown"),
+            || true,
+            || false, // never appeared
+        );
+
+        assert!(matches!(error, TunnelError::Timeout(_)));
+        assert!(!managed.exists(), "its scratch config is still cleaned up");
     }
 
     #[test]
@@ -2058,11 +2204,18 @@ mod tests {
         let prior_id = "2025-01-01T000000Z-9999";
         let prior = config_dir.join("tmp").join(prior_id);
         let current = config_dir.join("tmp").join("2026-05-28T120000Z-1234");
-        let prior_lease = crate::utils::acquire_temp_session_lease(config_dir, prior_id).unwrap();
+        // A session whose process died leaves its directory and an unlocked
+        // `.lease` behind -- that is what the sweep exists to collect. Taking a
+        // real lease and dropping it models the same end state but depends on
+        // this process's own `flock` being visible as released to the `flock`
+        // the sweep takes moments later, and under a loaded parallel run it
+        // intermittently was not, which failed the assertion below rather than
+        // any behaviour. Write the file the dead session would have left.
+        std::fs::create_dir_all(&prior).unwrap();
+        std::fs::write(prior.join(".lease"), b"").unwrap();
         std::fs::create_dir_all(&current).unwrap();
         std::fs::write(prior.join("corp.conf"), "stale").unwrap();
         std::fs::write(current.join("vpn.conf"), "live").unwrap();
-        drop(prior_lease);
 
         crate::utils::sweep_orphan_temp_configs(config_dir, "2026-05-28T120000Z-1234");
 

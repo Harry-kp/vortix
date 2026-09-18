@@ -209,7 +209,7 @@ impl BackgroundWorkflow {
     pub const fn cancelled_preview(self) -> &'static str {
         match self {
             Self::Setup => {
-                "Setup cancelled before elevation; Standard mode is unchanged. Re-run with --yes when you are ready."
+                "Setup stopped before changing anything; Standard mode is unchanged."
             }
             Self::Status => {
                 "Manual CLI/TUI VPN control remains available; Background capabilities require enrollment."
@@ -258,65 +258,6 @@ impl BackgroundOverlayState {
             committed: false,
         }
     }
-}
-
-/// Terminal operations required by a trusted-bootstrap consumer.
-/// Keeping this seam typed lets tests prove restoration without invoking
-/// `sudo`, a shell, or collecting an administrator password.
-pub trait BackgroundTerminal {
-    type Error;
-
-    fn suspend(&mut self) -> Result<(), Self::Error>;
-    fn restore(&mut self) -> Result<(), Self::Error>;
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum BackgroundTerminalError<TerminalError, OperationError> {
-    Suspend(TerminalError),
-    Operation(OperationError),
-    Restore(TerminalError),
-}
-
-struct TerminalRestoreGuard<'a, T: BackgroundTerminal> {
-    terminal: Option<&'a mut T>,
-}
-
-impl<T: BackgroundTerminal> TerminalRestoreGuard<'_, T> {
-    fn restore(mut self) -> Result<(), T::Error> {
-        self.terminal
-            .take()
-            .expect("terminal guard restores once")
-            .restore()
-    }
-}
-
-impl<T: BackgroundTerminal> Drop for TerminalRestoreGuard<'_, T> {
-    fn drop(&mut self) {
-        if let Some(terminal) = self.terminal.take() {
-            let _ = terminal.restore();
-        }
-    }
-}
-
-/// Run one already-verified operation outside raw/alternate-screen mode.
-/// The guard restores the terminal during unwinding as well as normal return.
-pub fn with_suspended_background_terminal<T, F, R, E>(
-    terminal: &mut T,
-    operation: F,
-) -> Result<R, BackgroundTerminalError<T::Error, E>>
-where
-    T: BackgroundTerminal,
-    F: FnOnce() -> Result<R, E>,
-{
-    terminal
-        .suspend()
-        .map_err(BackgroundTerminalError::Suspend)?;
-    let guard = TerminalRestoreGuard {
-        terminal: Some(terminal),
-    };
-    let operation_result = operation();
-    guard.restore().map_err(BackgroundTerminalError::Restore)?;
-    operation_result.map_err(BackgroundTerminalError::Operation)
 }
 
 /// Load one redacted diagnostic view with the same fallback policy for CLI
@@ -418,97 +359,5 @@ mod tests {
         value["mode"]["future_mode_field"] = serde_json::json!({ "version": 3 });
         let decoded: BackgroundCommandView = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.mode.state, BackgroundModeState::StandardActive);
-    }
-
-    #[derive(Default)]
-    struct FakeTerminal {
-        suspended: bool,
-        restores: usize,
-        fail_suspend: bool,
-        fail_restore: bool,
-    }
-
-    impl BackgroundTerminal for FakeTerminal {
-        type Error = &'static str;
-
-        fn suspend(&mut self) -> Result<(), Self::Error> {
-            if self.fail_suspend {
-                return Err("suspend failed");
-            }
-            self.suspended = true;
-            Ok(())
-        }
-
-        fn restore(&mut self) -> Result<(), Self::Error> {
-            self.restores += 1;
-            if self.fail_restore {
-                return Err("restore failed");
-            }
-            self.suspended = false;
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn terminal_restores_after_success_denial_and_backend_failure() {
-        let mut terminal = FakeTerminal::default();
-        assert_eq!(
-            with_suspended_background_terminal(&mut terminal, || Ok::<_, &'static str>(7)),
-            Ok(7)
-        );
-        assert!(!terminal.suspended);
-
-        assert_eq!(
-            with_suspended_background_terminal(&mut terminal, || {
-                Err::<(), _>("permission denied")
-            }),
-            Err(BackgroundTerminalError::Operation("permission denied"))
-        );
-        assert!(!terminal.suspended);
-        assert_eq!(terminal.restores, 2);
-    }
-
-    #[test]
-    fn terminal_restores_during_unwind() {
-        let mut terminal = FakeTerminal::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = with_suspended_background_terminal(&mut terminal, || -> Result<(), ()> {
-                panic!("simulated bootstrap panic")
-            });
-        }));
-
-        assert!(result.is_err());
-        assert!(!terminal.suspended);
-        assert_eq!(terminal.restores, 1);
-    }
-
-    #[test]
-    fn terminal_errors_preserve_suspend_and_restore_boundaries() {
-        let mut suspend_failure = FakeTerminal {
-            fail_suspend: true,
-            ..FakeTerminal::default()
-        };
-        let operation_called = std::cell::Cell::new(false);
-        assert_eq!(
-            with_suspended_background_terminal(&mut suspend_failure, || {
-                operation_called.set(true);
-                Ok::<_, &'static str>(())
-            }),
-            Err(BackgroundTerminalError::Suspend("suspend failed"))
-        );
-        assert!(!operation_called.get());
-        assert_eq!(suspend_failure.restores, 0);
-
-        let mut restore_failure = FakeTerminal {
-            fail_restore: true,
-            ..FakeTerminal::default()
-        };
-        assert_eq!(
-            with_suspended_background_terminal(&mut restore_failure, || {
-                Ok::<_, &'static str>(())
-            }),
-            Err(BackgroundTerminalError::Restore("restore failed"))
-        );
-        assert_eq!(restore_failure.restores, 1);
     }
 }

@@ -30,6 +30,8 @@ fn test_app() -> App {
         control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
         control_challenge: None,
         pending_credential_save: None,
+        last_control_error: None,
+        queued_killswitch_target: None,
         last_control_connected_profile: None,
         pending_control_killswitch_mode: None,
         pending_control_operations: std::collections::BTreeMap::new(),
@@ -720,6 +722,88 @@ fn test_auth_delete_profile_cleans_auth_file() {
 // ====================================================================
 
 // --- Phase 1: Last security check timestamp (#47) ---
+
+/// Each field is refreshed by its own probe. A shared "last checked" stamp
+/// let a healthy probe vouch for a stalled one, so each observation now
+/// carries its own timestamp and only its own probe advances it.
+#[test]
+fn each_telemetry_observation_carries_its_own_timestamp() {
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    assert!(app.runtime.last_egress_check.is_none());
+    assert!(app.runtime.last_dns_check.is_none());
+    assert!(app.runtime.last_ipv6_check.is_none());
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "1.2.3.4".to_string(),
+    )));
+    assert!(app.runtime.last_egress_check.is_some());
+    assert!(
+        app.runtime.last_dns_check.is_none(),
+        "a public-address reading must not vouch for the resolver reading"
+    );
+    assert!(
+        app.runtime.last_ipv6_check.is_none(),
+        "a public-address reading must not vouch for the IPv6 probe"
+    );
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::Dns(
+        "9.9.9.9".to_string(),
+    )));
+    assert!(app.runtime.last_dns_check.is_some());
+    assert!(app.runtime.last_ipv6_check.is_none());
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(None)));
+    assert!(app.runtime.last_ipv6_check.is_some());
+}
+
+/// A reading that has aged out is reported as unknown, not left on screen as
+/// though it were current.
+#[test]
+fn a_stale_observation_is_never_presented_as_current() {
+    use std::time::{Duration, Instant};
+    let mut app = test_app();
+    let window = app.telemetry_stale_after();
+
+    assert!(!app.observation_is_stale(None), "never observed is pending");
+    app.runtime.last_egress_check = Some(Instant::now());
+    assert!(!app.observation_is_stale(app.runtime.last_egress_check));
+
+    app.runtime.last_egress_check = Instant::now().checked_sub(window + Duration::from_secs(1));
+    assert!(
+        app.observation_is_stale(app.runtime.last_egress_check),
+        "a reading older than the staleness window must not stand for the present"
+    );
+}
+
+/// An address restored from the cache is what Vortix remembers, not what it
+/// has just seen. Only an unprotected observation may promote it.
+#[test]
+fn a_remembered_real_address_is_promoted_only_by_a_live_observation() {
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    app.runtime.real_ip = Some("203.0.113.5".to_string());
+    app.runtime.real_ip_from_cache = true;
+
+    // Nothing has proved the host is unprotected yet, so the flag stands.
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "203.0.113.5".to_string(),
+    )));
+    assert!(
+        app.runtime.real_ip_from_cache,
+        "without proof of an unprotected window the value stays remembered"
+    );
+
+    app.runtime.scanner_first_tick_done = true;
+    app.runtime.last_kernel_session_count = 0;
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "203.0.113.5".to_string(),
+    )));
+    assert!(
+        !app.runtime.real_ip_from_cache,
+        "an unprotected observation confirms the address as current"
+    );
+}
 
 #[test]
 fn test_last_security_check_updated_on_ip_telemetry() {
@@ -3366,13 +3450,19 @@ fn remote_tui_capacity_includes_completed_but_undrained_results() {
             )
             .unwrap();
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while transport
         .submitted
         .load(std::sync::atomic::Ordering::SeqCst)
         < 8
     {
-        assert!(std::time::Instant::now() < deadline);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} of 8 commands reached the transport",
+            transport
+                .submitted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
         std::thread::yield_now();
     }
     assert!(matches!(
@@ -3384,7 +3474,21 @@ fn remote_tui_capacity_includes_completed_but_undrained_results() {
         Err(crate::cli::control::LocalControlError::Busy)
     ));
 
-    let completed = session.take_tui_admission_results();
+    // `submitted` counts handoffs to the transport, and the admission result is
+    // recorded after that, so reaching 8 submissions does not mean 8 results
+    // exist yet. Draining once raced the worker on a loaded runner and returned
+    // 7. Collect until all 8 arrive, which is the condition the assertion means.
+    let mut completed = Vec::new();
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while completed.len() < 8 {
+        completed.extend(session.take_tui_admission_results());
+        assert!(
+            std::time::Instant::now() < drain_deadline,
+            "only {} of 8 admission results were recorded",
+            completed.len()
+        );
+        std::thread::yield_now();
+    }
     assert_eq!(completed.len(), 8);
     drop(completed);
     session
@@ -3567,7 +3671,7 @@ fn unavailable_egress_probe_never_replaces_the_real_ip_cache() {
         crate::core::telemetry::TelemetryUpdate::EgressUnavailable,
     ));
 
-    assert_eq!(app.runtime.public_ip, "Unavailable");
+    assert_eq!(app.runtime.public_ip, constants::MSG_UNAVAILABLE);
     assert_eq!(app.runtime.real_ip.as_deref(), Some("203.0.113.7"));
 }
 
@@ -3830,6 +3934,59 @@ fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
         app.toast.is_none(),
         "the dialog replaces a generic failure toast"
     );
+}
+
+#[test]
+fn refused_route_conflict_reopens_the_confirmation_instead_of_a_dead_end_toast() {
+    use crate::vortix_core::engine::Conflict;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["candidate"]);
+    set_connected(&mut app, "existing");
+    let existing = ProfileId::new("existing");
+    let candidate = ProfileId::new("candidate");
+
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.pending_route_conflicts.insert(
+        candidate.clone(),
+        Conflict::DefaultRouteTakeover {
+            current: existing.clone(),
+            new: candidate.clone(),
+        },
+    );
+    app.apply_control_snapshot(snapshot);
+    // The conflict alone must not open anything: this test is about what the
+    // *refusal* does, so the dialog below has to be attributable to it.
+    assert!(matches!(app.input_mode, InputMode::Normal));
+
+    assert!(
+        app.recover_route_conflict(&candidate),
+        "a live conflict must be recoverable into a confirmation"
+    );
+    assert!(matches!(
+        app.input_mode,
+        InputMode::ConfirmDefaultRouteTakeover {
+            ref from,
+            ref to_profile_id,
+            ref to_name,
+            ..
+        } if from == "existing" && to_profile_id == &candidate && to_name == "candidate"
+    ));
+}
+
+#[test]
+fn a_cleared_route_conflict_falls_back_to_the_error_message() {
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["candidate"]);
+
+    // No conflict in the snapshot: the peer released the route between the
+    // refusal and now. There is nothing to confirm, so the caller must be told
+    // to fall through and report the error rather than opening an empty dialog.
+    assert!(!app.recover_route_conflict(&ProfileId::new("candidate")));
+    assert!(matches!(app.input_mode, InputMode::Normal));
 }
 
 #[test]
@@ -4436,4 +4593,152 @@ fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
             ..
         } if password.expose() == "secretr"
     ));
+}
+
+#[test]
+fn rapid_killswitch_presses_submit_one_change_at_a_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut app, _profile_id, _profile) = app_with_openvpn_profile(&temp);
+
+    app.track_control_operation_with_profile(
+        crate::vortix_core::control::OperationId::from_parts(
+            crate::vortix_core::control::AuthorityEpoch(1),
+            9001,
+        ),
+        super::connection::PendingControlSubject::KillSwitch,
+        None,
+    );
+    assert!(app.killswitch_change_in_flight());
+
+    // Presses while a change runs coalesce into one target rather than
+    // queueing an operation each: the worker is serial, so the extras used to
+    // expire on their own deadline and report "kill switch change timed out".
+    for _ in 0..5 {
+        app.handle_message(Message::ToggleKillSwitch);
+    }
+    assert!(
+        app.queued_killswitch_target.is_some(),
+        "the cycled target must be retained while a change is in flight"
+    );
+
+    // An unknown effective state during that window must not be reported as
+    // Degraded, which means "cannot be proven" rather than "not yet known".
+    app.runtime.killswitch_state = crate::state::KillSwitchState::Blocking;
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.desired.kill_switch = crate::state::KillSwitchMode::AlwaysOn;
+    snapshot.effective.kill_switch = None;
+    app.apply_control_snapshot(snapshot);
+    assert_eq!(
+        app.runtime.killswitch_state,
+        crate::state::KillSwitchState::Blocking,
+        "an in-flight change must not turn a working kill switch into Degraded"
+    );
+}
+
+/// Both real-IP cache gates read these fields, and for a long time nothing in
+/// production wrote either one: `scanner_first_tick_done` stayed false, so the
+/// address was never cached, and `last_kernel_session_count == 0` was
+/// vacuously true. The suite did not notice because the tests set the flags by
+/// hand. This asserts the control snapshot actually establishes them.
+#[test]
+fn a_control_snapshot_establishes_the_real_ip_cache_gates() {
+    use crate::vortix_core::control::model::ObservedTunnel;
+    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    assert!(!app.runtime.scanner_first_tick_done, "starts unproven");
+
+    let mut snapshot = ControlSnapshot::default();
+    snapshot.observed.default_route = Some(ObservedDefaultRoute {
+        interface_name: Some("wlp3s0".into()),
+        observed_at_millis: 1,
+        received_at_millis: 1,
+    });
+    let tunnelled = ProfileId::new("carrying-traffic");
+    snapshot.observed.tunnels.insert(
+        tunnelled,
+        ObservedTunnel {
+            active: true,
+            interface_name: Some("tun0".into()),
+            observed_at_millis: 1,
+            received_at_millis: 1,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    assert!(
+        app.runtime.scanner_first_tick_done,
+        "a default-route observation proves the scan ran"
+    );
+    assert_eq!(
+        app.runtime.last_kernel_session_count, 1,
+        "an active tunnel must be counted, or the cache gate lets the VPN \
+         address be saved as the real one"
+    );
+}
+
+/// The real-IP gate proved only that *Vortix* owned no tunnel. A VPN started
+/// outside Vortix still carries the egress, so the probe returned that VPN's
+/// exit address and the gate — scanner ticked, no managed session, registry
+/// disconnected — cached it as the user's real IP. Security Guard then showed
+/// Real IP equal to Exit IP and flagged a leak that was its own bookkeeping.
+#[test]
+fn an_unmanaged_tunnel_on_the_default_route_blocks_real_ip_caching() {
+    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
+
+    for (interface, cacheable) in [
+        ("en0", true),
+        ("eth0", true),
+        ("utun4", false),
+        ("wg0", false),
+        ("tun0", false),
+    ] {
+        let mut app = test_app();
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.observed.default_route = Some(ObservedDefaultRoute {
+            interface_name: Some(interface.to_string()),
+            observed_at_millis: 1,
+            received_at_millis: 1,
+        });
+        app.apply_control_snapshot(snapshot);
+
+        assert_eq!(
+            !app.default_route_is_tunnel(),
+            cacheable,
+            "default route via {interface} must {} caching the real address",
+            if cacheable { "allow" } else { "block" }
+        );
+    }
+}
+
+/// `TunnelRegistry::recompute_primary` reads the default-route interface from
+/// the registry's own cache, and `feed_default_route_interface` is its only
+/// production write path. Nothing called it: every caller was a test. So the
+/// cache stayed empty for the whole process, `primary` was permanently `None`,
+/// and a full tunnel rendered as `Split tunnel` under a `NO EXIT` header while
+/// the kernel routed every packet through it. The registry's own unit tests
+/// missed it because they call the feeder directly. Assert the App forwards the
+/// canonical observation instead.
+#[test]
+fn a_control_snapshot_feeds_the_registry_default_route() {
+    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
+
+    let mut app = test_app();
+    let mut snapshot = ControlSnapshot::default();
+    snapshot.observed.default_route = Some(ObservedDefaultRoute {
+        interface_name: Some("utun4".into()),
+        observed_at_millis: 1,
+        received_at_millis: 1,
+    });
+
+    app.apply_control_snapshot(snapshot);
+
+    assert_eq!(
+        app.registry.default_route_interface_for_test(),
+        Some("utun4".to_string()),
+        "the registry must see the kernel's default-route interface, or no \
+         tunnel is ever elected primary"
+    );
 }
