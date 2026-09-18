@@ -285,6 +285,26 @@ impl App {
         });
     }
 
+    /// Step the Event Log down, resuming follow-the-tail near the bottom.
+    pub(crate) fn scroll_logs_down(&mut self) {
+        if self.logs_scroll < self.logs_max_scroll {
+            self.logs_scroll = self.logs_scroll.saturating_add(1);
+        }
+        if self.logs_scroll
+            >= self
+                .logs_max_scroll
+                .saturating_sub(constants::LOGS_AUTO_SCROLL_THRESHOLD)
+        {
+            self.logs_auto_scroll = true;
+        }
+    }
+
+    /// Step the Event Log up, which stops following the tail.
+    pub(crate) fn scroll_logs_up(&mut self) {
+        self.logs_auto_scroll = false;
+        self.logs_scroll = self.logs_scroll.saturating_sub(1);
+    }
+
     pub(crate) fn scroll_down(&mut self) {
         // 1. Config Viewer Overlay (Highest Priority)
         if self.show_config {
@@ -305,16 +325,7 @@ impl App {
                 }
             }
             FocusedPanel::Logs => {
-                if self.logs_scroll < self.logs_max_scroll {
-                    self.logs_scroll = self.logs_scroll.saturating_add(1);
-                }
-                if self.logs_scroll
-                    >= self
-                        .logs_max_scroll
-                        .saturating_sub(constants::LOGS_AUTO_SCROLL_THRESHOLD)
-                {
-                    self.logs_auto_scroll = true;
-                }
+                self.scroll_logs_down();
             }
             _ => {}
         }
@@ -336,8 +347,7 @@ impl App {
                 }
             }
             FocusedPanel::Logs => {
-                self.logs_auto_scroll = false;
-                self.logs_scroll = self.logs_scroll.saturating_sub(1);
+                self.scroll_logs_up();
             }
             _ => {}
         }

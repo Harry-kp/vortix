@@ -319,8 +319,10 @@ fn parse_netstat_destination(token: &str, ipv4: bool) -> Option<Cidr> {
     Cidr::new(std::net::Ipv4Addr::from(octets).into(), prefix)
 }
 
-fn parse_route_get_bypass(output: &str, target: IpAddr) -> Option<RouteEntry> {
-    if output.lines().any(|line| {
+/// Vortix marks its own routes `PROTO2`; reporting one back as observed system
+/// state would let the tunnel's routes masquerade as what they are measured against.
+fn carries_vortix_flag(output: &str) -> bool {
+    output.lines().any(|line| {
         line.trim_start()
             .strip_prefix("flags:")
             .is_some_and(|flags| {
@@ -328,7 +330,11 @@ fn parse_route_get_bypass(output: &str, target: IpAddr) -> Option<RouteEntry> {
                     .split([',', '<', '>'])
                     .any(|flag| flag.trim() == "PROTO2")
             })
-    }) {
+    })
+}
+
+fn parse_route_get_bypass(output: &str, target: IpAddr) -> Option<RouteEntry> {
+    if carries_vortix_flag(output) {
         return None;
     }
     let interface = unique_labeled_value(output, "interface:")?.to_owned();
@@ -342,15 +348,7 @@ fn parse_route_get_bypass(output: &str, target: IpAddr) -> Option<RouteEntry> {
 }
 
 fn parse_route_get_gateway(output: &str, destination: Cidr) -> Option<RouteEntry> {
-    if output.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("flags:")
-            .is_some_and(|flags| {
-                flags
-                    .split([',', '<', '>'])
-                    .any(|flag| flag.trim() == "PROTO2")
-            })
-    }) {
+    if carries_vortix_flag(output) {
         return None;
     }
     let interface = unique_labeled_value(output, "interface:")?.to_owned();
