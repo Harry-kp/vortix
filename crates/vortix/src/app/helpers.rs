@@ -89,6 +89,9 @@ impl App {
                     profile: display_name,
                     server_location,
                     latency_ms: 0,
+                    // The legacy view is a projection: ownership, teardown and
+                    // DNS intent stay with the canonical registry rather than
+                    // riding along here.
                     details: Box::new(DetailedConnectionInfo {
                         interface: details.interface.clone(),
                         internal_ip: details.internal_ip.clone(),
@@ -103,6 +106,7 @@ impl App {
                         handshake: details.handshake.clone(),
                         probe_receipts: details.probe_receipts.clone(),
                         pid: details.pid,
+                        ..Default::default()
                     }),
                 }
             }

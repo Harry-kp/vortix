@@ -17,43 +17,10 @@
 
 use std::time::Instant;
 
-/// Technical details parsed from the VPN interface.
-///
-/// Companion to [`crate::vortix_core::engine::state::DetailedConnectionInfo`]
-/// — the registry's snapshot panels read; this is the compatibility shape
-/// carried by [`ConnectionState::Connected`] and the return type
-/// of [`crate::app::App::legacy_state`]. Both shapes have identical
-/// field names + types; `legacy_to_core_details` in `app/connection.rs`
-/// translates between them when populating the registry.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct DetailedConnectionInfo {
-    /// System interface name (e.g., utun3, wg0).
-    pub interface: String,
-    /// Internal IP address assigned by the VPN.
-    pub internal_ip: String,
-    /// Remote server endpoint (IP:port).
-    pub endpoint: String,
-    /// Maximum Transmission Unit size.
-    pub mtu: String,
-    /// `WireGuard` public key (empty for `OpenVPN`).
-    pub public_key: String,
-    /// Local listening port.
-    pub listen_port: String,
-    /// Total bytes received.
-    pub transfer_rx: String,
-    /// Total bytes transmitted.
-    pub transfer_tx: String,
-    /// Time since last successful handshake.
-    pub latest_handshake: String,
-    /// Protocol attempt fence used by the canonical snapshot.
-    pub generation: u64,
-    /// Current-generation `WireGuard` proof.
-    pub handshake: Option<crate::vortix_core::ports::tunnel::HandshakeEvidence>,
-    /// Per-peer receipts for probes actually issued by the protocol path.
-    pub probe_receipts: Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>,
-    /// Process ID (for targeted termination).
-    pub pid: Option<u32>,
-}
+/// The canonical tunnel details. This module used to carry its own copy with
+/// the same field names and types, and a hand-written copy in `app/helpers.rs`
+/// moved values between the two.
+pub use crate::vortix_core::engine::state::DetailedConnectionInfo;
 
 /// VPN connection state machine (legacy single-tunnel mirror).
 ///
