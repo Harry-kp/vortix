@@ -2666,22 +2666,7 @@ fn drive_supervision(
                 result.result,
                 Err(WorkFailure::AuthenticationFailed | WorkFailure::InvalidProfile)
             ) {
-                let rollback_profiles = snapshot
-                    .operations
-                    .get(&result.operation_id)
-                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
-                    .map_or_else(
-                        || vec![result.profile_id.clone()],
-                        |tunnels| {
-                            tunnels
-                                .iter()
-                                .filter(|(_, requested)| {
-                                    **requested == RequestedTunnelState::Connected
-                                })
-                                .map(|(profile_id, _)| profile_id.clone())
-                                .collect::<Vec<_>>()
-                        },
-                    );
+                let rollback_profiles = connect_targets_to_roll_back(snapshot, &result);
                 let operation_failure = if result.result == Err(WorkFailure::AuthenticationFailed) {
                     OperationFailure::AuthenticationFailed
                 } else {
@@ -2791,22 +2776,7 @@ fn drive_supervision(
                 }
             } else if wireguard_handshake_failure {
                 let was_recovery = owner.recovery_operations.contains(&result.operation_id);
-                let rollback_profiles = snapshot
-                    .operations
-                    .get(&result.operation_id)
-                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
-                    .map_or_else(
-                        || vec![result.profile_id.clone()],
-                        |tunnels| {
-                            tunnels
-                                .iter()
-                                .filter(|(_, requested)| {
-                                    **requested == RequestedTunnelState::Connected
-                                })
-                                .map(|(profile_id, _)| profile_id.clone())
-                                .collect::<Vec<_>>()
-                        },
-                    );
+                let rollback_profiles = connect_targets_to_roll_back(snapshot, &result);
                 events.push(ControlEvent::ConnectAttemptFailed {
                     profile_id: result.profile_id.clone(),
                     attempt: 1,
@@ -2876,22 +2846,7 @@ fn drive_supervision(
                 // proves teardown before it reports a timeout. Do not preserve
                 // Connected intent and silently launch another attempt after
                 // telling the user that this one reached its terminal bound.
-                let rollback_profiles = snapshot
-                    .operations
-                    .get(&result.operation_id)
-                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
-                    .map_or_else(
-                        || vec![result.profile_id.clone()],
-                        |tunnels| {
-                            tunnels
-                                .iter()
-                                .filter(|(_, requested)| {
-                                    **requested == RequestedTunnelState::Connected
-                                })
-                                .map(|(profile_id, _)| profile_id.clone())
-                                .collect::<Vec<_>>()
-                        },
-                    );
+                let rollback_profiles = connect_targets_to_roll_back(snapshot, &result);
                 let retired = supervisor
                     .retire_cleaned_connect_timeout(
                         &result.profile_id,
@@ -4406,12 +4361,7 @@ const fn operation_failure_for_policy_result(
     }
 }
 
-/// Pull the contended network and the interface that actually carries it out of
-/// a route verification failure.
-///
-/// That message is the only place this evidence survives, so the shapes it
-/// accepts are pinned by tests; anything else yields `None` and the failure is
-/// reported exactly as it was before.
+/// Split `<network> should route through <a>, but the system routes it through <b>`.
 fn parse_route_ownership_detail(detail: &str) -> Option<(crate::vortix_core::cidr::Cidr, String)> {
     let (claim, rest) = detail.split_once(" should route through ")?;
     let (_expected, observed) = rest.split_once(", but the system routes it through ")?;
@@ -4426,28 +4376,38 @@ fn parse_route_ownership_detail(detail: &str) -> Option<(crate::vortix_core::cid
     Some((cidr, observed.to_string()))
 }
 
-/// Recognise a route-ownership refusal and name the tunnel that holds the route.
+/// The profiles a failed attempt has to undo.
 ///
-/// Route collisions are meant to reach the user as a takeover offer, not an
-/// error: the executor reports `WorkFailure::RouteConflict`, the service records
-/// it in `pending_route_conflicts`, and the dashboard asks whether to switch.
-/// A collision discovered by the final route read-back never took that path.
-/// `refine_openvpn_reservation` classifies conflicts from a *successful*
-/// receipt and returns early when the attempt already failed, so a policy that
-/// fails verification is reported as a bare failure and the offer is lost.
-///
-/// The verification message is the evidence that survives, and the snapshot
-/// knows which profile owns the interface it names, so the conflict can be
-/// reconstructed here and handed to the machinery that was always waiting for
-/// it.
+/// Every tunnel the operation asked to connect, or just the one that reported
+/// the failure when the operation is no longer on the snapshot.
+fn connect_targets_to_roll_back(
+    snapshot: &ControlSnapshot,
+    result: &crate::vortix_core::control::worker::TunnelWorkResult,
+) -> Vec<ProfileId> {
+    snapshot
+        .operations
+        .get(&result.operation_id)
+        .and_then(|operation| operation_intent_tunnels(&operation.intent))
+        .map_or_else(
+            || vec![result.profile_id.clone()],
+            |tunnels| {
+                tunnels
+                    .iter()
+                    .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
+                    .map(|(profile_id, _)| profile_id.clone())
+                    .collect::<Vec<_>>()
+            },
+        )
+}
+
+/// Rebuild the conflict behind a route verification failure, so the dashboard
+/// can offer the takeover instead of reporting a dead end.
 fn route_conflict_from_verification_detail(
     detail: &str,
     snapshot: &ControlSnapshot,
     policy: &crate::vortix_core::control::worker::TopologyPolicy,
 ) -> Option<(ProfileId, crate::vortix_core::engine::Conflict)> {
     let (cidr, observed) = parse_route_ownership_detail(detail)?;
-    let observed = observed.as_str();
-
     let holder = snapshot
         .observed
         .tunnel_details
