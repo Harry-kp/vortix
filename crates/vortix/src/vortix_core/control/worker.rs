@@ -491,46 +491,19 @@ fn find_route_conflict(
         if Some(*lease_id) == excluded || lease.profile_id == *profile_id {
             continue;
         }
-        // Two defaults are a takeover: only one tunnel can carry everything.
-        // Anything else is about specific destinations, and a default route
-        // must not be compared there — it overlaps every route by definition,
-        // so a full tunnel joining a split tunnel looked like a collision on
-        // `0.0.0.0/0` when nothing was contended. `ControlSnapshot::
-        // topology_conflict` answers the same question for the confirmation
-        // overlay and has to agree with this, or admission refuses a connect
-        // the overlay will not offer to confirm.
-        let requested_default = routes.iter().any(|route| route.is_default());
-        let existing_default = lease.routes.iter().any(|route| route.is_default());
-        let conflict = if requested_default && existing_default {
-            Conflict::DefaultRouteTakeover {
-                current: lease.profile_id.clone(),
-                new: profile_id.clone(),
-            }
-        } else {
-            let overlapping = routes
+        let as_cidrs = |routes: &BTreeSet<RouteClaim>| {
+            routes
                 .iter()
-                .filter(|route| !route.is_default())
-                .filter(|route| {
-                    lease
-                        .routes
-                        .iter()
-                        .any(|existing| !existing.is_default() && existing.overlaps(**route))
-                })
-                .copied()
-                .collect::<Vec<_>>();
-            if overlapping.is_empty() {
-                continue;
-            }
-            Conflict::RouteOverlap {
-                with: lease.profile_id.clone(),
-                overlapping_cidrs: overlapping
-                    .into_iter()
-                    .map(|route| {
-                        Cidr::new(route.network(), route.prefix_len())
-                            .expect("normalized route claim is a valid CIDR")
-                    })
-                    .collect(),
-            }
+                .filter_map(|route| Cidr::new(route.network(), route.prefix_len()))
+                .collect::<Vec<_>>()
+        };
+        let Some(conflict) = crate::vortix_core::engine::classify_route_conflict(
+            &as_cidrs(routes),
+            &as_cidrs(&lease.routes),
+            &lease.profile_id,
+            profile_id,
+        ) else {
+            continue;
         };
         if acknowledgement != Some(&conflict) {
             return Some(conflict);

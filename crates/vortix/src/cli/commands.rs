@@ -1178,17 +1178,11 @@ fn detect_conflict_for_cli(
     engine: &VpnRuntime,
     target_name: &str,
 ) -> Option<crate::vortix_core::engine::Conflict> {
-    use crate::vortix_core::cidr::{
-        claims_default_route_v4, claims_default_route_v6, overlapping_cidrs,
-    };
-    use crate::vortix_core::engine::Conflict;
     let target_profile = engine.profiles.iter().find(|p| p.name == target_name)?;
     let target_allowed = crate::topology_policy::declared_routes(
         target_profile.protocol,
         &target_profile.config_path,
     );
-    let target_claims_default =
-        claims_default_route_v4(&target_allowed) || claims_default_route_v6(&target_allowed);
 
     let active = crate::core::scanner::get_active_profiles(&engine.profiles);
     for session in &active {
@@ -1204,21 +1198,13 @@ fn detect_conflict_for_cli(
             active_profile.protocol,
             &active_profile.config_path,
         );
-        let active_claims_default =
-            claims_default_route_v4(&active_allowed) || claims_default_route_v6(&active_allowed);
-
-        if target_claims_default && active_claims_default {
-            return Some(Conflict::DefaultRouteTakeover {
-                current: active_profile.id.clone(),
-                new: target_profile.id.clone(),
-            });
-        }
-        let overlap = overlapping_cidrs(&target_allowed, &active_allowed);
-        if !overlap.is_empty() {
-            return Some(Conflict::RouteOverlap {
-                with: active_profile.id.clone(),
-                overlapping_cidrs: overlap,
-            });
+        if let Some(conflict) = crate::vortix_core::engine::classify_route_conflict(
+            &target_allowed,
+            &active_allowed,
+            &active_profile.id,
+            &target_profile.id,
+        ) {
+            return Some(conflict);
         }
     }
     None

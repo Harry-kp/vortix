@@ -21,7 +21,8 @@ pub use fsm::{Engine, EngineSettings};
 pub use handle::{CommandAck, EngineHandle, EngineSubscription, LocalHandle, Snapshot};
 pub use input::{Input, LinkState, ProfileChange, TunnelStatusObservation, UserCommand};
 pub use registry::{
-    Conflict, PrimaryTunnelChangeReason, RegistryError, Role, TunnelRegistry, TunnelSnapshot,
+    classify_route_conflict, Conflict, PrimaryTunnelChangeReason, RegistryError, Role,
+    TunnelRegistry, TunnelSnapshot,
 };
 pub use state::{
     Connection, ConnectionHealth, DegradedReason, DetailedConnectionInfo, FailureReason,
