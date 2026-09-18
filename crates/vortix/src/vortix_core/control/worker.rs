@@ -1341,6 +1341,19 @@ pub struct PolicyResult {
     pub failed_at: Option<PolicyBarrier>,
 }
 
+impl PolicyResult {
+    /// The revision this result belongs to, in the same shape
+    /// `TopologyPolicy::revision` produces so the two can be compared.
+    #[must_use]
+    pub fn revision(&self) -> ControlRevision {
+        ControlRevision {
+            authority_epoch: self.authority_epoch,
+            generation: self.generation,
+            digest: self.digest.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyAuditResult {
     pub revision: ControlRevision,

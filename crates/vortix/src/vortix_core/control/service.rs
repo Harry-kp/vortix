@@ -2986,11 +2986,7 @@ fn drive_supervision(
                     supervisor,
                     snapshot,
                     owner,
-                    ControlRevision {
-                        authority_epoch: result.authority_epoch,
-                        generation: result.generation,
-                        digest: result.digest.clone(),
-                    },
+                    result.revision(),
                     result.operation_id.clone(),
                     readback,
                     now,
@@ -3005,11 +3001,7 @@ fn drive_supervision(
         {
             accept_pre_block_readback(
                 supervisor,
-                ControlRevision {
-                    authority_epoch: result.authority_epoch,
-                    generation: result.generation,
-                    digest: result.digest.clone(),
-                },
+                result.revision(),
                 result.operation_id.clone(),
                 result.verification,
                 now,
@@ -3128,11 +3120,7 @@ fn drive_supervision(
     }
     let _ = supervisor.submit_policy_audit_if_due(now);
 
-    let revision = ControlRevision {
-        authority_epoch: snapshot.desired.authority_epoch,
-        generation: snapshot.desired.generation,
-        digest: snapshot.desired.policy_digest.clone(),
-    };
+    let revision = snapshot.desired.revision();
     // Tunnel truth is fenced by the supervisor's exact work receipt,
     // protocol-owned adoption/handshake, revision, and interface. Requiring
     // global policy evidence here would create a cycle: final route/DNS/
@@ -4285,13 +4273,7 @@ fn restore_prior_topology_intent(
     now: u64,
     events: &mut Vec<ControlEvent>,
 ) -> bool {
-    if policy.revision()
-        != (ControlRevision {
-            authority_epoch: snapshot.desired.authority_epoch,
-            generation: snapshot.desired.generation,
-            digest: snapshot.desired.policy_digest.clone(),
-        })
-    {
+    if policy.revision() != (snapshot.desired.revision()) {
         return false;
     }
     snapshot.desired.generation = snapshot.desired.generation.saturating_add(1);
@@ -4513,11 +4495,7 @@ fn capture_topology_policy(
     transition: TopologyTransitionKind,
     now: u64,
 ) -> Option<TopologyPolicy> {
-    let revision = ControlRevision {
-        authority_epoch: snapshot.desired.authority_epoch,
-        generation: snapshot.desired.generation,
-        digest: snapshot.desired.policy_digest.clone(),
-    };
+    let revision = snapshot.desired.revision();
     let target_profiles = snapshot
         .desired
         .tunnels
@@ -7549,11 +7527,7 @@ fn derive_effective(
     };
     let age = now.saturating_sub(evidence.observed_at_millis);
     let current = evidence_matches(evidence, snapshot, now);
-    let revision = ControlRevision {
-        authority_epoch: desired.authority_epoch,
-        generation: desired.generation,
-        digest: desired.policy_digest.clone(),
-    };
+    let revision = desired.revision();
     let supervised_protection = selection != ExecutionSelection::CanonicalAuthority
         || supervisor.is_some_and(|supervisor| supervisor.protects(&revision, now));
     let protection = if current && evidence.all_gates_verified() && supervised_protection {
