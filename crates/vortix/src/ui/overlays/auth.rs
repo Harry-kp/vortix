@@ -157,20 +157,10 @@ pub fn render(
                     .nth(cursor)
                     .map_or_else(|| "\u{2588}".to_string(), |c| c.to_string()); // █
                 let after: String = display_text.chars().skip(cursor + 1).collect();
-                spans.push(Span::styled(
+                spans.extend(crate::ui::helpers::text_entry_spans(
                     before,
-                    Style::default().fg(theme::current().text_primary),
-                ));
-                spans.push(Span::styled(
                     cursor_char,
-                    Style::default()
-                        .fg(theme::current().accent_secondary)
-                        .add_modifier(Modifier::REVERSED)
-                        .add_modifier(Modifier::SLOW_BLINK),
-                ));
-                spans.push(Span::styled(
                     after,
-                    Style::default().fg(theme::current().text_primary),
                 ));
             } else {
                 // Non-focused rows: show the value muted; empty values

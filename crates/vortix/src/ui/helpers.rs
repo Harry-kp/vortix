@@ -1,6 +1,7 @@
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::{
-    style::Style,
+    style::{Modifier, Style},
+    text::Span,
     widgets::{Block, Clear},
     Frame,
 };
@@ -76,6 +77,32 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
     }
     truncated.push_str("...");
     truncated
+}
+
+/// Typed text, a blinking cursor, then the remainder.
+///
+/// Every text-entry overlay draws this. Keeping the cursor's treatment here
+/// stops one field blinking differently from the next.
+pub(crate) fn text_entry_spans(
+    before: String,
+    cursor: String,
+    after: String,
+) -> Vec<Span<'static>> {
+    let theme = crate::theme::current();
+    let mut spans = vec![
+        Span::styled(before, Style::default().fg(theme.text_primary)),
+        Span::styled(
+            cursor,
+            Style::default()
+                .fg(theme.accent_secondary)
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+    ];
+    if !after.is_empty() {
+        spans.push(Span::styled(after, Style::default().fg(theme.text_primary)));
+    }
+    spans
 }
 
 #[cfg(test)]
