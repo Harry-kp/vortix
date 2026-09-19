@@ -13,7 +13,6 @@ pub mod dns;
 pub mod firewall;
 pub mod interface;
 pub mod interface_list;
-pub(crate) mod network_manager;
 pub mod network_stats;
 mod nft_policy;
 pub mod process_identity;
