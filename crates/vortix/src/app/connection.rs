@@ -248,18 +248,12 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
 }
 
 /// Whether a refusal is the service saying "these routes are already claimed".
-///
-/// Both the in-process and the daemon-backed control paths can raise it, and
-/// the user's situation is identical either way, so both must be recognised.
 fn is_route_conflict(error: &crate::cli::control::LocalControlError) -> bool {
     use crate::cli::control::LocalControlError;
     use crate::vortix_core::control::AdmissionError;
     matches!(
         error,
         LocalControlError::Admission(AdmissionError::RouteConflict)
-            | LocalControlError::Remote(crate::daemon::service::RemoteControlError::Admission(
-                AdmissionError::RouteConflict
-            ))
     )
 }
 
@@ -588,19 +582,6 @@ impl App {
         Ok(())
     }
 
-    /// Test-only/preparatory attachment seam for U19's dormant remote
-    /// adapter. Production startup continues to call
-    /// [`Self::attach_control_session`] and therefore remains Standard-only.
-    #[doc(hidden)]
-    pub fn attach_remote_control_session(
-        &mut self,
-        control: crate::daemon::service::RemoteControlSession,
-    ) -> Result<(), crate::cli::control::LocalControlError> {
-        self.attach_client_control_session(
-            crate::cli::control::ClientControlSession::remote_for_parity(control),
-        )
-    }
-
     pub(crate) fn issue_control_command(
         &mut self,
         command: crate::vortix_core::control::UserCommand,
@@ -814,39 +795,6 @@ impl App {
                         }
                     }
                     self.show_toast(control_error_message(&error), ToastType::Error);
-                }
-                crate::cli::control::TuiControlCompletion::ChallengeResponse {
-                    challenge_id,
-                    result: Ok(()),
-                } => self.log(&format!(
-                    "AUTH: Service accepted challenge response {challenge_id:?}"
-                )),
-                crate::cli::control::TuiControlCompletion::ChallengeCancellation {
-                    challenge_id,
-                    result: Ok(()),
-                } => self.log(&format!(
-                    "AUTH: Service cancelled challenge {challenge_id:?}"
-                )),
-                crate::cli::control::TuiControlCompletion::ChallengeResponse {
-                    challenge_id,
-                    result: Err(error),
-                } => {
-                    self.log(&format!(
-                        "ERR: Challenge response {challenge_id:?} failed: {error}"
-                    ));
-                    self.show_toast(
-                        "Credentials could not be submitted. Your entries are still available; try again."
-                            .to_string(),
-                        ToastType::Error,
-                    );
-                }
-                crate::cli::control::TuiControlCompletion::ChallengeCancellation {
-                    challenge_id,
-                    result: Err(error),
-                } => {
-                    self.log(&format!(
-                        "WARN: Challenge cancellation {challenge_id:?} failed: {error}"
-                    ));
                 }
             }
         }

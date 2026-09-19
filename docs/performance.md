@@ -181,9 +181,9 @@ branch against `main` at `268b821`.
 | Binary | main | branch | Delta |
 |---|---:|---:|---:|
 | `vortix` | 10,443,856 B | 6,039,184 B | **-42.2%** |
-| `vortix-helper` | 1,015,440 B | 769,904 B | -24.2% |
-| `vortix-bootstrap` | 452,848 B | 369,744 B | -18.4% |
-| shipped total | 11,912,144 B | 7,178,832 B | **-39.7%** |
+
+(Measured when `vortix-helper` and `vortix-bootstrap` still shipped; both were
+later removed with Background mode, leaving `vortix` as the only binary.)
 
 ## Keeping the win
 

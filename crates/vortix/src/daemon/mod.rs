@@ -20,7 +20,6 @@ pub mod client;
 pub mod diagnostics;
 pub mod passive;
 mod server;
-pub mod service;
 
 pub use server::DaemonServer;
 
