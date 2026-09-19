@@ -194,7 +194,162 @@ fn signal_for(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// One profile row: status badge, name (with the primary `*`), protocol
+/// tag and last-used time. Selection owns the foreground of every cell.
+fn profile_row(
+    profile: &crate::state::VpnProfile,
+    idx: usize,
+    is_selected: bool,
+    signal: &RowSignal,
+    profile_missing: bool,
+    name_cell_width: usize,
+) -> Row<'static> {
+    // Status cell: badge taxonomy + optional `!` risk annotation.
+    // Numeric prefix (1..=9) remains the affordance for keyboard
+    // quick-select; once a row is active the badge replaces the number
+    // so the user sees state, not muscle-memory.
+    let status_cell = if let Some((glyph, style)) = signal.badge {
+        let badge_style = if is_selected {
+            style.fg(theme::current().row_selected_fg)
+        } else {
+            style
+        };
+        let mut spans = vec![Span::styled(glyph, badge_style)];
+        if signal.risk || profile_missing {
+            spans.push(Span::styled(
+                "!",
+                Style::default().fg(row_fg(is_selected, theme::current().warning)),
+            ));
+        }
+        Cell::from(Line::from(spans))
+    } else if profile_missing {
+        Cell::from(Span::styled(
+            "!",
+            Style::default().fg(row_fg(is_selected, theme::current().warning)),
+        ))
+    } else if idx < 9 {
+        Cell::from(Span::styled(
+            format!("{}", idx + 1),
+            Style::default().fg(row_fg(is_selected, theme::current().text_secondary)),
+        ))
+    } else {
+        Cell::from(Span::styled(" ", Style::default()))
+    };
+
+    // Primary marker: shown only when there's enough room for both a
+    // 2-char ` *` suffix AND a 3-char minimum name stub. Below that we
+    // suppress the marker (header still carries it cross-surface).
+    let show_primary_marker = should_show_primary_marker(signal.is_primary, name_cell_width);
+    let primary_reserve = if show_primary_marker { 2 } else { 0 };
+    let name_budget = name_cell_width.saturating_sub(primary_reserve).max(1);
+
+    let name_style = if is_selected {
+        Style::default()
+            .fg(theme::current().row_selected_fg)
+            .add_modifier(Modifier::BOLD)
+    } else if profile_missing {
+        Style::default().fg(theme::current().warning)
+    } else if signal.is_primary {
+        Style::default()
+            .fg(signal.accent)
+            .add_modifier(Modifier::BOLD)
+    } else if signal.is_active {
+        Style::default().fg(signal.accent)
+    } else {
+        Style::default().fg(theme::current().inactive)
+    };
+
+    let display_name = utils::truncate(&profile.name, name_budget);
+    let mut name_spans = vec![Span::styled(display_name, name_style)];
+    if show_primary_marker {
+        name_spans.push(Span::styled(
+            " *",
+            Style::default()
+                .fg(row_fg(is_selected, signal.accent))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let name_cell = Cell::from(Line::from(name_spans));
+
+    let proto_icon = match profile.protocol {
+        crate::app::Protocol::WireGuard => "WG",
+        crate::app::Protocol::OpenVPN => "OV",
+    };
+    let proto_color = if is_selected {
+        theme::current().row_selected_fg
+    } else if signal.is_active {
+        signal.accent
+    } else {
+        theme::current().text_secondary
+    };
+
+    let time_str = if let Some(last_used) = profile.last_used {
+        let relative = utils::format_relative_time(last_used);
+        if !relative.ends_with("ago") && !relative.is_empty() {
+            format!("{relative} ago")
+        } else {
+            relative
+        }
+    } else {
+        "never".to_string()
+    };
+
+    let row_style = if is_selected {
+        Style::default().bg(theme::current().row_selected_bg)
+    } else {
+        Style::default()
+    };
+
+    let proto_cell = Cell::from(Span::styled(proto_icon, Style::default().fg(proto_color)));
+    let time_cell = Cell::from(Span::styled(
+        time_str,
+        Style::default().fg(row_fg(is_selected, theme::current().text_secondary)),
+    ));
+
+    Row::new(vec![status_cell, name_cell, proto_cell, time_cell]).style(row_style)
+}
+
+/// `fallback`, unless the row is selected — selection owns the foreground.
+fn row_fg(is_selected: bool, fallback: Color) -> Color {
+    if is_selected {
+        theme::current().row_selected_fg
+    } else {
+        fallback
+    }
+}
+
+/// The sidebar with no profiles at all: what's missing, and the key to fix it.
+fn render_empty_state(frame: &mut Frame, inner: Rect) {
+    let empty_msg = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "No profiles yet",
+            Style::default().fg(theme::current().text_secondary),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Press ",
+                Style::default().fg(theme::current().key_hint_desc),
+            ),
+            Span::styled(
+                "[i]",
+                Style::default()
+                    .fg(theme::current().accent_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " to import",
+                Style::default().fg(theme::current().key_hint_desc),
+            ),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(empty_msg).alignment(Alignment::Center),
+        inner,
+    );
+}
+
 pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Sidebar);
     let border_style = if is_focused {
@@ -218,34 +373,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let primary = app.registry.primary().cloned();
 
     if app.runtime.profiles.is_empty() && snapshots.is_empty() {
-        let empty_msg = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "No profiles yet",
-                Style::default().fg(theme::current().text_secondary),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "Press ",
-                    Style::default().fg(theme::current().key_hint_desc),
-                ),
-                Span::styled(
-                    "[i]",
-                    Style::default()
-                        .fg(theme::current().accent_primary)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " to import",
-                    Style::default().fg(theme::current().key_hint_desc),
-                ),
-            ]),
-        ];
-        frame.render_widget(
-            Paragraph::new(empty_msg).alignment(Alignment::Center),
-            inner,
-        );
+        render_empty_state(frame, inner);
         return;
     }
 
@@ -259,7 +387,6 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(idx, p)| {
-            let is_selected = app.profile_list_state.selected() == Some(idx);
             let signal = signal_for(&snapshots, primary.as_ref(), &p.id, p.protocol);
             let profile_missing = app
                 .runtime
@@ -268,131 +395,14 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 .is_some_and(|tracker| {
                     matches!(tracker.state(), crate::state::ProfilePresence::Missing)
                 });
-
-            // Status cell: badge taxonomy + optional `!` risk annotation.
-            // Numeric prefix (1..=9) remains the affordance for keyboard
-            // quick-select; once a row is active the badge replaces the number
-            // so the user sees state, not muscle-memory.
-            let status_cell = if let Some((glyph, style)) = signal.badge {
-                let badge_style = if is_selected {
-                    style.fg(theme::current().row_selected_fg)
-                } else {
-                    style
-                };
-                let mut spans = vec![Span::styled(glyph, badge_style)];
-                if signal.risk || profile_missing {
-                    spans.push(Span::styled(
-                        "!",
-                        Style::default().fg(if is_selected {
-                            theme::current().row_selected_fg
-                        } else {
-                            theme::current().warning
-                        }),
-                    ));
-                }
-                Cell::from(Line::from(spans))
-            } else if profile_missing {
-                Cell::from(Span::styled(
-                    "!",
-                    Style::default().fg(if is_selected {
-                        theme::current().row_selected_fg
-                    } else {
-                        theme::current().warning
-                    }),
-                ))
-            } else if idx < 9 {
-                Cell::from(Span::styled(
-                    format!("{}", idx + 1),
-                    Style::default().fg(if is_selected {
-                        theme::current().row_selected_fg
-                    } else {
-                        theme::current().text_secondary
-                    }),
-                ))
-            } else {
-                Cell::from(Span::styled(" ", Style::default()))
-            };
-
-            // Primary marker: shown only when there's enough room for both a
-            // 2-char ` *` suffix AND a 3-char minimum name stub. Below that we
-            // suppress the marker (header still carries it cross-surface).
-            let show_primary_marker =
-                should_show_primary_marker(signal.is_primary, name_cell_width);
-            let primary_reserve = if show_primary_marker { 2 } else { 0 };
-            let name_budget = name_cell_width.saturating_sub(primary_reserve).max(1);
-
-            let name_style = if is_selected {
-                Style::default()
-                    .fg(theme::current().row_selected_fg)
-                    .add_modifier(Modifier::BOLD)
-            } else if profile_missing {
-                Style::default().fg(theme::current().warning)
-            } else if signal.is_primary {
-                Style::default()
-                    .fg(signal.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else if signal.is_active {
-                Style::default().fg(signal.accent)
-            } else {
-                Style::default().fg(theme::current().inactive)
-            };
-
-            let display_name = utils::truncate(&p.name, name_budget);
-            let mut name_spans = vec![Span::styled(display_name, name_style)];
-            if show_primary_marker {
-                name_spans.push(Span::styled(
-                    " *",
-                    Style::default()
-                        .fg(if is_selected {
-                            theme::current().row_selected_fg
-                        } else {
-                            signal.accent
-                        })
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            let name_cell = Cell::from(Line::from(name_spans));
-
-            let proto_icon = match p.protocol {
-                crate::app::Protocol::WireGuard => "WG",
-                crate::app::Protocol::OpenVPN => "OV",
-            };
-            let proto_color = if is_selected {
-                theme::current().row_selected_fg
-            } else if signal.is_active {
-                signal.accent
-            } else {
-                theme::current().text_secondary
-            };
-
-            let time_str = if let Some(last_used) = p.last_used {
-                let relative = utils::format_relative_time(last_used);
-                if !relative.ends_with("ago") && !relative.is_empty() {
-                    format!("{relative} ago")
-                } else {
-                    relative
-                }
-            } else {
-                "never".to_string()
-            };
-
-            let row_style = if is_selected {
-                Style::default().bg(theme::current().row_selected_bg)
-            } else {
-                Style::default()
-            };
-
-            let proto_cell = Cell::from(Span::styled(proto_icon, Style::default().fg(proto_color)));
-            let time_cell = Cell::from(Span::styled(
-                time_str,
-                Style::default().fg(if is_selected {
-                    theme::current().row_selected_fg
-                } else {
-                    theme::current().text_secondary
-                }),
-            ));
-
-            Row::new(vec![status_cell, name_cell, proto_cell, time_cell]).style(row_style)
+            profile_row(
+                p,
+                idx,
+                app.profile_list_state.selected() == Some(idx),
+                &signal,
+                profile_missing,
+                name_cell_width,
+            )
         })
         .collect();
 
