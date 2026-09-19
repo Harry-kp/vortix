@@ -1,11 +1,38 @@
+use std::borrow::Cow;
+
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::{
-    style::{Modifier, Style},
-    text::Span,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Clear},
     Frame,
 };
 use unicode_width::UnicodeWidthChar;
+
+use crate::theme;
+
+/// A `label: value` detail row — label in secondary, value in `color`.
+pub(crate) fn detail_row<'a>(
+    label: &'a str,
+    value: impl Into<Cow<'a, str>>,
+    color: Color,
+) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(theme::current().text_secondary)),
+        Span::styled(value, Style::default().fg(color)),
+    ])
+}
+
+/// Green under 50ms, yellow under 150ms, red beyond.
+pub(crate) fn latency_color(latency_ms: u64) -> Color {
+    if latency_ms < 50 {
+        theme::current().success
+    } else if latency_ms < 150 {
+        theme::current().yellow
+    } else {
+        theme::current().error
+    }
+}
 
 /// Clear an area and repaint the active theme's owned surface.
 pub(crate) fn clear_area(frame: &mut Frame, area: Rect) {
