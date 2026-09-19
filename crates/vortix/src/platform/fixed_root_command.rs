@@ -26,6 +26,10 @@ pub(crate) enum FixedCommandError {
 
 pub(crate) struct FixedCommandOutput {
     pub(crate) status: ExitStatus,
+    #[allow(
+        dead_code,
+        reason = "NetworkManager parses connection state from stdout on Linux"
+    )]
     pub(crate) stdout: String,
     #[allow(
         dead_code,

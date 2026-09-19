@@ -91,28 +91,14 @@ pub(crate) fn invalid_unicast_ip(address: &IpAddr) -> bool {
 }
 
 mod child_owner;
-mod ledger;
 mod operation;
 mod protocol_plan;
 mod receipt;
 mod resource;
 
-pub(crate) use child_owner::ChildSpawnAuthority;
 pub use child_owner::{
     ChildExit, ChildObservation, ChildOwner, ChildOwnershipError, ChildOwnershipState,
     ContainmentId, CustodianAction, ObservedChildIdentity, OwnedChild, StandardCustodianContract,
-};
-#[allow(
-    unused_imports,
-    reason = "the typed transaction minter remains dormant until the firewall adapter lands"
-)]
-pub(crate) use ledger::{
-    released_identity_set_is_invalid, DnsTransactionId, FirewallTransactionId, HelperLedgerDns,
-    HelperLedgerFirewall, HelperLedgerPhysicalOwnership, HelperLedgerPolicy, HelperLedgerRecord,
-    HelperLedgerResource, HelperLedgerRoutes, HelperResourceState, PhysicalDnsBackend,
-    PhysicalDnsLink, PhysicalDnsPrior, PhysicalDnsStage, PhysicalDnsValue, PhysicalFirewallBackend,
-    PhysicalFirewallStage, PhysicalRouteBackend, PhysicalRouteEntry, PhysicalRouteStage,
-    RouteTransactionId, MAX_HELPER_LEDGER_BYTES,
 };
 pub use operation::{
     AuthorityBinding, BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission,
@@ -123,8 +109,6 @@ pub use operation::{
     RequestSequence, RootAuthorityLedger, ScopedOpenVpnRedirect, ScopedRoute, ScopedRouteGateway,
     ScopedRouteOrigin, ServiceInstanceClaim, ServiceManager, TrustedDaemonPrincipal,
 };
-pub(crate) use operation::{PlatformVerifiedAuthority, PolicyProjection};
-pub(crate) use protocol_plan::TunnelDescriptorRef;
 pub use protocol_plan::{
     DnsHostname, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnDefaultGateway,
     OpenVpnDefaultGateways, OpenVpnKeyDirection, OpenVpnPlan, OpenVpnRedirectFlag,
@@ -133,7 +117,6 @@ pub use protocol_plan::{
     ProfileMaterialSlot, ProtocolEndpoint, ProtocolPlan, ProtocolPlanError,
     WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
 };
-pub(crate) use receipt::AuthenticatedReceiptVerifier;
 pub use receipt::{
     AmbiguousPhase, ObservationState, OpenVpnRouteEvidence, OpenVpnRouteSetEvidence, ReceiptError,
     ReceiptLedger, ReceiptOutcome, RejectionCode, ResourceObservation, ResourceOwnership,

@@ -16,7 +16,6 @@ use crate::vortix_core::control::model::{
     AuthorityEpoch, OperationId, PolicyDigest, MAX_OPERATION_FAILURE_DETAIL_CHARS,
 };
 use crate::vortix_core::engine::registry::Conflict;
-use crate::vortix_core::ports::owned_routes::canonical_route_destination;
 pub use crate::vortix_core::ports::tunnel::TunnelCancellation as CancellationToken;
 use crate::vortix_core::ports::tunnel::{
     AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
@@ -230,7 +229,7 @@ impl RouteClaim {
     }
 
     fn from_cidr(cidr: Cidr) -> Self {
-        let cidr = canonical_route_destination(cidr);
+        let cidr = cidr.canonical_network();
         Self {
             network: cidr.addr,
             prefix_len: cidr.prefix_len,

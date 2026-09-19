@@ -1040,19 +1040,6 @@ fn route_covers_target(route: crate::vortix_core::cidr::Cidr, target: IpAddr) ->
         .is_some_and(|target| route.intersects(&target))
 }
 
-/// Select the first configured health target covered by canonical peer routes.
-#[must_use]
-pub(crate) fn select_health_probe_for_allowed_routes(
-    routes: &[crate::vortix_core::cidr::Cidr],
-    health_targets: &[IpAddr],
-) -> Option<IpAddr> {
-    health_targets.iter().copied().find(|target| {
-        routes
-            .iter()
-            .any(|route| route_covers_target(*route, *target))
-    })
-}
-
 /// Verify that a configured health target is currently routed through the
 /// exact owned `WireGuard` interface, then issue one UDP packet to elicit a
 /// handshake. The route proof and packet emission stay inside the protocol

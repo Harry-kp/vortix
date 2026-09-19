@@ -17,46 +17,6 @@ use crate::vortix_core::ports::route_table::DefaultRouteObservation;
 
 const MAX_DNS_ROUTE_PROBES: usize = 256;
 
-pub(crate) fn policy_for_topology(
-    generation: u64,
-    state: &TopologyState,
-    capabilities: DnsPlatformCapabilities,
-) -> Result<DnsPolicy, String> {
-    let intents = state
-        .profiles
-        .iter()
-        .filter_map(|profile| {
-            state
-                .dns_requests
-                .get(profile)
-                .filter(|request| !request.is_empty())
-                .map(|request| (profile, request))
-        })
-        .map(|(profile, request)| {
-            let interface =
-                state.interfaces.get(profile).cloned().ok_or_else(|| {
-                    format!("profile {profile} has no authoritative DNS interface")
-                })?;
-            let role = if state
-                .routes
-                .get(profile)
-                .is_some_and(|routes| routes.iter().any(|route| route.is_default()))
-            {
-                DnsTunnelRole::Primary
-            } else {
-                DnsTunnelRole::Secondary
-            };
-            Ok(DnsTunnelIntent {
-                profile_id: profile.clone(),
-                interface,
-                role,
-                request: request.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    DnsPolicy::compute(generation, &intents, capabilities).map_err(|error| error.to_string())
-}
-
 pub(crate) fn verify_dns_routes(policy: &DnsPolicy, deadline: Instant) -> Result<(), String> {
     verify_dns_routes_with(policy, deadline, |server| {
         crate::platform::current_platform()

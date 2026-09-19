@@ -17,15 +17,10 @@
 //! 5. Unlink only the exact socket inode this process created
 
 pub mod client;
-pub(crate) mod control_host;
 pub mod diagnostics;
-pub(crate) mod helper_client;
 pub mod passive;
-mod policy_executor;
 mod server;
 pub mod service;
-mod tunnel_executor;
-mod tunnel_material;
 
 pub use server::DaemonServer;
 

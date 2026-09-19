@@ -12,13 +12,12 @@ use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 use zeroize::Zeroize as _;
 
-use super::control_host::ControlAuthorityHost;
 use super::diagnostics::{DiagnosticHub, DiagnosticQueryProvider};
 use super::passive::{legacy_connection, PassiveQueryProvider};
-use crate::vortix_core::control::{ControlSubscription, DiagnosticSnapshot};
+use crate::vortix_core::control::DiagnosticSnapshot;
 use crate::vortix_core::ipc::{
-    negotiate_control, negotiate_passive, ControlAvailability, FrameError, IpcCapability, IpcError,
-    IpcOp, IpcRequest, IpcResponse, IpcResult, PassiveSnapshot, MAX_FRAME_BYTES,
+    negotiate_passive, FrameError, IpcCapability, IpcError, IpcOp, IpcRequest, IpcResponse,
+    IpcResult, PassiveSnapshot, MAX_FRAME_BYTES,
 };
 
 const MAX_CONNECTIONS: usize = 32;
@@ -34,26 +33,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct EmptyQueryProvider {
     events: tokio::sync::broadcast::Sender<PassiveSnapshot>,
-}
-
-#[derive(Clone)]
-#[allow(
-    dead_code,
-    reason = "U13 tests the dormant enrolled endpoint before production activation is wired"
-)]
-enum ControlEndpoint {
-    Disabled,
-    Unavailable(ControlAvailability),
-    Active(Arc<ControlAuthorityHost>),
-}
-
-impl ControlEndpoint {
-    fn active(&self) -> Option<&ControlAuthorityHost> {
-        match self {
-            Self::Active(host) => Some(host),
-            Self::Disabled | Self::Unavailable(_) => None,
-        }
-    }
 }
 
 impl EmptyQueryProvider {
@@ -82,7 +61,6 @@ pub struct DaemonServer {
     listener: UnixListener,
     provider: Arc<dyn PassiveQueryProvider>,
     diagnostics: Arc<dyn DiagnosticQueryProvider>,
-    control: ControlEndpoint,
     daemon_uid: u32,
     socket_identity: SocketIdentity,
     shutdown: watch::Sender<bool>,
@@ -100,7 +78,6 @@ impl DaemonServer {
             listener,
             provider: Arc::new(EmptyQueryProvider::new()),
             diagnostics: Arc::new(DiagnosticHub::start(None)?),
-            control: ControlEndpoint::Disabled,
             daemon_uid: effective_uid(),
             socket_identity,
             shutdown: watch::channel(false).0,
@@ -162,12 +139,11 @@ impl DaemonServer {
                     };
                     let provider = Arc::clone(&self.provider);
                     let diagnostics = Arc::clone(&self.diagnostics);
-                    let control = self.control.clone();
                     let shutdown = self.shutdown.clone();
                     let daemon_uid = self.daemon_uid;
                     clients.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = handle_client(stream, daemon_uid, provider, diagnostics, control, shutdown).await {
+                        if let Err(error) = handle_client(stream, daemon_uid, provider, diagnostics, shutdown).await {
                             tracing::debug!(%error, "daemon client closed");
                         }
                     });
@@ -304,7 +280,6 @@ async fn handle_client(
     daemon_uid: u32,
     provider: Arc<dyn PassiveQueryProvider>,
     diagnostics: Arc<dyn DiagnosticQueryProvider>,
-    control: ControlEndpoint,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), DaemonError> {
     if get_peer_uid(&stream)? != daemon_uid {
@@ -323,15 +298,7 @@ async fn handle_client(
     let (mut reader, writer) = stream.into_split();
     let (output, output_rx) = mpsc::channel(OUTPUT_CAPACITY);
     let writer_task = tokio::spawn(writer_loop(writer, output_rx));
-    let result = connection_loop(
-        &mut reader,
-        &output,
-        provider,
-        diagnostics,
-        control,
-        shutdown,
-    )
-    .await;
+    let result = connection_loop(&mut reader, &output, provider, diagnostics, shutdown).await;
     drop(output);
     let _ = writer_task.await;
     result
@@ -346,7 +313,6 @@ async fn connection_loop<R: AsyncRead + Unpin>(
     output: &mpsc::Sender<Outbound>,
     provider: Arc<dyn PassiveQueryProvider>,
     diagnostics: Arc<dyn DiagnosticQueryProvider>,
-    control: ControlEndpoint,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), DaemonError> {
     let first = read_request(reader).await?;
@@ -357,13 +323,11 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         IpcOp::Snapshot => {
             let response = dispatch(
                 first.id,
-                first.op.clone(),
+                &first.op,
                 provider.as_ref(),
                 diagnostics.as_ref(),
-                control.active(),
                 &shutdown,
-            )
-            .await;
+            );
             send_response(output, response).await?;
             return Ok(());
         }
@@ -383,18 +347,9 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         .required_capabilities
         .contains(&IpcCapability::ControlMutation);
     let negotiated = if control_connection {
-        match &control {
-            ControlEndpoint::Active(authority) => match authority.unavailable_state() {
-                None => negotiate_control(hello, authority.authority_binding()),
-                Some(state) => Err(IpcError::ControlUnavailable { state }),
-            },
-            ControlEndpoint::Unavailable(state) => {
-                Err(IpcError::ControlUnavailable { state: *state })
-            }
-            ControlEndpoint::Disabled => Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::ControlMutation,
-            }),
-        }
+        Err(IpcError::CapabilityUnavailable {
+            capability: IpcCapability::ControlMutation,
+        })
     } else {
         negotiate_passive(hello)
     };
@@ -498,66 +453,27 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         let IpcRequest { id: request_id, op } = request;
         let passive_subscribe = matches!(&op, IpcOp::Subscribe | IpcOp::PassiveSubscribe);
         let diagnostic_subscribe = matches!(&op, IpcOp::DiagnosticsSubscribe);
-        let control_session = match &op {
-            IpcOp::ControlSubscribe { session_id } => Some(session_id.clone()),
-            _ => None,
-        };
         let mut subscription = passive_subscribe.then(|| provider.subscribe());
         let mut diagnostic_subscription = diagnostic_subscribe.then(|| diagnostics.subscribe());
-        let mut control_subscription = None;
-        let response = if let Some(session_id) = &control_session {
-            let result = control
-                .active()
-                .ok_or(IpcError::CapabilityUnavailable {
-                    capability: IpcCapability::ControlMutation,
-                })
-                .and_then(|authority| authority.subscribe(session_id))
-                .map(|(subscription, snapshot)| {
-                    control_subscription = Some(subscription);
-                    IpcResult::ControlSubscribed { snapshot }
-                });
-            IpcResponse {
-                id: request_id,
-                result,
-            }
-        } else {
-            dispatch(
-                request_id,
-                op,
-                provider.as_ref(),
-                diagnostics.as_ref(),
-                control.active(),
-                &shutdown,
-            )
-            .await
-        };
+        let response = dispatch(
+            request_id,
+            &op,
+            provider.as_ref(),
+            diagnostics.as_ref(),
+            &shutdown,
+        );
         let subscription_boundary = match &response.result {
             Ok(IpcResult::PassiveSubscribed { snapshot }) => snapshot.generation,
             Ok(IpcResult::DiagnosticSubscribed { snapshot }) => snapshot.generation,
-            Ok(IpcResult::ControlSubscribed { snapshot }) => snapshot.generation,
             _ => 0,
         };
         // Subscription connections become read-only immediately, so no later
         // request can replay this acknowledgement and it need not be retained.
-        let frame = match response_frame(&response) {
-            Ok(frame) => frame,
-            Err(error) => {
-                if let (Some(authority), Some(session_id)) = (control.active(), &control_session) {
-                    authority.close_session(session_id);
-                }
-                return Err(error.into());
-            }
-        };
+        let frame = response_frame(&response)?;
         let retained = passive_subscribe
             || diagnostic_subscribe
-            || control_subscription.is_some()
             || requests.insert(request_id, digest, Arc::clone(&frame));
-        if let Err(error) = send_frame(output, frame).await {
-            if let (Some(authority), Some(session_id)) = (control.active(), &control_session) {
-                authority.close_session(session_id);
-            }
-            return Err(error);
-        }
+        send_frame(output, frame).await?;
         if let Some(receiver) = subscription.as_mut() {
             stream_subscription(
                 reader,
@@ -582,16 +498,6 @@ async fn connection_loop<R: AsyncRead + Unpin>(
             .await?;
             return Ok(());
         }
-        if let (Some(session_id), Some(receiver)) =
-            (control_session.as_ref(), control_subscription.as_mut())
-        {
-            let result = stream_control_subscription(reader, output, receiver, &shutdown).await;
-            if let Some(authority) = control.active() {
-                authority.close_session(session_id);
-            }
-            result?;
-            return Ok(());
-        }
         // Never keep processing IDs whose response could not be retained:
         // closing after the one successful write preserves exact replay
         // semantics without letting cached response memory exceed its cap.
@@ -601,31 +507,25 @@ async fn connection_loop<R: AsyncRead + Unpin>(
     }
 }
 
-async fn dispatch(
+fn dispatch(
     request_id: u64,
-    op: IpcOp,
+    op: &IpcOp,
     provider: &dyn PassiveQueryProvider,
     diagnostics: &dyn DiagnosticQueryProvider,
-    control: Option<&ControlAuthorityHost>,
     shutdown: &watch::Sender<bool>,
 ) -> IpcResponse {
     let result = match op {
         IpcOp::Handshake { .. } => Err(IpcError::HandshakeRequired),
-        IpcOp::Execute(_) => Err(IpcError::CapabilityUnavailable {
-            capability: IpcCapability::ControlMutation,
-        }),
-        control_op @ (IpcOp::ControlOpen
+        IpcOp::Execute(_)
+        | IpcOp::ControlOpen
         | IpcOp::ControlSubmit { .. }
         | IpcOp::ControlSnapshot { .. }
         | IpcOp::ControlRespondChallenge { .. }
         | IpcOp::ControlCancelChallenge { .. }
         | IpcOp::ControlStageProfileImport { .. }
-        | IpcOp::ControlCancelProfileImport { .. }) => match control {
-            Some(authority) => authority.dispatch(control_op).await,
-            None => Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::ControlMutation,
-            }),
-        },
+        | IpcOp::ControlCancelProfileImport { .. } => Err(IpcError::CapabilityUnavailable {
+            capability: IpcCapability::ControlMutation,
+        }),
         IpcOp::ControlSubscribe { .. } => Err(IpcError::MalformedRequest(
             "control subscriptions require a dedicated connection".into(),
         )),
@@ -722,42 +622,6 @@ where
                     return Ok(());
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-            }
-        }
-    }
-}
-
-async fn stream_control_subscription<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    output: &mpsc::Sender<Outbound>,
-    subscription: &mut ControlSubscription,
-    shutdown: &watch::Sender<bool>,
-) -> Result<(), DaemonError> {
-    let mut probe = [0_u8; 1];
-    let mut shutdown_receiver = shutdown.subscribe();
-    loop {
-        tokio::select! {
-            () = wait_for_shutdown(&mut shutdown_receiver) => return Ok(()),
-            read = reader.read(&mut probe) => {
-                match read {
-                    Ok(0) => return Ok(()),
-                    Ok(_) => return Err(DaemonError::Protocol(
-                        "subscription connections are read-only".into(),
-                    )),
-                    Err(error) => return Err(DaemonError::Io(error)),
-                }
-            }
-            changed = subscription.changed() => {
-                let snapshot = changed.map_err(|error| {
-                    DaemonError::Protocol(format!("control subscription stopped: {error}"))
-                })?;
-                send_response(output, IpcResponse {
-                    id: 0,
-                    result: Ok(IpcResult::ControlEvent {
-                        event: None,
-                        snapshot,
-                    }),
-                }).await?;
             }
         }
     }
@@ -1020,7 +884,7 @@ enum DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vortix_core::ipc::{ClientHello, IpcCapability, RemoteSessionId};
+    use crate::vortix_core::ipc::{ClientHello, IpcCapability};
 
     struct FixedProvider {
         snapshot: PassiveSnapshot,
@@ -1059,432 +923,6 @@ mod tests {
                 hello: ClientHello::current(vec![IpcCapability::PassiveSnapshot]),
             },
         }
-    }
-
-    fn test_binding() -> crate::vortix_core::privileged::AuthorityBinding {
-        crate::vortix_core::privileged::AuthorityBinding::new(
-            crate::vortix_core::control::AuthorityEpoch(7),
-            crate::vortix_core::privileged::BootScope::new([1; 16]),
-            crate::vortix_core::privileged::LeaseId::new([2; 32]),
-            crate::vortix_core::privileged::OperationDigest::of_bytes(b"daemon"),
-        )
-        .unwrap()
-    }
-
-    fn test_control_host() -> Arc<ControlAuthorityHost> {
-        Arc::new(ControlAuthorityHost::new_for_test(
-            crate::vortix_core::control::ControlService::start(
-                crate::vortix_core::control::ControlServiceConfig {
-                    authority_epoch: test_binding().authority_epoch(),
-                    ..crate::vortix_core::control::ControlServiceConfig::default()
-                },
-            ),
-            test_binding(),
-        ))
-    }
-
-    fn spawn_test_connection(
-        server: tokio::io::DuplexStream,
-        control: ControlEndpoint,
-    ) -> tokio::task::JoinHandle<Result<(), DaemonError>> {
-        tokio::spawn(async move {
-            let (mut reader, writer_half) = tokio::io::split(server);
-            let (output, output_rx) = mpsc::channel(4);
-            let writer = tokio::spawn(writer_loop(writer_half, output_rx));
-            let result = connection_loop(
-                &mut reader,
-                &output,
-                Arc::new(EmptyQueryProvider::new()),
-                Arc::new(DiagnosticHub::start(None).unwrap()),
-                control,
-                watch::channel(false).0,
-            )
-            .await;
-            drop(output);
-            let _ = writer.await;
-            result
-        })
-    }
-
-    async fn duplex_exchange(
-        client: &mut tokio::io::DuplexStream,
-        request: &IpcRequest,
-    ) -> IpcResponse {
-        client
-            .write_all(&crate::vortix_core::ipc::encode_frame(request).unwrap())
-            .await
-            .unwrap();
-        duplex_read_response(client).await
-    }
-
-    async fn duplex_read_response(client: &mut tokio::io::DuplexStream) -> IpcResponse {
-        let mut header = [0_u8; 4];
-        client.read_exact(&mut header).await.unwrap();
-        let body_len = u32::from_be_bytes(header) as usize;
-        let mut body = vec![0_u8; body_len];
-        client.read_exact(&mut body).await.unwrap();
-        serde_json::from_slice(&body).unwrap()
-    }
-
-    async fn read_test_response(client: &mut tokio::io::DuplexStream) -> IpcResponse {
-        duplex_read_response(client).await
-    }
-
-    fn test_connection() -> (
-        tokio::io::DuplexStream,
-        tokio::task::JoinHandle<Result<(), DaemonError>>,
-    ) {
-        let (client, server) = tokio::io::duplex(4096);
-        let task = spawn_test_connection(server, ControlEndpoint::Disabled);
-        (client, task)
-    }
-
-    async fn exchange_test(
-        client: &mut tokio::io::DuplexStream,
-        request: &IpcRequest,
-    ) -> IpcResponse {
-        client
-            .write_all(&crate::vortix_core::ipc::encode_frame(request).unwrap())
-            .await
-            .unwrap();
-        read_test_response(client).await
-    }
-
-    #[tokio::test]
-    async fn pre_handshake_v1_snapshot_keeps_the_base_wire_shape() {
-        let (mut client, task) = test_connection();
-        let request = IpcRequest {
-            id: 1,
-            op: IpcOp::Snapshot,
-        };
-        let response = exchange_test(&mut client, &request).await;
-        assert!(matches!(response.result, Ok(IpcResult::Snapshot { .. })));
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn negotiated_capabilities_reject_undeclared_diagnostics() {
-        let (mut client, task) = test_connection();
-        let handshake = IpcRequest {
-            id: 1,
-            op: IpcOp::Handshake {
-                hello: ClientHello::current(vec![IpcCapability::LegacySnapshot]),
-            },
-        };
-        assert!(matches!(
-            exchange_test(&mut client, &handshake).await.result,
-            Ok(IpcResult::Handshake { .. })
-        ));
-
-        let undeclared = IpcRequest {
-            id: 2,
-            op: IpcOp::Diagnostics,
-        };
-        assert!(matches!(
-            exchange_test(&mut client, &undeclared).await.result,
-            Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::Diagnostics
-            })
-        ));
-        task.abort();
-    }
-
-    #[tokio::test]
-    async fn schema_one_connection_rejects_diagnostics() {
-        let (mut client, task) = test_connection();
-        let mut hello = ClientHello::current(vec![IpcCapability::LegacySnapshot]);
-        hello.schema = crate::vortix_core::ipc::CompatibilityRange { min: 1, max: 1 };
-        let handshake = IpcRequest {
-            id: 1,
-            op: IpcOp::Handshake { hello },
-        };
-        assert!(matches!(
-            exchange_test(&mut client, &handshake).await.result,
-            Ok(IpcResult::Handshake { .. })
-        ));
-        let diagnostics = IpcRequest {
-            id: 2,
-            op: IpcOp::Diagnostics,
-        };
-        assert!(matches!(
-            exchange_test(&mut client, &diagnostics).await.result,
-            Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::Diagnostics
-            })
-        ));
-        task.abort();
-    }
-
-    #[tokio::test]
-    async fn first_non_handshake_request_is_rejected() {
-        let (mut client, task) = test_connection();
-        let request = IpcRequest {
-            id: 1,
-            op: IpcOp::PassiveSnapshot,
-        };
-        let response = exchange_test(&mut client, &request).await;
-        assert!(matches!(response.result, Err(IpcError::HandshakeRequired)));
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn control_handshake_requires_explicit_host_and_exact_binding() {
-        let (mut absent_client, absent_server) = tokio::io::duplex(16 * 1024);
-        let absent_task = spawn_test_connection(absent_server, ControlEndpoint::Disabled);
-        let control_handshake = IpcRequest {
-            id: 1,
-            op: IpcOp::Handshake {
-                hello: ClientHello::current(vec![IpcCapability::ControlMutation]),
-            },
-        };
-        assert!(matches!(
-            duplex_exchange(&mut absent_client, &control_handshake)
-                .await
-                .result,
-            Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::ControlMutation
-            })
-        ));
-        drop(absent_client);
-        absent_task.await.unwrap().unwrap();
-
-        let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let task = spawn_test_connection(server, ControlEndpoint::Active(test_control_host()));
-        let response = duplex_exchange(&mut client, &control_handshake).await;
-        assert!(matches!(
-            response.result,
-            Ok(IpcResult::Handshake { hello })
-                if !hello.passive && hello.authority_binding == Some(test_binding())
-        ));
-        assert!(matches!(
-            duplex_exchange(
-                &mut client,
-                &IpcRequest {
-                    id: 2,
-                    op: IpcOp::PassiveSnapshot,
-                },
-            )
-            .await
-            .result,
-            Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::PassiveSnapshot
-            })
-        ));
-        drop(client);
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn failed_control_subscribe_retains_request_id_semantics() {
-        let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let task = spawn_test_connection(server, ControlEndpoint::Active(test_control_host()));
-        let control_handshake = IpcRequest {
-            id: 1,
-            op: IpcOp::Handshake {
-                hello: ClientHello::current(vec![IpcCapability::ControlMutation]),
-            },
-        };
-        assert!(duplex_exchange(&mut client, &control_handshake)
-            .await
-            .result
-            .is_ok());
-        let missing = RemoteSessionId::parse("session-00000000000000000000000000000000").unwrap();
-        assert!(matches!(
-            duplex_exchange(
-                &mut client,
-                &IpcRequest {
-                    id: 2,
-                    op: IpcOp::ControlSubscribe {
-                        session_id: missing,
-                    },
-                },
-            )
-            .await
-            .result,
-            Err(IpcError::ControlSessionNotFound)
-        ));
-        assert!(matches!(
-            duplex_exchange(
-                &mut client,
-                &IpcRequest {
-                    id: 2,
-                    op: IpcOp::ControlOpen,
-                },
-            )
-            .await
-            .result,
-            Err(IpcError::DuplicateRequestId)
-        ));
-        drop(client);
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn control_subscription_streams_and_closes_its_hosted_session() {
-        let host = test_control_host();
-        let handshake = IpcRequest {
-            id: 1,
-            op: IpcOp::Handshake {
-                hello: ClientHello::current(vec![IpcCapability::ControlMutation]),
-            },
-        };
-
-        let (mut commands, command_server) = tokio::io::duplex(32 * 1024);
-        let command_task =
-            spawn_test_connection(command_server, ControlEndpoint::Active(Arc::clone(&host)));
-        assert!(duplex_exchange(&mut commands, &handshake)
-            .await
-            .result
-            .is_ok());
-        let opened = duplex_exchange(
-            &mut commands,
-            &IpcRequest {
-                id: 2,
-                op: IpcOp::ControlOpen,
-            },
-        )
-        .await;
-        let Ok(IpcResult::ControlOpened { session_id, .. }) = opened.result else {
-            panic!("control session must open");
-        };
-
-        let (mut events, event_server) = tokio::io::duplex(32 * 1024);
-        let event_task = spawn_test_connection(event_server, ControlEndpoint::Active(host));
-        assert!(duplex_exchange(&mut events, &handshake)
-            .await
-            .result
-            .is_ok());
-        assert!(matches!(
-            duplex_exchange(
-                &mut events,
-                &IpcRequest {
-                    id: 2,
-                    op: IpcOp::ControlSubscribe {
-                        session_id: session_id.clone(),
-                    },
-                },
-            )
-            .await
-            .result,
-            Ok(IpcResult::ControlSubscribed { .. })
-        ));
-
-        assert!(matches!(
-            duplex_exchange(
-                &mut commands,
-                &IpcRequest {
-                    id: 3,
-                    op: IpcOp::ControlSubmit {
-                        session_id: session_id.clone(),
-                        command: crate::vortix_core::control::UserCommand::Disconnect {
-                            profile_id: None,
-                        },
-                        idempotency_key: crate::vortix_core::control::IdempotencyKey::new(
-                            "wire-subscription",
-                        ),
-                        timeout_millis: 1_000,
-                    },
-                },
-            )
-            .await
-            .result,
-            Ok(IpcResult::ControlAccepted { .. })
-        ));
-        assert!(matches!(
-            duplex_read_response(&mut events).await.result,
-            Ok(IpcResult::ControlEvent { .. })
-        ));
-
-        events.write_all(b"x").await.unwrap();
-        assert!(matches!(
-            event_task.await.unwrap(),
-            Err(DaemonError::Protocol(_))
-        ));
-        assert!(matches!(
-            duplex_exchange(
-                &mut commands,
-                &IpcRequest {
-                    id: 4,
-                    op: IpcOp::ControlSnapshot { session_id },
-                },
-            )
-            .await
-            .result,
-            Err(IpcError::ControlSessionNotFound)
-        ));
-        drop(commands);
-        command_task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn control_handshake_reports_live_nonactive_state() {
-        let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let task = spawn_test_connection(
-            server,
-            ControlEndpoint::Unavailable(ControlAvailability::Degraded),
-        );
-        let response = duplex_exchange(
-            &mut client,
-            &IpcRequest {
-                id: 1,
-                op: IpcOp::Handshake {
-                    hello: ClientHello::current(vec![IpcCapability::ControlMutation]),
-                },
-            },
-        )
-        .await;
-        assert!(matches!(
-            response.result,
-            Err(IpcError::ControlUnavailable {
-                state: ControlAvailability::Degraded
-            })
-        ));
-        drop(client);
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn passive_handshake_cannot_cross_into_present_control_host() {
-        let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let task = spawn_test_connection(server, ControlEndpoint::Active(test_control_host()));
-        assert!(matches!(
-            duplex_exchange(&mut client, &handshake(1)).await.result,
-            Ok(IpcResult::Handshake { hello }) if hello.passive
-        ));
-        assert!(matches!(
-            duplex_exchange(
-                &mut client,
-                &IpcRequest {
-                    id: 2,
-                    op: IpcOp::ControlOpen,
-                },
-            )
-            .await
-            .result,
-            Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::ControlMutation
-            })
-        ));
-        drop(client);
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn passive_dispatch_rejects_execute() {
-        let provider = EmptyQueryProvider::new();
-        let diagnostics = DiagnosticHub::start(None).unwrap();
-        let shutdown = watch::channel(false).0;
-        let op = IpcOp::Execute(crate::vortix_core::engine::input::UserCommand::Disconnect {
-            profile_id: None,
-        });
-        assert!(matches!(
-            dispatch(9, op, &provider, &diagnostics, None, &shutdown)
-                .await
-                .result,
-            Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::ControlMutation
-            })
-        ));
     }
 
     #[test]

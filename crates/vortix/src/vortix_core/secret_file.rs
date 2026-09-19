@@ -31,24 +31,7 @@ pub(crate) struct SecretFileIdentity {
     inode: u64,
 }
 
-impl SecretFileIdentity {
-    #[cfg(unix)]
-    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt as _;
-
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn matches_metadata(self, metadata: &std::fs::Metadata) -> bool {
-        use std::os::unix::fs::MetadataExt as _;
-
-        metadata.dev() == self.device && metadata.ino() == self.inode
-    }
-}
+impl SecretFileIdentity {}
 
 /// Errors returned by [`write_secret_file`].
 #[derive(Debug, thiserror::Error)]

@@ -778,25 +778,6 @@ impl VerifiedReceipt {
         matches!(self.outcome, ReceiptOutcome::Ambiguous(_))
     }
 
-    pub(crate) const fn rejection_code(&self) -> Option<RejectionCode> {
-        match self.outcome {
-            ReceiptOutcome::Rejected(code) => Some(code),
-            ReceiptOutcome::Applied(_)
-            | ReceiptOutcome::Observed(_)
-            | ReceiptOutcome::Ambiguous(_) => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn is_rejected(&self) -> bool {
-        self.rejection_code().is_some()
-    }
-
-    pub(crate) fn observes(&self, resource: &ResourceTag, state: ObservationState) -> bool {
-        matches!(&self.outcome, ReceiptOutcome::Observed(observations) if observations
-            .iter().any(|observation| observation.resource == *resource && observation.state == state))
-    }
-
     #[must_use]
     pub fn observation(&self, resource: &ResourceTag) -> Option<&ResourceObservation> {
         match &self.outcome {
