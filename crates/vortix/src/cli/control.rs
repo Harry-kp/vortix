@@ -1040,21 +1040,6 @@ impl ClientControlSession {
         Ok((session, profile_id))
     }
 
-    /// Closed production activation seam. It returns before connecting while
-    /// U19's enrollment gate is disabled.
-    pub fn connect_remote_production(
-        socket_path: std::path::PathBuf,
-    ) -> Result<Self, LocalControlError> {
-        let transport: Arc<dyn crate::daemon::service::RemoteControlTransport> = Arc::new(
-            crate::daemon::client::UnixRemoteControlTransport::new(socket_path),
-        );
-        let session = crate::daemon::service::RemoteControlSession::connect_production(
-            crate::daemon::service::RemoteMutationGate::production(),
-            transport,
-        )?;
-        Ok(Self::remote(session))
-    }
-
     #[doc(hidden)]
     #[must_use]
     pub fn remote_for_parity(session: crate::daemon::service::RemoteControlSession) -> Self {
@@ -1699,7 +1684,6 @@ pub(crate) struct LocalProfileMutationSession {
 }
 
 impl LocalProfileMutationSession {
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn start(
         config_dir: &Path,
         profiles: &[VpnProfile],
@@ -1996,7 +1980,6 @@ impl LocalControlSession {
         Ok(session)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn start(
         config: &crate::config::AppConfig,
         config_dir: &Path,
@@ -2008,7 +1991,6 @@ impl LocalControlSession {
     /// Start the interactive authority without withholding the session while
     /// recovered work settles. Admission and observation are ready at this
     /// boundary, so the TUI can display and cancel exact in-flight work.
-    #[allow(clippy::too_many_lines)]
     pub fn start_tui(
         config: &crate::config::AppConfig,
         config_dir: &Path,

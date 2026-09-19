@@ -187,6 +187,20 @@ pub struct DesiredState {
     pub conflict_acknowledgements: BTreeMap<ProfileId, Conflict>,
 }
 
+impl DesiredState {
+    /// The revision currently desired, in the shape the policy layer compares
+    /// against. Its digest field is named `policy_digest` here, which is why
+    /// this was worth naming rather than rebuilding at each call site.
+    #[must_use]
+    pub fn revision(&self) -> crate::vortix_core::control::worker::ControlRevision {
+        crate::vortix_core::control::worker::ControlRevision {
+            authority_epoch: self.authority_epoch,
+            generation: self.generation,
+            digest: self.policy_digest.clone(),
+        }
+    }
+}
+
 impl Default for DesiredState {
     fn default() -> Self {
         Self {

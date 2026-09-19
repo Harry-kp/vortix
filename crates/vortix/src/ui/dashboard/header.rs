@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::state::QualityLevel;
+use crate::ui::helpers;
 use crate::vortix_core::engine::state::Connection;
 use crate::vortix_core::engine::TunnelSnapshot;
 use crate::vortix_core::profile::ProfileId;
@@ -40,7 +41,6 @@ fn profile_display_name(app: &App, id: &ProfileId) -> String {
 /// current width, names are abbreviated to the first character, then
 /// dropped with a `+N` overflow suffix, then the whole strip collapses to a
 /// dot-row of badge chars (`[●●●● +1]`).
-#[allow(clippy::too_many_lines)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let tunnel_count = app.registry.tunnel_count();
     let primary = app.registry.primary().cloned();
@@ -164,10 +164,7 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
                 .fg(theme::current().warning)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            " │ ",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        ),
+        helpers::divider_padded(),
         Span::styled(
             "Real: ",
             Style::default().fg(theme::current().text_secondary),
@@ -176,10 +173,7 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
             app.runtime.public_ip.clone(),
             Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(
-            " │",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        ),
+        helpers::divider(),
         ks_indicator,
     ])
 }
@@ -198,10 +192,7 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
                 .fg(theme::current().error)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            " │ ",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        ),
+        helpers::divider_padded(),
         Span::styled(
             "Real: ",
             Style::default().fg(theme::current().text_secondary),
@@ -210,10 +201,7 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
             app.runtime.public_ip.clone(),
             Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(
-            " │",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        ),
+        helpers::divider(),
         ks_indicator,
     ])
 }
@@ -222,7 +210,138 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
 /// is the existing single-tunnel rendering preserved verbatim from U6B; the
 /// only behavioural delta is that the `(+N more)` suffix has been retired
 /// in favour of the explicit Tunnels strip appended by the caller.
-#[allow(clippy::too_many_lines)]
+/// Session uptime as `▲Nd HH:MM:SS`, dropping the units it doesn't need.
+fn format_uptime(elapsed: u64) -> String {
+    let (h, m, s) = (elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
+    if elapsed >= 86400 {
+        format!("▲{}d {:02}:{:02}:{:02}", elapsed / 86400, h % 24, m, s)
+    } else if elapsed >= 3600 {
+        format!("▲{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("▲{:02}:{s:02}", elapsed / 60)
+    }
+}
+
+/// The header line for a connected primary: identity, exit IP, uptime,
+/// signal bars and the kill-switch indicator, thinned out below 84 columns.
+fn connected_line(
+    app: &App,
+    primary_snap: &TunnelSnapshot,
+    details: &crate::vortix_core::engine::state::DetailedConnectionInfo,
+    since: std::time::SystemTime,
+    ks_indicator: Span<'static>,
+    area_width: u16,
+) -> Line<'static> {
+    let profile_name = profile_display_name(app, &primary_snap.profile_id);
+    // The dormant mode prefix used to reserve roughly 14 columns.
+    // Keep the compact layout through normal 80-column terminals so
+    // removing that prefix cannot clip the kill-switch signal.
+    let compact = area_width < 84;
+    let profile_name = if compact {
+        utils::truncate(&profile_name, 10)
+    } else {
+        profile_name
+    };
+
+    let uptime = format_uptime(since.elapsed().map_or(0, |d| d.as_secs()));
+
+    let quality_indicator = match QualityLevel::from_metrics(
+        app.runtime.latency_ms,
+        app.runtime.packet_loss,
+        app.runtime.jitter_ms,
+    ) {
+        QualityLevel::Unknown => ("─────", theme::current().text_secondary),
+        QualityLevel::Poor => ("●●○○○", theme::current().error),
+        QualityLevel::Fair => ("●●●○○", theme::current().yellow),
+        QualityLevel::Excellent => ("●●●●●", theme::current().success),
+    };
+
+    let proto_tag = app
+        .runtime
+        .profiles
+        .iter()
+        .find(|p| p.name == profile_name)
+        .map_or("", |p| match p.protocol {
+            crate::state::Protocol::WireGuard => "WG",
+            crate::state::Protocol::OpenVPN => "OVPN",
+        });
+
+    let proto_suffix = if proto_tag.is_empty() {
+        ")".to_string()
+    } else {
+        format!("/{proto_tag})")
+    };
+
+    let mut header_spans = vec![
+        Span::styled(
+            "● CONNECTED",
+            Style::default()
+                .fg(theme::current().success)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" ({profile_name}"),
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(
+            proto_suffix,
+            Style::default().fg(theme::current().accent_primary),
+        ),
+        helpers::divider_padded(),
+        Span::styled(
+            "VPN: ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(
+            app.runtime.public_ip.clone(),
+            Style::default().fg(theme::current().success),
+        ),
+    ];
+
+    if !compact
+        && !app.runtime.location.is_empty()
+        && app.runtime.location != "Unknown"
+        && app.runtime.location != constants::MSG_DETECTING
+    {
+        let loc_budget = (area_width as usize / 4).max(10);
+        header_spans.push(Span::styled(
+            " @ ",
+            Style::default().fg(theme::current().text_secondary),
+        ));
+        header_spans.push(Span::styled(
+            utils::truncate(&app.runtime.location, loc_budget),
+            Style::default().fg(theme::current().accent_primary),
+        ));
+    }
+
+    if !compact && !details.interface.is_empty() {
+        header_spans.push(Span::styled(
+            format!(" [{}]", details.interface),
+            Style::default().fg(theme::current().text_secondary),
+        ));
+    }
+
+    header_spans.extend_from_slice(&[
+        helpers::divider_padded(),
+        Span::styled(
+            uptime,
+            Style::default().fg(theme::current().accent_secondary),
+        ),
+    ]);
+    if !compact {
+        header_spans.extend_from_slice(&[
+            helpers::divider_padded(),
+            Span::styled(
+                quality_indicator.0,
+                Style::default().fg(quality_indicator.1),
+            ),
+        ]);
+    }
+    header_spans.extend_from_slice(&[helpers::divider(), ks_indicator]);
+
+    Line::from(header_spans)
+}
+
 fn render_primary_line(
     app: &App,
     primary_snap: &TunnelSnapshot,
@@ -278,10 +397,7 @@ fn render_primary_line(
                     format!(" {elapsed}s"),
                     Style::default().fg(theme::current().accent_secondary),
                 ),
-                Span::styled(
-                    " │",
-                    Style::default().fg(theme::current().nord_polar_night_4),
-                ),
+                helpers::divider(),
                 ks_indicator,
             ])
         }
@@ -292,154 +408,11 @@ fn render_primary_line(
                     .fg(theme::current().warning)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                " │",
-                Style::default().fg(theme::current().nord_polar_night_4),
-            ),
+            helpers::divider(),
             ks_indicator,
         ]),
         Connection::Connected { details, since, .. } => {
-            let profile_name = profile_display_name(app, &primary_snap.profile_id);
-            // The dormant mode prefix used to reserve roughly 14 columns.
-            // Keep the compact layout through normal 80-column terminals so
-            // removing that prefix cannot clip the kill-switch signal.
-            let compact = area_width < 84;
-            let profile_name = if compact {
-                utils::truncate(&profile_name, 10)
-            } else {
-                profile_name
-            };
-
-            let elapsed = since.elapsed().map_or(0, |d| d.as_secs());
-            let uptime = if elapsed >= 86400 {
-                format!(
-                    "▲{}d {:02}:{:02}:{:02}",
-                    elapsed / 86400,
-                    (elapsed % 86400) / 3600,
-                    (elapsed % 3600) / 60,
-                    elapsed % 60,
-                )
-            } else if elapsed >= 3600 {
-                format!(
-                    "▲{:02}:{:02}:{:02}",
-                    elapsed / 3600,
-                    (elapsed % 3600) / 60,
-                    elapsed % 60,
-                )
-            } else {
-                format!("▲{:02}:{:02}", elapsed / 60, elapsed % 60)
-            };
-
-            let quality_indicator = match QualityLevel::from_metrics(
-                app.runtime.latency_ms,
-                app.runtime.packet_loss,
-                app.runtime.jitter_ms,
-            ) {
-                QualityLevel::Unknown => ("─────", theme::current().text_secondary),
-                QualityLevel::Poor => ("●●○○○", theme::current().error),
-                QualityLevel::Fair => ("●●●○○", theme::current().yellow),
-                QualityLevel::Excellent => ("●●●●●", theme::current().success),
-            };
-
-            let proto_tag = app
-                .runtime
-                .profiles
-                .iter()
-                .find(|p| p.name == profile_name)
-                .map_or("", |p| match p.protocol {
-                    crate::state::Protocol::WireGuard => "WG",
-                    crate::state::Protocol::OpenVPN => "OVPN",
-                });
-
-            let proto_suffix = if proto_tag.is_empty() {
-                ")".to_string()
-            } else {
-                format!("/{proto_tag})")
-            };
-
-            let mut header_spans = vec![
-                Span::styled(
-                    "● CONNECTED",
-                    Style::default()
-                        .fg(theme::current().success)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" ({profile_name}"),
-                    Style::default().fg(theme::current().text_secondary),
-                ),
-                Span::styled(
-                    proto_suffix,
-                    Style::default().fg(theme::current().accent_primary),
-                ),
-                Span::styled(
-                    " │ ",
-                    Style::default().fg(theme::current().nord_polar_night_4),
-                ),
-                Span::styled(
-                    "VPN: ",
-                    Style::default().fg(theme::current().text_secondary),
-                ),
-                Span::styled(
-                    app.runtime.public_ip.clone(),
-                    Style::default().fg(theme::current().success),
-                ),
-            ];
-
-            if !compact
-                && !app.runtime.location.is_empty()
-                && app.runtime.location != "Unknown"
-                && app.runtime.location != constants::MSG_DETECTING
-            {
-                let loc_budget = (area_width as usize / 4).max(10);
-                header_spans.push(Span::styled(
-                    " @ ",
-                    Style::default().fg(theme::current().text_secondary),
-                ));
-                header_spans.push(Span::styled(
-                    utils::truncate(&app.runtime.location, loc_budget),
-                    Style::default().fg(theme::current().accent_primary),
-                ));
-            }
-
-            if !compact && !details.interface.is_empty() {
-                header_spans.push(Span::styled(
-                    format!(" [{}]", details.interface),
-                    Style::default().fg(theme::current().text_secondary),
-                ));
-            }
-
-            header_spans.extend_from_slice(&[
-                Span::styled(
-                    " │ ",
-                    Style::default().fg(theme::current().nord_polar_night_4),
-                ),
-                Span::styled(
-                    uptime,
-                    Style::default().fg(theme::current().accent_secondary),
-                ),
-            ]);
-            if !compact {
-                header_spans.extend_from_slice(&[
-                    Span::styled(
-                        " │ ",
-                        Style::default().fg(theme::current().nord_polar_night_4),
-                    ),
-                    Span::styled(
-                        quality_indicator.0,
-                        Style::default().fg(quality_indicator.1),
-                    ),
-                ]);
-            }
-            header_spans.extend_from_slice(&[
-                Span::styled(
-                    " │",
-                    Style::default().fg(theme::current().nord_polar_night_4),
-                ),
-                ks_indicator,
-            ]);
-
-            Line::from(header_spans)
+            connected_line(app, primary_snap, details, *since, ks_indicator, area_width)
         }
     }
 }
@@ -702,10 +675,7 @@ fn build_dotrow(
 
 /// Push the assembled strip spans onto the trailing edge of the header line.
 fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>]) {
-    line.spans.push(Span::styled(
-        " │ ",
-        Style::default().fg(theme::current().nord_polar_night_4),
-    ));
+    line.spans.push(helpers::divider_padded());
     if with_label {
         line.spans.push(Span::styled(
             "Tunnels: ",

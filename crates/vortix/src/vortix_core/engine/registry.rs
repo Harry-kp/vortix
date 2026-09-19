@@ -125,6 +125,47 @@ pub enum Conflict {
     },
 }
 
+/// Whether two route sets collide, and how.
+///
+/// Admission, the dashboard overlay and the CLI gate all have to answer this
+/// identically: if they disagree, one refuses a connect another will not offer
+/// to confirm. They each used to carry their own copy of the rule.
+///
+/// A default route intersects every other route, so it is only ever compared
+/// against another default. That question is asked first; everything after it
+/// is about specific destinations. A split tunnel alongside a full one is
+/// legitimate — the more specific prefix wins, which is the point of running
+/// both.
+#[must_use]
+pub fn classify_route_conflict(
+    requested: &[Cidr],
+    existing: &[Cidr],
+    existing_profile: &ProfileId,
+    requested_profile: &ProfileId,
+) -> Option<Conflict> {
+    let specific = |routes: &[Cidr]| {
+        routes
+            .iter()
+            .filter(|route| route.prefix_len != 0)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let claims_default = |routes: &[Cidr]| routes.iter().any(|route| route.prefix_len == 0);
+
+    if claims_default(requested) && claims_default(existing) {
+        return Some(Conflict::DefaultRouteTakeover {
+            current: existing_profile.clone(),
+            new: requested_profile.clone(),
+        });
+    }
+    let overlapping_cidrs =
+        crate::vortix_core::cidr::overlapping_cidrs(&specific(requested), &specific(existing));
+    (!overlapping_cidrs.is_empty()).then(|| Conflict::RouteOverlap {
+        with: existing_profile.clone(),
+        overlapping_cidrs,
+    })
+}
+
 /// Errors `TunnelRegistry` operations can return.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

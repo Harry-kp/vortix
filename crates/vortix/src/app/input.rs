@@ -728,7 +728,6 @@ impl crate::app::App {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn handle_normal_keys(&mut self, key: KeyEvent) {
         // Tab is reserved for panel navigation (always advances to the
         // next UI panel). Connection Details mirrors the sidebar's
@@ -857,7 +856,6 @@ impl crate::app::App {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn handle_panel_keys(&mut self, key: KeyEvent) {
         match self.focused_panel {
             FocusedPanel::Sidebar => match key.code {
@@ -916,20 +914,10 @@ impl crate::app::App {
                 // Activity Log navigation (scroll through log history)
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        self.logs_auto_scroll = false;
-                        self.logs_scroll = self.logs_scroll.saturating_sub(1);
+                        self.scroll_logs_up();
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if self.logs_scroll < self.logs_max_scroll {
-                            self.logs_scroll = self.logs_scroll.saturating_add(1);
-                        }
-                        if self.logs_scroll
-                            >= self
-                                .logs_max_scroll
-                                .saturating_sub(constants::LOGS_AUTO_SCROLL_THRESHOLD)
-                        {
-                            self.logs_auto_scroll = true;
-                        }
+                        self.scroll_logs_down();
                     }
                     KeyCode::End | KeyCode::Char('G') => {
                         // Jump to end and re-enable auto-scroll

@@ -1,10 +1,63 @@
+use std::borrow::Cow;
+
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::{
-    style::Style,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Clear},
     Frame,
 };
 use unicode_width::UnicodeWidthChar;
+
+use crate::theme;
+
+/// The dim vertical rule between panel segments.
+pub(crate) fn divider() -> Span<'static> {
+    Span::styled(
+        " │",
+        Style::default().fg(theme::current().nord_polar_night_4),
+    )
+}
+
+/// `divider`, padded on the right for segments that don't lead with a space.
+pub(crate) fn divider_padded() -> Span<'static> {
+    Span::styled(
+        " │ ",
+        Style::default().fg(theme::current().nord_polar_night_4),
+    )
+}
+
+/// A `label: value` detail row — label in secondary, value in `color`.
+pub(crate) fn detail_row<'a>(
+    label: &'a str,
+    value: impl Into<Cow<'a, str>>,
+    color: Color,
+) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(theme::current().text_secondary)),
+        Span::styled(value, Style::default().fg(color)),
+    ])
+}
+
+/// `value`, or `fallback` when the backend reported the field blank.
+pub(crate) fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+/// Green under 50ms, yellow under 150ms, red beyond.
+pub(crate) fn latency_color(latency_ms: u64) -> Color {
+    if latency_ms < 50 {
+        theme::current().success
+    } else if latency_ms < 150 {
+        theme::current().yellow
+    } else {
+        theme::current().error
+    }
+}
 
 /// Clear an area and repaint the active theme's owned surface.
 pub(crate) fn clear_area(frame: &mut Frame, area: Rect) {
@@ -76,6 +129,32 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
     }
     truncated.push_str("...");
     truncated
+}
+
+/// Typed text, a blinking cursor, then the remainder.
+///
+/// Every text-entry overlay draws this. Keeping the cursor's treatment here
+/// stops one field blinking differently from the next.
+pub(crate) fn text_entry_spans(
+    before: String,
+    cursor: String,
+    after: String,
+) -> Vec<Span<'static>> {
+    let theme = crate::theme::current();
+    let mut spans = vec![
+        Span::styled(before, Style::default().fg(theme.text_primary)),
+        Span::styled(
+            cursor,
+            Style::default()
+                .fg(theme.accent_secondary)
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+    ];
+    if !after.is_empty() {
+        spans.push(Span::styled(after, Style::default().fg(theme.text_primary)));
+    }
+    spans
 }
 
 #[cfg(test)]

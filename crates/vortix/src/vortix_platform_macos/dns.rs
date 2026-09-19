@@ -28,9 +28,6 @@ use crate::vortix_core::ports::dns::{
     DnsAssignment, DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource,
     DnsPlatformCapabilities, DnsPolicy, DnsPolicyAdapter, DnsScope,
 };
-use crate::vortix_core::ports::owned_dns::{
-    ExpectedDnsState, OwnedDns, OwnedDnsBackend, OwnedDnsError,
-};
 
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const SC_STORE_NAME: &str = "vortix.dns";
@@ -59,7 +56,6 @@ impl DnsResolver for MacDns {
 }
 
 const VORTIX_RESOLVER_MARKER: &str = "# managed-by: vortix dns";
-const MAX_RESOLVER_FILES: usize = 256;
 const MAX_RESOLVER_BYTES: u64 = 64 * 1024;
 
 impl DnsPolicyAdapter for MacDns {
@@ -910,107 +906,6 @@ impl MacDnsPolicy {
         Ok(planned)
     }
 
-    pub(crate) fn has_active_assignments(policy: &DnsPolicy) -> bool {
-        policy
-            .assignments
-            .iter()
-            .any(|assignment| !matches!(assignment.scope, DnsScope::Suppressed))
-    }
-
-    pub(crate) fn effective_state_for(
-        &self,
-        policy: &DnsPolicy,
-    ) -> Result<DnsEffectiveState, String> {
-        self.plan(policy)?;
-        let owned = self.resources_for_policy(policy)?;
-        Ok(DnsEffectiveState {
-            requested_generation: policy.generation,
-            applied_generation: Some(policy.generation),
-            status: if owned.is_empty() {
-                DnsEffectiveStatus::Released
-            } else {
-                DnsEffectiveStatus::Applied
-            },
-            owned,
-            errors: Vec::new(),
-        })
-    }
-
-    pub(crate) fn verify_exclusive(&self, policy: &DnsPolicy) -> Result<(), String> {
-        self.verify(policy, &self.effective_state_for(policy)?)
-            .map_err(|errors| errors.join("; "))?;
-        let expected = self
-            .resources_for_policy(policy)?
-            .into_iter()
-            .map(|resource| resource.id)
-            .collect::<std::collections::BTreeSet<_>>();
-        let observed = self.managed_resource_ids()?;
-        if observed == expected {
-            Ok(())
-        } else {
-            Err("managed DNS resolver inventory does not match policy".to_string())
-        }
-    }
-
-    pub(crate) fn audit_absent(&self) -> Result<(), String> {
-        if self.managed_resource_ids()?.is_empty() {
-            Ok(())
-        } else {
-            Err("managed DNS resolver inventory is not empty".to_string())
-        }
-    }
-
-    fn resources_for_policy(&self, policy: &DnsPolicy) -> Result<Vec<DnsOwnedResource>, String> {
-        let mut resources: Vec<DnsOwnedResource> = policy
-            .assignments
-            .iter()
-            .filter(|assignment| matches!(assignment.scope, DnsScope::Scoped { .. }))
-            .map(|assignment| self.resources_for(policy.generation, assignment))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|groups| {
-                groups
-                    .into_iter()
-                    .flatten()
-                    .map(|(resource, _)| resource)
-                    .collect()
-            })?;
-        if let Some(primary) = Self::primary_assignment(policy)? {
-            resources.push(Self::primary_resource(policy.generation, primary));
-        }
-        Ok(resources)
-    }
-
-    fn managed_resource_ids(&self) -> Result<std::collections::BTreeSet<String>, String> {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let mut managed = std::collections::BTreeSet::new();
-        if let Some(directory) = self.directory(false)? {
-            for name in directory.entry_names()? {
-                let Some(body) = directory.read_managed(&name)? else {
-                    continue;
-                };
-                debug_assert!(body.starts_with(VORTIX_RESOLVER_MARKER.as_bytes()));
-                let path = self
-                    .resolver_dir
-                    .join(std::ffi::OsStr::from_bytes(name.to_bytes()));
-                managed.insert(format!("macos:{}", path.display()));
-            }
-        }
-        match (self.primary_owner_state()?, self.primary_backup_state()?) {
-            (None, None) => {}
-            (Some(owner), Some(backup)) if owner.service_key == backup.service_key => {
-                managed.insert(VORTIX_PRIMARY_DNS_RESOURCE_ID.to_string());
-            }
-            (None, Some(_)) => {
-                // A crash after the backup write still represents owned state
-                // and must not be treated as an absent platform.
-                managed.insert(VORTIX_PRIMARY_DNS_RESOURCE_ID.to_string());
-            }
-            _ => return Err("macOS primary DNS ownership and backup disagree".to_string()),
-        }
-        Ok(managed)
-    }
-
     fn actual_owned<'a>(
         &self,
         candidates: impl IntoIterator<Item = &'a DnsOwnedResource>,
@@ -1076,139 +971,6 @@ impl MacDnsPolicy {
             return false;
         };
         body_has_generation(&String::from_utf8_lossy(&body), resource.generation)
-    }
-
-    fn expected_resolver_bodies(
-        &self,
-        policy: &DnsPolicy,
-    ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, String> {
-        let mut expected = std::collections::BTreeMap::new();
-        for assignment in policy
-            .assignments
-            .iter()
-            .filter(|assignment| matches!(assignment.scope, DnsScope::Scoped { .. }))
-        {
-            let body = resolver_body(policy.generation, assignment).into_bytes();
-            for (_, path) in self.resources_for(policy.generation, assignment)? {
-                let name = Self::resolver_name(&path)?.into_bytes();
-                if expected.insert(name, body.clone()).is_some() {
-                    return Err("duplicate DNS resolver recovery resource".to_string());
-                }
-            }
-        }
-        Ok(expected)
-    }
-
-    fn validate_pending_inventory(
-        &self,
-        desired: &DnsPolicy,
-        prior: Option<&DnsPolicy>,
-    ) -> Result<(), String> {
-        self.validate_pending_primary(desired, prior)?;
-        let desired = self.expected_resolver_bodies(desired)?;
-        let prior = prior
-            .map(|policy| self.expected_resolver_bodies(policy))
-            .transpose()?
-            .unwrap_or_default();
-        let Some(directory) = self.directory(false)? else {
-            return Ok(());
-        };
-        for name in directory.entry_names()? {
-            let Some(body) = directory.read_managed(&name)? else {
-                continue;
-            };
-            let name = name.to_bytes();
-            let matches_desired = desired.get(name) == Some(&body);
-            let matches_prior = prior.get(name) == Some(&body);
-            if !matches_desired && !matches_prior {
-                return Err(
-                    "managed DNS inventory is not an exact intended/prior generation member"
-                        .to_string(),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_pending_primary(
-        &self,
-        desired: &DnsPolicy,
-        prior: Option<&DnsPolicy>,
-    ) -> Result<(), String> {
-        let owner = self.primary_owner_state()?;
-        let backup = self.primary_backup_state()?;
-        let (owner, backup) = match (owner, backup) {
-            (None, None) => return Ok(()),
-            (owner, Some(backup)) => (owner, backup),
-            (Some(_), None) => {
-                return Err("macOS primary DNS owner has no recovery backup".to_string())
-            }
-        };
-        if owner
-            .as_ref()
-            .is_some_and(|owner| owner.service_key != backup.service_key)
-        {
-            return Err("macOS primary DNS ownership and backup disagree".to_string());
-        }
-        let actual = self
-            .dynamic_store
-            .get(&backup.service_key)?
-            .ok_or_else(|| "macOS primary DNS configuration is absent".to_string())?;
-        let mut allowed = vec![Self::backup_value(&backup)?];
-        if let Some(assignment) = Self::primary_assignment(desired)? {
-            allowed.push(Self::owner_dns_value(&Self::primary_owner(
-                desired.generation,
-                assignment,
-                backup.service_key.clone(),
-            ))?);
-        }
-        if let Some(prior) = prior {
-            if let Some(assignment) = Self::primary_assignment(prior)? {
-                allowed.push(Self::owner_dns_value(&Self::primary_owner(
-                    prior.generation,
-                    assignment,
-                    backup.service_key.clone(),
-                ))?);
-            }
-        }
-        if !allowed
-            .iter()
-            .any(|candidate| plist_values_equal(&actual, candidate).unwrap_or(false))
-        {
-            return Err(
-                "macOS primary DNS is not an exact intended/prior/backup value".to_string(),
-            );
-        }
-        if let Some(owner) = owner {
-            let owner_matches_desired =
-                Self::primary_assignment(desired)?.is_some_and(|assignment| {
-                    owner
-                        == Self::primary_owner(
-                            desired.generation,
-                            assignment,
-                            backup.service_key.clone(),
-                        )
-                });
-            let owner_matches_prior = prior.is_some_and(|prior| {
-                Self::primary_assignment(prior)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|assignment| {
-                        owner
-                            == Self::primary_owner(
-                                prior.generation,
-                                assignment,
-                                backup.service_key.clone(),
-                            )
-                    })
-            });
-            if !owner_matches_desired && !owner_matches_prior {
-                return Err(
-                    "macOS primary DNS owner is not an intended/prior generation".to_string(),
-                );
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1476,108 +1238,6 @@ impl DnsPolicyAdapter for MacDnsPolicy {
     }
 }
 
-impl OwnedDns for MacDnsPolicy {
-    fn backend(&self) -> OwnedDnsBackend {
-        OwnedDnsBackend::MacOsResolverFiles
-    }
-
-    fn apply(
-        &mut self,
-        desired: &DnsPolicy,
-        expected: ExpectedDnsState<'_>,
-    ) -> Result<(), OwnedDnsError> {
-        let previous_desired = match expected {
-            ExpectedDnsState::Absent => {
-                self.audit_absent()
-                    .map_err(|_| OwnedDnsError::FailedBeforeEffect)?;
-                None
-            }
-            ExpectedDnsState::Applied(policy) => {
-                self.verify_exclusive(policy)
-                    .map_err(|_| OwnedDnsError::FailedBeforeEffect)?;
-                Some(policy)
-            }
-        };
-        let previous_effective = previous_desired
-            .map(|policy| self.effective_state_for(policy))
-            .transpose()
-            .map_err(|_| OwnedDnsError::FailedBeforeEffect)?
-            .unwrap_or_default();
-        // Classify destination collisions, links, and unsafe ownership before
-        // entering the mutation adapter. Once the first resolver write is
-        // attempted, failures must conservatively become EffectMayHaveApplied.
-        self.plan(desired)
-            .map_err(|_| OwnedDnsError::FailedBeforeEffect)?;
-        let result = DnsPolicyAdapter::apply(self, desired, previous_desired, &previous_effective);
-        let expected_status = if Self::has_active_assignments(desired) {
-            DnsEffectiveStatus::Applied
-        } else {
-            DnsEffectiveStatus::Released
-        };
-        if result.status != expected_status
-            || result.applied_generation != Some(desired.generation)
-            || self.verify_exclusive(desired).is_err()
-        {
-            return Err(OwnedDnsError::EffectMayHaveApplied);
-        }
-        Ok(())
-    }
-
-    fn audit(&mut self, desired: &DnsPolicy) -> Result<(), OwnedDnsError> {
-        self.verify_exclusive(desired)
-            .map_err(|_| OwnedDnsError::EffectMayHaveApplied)
-    }
-
-    fn audit_absent(&mut self) -> Result<(), OwnedDnsError> {
-        MacDnsPolicy::audit_absent(self).map_err(|_| OwnedDnsError::EffectMayHaveApplied)
-    }
-
-    fn recover_pending(
-        &mut self,
-        desired: &DnsPolicy,
-        prior: Option<&DnsPolicy>,
-    ) -> Result<(), OwnedDnsError> {
-        self.validate_pending_inventory(desired, prior)
-            .map_err(|_| OwnedDnsError::EffectMayHaveApplied)?;
-        let previous_effective = prior
-            .map(|policy| self.effective_state_for(policy))
-            .transpose()
-            .map_err(|_| OwnedDnsError::EffectMayHaveApplied)?
-            .unwrap_or_default();
-        let result = DnsPolicyAdapter::apply(self, desired, prior, &previous_effective);
-        let expected_status = if Self::has_active_assignments(desired) {
-            DnsEffectiveStatus::Applied
-        } else {
-            DnsEffectiveStatus::Released
-        };
-        if result.status != expected_status
-            || result.applied_generation != Some(desired.generation)
-            || self.verify_exclusive(desired).is_err()
-        {
-            return Err(OwnedDnsError::EffectMayHaveApplied);
-        }
-        Ok(())
-    }
-
-    fn audit_recovery(
-        &mut self,
-        candidates: &[DnsPolicy],
-        allow_absent: bool,
-    ) -> Result<(), OwnedDnsError> {
-        if allow_absent && MacDnsPolicy::audit_absent(self).is_ok() {
-            return Ok(());
-        }
-        if candidates
-            .iter()
-            .any(|candidate| self.verify_exclusive(candidate).is_ok())
-        {
-            Ok(())
-        } else {
-            Err(OwnedDnsError::EffectMayHaveApplied)
-        }
-    }
-}
-
 /// Pinned, root-owned resolver directory used for every privileged file
 /// mutation. All entry operations are descriptor-relative and refuse links.
 struct ResolverDirectory {
@@ -1680,16 +1340,6 @@ impl ResolverDirectory {
 
     fn read(&self, name: &std::ffi::CStr) -> Result<Option<Vec<u8>>, String> {
         self.read_entry(name, true)
-    }
-
-    fn read_managed(&self, name: &std::ffi::CStr) -> Result<Option<Vec<u8>>, String> {
-        let body = self.read_entry(name, false)?;
-        match body {
-            Some(body) if body.starts_with(VORTIX_RESOLVER_MARKER.as_bytes()) => {
-                self.read_entry(name, true)
-            }
-            _ => Ok(None),
-        }
     }
 
     fn read_entry(
@@ -1856,57 +1506,6 @@ impl ResolverDirectory {
             }
         }
         self.directory.sync_all().map_err(|error| error.to_string())
-    }
-
-    fn entry_names(&self) -> Result<Vec<std::ffi::CString>, String> {
-        use std::os::fd::AsRawFd as _;
-
-        // SAFETY: fcntl creates a close-on-exec descriptor consumed by
-        // fdopendir. The DIR stream is closed exactly once below.
-        let duplicate =
-            unsafe { libc::fcntl(self.directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if duplicate < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        // SAFETY: `duplicate` is a valid directory descriptor.
-        let stream = unsafe { libc::fdopendir(duplicate) };
-        if stream.is_null() {
-            // SAFETY: fdopendir failed and did not consume the descriptor.
-            let _ = unsafe { libc::close(duplicate) };
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let mut names = Vec::new();
-        loop {
-            // SAFETY: macOS exposes thread-local errno through `__error`.
-            unsafe { *libc::__error() = 0 };
-            // SAFETY: the DIR stream remains valid until closed below.
-            let entry = unsafe { libc::readdir(stream) };
-            if entry.is_null() {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(0) {
-                    // SAFETY: closes the valid stream and its descriptor.
-                    let _ = unsafe { libc::closedir(stream) };
-                    return Err(error.to_string());
-                }
-                break;
-            }
-            // SAFETY: POSIX guarantees d_name is NUL-terminated.
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-            if name.to_bytes() == b"." || name.to_bytes() == b".." {
-                continue;
-            }
-            if names.len() >= MAX_RESOLVER_FILES {
-                // SAFETY: closes the valid stream and its descriptor.
-                let _ = unsafe { libc::closedir(stream) };
-                return Err("DNS resolver inventory exceeds its fixed limit".to_string());
-            }
-            names.push(name.to_owned());
-        }
-        // SAFETY: closes the valid stream and its descriptor.
-        if unsafe { libc::closedir(stream) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        Ok(names)
     }
 }
 
@@ -2120,30 +1719,6 @@ mod policy_tests {
     }
 
     #[test]
-    fn foreign_default_resolver_is_never_overwritten() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let temp = tempfile::tempdir().unwrap();
-        let resolver_dir = temp.path().join("resolver");
-        std::fs::create_dir_all(&resolver_dir).unwrap();
-        std::fs::write(resolver_dir.join("default"), "nameserver 9.9.9.9\n").unwrap();
-        std::fs::set_permissions(
-            resolver_dir.join("default"),
-            std::fs::Permissions::from_mode(0o666),
-        )
-        .unwrap();
-        let mut adapter = MacDnsPolicy::at(resolver_dir.clone());
-        assert_eq!(OwnedDns::audit_absent(&mut adapter), Ok(()));
-        let effective = adapter.apply(&policy(1, "1.1.1.1"), None, &DnsEffectiveState::default());
-        assert_eq!(effective.status, DnsEffectiveStatus::Applied);
-        assert_eq!(adapter.test_primary_dns_servers(), vec!["1.1.1.1"]);
-        assert_eq!(
-            std::fs::read_to_string(resolver_dir.join("default")).unwrap(),
-            "nameserver 9.9.9.9\n"
-        );
-    }
-
-    #[test]
     fn prior_generation_release_cannot_delete_new_generation_resource() {
         let temp = tempfile::tempdir().unwrap();
         let adapter = MacDnsPolicy::at(temp.path().join("resolver"));
@@ -2153,50 +1728,6 @@ mod policy_tests {
         let second = adapter.apply(&second_policy, Some(&first_policy), &first);
         assert_eq!(second.status, DnsEffectiveStatus::Applied);
         adapter.release(&first.owned[0]).unwrap();
-        assert_eq!(adapter.test_primary_dns_servers(), vec!["8.8.8.8"]);
-    }
-
-    #[test]
-    fn interrupted_primary_apply_resumes_from_the_exact_backup() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut adapter = MacDnsPolicy::at(temp.path().join("resolver"));
-        let service_key = adapter.primary_service_key().unwrap();
-        let original = adapter.dynamic_store.get(&service_key).unwrap().unwrap();
-        adapter
-            .set_primary_backup(&MacDnsPolicy::new_backup(service_key, &original))
-            .unwrap();
-
-        let desired = policy(7, "1.1.1.1");
-        OwnedDns::recover_pending(&mut adapter, &desired, None).unwrap();
-        assert_eq!(OwnedDns::audit(&mut adapter, &desired), Ok(()));
-        assert_eq!(adapter.test_primary_dns_servers(), vec!["1.1.1.1"]);
-
-        let resource = MacDnsPolicy::primary_resource(7, &desired.assignments[0]);
-        adapter.release(&resource).unwrap();
-        assert_eq!(adapter.test_primary_dns_servers(), vec!["192.0.2.53"]);
-    }
-
-    #[test]
-    fn interrupted_primary_replacement_accepts_only_the_intended_next_value() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut adapter = MacDnsPolicy::at(temp.path().join("resolver"));
-        let prior = policy(4, "1.1.1.1");
-        OwnedDns::apply(&mut adapter, &prior, ExpectedDnsState::Absent).unwrap();
-        let desired = policy(5, "8.8.8.8");
-        let service_key = adapter.primary_service_key().unwrap();
-
-        // Model a crash after replacing the service DNS but before advancing
-        // the Vortix owner marker from generation 4 to generation 5.
-        adapter
-            .dynamic_store
-            .set(
-                &service_key,
-                &primary_dns_value(&["8.8.8.8".to_string()], &[]).unwrap(),
-            )
-            .unwrap();
-
-        OwnedDns::recover_pending(&mut adapter, &desired, Some(&prior)).unwrap();
-        assert_eq!(OwnedDns::audit(&mut adapter, &desired), Ok(()));
         assert_eq!(adapter.test_primary_dns_servers(), vec!["8.8.8.8"]);
     }
 
@@ -2309,132 +1840,5 @@ mod policy_tests {
         let effective = adapter.apply(&duplicate, None, &DnsEffectiveState::default());
         assert_eq!(effective.status, DnsEffectiveStatus::Degraded);
         assert!(!duplicate_dir.join("corp.example").exists());
-    }
-
-    #[test]
-    fn helper_replacement_requires_exact_prior_and_keeps_one_owned_projection() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut adapter = MacDnsPolicy::at(temp.path().join("resolver"));
-        let first = policy(1, "1.1.1.1");
-        let second = policy(2, "9.9.9.9");
-
-        OwnedDns::apply(&mut adapter, &first, ExpectedDnsState::Absent).unwrap();
-        OwnedDns::apply(&mut adapter, &second, ExpectedDnsState::Applied(&first)).unwrap();
-
-        assert_eq!(OwnedDns::audit(&mut adapter, &second), Ok(()));
-        assert_eq!(
-            OwnedDns::audit(&mut adapter, &first),
-            Err(OwnedDnsError::EffectMayHaveApplied)
-        );
-    }
-
-    #[test]
-    fn helper_audit_rejects_an_unexpected_managed_resolver() {
-        let temp = tempfile::tempdir().unwrap();
-        let resolver_dir = temp.path().join("resolver");
-        let mut adapter = MacDnsPolicy::at(resolver_dir.clone());
-        let expected = policy(1, "1.1.1.1");
-        OwnedDns::apply(&mut adapter, &expected, ExpectedDnsState::Absent).unwrap();
-        std::fs::create_dir_all(&resolver_dir).unwrap();
-        std::fs::write(
-            resolver_dir.join("stale.example"),
-            "# managed-by: vortix dns\n# generation: 9\nnameserver 8.8.8.8\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            OwnedDns::audit(&mut adapter, &expected),
-            Err(OwnedDnsError::EffectMayHaveApplied)
-        );
-        assert_eq!(
-            OwnedDns::audit_absent(&mut adapter),
-            Err(OwnedDnsError::EffectMayHaveApplied)
-        );
-    }
-
-    #[test]
-    fn helper_pending_recovery_converges_only_exact_intended_prior_members() {
-        let temp = tempfile::tempdir().unwrap();
-        let resolver_dir = temp.path().join("resolver");
-        let mut adapter = MacDnsPolicy::at(resolver_dir.clone());
-        let prior = scoped_policy(1, "1.1.1.1", &["a.example"]);
-        let desired = scoped_policy(2, "9.9.9.9", &["a.example", "b.example"]);
-        OwnedDns::apply(&mut adapter, &prior, ExpectedDnsState::Absent).unwrap();
-
-        let desired_a = resolver_body(desired.generation, &desired.assignments[0]);
-        std::fs::write(resolver_dir.join("a.example"), desired_a).unwrap();
-        OwnedDns::recover_pending(&mut adapter, &desired, Some(&prior)).unwrap();
-        assert_eq!(OwnedDns::audit(&mut adapter, &desired), Ok(()));
-
-        std::fs::write(
-            resolver_dir.join("unexpected.example"),
-            "# managed-by: vortix dns\n# generation: 99\nnameserver 8.8.8.8\n",
-        )
-        .unwrap();
-        assert_eq!(
-            OwnedDns::recover_pending(&mut adapter, &desired, Some(&prior)),
-            Err(OwnedDnsError::EffectMayHaveApplied)
-        );
-        assert!(resolver_dir.join("unexpected.example").exists());
-    }
-
-    #[test]
-    fn helper_writer_rejects_linked_directory_entries_and_hardlinks() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let resolver_dir = temp.path().join("resolver");
-        let foreign_dir = temp.path().join("foreign");
-        std::fs::create_dir_all(&foreign_dir).unwrap();
-        symlink(&foreign_dir, &resolver_dir).unwrap();
-        let mut linked_directory = MacDnsPolicy::at(resolver_dir.clone());
-        assert_eq!(
-            OwnedDns::apply(
-                &mut linked_directory,
-                &scoped_policy(1, "1.1.1.1", &["a.example"]),
-                ExpectedDnsState::Absent
-            ),
-            Err(OwnedDnsError::FailedBeforeEffect)
-        );
-        assert!(std::fs::read_dir(&foreign_dir).unwrap().next().is_none());
-
-        std::fs::remove_file(&resolver_dir).unwrap();
-        std::fs::create_dir_all(&resolver_dir).unwrap();
-        let foreign = temp.path().join("foreign-resolver");
-        std::fs::write(&foreign, "nameserver 9.9.9.9\n").unwrap();
-        symlink(&foreign, resolver_dir.join("a.example")).unwrap();
-        let mut linked_entry = MacDnsPolicy::at(resolver_dir.clone());
-        assert_eq!(
-            OwnedDns::apply(
-                &mut linked_entry,
-                &scoped_policy(1, "1.1.1.1", &["a.example"]),
-                ExpectedDnsState::Absent
-            ),
-            Err(OwnedDnsError::FailedBeforeEffect)
-        );
-        assert_eq!(
-            std::fs::read_to_string(&foreign).unwrap(),
-            "nameserver 9.9.9.9\n"
-        );
-
-        std::fs::remove_file(resolver_dir.join("a.example")).unwrap();
-        std::fs::write(
-            resolver_dir.join("a.example"),
-            "# managed-by: vortix dns\n# generation: 1\nnameserver 1.1.1.1\n",
-        )
-        .unwrap();
-        std::fs::hard_link(
-            resolver_dir.join("a.example"),
-            resolver_dir.join("duplicate"),
-        )
-        .unwrap();
-        let mut hardlinked = MacDnsPolicy::at(resolver_dir);
-        assert_eq!(
-            OwnedDns::audit(
-                &mut hardlinked,
-                &scoped_policy(1, "1.1.1.1", &["a.example"])
-            ),
-            Err(OwnedDnsError::EffectMayHaveApplied)
-        );
     }
 }

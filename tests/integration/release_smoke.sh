@@ -18,8 +18,6 @@ set -euo pipefail
 
 BIN_DIR="${VORTIX_BIN_DIR:-target/release}"
 VORTIX="$BIN_DIR/vortix"
-HELPER="$BIN_DIR/vortix-helper"
-BOOTSTRAP="$BIN_DIR/vortix-bootstrap"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -31,14 +29,12 @@ trap 'rm -rf "$WORK"' EXIT
 export VORTIX_CONFIG_DIR="$WORK/config"
 mkdir -p "$VORTIX_CONFIG_DIR"
 
-for bin in "$VORTIX" "$HELPER" "$BOOTSTRAP"; do
-    [ -x "$bin" ] || fail "missing or non-executable release binary: $bin"
-done
+[ -x "$VORTIX" ] || fail "missing or non-executable release binary: $VORTIX"
 
 # --- version agreement -------------------------------------------------------
 #
 # A stale artifact left in target/ from an earlier build is invisible until
-# something reads the version back, and all three ship together.
+# something reads the version back.
 
 workspace_version="$(
     sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
@@ -46,13 +42,11 @@ workspace_version="$(
 )"
 [ -n "$workspace_version" ] || fail "could not read version from [workspace.package] in Cargo.toml"
 
-for bin in "$VORTIX" "$HELPER" "$BOOTSTRAP"; do
-    out="$("$bin" --version 2>/dev/null)" || fail "$bin --version exited non-zero"
-    case "$out" in
-    *"$workspace_version"*) ;;
-    *) fail "$bin reported '$out', expected version $workspace_version" ;;
-    esac
-done
+out="$("$VORTIX" --version 2>/dev/null)" || fail "$VORTIX --version exited non-zero"
+case "$out" in
+*"$workspace_version"*) ;;
+*) fail "$VORTIX reported '$out', expected version $workspace_version" ;;
+esac
 
 "$VORTIX" --help >/dev/null 2>&1 || fail "vortix --help exited non-zero"
 "$VORTIX" killswitch --help >/dev/null 2>&1 || fail "vortix killswitch --help exited non-zero"

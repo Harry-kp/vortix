@@ -23,9 +23,6 @@ pub mod vortix_platform_linux;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub mod vortix_platform_macos;
-#[cfg(target_os = "windows")]
-#[doc(hidden)]
-pub mod vortix_platform_windows;
 
 // Application modules
 pub mod app;
@@ -37,7 +34,6 @@ pub mod constants;
 pub mod core;
 pub mod daemon;
 pub mod event;
-pub mod helper;
 pub mod hooks;
 pub mod logger;
 pub mod message;

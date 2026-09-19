@@ -162,109 +162,16 @@ fn remembered_real_addresses(config_dir: &std::path::Path) -> (Option<String>, O
     )
 }
 impl VpnRuntime {
-    /// Create the TUI presentation runtime. Lifecycle observation, retry,
-    /// network-change handling, DNS/firewall policy, and protocol effects are
-    /// owned by the attached canonical control service; this runtime starts
-    /// telemetry only.
+    /// Every field, with nothing detected and no background work started.
     ///
-    /// Use this constructor when the engine will be long-lived (TUI mode).
-    #[must_use]
-    pub fn new(config: AppConfig, config_dir: PathBuf) -> Self {
+    /// The three public constructors differ by a handful of fields and what
+    /// they do afterwards, so they share this and apply their own deltas. A
+    /// new field is added here once instead of in three literals that have to
+    /// be kept in step.
+    fn blank(config: AppConfig, config_dir: PathBuf) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
         let history_size = constants::NETWORK_HISTORY_SIZE;
-
-        let mut engine = Self {
-            profiles: Vec::new(),
-            profile_presence: HashMap::new(),
-            session_start: None,
-
-            down_history: VecDeque::from(vec![0.0; history_size]),
-            up_history: VecDeque::from(vec![0.0; history_size]),
-            current_down: 0,
-            current_up: 0,
-            latency_ms: 0,
-            packet_loss: 0.0,
-            jitter_ms: 0,
-            location: constants::MSG_DETECTING.to_string(),
-            isp: constants::MSG_DETECTING.to_string(),
-            dns_server: constants::MSG_DETECTING.to_string(),
-
-            public_ip: constants::MSG_DETECTING.to_string(),
-            real_ip: None,
-            public_ipv6: None,
-            real_ipv6: None,
-            real_ip_from_cache: false,
-            real_ipv6_from_cache: false,
-            last_ipv6_check: None,
-            last_egress_check: None,
-            last_dns_check: None,
-            last_security_check: None,
-            ip_unchanged_warned: false,
-            last_connected_profile: None,
-            scanner_first_tick_done: false,
-            last_kernel_session_count: 0,
-            default_route_interface: None,
-
-            config,
-            config_dir,
-            is_root: utils::is_root(),
-
-            connection_drops: 0,
-            sort_order: ProfileSortOrder::default(),
-
-            killswitch_mode: KillSwitchMode::default(),
-            killswitch_state: KillSwitchState::default(),
-            dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
-            dns_requests: HashMap::new(),
-            persist_dns_policy: true,
-            dns_external_sessions: 0,
-            route_observation_fresh: false,
-
-            telemetry_rx: None,
-            telemetry_nudge: None,
-            cmd_tx,
-            cmd_rx,
-            netstats_rx: None,
-            last_bytes_in: 0,
-            last_bytes_out: 0,
-        };
-
-        engine.recover_killswitch_truth();
-        if let Some(persisted) = crate::core::dns_policy::load(&engine.config_dir) {
-            engine.dns_policy = persisted;
-        }
-
-        // Restore the cached real IPv4 / IPv6 — handles launch-with-VPN-up.
-        // Only a recent record, and only as remembered until reconfirmed.
-        let (remembered_ipv4, remembered_ipv6) = remembered_real_addresses(&engine.config_dir);
-        if let Some(ip) = remembered_ipv4 {
-            engine.real_ip = Some(ip);
-            engine.real_ip_from_cache = true;
-        }
-        if let Some(ip) = remembered_ipv6 {
-            engine.real_ipv6 = Some(ip);
-            engine.real_ipv6_from_cache = true;
-        }
-
-        // Load profiles
-        engine.profiles = crate::vpn::load_profiles();
-
-        // Start background workers
-        engine.start_background_workers();
-
-        engine
-    }
-
-    /// Create a lightweight engine without background workers.
-    ///
-    /// Use this for CLI one-shot commands (status, list, import, etc.) where
-    /// you don't need continuous telemetry or scanner polling.
-    #[must_use]
-    pub fn new_headless(config: AppConfig, config_dir: PathBuf) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
-        let history_size = constants::NETWORK_HISTORY_SIZE;
-
-        let mut engine = Self {
+        Self {
             profiles: Vec::new(),
             profile_presence: HashMap::new(),
             session_start: None,
@@ -318,16 +225,7 @@ impl VpnRuntime {
             netstats_rx: None,
             last_bytes_in: 0,
             last_bytes_out: 0,
-        };
-
-        engine.recover_killswitch_truth();
-        if let Some(persisted) = crate::core::dns_policy::load(&engine.config_dir) {
-            engine.dns_policy = persisted;
         }
-
-        engine.profiles = crate::vpn::load_profiles();
-
-        engine
     }
 
     fn recover_killswitch_truth(&mut self) {
@@ -348,60 +246,59 @@ impl VpnRuntime {
         }
     }
 
+    /// Adopt the kill-switch and DNS policy already on disk.
+    fn restore_persisted_state(&mut self) {
+        self.recover_killswitch_truth();
+        if let Some(persisted) = crate::core::dns_policy::load(&self.config_dir) {
+            self.dns_policy = persisted;
+        }
+    }
+
+    /// Long-lived engine for the TUI: detects telemetry and runs background workers.
+    #[must_use]
+    pub fn new(config: AppConfig, config_dir: PathBuf) -> Self {
+        let mut engine = Self::blank(config, config_dir);
+        engine.location = constants::MSG_DETECTING.to_string();
+        engine.isp = constants::MSG_DETECTING.to_string();
+        engine.dns_server = constants::MSG_DETECTING.to_string();
+        engine.public_ip = constants::MSG_DETECTING.to_string();
+        engine.restore_persisted_state();
+
+        // Remembered only until reconfirmed, so launch-with-VPN-up still shows a real IP.
+        let (remembered_ipv4, remembered_ipv6) = remembered_real_addresses(&engine.config_dir);
+        if let Some(ip) = remembered_ipv4 {
+            engine.real_ip = Some(ip);
+            engine.real_ip_from_cache = true;
+        }
+        if let Some(ip) = remembered_ipv6 {
+            engine.real_ipv6 = Some(ip);
+            engine.real_ipv6_from_cache = true;
+        }
+
+        engine.profiles = crate::vpn::load_profiles();
+        engine.start_background_workers();
+        engine
+    }
+
+    /// One-shot engine for the CLI: no telemetry placeholders, no background threads.
+    #[must_use]
+    pub fn new_headless(config: AppConfig, config_dir: PathBuf) -> Self {
+        let mut engine = Self::blank(config, config_dir);
+        engine.restore_persisted_state();
+        engine.profiles = crate::vpn::load_profiles();
+        engine
+    }
+
     /// Lightweight constructor for testing — no background threads, no disk I/O.
     #[must_use]
     pub fn new_test() -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
-        let history_size = constants::NETWORK_HISTORY_SIZE;
-        Self {
-            profiles: Vec::new(),
-            profile_presence: HashMap::new(),
-            session_start: None,
-            down_history: VecDeque::from(vec![0.0; history_size]),
-            up_history: VecDeque::from(vec![0.0; history_size]),
-            current_down: 0,
-            current_up: 0,
-            latency_ms: 0,
-            packet_loss: 0.0,
-            jitter_ms: 0,
-            location: String::new(),
-            isp: String::new(),
-            dns_server: String::new(),
-            public_ip: String::new(),
-            real_ip: None,
-            public_ipv6: None,
-            real_ipv6: None,
-            real_ip_from_cache: false,
-            real_ipv6_from_cache: false,
-            last_ipv6_check: None,
-            last_egress_check: None,
-            last_dns_check: None,
-            last_security_check: None,
-            ip_unchanged_warned: false,
-            last_connected_profile: None,
-            scanner_first_tick_done: false,
-            last_kernel_session_count: 0,
-            default_route_interface: None,
-            config: AppConfig::default(),
-            config_dir: std::env::temp_dir().join("vortix_test"),
-            is_root: false,
-            connection_drops: 0,
-            sort_order: ProfileSortOrder::default(),
-            killswitch_mode: KillSwitchMode::Off,
-            killswitch_state: KillSwitchState::Disabled,
-            dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
-            dns_requests: HashMap::new(),
-            persist_dns_policy: false,
-            dns_external_sessions: 0,
-            route_observation_fresh: false,
-            telemetry_rx: None,
-            telemetry_nudge: None,
-            cmd_tx,
-            cmd_rx,
-            netstats_rx: None,
-            last_bytes_in: 0,
-            last_bytes_out: 0,
-        }
+        let mut engine = Self::blank(
+            AppConfig::default(),
+            std::env::temp_dir().join("vortix_test"),
+        );
+        engine.is_root = false;
+        engine.persist_dns_policy = false;
+        engine
     }
 
     /// Start presentation-only telemetry workers.

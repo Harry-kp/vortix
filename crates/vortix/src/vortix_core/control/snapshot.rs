@@ -127,37 +127,13 @@ impl ControlSnapshot {
             let Some(existing) = self.profile_routes.get(existing_id) else {
                 continue;
             };
-            let requested_default = requested.iter().any(|route| route.prefix_len == 0);
-            let existing_default = existing.iter().any(|route| route.prefix_len == 0);
-            if requested_default && existing_default {
-                return Some(Conflict::DefaultRouteTakeover {
-                    current: existing_id.clone(),
-                    new: profile_id.clone(),
-                });
-            }
-            // A default route intersects every other route by definition, so
-            // comparing it here reported a full tunnel joining a split tunnel
-            // as a "Route Overlap" — a conflict the user cannot act on,
-            // because nothing is actually contended. Whether two profiles both
-            // want the default is the question asked immediately above; this
-            // one is only about specific destinations colliding. A split
-            // tunnel alongside a full one is legitimate: the more specific
-            // prefix wins, which is the point of running both.
-            let overlapping_cidrs = requested
-                .iter()
-                .filter(|route| route.prefix_len != 0)
-                .filter(|route| {
-                    existing
-                        .iter()
-                        .any(|current| current.prefix_len != 0 && route.intersects(current))
-                })
-                .copied()
-                .collect::<Vec<_>>();
-            if !overlapping_cidrs.is_empty() {
-                return Some(Conflict::RouteOverlap {
-                    with: existing_id.clone(),
-                    overlapping_cidrs,
-                });
+            if let Some(conflict) = crate::vortix_core::engine::classify_route_conflict(
+                requested,
+                existing,
+                existing_id,
+                profile_id,
+            ) {
+                return Some(conflict);
             }
         }
         None

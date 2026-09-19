@@ -10,10 +10,10 @@ use thiserror::Error;
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::AuthorityEpoch;
 use crate::vortix_core::privileged::protocol_plan::{
-    DnsHostname, OpenVpnRedirectFlag, OpenVpnRedirectGateway, OpenVpnRoute, OpenVpnRouteDefaults,
-    OpenVpnRouteGateway, ProtocolPlan,
+    DnsHostname, OpenVpnRedirectGateway, OpenVpnRoute, OpenVpnRouteDefaults, OpenVpnRouteGateway,
+    ProtocolPlan,
 };
-use crate::vortix_core::privileged::receipt::{ObservationState, VerifiedReceipt};
+use crate::vortix_core::privileged::receipt::ObservationState;
 use crate::vortix_core::privileged::resource::{
     ResourceKind, ResourceObservationTarget, ResourceTag,
 };
@@ -72,11 +72,6 @@ impl OperationDigest {
     #[must_use]
     pub fn of_bytes(bytes: &[u8]) -> Self {
         Self(Sha256::digest(bytes).into())
-    }
-
-    #[must_use]
-    pub(crate) const fn from_sha256(digest: [u8; 32]) -> Self {
-        Self(digest)
     }
 
     fn semantic<T: Serialize>(domain: &[u8], value: &T) -> Self {
@@ -317,10 +312,6 @@ impl ServiceInstanceClaim {
     fn binding_digest(&self) -> OperationDigest {
         OperationDigest::semantic(b"service-instance", self)
     }
-
-    fn authority_binding_digest(&self) -> OperationDigest {
-        authority_binding_digest(self.manager_instance_nonce)
-    }
 }
 
 /// Untrusted peer credential claim. Scalar construction never grants trust;
@@ -368,11 +359,6 @@ impl LeaseId {
     #[must_use]
     pub const fn new(value: [u8; 32]) -> Self {
         Self(value)
-    }
-
-    #[must_use]
-    pub(crate) const fn as_bytes(self) -> [u8; 32] {
-        self.0
     }
 
     pub(crate) fn is_zero(self) -> bool {
@@ -433,40 +419,6 @@ impl AuthorityBinding {
     pub const fn service_instance_digest(self) -> OperationDigest {
         self.service_instance_digest
     }
-
-    pub(crate) fn for_service(
-        authority_epoch: AuthorityEpoch,
-        boot_scope: BootScope,
-        lease_id: LeaseId,
-        service: &ServiceInstanceClaim,
-    ) -> Result<Self, OperationError> {
-        Self::for_manager_nonce(
-            authority_epoch,
-            boot_scope,
-            lease_id,
-            service.manager_instance_nonce(),
-        )
-    }
-
-    pub(crate) fn for_manager_nonce(
-        authority_epoch: AuthorityEpoch,
-        boot_scope: BootScope,
-        lease_id: LeaseId,
-        manager_instance_nonce: [u8; 32],
-    ) -> Result<Self, OperationError> {
-        Self::new(
-            authority_epoch,
-            boot_scope,
-            lease_id,
-            authority_binding_digest(manager_instance_nonce),
-        )
-    }
-}
-
-fn authority_binding_digest(manager_instance_nonce: [u8; 32]) -> OperationDigest {
-    let mut material = b"vortix-manager-instance-v1\0".to_vec();
-    material.extend_from_slice(&manager_instance_nonce);
-    OperationDigest::of_bytes(&material)
 }
 
 /// Opaque result of U11's platform verifier. Construction is crate-private so
@@ -587,16 +539,6 @@ impl RootAuthorityLedger {
         }
     }
 
-    pub(crate) fn authority_binding(&self) -> AuthorityBinding {
-        AuthorityBinding::for_service(
-            self.authority_epoch,
-            self.boot_scope,
-            self.lease_id,
-            &self.service,
-        )
-        .expect("validated root authority always has a valid public binding")
-    }
-
     #[must_use]
     pub const fn authority_epoch(&self) -> AuthorityEpoch {
         self.authority_epoch
@@ -673,24 +615,6 @@ pub struct TrustedDaemonPrincipal {
 }
 
 impl TrustedDaemonPrincipal {
-    pub(crate) fn from_authenticated_binding(
-        owner_uid: u32,
-        binding: AuthorityBinding,
-        service: &ServiceInstanceClaim,
-    ) -> Result<Self, OperationError> {
-        if owner_uid == 0 || binding.service_instance_digest() != service.authority_binding_digest()
-        {
-            return Err(OperationError::PrincipalMismatch);
-        }
-        Ok(Self {
-            owner_uid,
-            authority_epoch: binding.authority_epoch(),
-            boot_scope: binding.boot_scope(),
-            lease_id: binding.lease_id(),
-            service_binding: service.binding_digest(),
-        })
-    }
-
     #[must_use]
     pub const fn authority_epoch(&self) -> AuthorityEpoch {
         self.authority_epoch
@@ -743,13 +667,6 @@ impl PolicyDigest {
     pub(crate) fn is_zero(self) -> bool {
         self.0.is_zero()
     }
-
-    fn of_projection(projection: &PolicyProjection) -> Self {
-        Self(OperationDigest::semantic(
-            b"network-policy-projection",
-            projection,
-        ))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,36 +689,6 @@ pub struct PolicyPredecessor {
 }
 
 impl PolicyPredecessor {
-    pub(crate) fn pending(
-        digest: PolicyDigest,
-        phase: PolicyPhase,
-    ) -> Result<Self, OperationError> {
-        let predecessor = Self {
-            digest,
-            phase,
-            observed: false,
-        };
-        predecessor
-            .is_valid()
-            .then_some(predecessor)
-            .ok_or(OperationError::PolicyTransition)
-    }
-
-    pub(crate) fn settled(
-        digest: PolicyDigest,
-        phase: PolicyPhase,
-    ) -> Result<Self, OperationError> {
-        let predecessor = Self {
-            digest,
-            phase,
-            observed: true,
-        };
-        predecessor
-            .is_valid()
-            .then_some(predecessor)
-            .ok_or(OperationError::PolicyTransition)
-    }
-
     #[allow(
         dead_code,
         reason = "daemon policy adapter consumes these authenticated fields"
@@ -809,20 +696,6 @@ impl PolicyPredecessor {
     #[must_use]
     pub(crate) const fn digest(self) -> PolicyDigest {
         self.digest
-    }
-
-    #[must_use]
-    pub(crate) const fn phase(self) -> PolicyPhase {
-        self.phase
-    }
-
-    #[must_use]
-    pub(crate) const fn observed(self) -> bool {
-        self.observed
-    }
-
-    pub(crate) fn is_valid(self) -> bool {
-        !self.digest.is_zero()
     }
 
     #[cfg(test)]
@@ -870,19 +743,6 @@ impl PolicyRollback {
                 projection: cursor.projection.clone(),
             },
         )
-    }
-
-    fn into_cursor(self) -> PolicyCursor {
-        PolicyCursor {
-            authority_epoch: self.authority_epoch,
-            generation: self.generation,
-            digest: self.digest,
-            phase: self.phase,
-            observed: true,
-            projection: self.projection,
-            previous: None,
-            pending_release: Vec::new(),
-        }
     }
 }
 
@@ -1546,34 +1406,6 @@ impl ScopedOpenVpnRedirect {
     pub const fn route_defaults(&self) -> OpenVpnRouteDefaults {
         self.route_defaults
     }
-
-    pub(crate) fn destinations(&self) -> Result<Vec<Cidr>, OperationError> {
-        let flags = self.redirect.flags();
-        if flags.contains(&OpenVpnRedirectFlag::BypassDhcp)
-            || flags.contains(&OpenVpnRedirectFlag::BypassDns)
-            || flags.contains(&OpenVpnRedirectFlag::BlockLocal)
-        {
-            return Err(OperationError::ResourceScopeMismatch);
-        }
-        let mut destinations = Vec::with_capacity(4);
-        if self.redirect.ipv4() {
-            if flags.contains(&OpenVpnRedirectFlag::Def1) {
-                destinations.extend([
-                    "0.0.0.0/1".parse::<Cidr>().expect("fixed CIDR is valid"),
-                    "128.0.0.0/1".parse::<Cidr>().expect("fixed CIDR is valid"),
-                ]);
-            } else {
-                destinations.push("0.0.0.0/0".parse::<Cidr>().expect("fixed CIDR is valid"));
-            }
-        }
-        if self.redirect.ipv6() {
-            destinations.extend([
-                "2000::/4".parse::<Cidr>().expect("fixed CIDR is valid"),
-                "3000::/4".parse::<Cidr>().expect("fixed CIDR is valid"),
-            ]);
-        }
-        Ok(destinations)
-    }
 }
 
 /// Exact typed projection persisted with the replay cursor before a policy
@@ -1689,31 +1521,6 @@ impl PolicyProjection {
             | Self::Routes { policy, .. }
             | Self::Dns { policy, .. }
             | Self::Firewall { policy, .. } => policy,
-        }
-    }
-
-    pub(crate) fn digest(&self) -> PolicyDigest {
-        PolicyDigest::of_projection(self)
-    }
-
-    pub(crate) fn route_inputs(
-        &self,
-    ) -> Option<(
-        &[ScopedRoute],
-        &[ScopedOpenVpnRedirect],
-        &[PrivilegedFirewallTunnel],
-    )> {
-        match self {
-            Self::Routes {
-                routes,
-                redirects,
-                tunnels,
-                ..
-            } => Some((routes, redirects, tunnels)),
-            Self::FirewallBaseline { .. }
-            | Self::Blocking { .. }
-            | Self::Dns { .. }
-            | Self::Firewall { .. } => None,
         }
     }
 
@@ -2374,51 +2181,13 @@ pub enum ReplayRecord {
     HighWater(Box<ReplayHighWater>),
 }
 
-impl ReplayRecord {
-    pub(super) const fn authority_epoch(&self) -> AuthorityEpoch {
-        match self {
-            Self::Unused(record) => record.authority_epoch,
-            Self::HighWater(record) => record.authority_epoch,
-        }
-    }
-
-    pub(crate) fn next_helper_session(
-        &self,
-    ) -> Result<(HelperEpoch, RequestSequence), OperationError> {
-        match self {
-            Self::Unused(record) => Ok((record.initial_helper_epoch, RequestSequence::new(1)?)),
-            Self::HighWater(record) => {
-                let helper_epoch = record
-                    .helper_epoch
-                    .get()
-                    .checked_add(1)
-                    .ok_or(OperationError::InvalidReplayState)?;
-                let next_sequence = record
-                    .highest_id
-                    .sequence
-                    .get()
-                    .checked_add(1)
-                    .ok_or(OperationError::InvalidReplayState)?;
-                Ok((
-                    HelperEpoch::new(helper_epoch)?,
-                    RequestSequence::new(next_sequence)?,
-                ))
-            }
-        }
-    }
-}
+impl ReplayRecord {}
 
 /// Non-serializable replay capability authenticated by the root ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayBaseline(ReplayRecord);
 
-impl ReplayBaseline {
-    /// Consume the authenticated baseline for root-ledger persistence. This
-    /// stays crate-private so wire callers cannot manufacture replay state.
-    pub(crate) fn into_record(self) -> ReplayRecord {
-        self.0
-    }
-}
+impl ReplayBaseline {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2545,17 +2314,6 @@ impl OperationGuard {
             .map(ReplayRecord::HighWater)
     }
 
-    /// First sequence that cannot alias any request durably admitted by this
-    /// authority. The helper authenticates this cursor in the v4 handshake so
-    /// a reconnecting daemon cannot reset its local counter.
-    pub(crate) fn next_sequence(&self) -> Result<RequestSequence, OperationError> {
-        let next = self.highest.as_ref().map_or(Some(1), |state| {
-            state.highest_id.sequence.get().checked_add(1)
-        });
-        let next = next.ok_or(OperationError::InvalidReplayState)?;
-        RequestSequence::new(next).map_err(|_| OperationError::InvalidReplayState)
-    }
-
     #[must_use]
     pub fn policy_predecessor(&self) -> Option<PolicyPredecessor> {
         self.highest
@@ -2563,38 +2321,6 @@ impl OperationGuard {
             .policy
             .as_ref()
             .map(PolicyCursor::predecessor)
-    }
-
-    /// Return the root-ledger-authenticated projection for the current policy
-    /// phase. This is the only policy payload an executor may use for a
-    /// barrier or post-restart release.
-    pub(crate) fn policy_projection(&self) -> Option<&PolicyProjection> {
-        self.highest
-            .as_ref()?
-            .policy
-            .as_ref()
-            .map(|policy| &policy.projection)
-    }
-
-    /// Restore the last observed cursor after an executor proves a fresh
-    /// mutation failed before any external effect. The replay high-water mark
-    /// remains advanced, so the rejected request cannot be replayed.
-    pub(crate) fn rollback_policy_before_effect(
-        &mut self,
-        request: &PrivilegedRequest,
-    ) -> Result<(), OperationError> {
-        let Some(state) = &mut self.highest else {
-            return Err(OperationError::PolicyTransition);
-        };
-        if state.highest_id != *request.operation_id() || state.highest_digest != *request.digest()
-        {
-            return Err(OperationError::PolicyTransition);
-        }
-        let Some(cursor) = &mut state.policy else {
-            return Err(OperationError::PolicyTransition);
-        };
-        state.policy = cursor.previous.take().map(PolicyRollback::into_cursor);
-        Ok(())
     }
 
     pub fn validate(
@@ -2768,83 +2494,6 @@ impl OperationGuard {
             });
         }
         Ok(admission)
-    }
-
-    /// Commit an observation barrier only after an authenticated receipt has
-    /// proven that the helper actually observed the requested policy resource.
-    pub fn confirm_observation(
-        &mut self,
-        request: &PrivilegedRequest,
-        receipt: &VerifiedReceipt,
-        root: &RootAuthorityLedger,
-    ) -> Result<(), OperationError> {
-        let PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ObserveBarrier {
-            policy,
-            ..
-        }) = request.operation()
-        else {
-            return Err(OperationError::InvalidObservationReceipt);
-        };
-        let Some(state) = &mut self.highest else {
-            return Err(OperationError::InvalidObservationReceipt);
-        };
-        let Some(cursor) = &mut state.policy else {
-            return Err(OperationError::InvalidObservationReceipt);
-        };
-        if state.highest_id != *request.operation_id()
-            || state.highest_digest != *request.digest()
-            || receipt.validate_against(request, root).is_err()
-            || !receipt.observes(policy, cursor.projection.expected_observation_state())
-        {
-            return Err(OperationError::InvalidObservationReceipt);
-        }
-        cursor.observed = true;
-        cursor.previous = None;
-        Ok(())
-    }
-
-    /// Finish a release only after one authenticated observation proves the
-    /// current retained projection remains in its exact expected state and
-    /// every obsolete resource retained in the persisted cursor is absent.
-    pub fn confirm_release(
-        &mut self,
-        request: &PrivilegedRequest,
-        receipt: &VerifiedReceipt,
-        root: &RootAuthorityLedger,
-    ) -> Result<(), OperationError> {
-        let PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
-            policy,
-            resources,
-            retained_state,
-            ..
-        }) = request.operation()
-        else {
-            return Err(OperationError::InvalidObservationReceipt);
-        };
-        let Some(state) = &mut self.highest else {
-            return Err(OperationError::InvalidObservationReceipt);
-        };
-        let Some(cursor) = &mut state.policy else {
-            return Err(OperationError::InvalidObservationReceipt);
-        };
-        if state.highest_id != *request.operation_id()
-            || state.highest_digest != *request.digest()
-            || cursor.phase != PolicyPhase::Released
-            || cursor.pending_release != *resources
-            || cursor.projection.expected_observation_state() != *retained_state
-            || receipt.validate_against(request, root).is_err()
-            || !receipt.observes(policy, *retained_state)
-            || cursor
-                .pending_release
-                .iter()
-                .any(|resource| !receipt.observes(resource, ObservationState::Absent))
-        {
-            return Err(OperationError::InvalidObservationReceipt);
-        }
-        cursor.observed = true;
-        cursor.pending_release.clear();
-        cursor.previous = None;
-        Ok(())
     }
 }
 
@@ -3275,26 +2924,6 @@ mod tests {
     }
 
     #[test]
-    fn firewall_mode_uses_the_canonical_kill_switch_slug() {
-        let policy = ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Firewall).unwrap();
-        let operation = NetworkPolicyOperation::ApplyFirewall {
-            policy,
-            mode: KillSwitchMode::Auto,
-            tunnels: Vec::new(),
-            predecessor: PolicyPredecessor {
-                digest: PolicyDigest(OperationDigest::from_sha256([3; 32])),
-                phase: PolicyPhase::Dns,
-                observed: true,
-            },
-        };
-        let mut wire = serde_json::to_value(&operation).unwrap();
-
-        assert_eq!(wire["mode"], "block-on-drop");
-        wire["mode"] = serde_json::json!("block_on_drop");
-        assert!(serde_json::from_value::<NetworkPolicyOperation>(wire).is_err());
-    }
-
-    #[test]
     fn canonical_v3_digest_golden_and_deterministic_mutations() {
         let service = ServiceInstanceClaim::systemd(
             75,
@@ -3708,144 +3337,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one end-to-end release test retains the crash/restart proof chain"
-    )]
-    fn release_requires_exact_retained_state_and_every_obsolete_resource_absent() {
-        let (root, principal) = authority();
-        let helper = HelperEpoch::new(3).unwrap();
-        let mut guard = OperationGuard::resume(
-            &principal,
-            helper,
-            root.unused_replay_baseline(&principal, helper).unwrap(),
-        )
-        .unwrap();
-        let current = ResourceTag::topology(AuthorityEpoch(7), 2, ResourceKind::Firewall).unwrap();
-        let obsolete_dns = ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Dns).unwrap();
-        let obsolete_routes =
-            ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Routes).unwrap();
-        let establish = PrivilegedRequest::new(
-            &principal,
-            helper,
-            RequestSequence::new(1).unwrap(),
-            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishFirewall {
-                policy: current.clone(),
-                mode: KillSwitchMode::Off,
-                tunnels: Vec::new(),
-            }),
-        )
-        .unwrap();
-        guard.admit(&establish).unwrap();
-        let observe = PrivilegedRequest::new(
-            &principal,
-            helper,
-            RequestSequence::new(2).unwrap(),
-            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ObserveBarrier {
-                policy: current.clone(),
-                predecessor: guard.policy_predecessor().unwrap(),
-            }),
-        )
-        .unwrap();
-        guard.admit(&observe).unwrap();
-        let receipts = ReceiptLedger::new(&root, &principal).unwrap();
-        let observed = receipts
-            .observed(
-                &observe,
-                vec![
-                    ResourceObservation::new(current.clone(), ObservationState::Absent, 1).unwrap(),
-                ],
-            )
-            .unwrap();
-        guard
-            .confirm_observation(&observe, &observed, &root)
-            .unwrap();
-        assert_eq!(
-            PrivilegedRequest::new(
-                &principal,
-                helper,
-                RequestSequence::new(3).unwrap(),
-                PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
-                    policy: current.clone(),
-                    resources: Vec::new(),
-                    predecessor: guard.policy_predecessor().unwrap(),
-                    retained_state: ObservationState::Absent,
-                }),
-            )
-            .unwrap_err(),
-            OperationError::ResourceScopeMismatch
-        );
-        let release = PrivilegedRequest::new(
-            &principal,
-            helper,
-            RequestSequence::new(3).unwrap(),
-            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
-                policy: current.clone(),
-                resources: vec![obsolete_dns.clone(), obsolete_routes.clone()],
-                predecessor: guard.policy_predecessor().unwrap(),
-                retained_state: ObservationState::Absent,
-            }),
-        )
-        .unwrap();
-        guard.admit(&release).unwrap();
-        let continuation = PrivilegedRequest::new(
-            &principal,
-            helper,
-            RequestSequence::new(4).unwrap(),
-            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
-                policy: current.clone(),
-                resources: vec![obsolete_dns.clone(), obsolete_routes.clone()],
-                predecessor: guard.policy_predecessor().unwrap(),
-                retained_state: ObservationState::Absent,
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            guard.validate(&continuation),
-            Ok(OperationAdmission::PendingReleaseContinuation)
-        );
-        let persisted = serde_json::to_value(guard.checkpoint().unwrap()).unwrap();
-        let persisted_text = persisted.to_string();
-        assert!(persisted_text.contains("projection"));
-        assert!(persisted_text.contains("dns"));
-        assert!(persisted_text.contains("routes"));
-        let record: ReplayRecord = serde_json::from_value(persisted).unwrap();
-        let baseline = root.loaded_replay_baseline(&principal, record).unwrap();
-        let mut restarted =
-            OperationGuard::resume(&principal, HelperEpoch::new(4).unwrap(), baseline).unwrap();
-        assert!(restarted.policy_projection().is_some());
-        assert_eq!(
-            receipts
-                .observed(
-                    &release,
-                    vec![
-                        ResourceObservation::new(current.clone(), ObservationState::Absent, 2)
-                            .unwrap(),
-                        ResourceObservation::new(
-                            obsolete_dns.clone(),
-                            ObservationState::Absent,
-                            2,
-                        )
-                        .unwrap(),
-                    ],
-                )
-                .unwrap_err(),
-            ReceiptError::MissingRequiredResource
-        );
-        let proof = receipts
-            .observed(
-                &release,
-                vec![
-                    ResourceObservation::new(current, ObservationState::Absent, 3).unwrap(),
-                    ResourceObservation::new(obsolete_dns, ObservationState::Absent, 3).unwrap(),
-                    ResourceObservation::new(obsolete_routes, ObservationState::Absent, 3).unwrap(),
-                ],
-            )
-            .unwrap();
-        restarted.confirm_release(&release, &proof, &root).unwrap();
-    }
-
-    #[test]
     fn invalid_public_cidr_literals_fail_every_privileged_constructor() {
         let invalid = Cidr {
             addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
@@ -3866,60 +3357,6 @@ mod tests {
             WireGuardInterfaceOptions::default(),
         )
         .is_err());
-    }
-
-    #[test]
-    fn route_projection_persists_and_validates_blocking_subjects() {
-        let tunnel = ResourceTag::tunnel(profile('a'), 1).unwrap();
-        let declared: Cidr = "10.0.0.0/8".parse().unwrap();
-        let subjects = vec![PrivilegedFirewallTunnel::new(
-            tunnel.clone(),
-            vec!["198.51.100.7".parse().unwrap()],
-            vec![declared],
-            PrivilegedFirewallRole::PendingEndpoint,
-        )
-        .unwrap()];
-        let blocking = PolicyProjection::Blocking {
-            policy: ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Firewall).unwrap(),
-            tunnels: subjects.clone(),
-        };
-        let routes = ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Routes).unwrap();
-        let operation = NetworkPolicyOperation::ApplyRoutes {
-            policy: routes.clone(),
-            routes: vec![ScopedRoute::new(declared, tunnel.clone()).unwrap()],
-            redirects: Vec::new(),
-            predecessor: PolicyPredecessor {
-                digest: blocking.digest(),
-                phase: PolicyPhase::Blocking,
-                observed: true,
-            },
-        };
-
-        let projection = PolicyProjection::from_mutation(&operation, Some(&blocking))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            projection,
-            PolicyProjection::Routes {
-                policy: routes,
-                routes: vec![ScopedRoute::new(declared, tunnel).unwrap()],
-                redirects: Vec::new(),
-                tunnels: subjects,
-            }
-        );
-
-        let foreign = ResourceTag::tunnel(profile('b'), 1).unwrap();
-        let invalid = NetworkPolicyOperation::ApplyRoutes {
-            policy: ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Routes).unwrap(),
-            routes: vec![ScopedRoute::new(declared, foreign).unwrap()],
-            redirects: Vec::new(),
-            predecessor: PolicyPredecessor {
-                digest: blocking.digest(),
-                phase: PolicyPhase::Blocking,
-                observed: true,
-            },
-        };
-        assert!(PolicyProjection::from_mutation(&invalid, Some(&blocking)).is_err());
     }
 
     #[test]

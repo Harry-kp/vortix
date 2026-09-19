@@ -727,26 +727,12 @@ impl Supervisor {
             && result.stage == PolicyStage::PreTunnelBlocking
             && result.outcome == PolicyOutcome::Applied
         {
-            state.pre_tunnel_blocking = Some((
-                ControlRevision {
-                    authority_epoch: result.authority_epoch,
-                    generation: result.generation,
-                    digest: result.digest.clone(),
-                },
-                result.operation_id.clone(),
-            ));
+            state.pre_tunnel_blocking = Some((result.revision(), result.operation_id.clone()));
         } else if exact
             && result.stage == PolicyStage::Final
             && result.outcome == PolicyOutcome::Applied
         {
-            state.applied_policy = Some((
-                ControlRevision {
-                    authority_epoch: result.authority_epoch,
-                    generation: result.generation,
-                    digest: result.digest.clone(),
-                },
-                result.operation_id.clone(),
-            ));
+            state.applied_policy = Some((result.revision(), result.operation_id.clone()));
             state.applied_topology = state
                 .latest_topology
                 .as_ref()

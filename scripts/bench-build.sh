@@ -59,7 +59,7 @@ step "release build (cold)" cargo build --release
 {
     echo "-- release binary sizes --"
     total=0
-    for binary in vortix vortix-helper vortix-bootstrap; do
+    for binary in vortix; do
         path="target/release/$binary"
         [ -f "$path" ] || continue
         bytes=$(wc -c < "$path" | tr -d ' ')

@@ -31,10 +31,6 @@ impl Debug for DecodedOpenVpnCredentials {
 }
 
 impl DecodedOpenVpnCredentials {
-    pub(crate) fn answer_is_empty(&self) -> bool {
-        self.answer.is_empty()
-    }
-
     pub(crate) fn into_parts(self) -> (Zeroizing<String>, Zeroizing<String>, Zeroizing<Vec<u8>>) {
         (self.username, self.password, self.answer)
     }

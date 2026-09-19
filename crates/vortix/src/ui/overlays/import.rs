@@ -1,7 +1,7 @@
 use crate::{constants, theme};
 use ratatui::{
     layout::Alignment,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -113,18 +113,18 @@ pub fn render(frame: &mut Frame, path: &str, cursor: usize) {
             Style::default().fg(theme::current().text_primary),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(" > ", Style::default().fg(theme::current().text_secondary)),
-            Span::styled(before, Style::default().fg(theme::current().text_primary)),
-            Span::styled(
+        Line::from(
+            std::iter::once(Span::styled(
+                " > ",
+                Style::default().fg(theme::current().text_secondary),
+            ))
+            .chain(crate::ui::helpers::text_entry_spans(
+                before,
                 cursor_char,
-                Style::default()
-                    .fg(theme::current().accent_secondary)
-                    .add_modifier(Modifier::REVERSED)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ),
-            Span::styled(after, Style::default().fg(theme::current().text_primary)),
-        ]),
+                after,
+            ))
+            .collect::<Vec<_>>(),
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "Directory paths import every supported profile.",

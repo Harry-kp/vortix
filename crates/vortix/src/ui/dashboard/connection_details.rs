@@ -1,8 +1,9 @@
 use crate::app::App;
 use crate::state::{Protocol, QualityLevel};
+use crate::ui::helpers;
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
-use crate::vortix_core::engine::state::Connection;
+use crate::vortix_core::engine::state::{Connection, DetailedConnectionInfo};
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::Rect,
@@ -20,7 +21,7 @@ use ratatui::{
 /// H7 — when the focused profile is a split-tunnel row the panel renders
 /// "Latency: n/a" + the explanatory follow-up line "only measured on
 /// the active exit" instead of primary-scoped metrics.
-#[allow(clippy::too_many_lines, clippy::similar_names)]
+#[allow(clippy::similar_names)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::ConnectionDetails);
     let border_style = if is_focused {
@@ -98,23 +99,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     render_disconnected(frame, app, inner);
 }
 
-#[allow(clippy::too_many_lines)]
-fn render_connected(
-    frame: &mut Frame,
-    app: &App,
-    inner: Rect,
-    snap: &TunnelSnapshot,
-    details: &crate::vortix_core::engine::state::DetailedConnectionInfo,
-    is_focused_primary: bool,
-) {
-    let is_openvpn = details.public_key == "OpenVPN" || details.public_key.is_empty();
-
-    let mtu_str = if details.mtu.is_empty() {
-        "-".to_string()
-    } else {
-        details.mtu.clone()
-    };
-
+/// The `VPN IP` row: tunnel address and the interface carrying it.
+fn vpn_ip_line(details: &DetailedConnectionInfo) -> Line<'_> {
     let iface_display = if details.interface.is_empty() {
         "-".to_string()
     } else if details.interface_authoritative {
@@ -122,37 +108,187 @@ fn render_connected(
     } else {
         format!("{} (external)", details.interface)
     };
-    let mut text = vec![
-        Line::from(vec![
+    Line::from(vec![
+        Span::styled(
+            "VPN IP  : ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(
+            &details.internal_ip,
+            Style::default()
+                .fg(theme::current().accent_primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" @ {iface_display}"),
+            Style::default().fg(if details.interface_authoritative {
+                theme::current().text_secondary
+            } else {
+                theme::current().inactive
+            }),
+        ),
+    ])
+}
+
+/// The `Transfer` row: rx/tx counters and the tunnel MTU.
+fn transfer_line<'a>(details: &'a DetailedConnectionInfo, mtu_str: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            "Transfer: ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
+        Span::styled(
+            helpers::nonempty_or(&details.transfer_rx, "0"),
+            Style::default().fg(theme::current().text_primary),
+        ),
+        Span::styled(" ↑", Style::default().fg(theme::current().success)),
+        Span::styled(
+            helpers::nonempty_or(&details.transfer_tx, "0"),
+            Style::default().fg(theme::current().text_primary),
+        ),
+        Span::styled(
+            " (MTU:",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(
+            mtu_str,
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(")", Style::default().fg(theme::current().text_secondary)),
+    ])
+}
+
+/// Telemetry rows for the focused tunnel. Primary-only per H7 —
+/// split-tunnel rows get the n/a line and its explanation instead.
+fn quality_rows(app: &App, is_focused_primary: bool) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    if is_focused_primary {
+        let quality_status = match QualityLevel::from_metrics(
+            app.runtime.latency_ms,
+            app.runtime.packet_loss,
+            app.runtime.jitter_ms,
+        ) {
+            QualityLevel::Unknown => ("UNKNOWN", theme::current().text_secondary),
+            QualityLevel::Poor => ("POOR", theme::current().error),
+            QualityLevel::Fair => ("FAIR", theme::current().yellow),
+            QualityLevel::Excellent => ("EXCELLENT", theme::current().success),
+        };
+
+        rows.push(Line::from(vec![
             Span::styled(
-                "VPN IP  : ",
+                "Quality: ",
                 Style::default().fg(theme::current().text_secondary),
             ),
             Span::styled(
-                &details.internal_ip,
+                quality_status.0,
                 Style::default()
-                    .fg(theme::current().accent_primary)
+                    .fg(quality_status.1)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!(" @ {iface_display}"),
-                Style::default().fg(if details.interface_authoritative {
-                    theme::current().text_secondary
-                } else {
-                    theme::current().inactive
-                }),
+        ]));
+
+        let jitter_color = if app.runtime.jitter_ms < 5 {
+            theme::current().success
+        } else if app.runtime.jitter_ms < 15 {
+            theme::current().yellow
+        } else {
+            theme::current().error
+        };
+        let loss_color = if app.runtime.packet_loss < 1.0 {
+            theme::current().success
+        } else {
+            theme::current().error
+        };
+        rows.extend([
+            helpers::detail_row(
+                "  ├─ Ping (Latency)   : ",
+                format!("{}ms", app.runtime.latency_ms),
+                helpers::latency_color(app.runtime.latency_ms),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Server  : ",
-                Style::default().fg(theme::current().text_secondary),
+            helpers::detail_row(
+                "  ├─ Stability (Jitter): ",
+                format!("±{}ms", app.runtime.jitter_ms),
+                jitter_color,
             ),
-            Span::styled(
-                &details.endpoint,
-                Style::default().fg(theme::current().text_primary),
+            helpers::detail_row(
+                "  └─ Reliability (Loss): ",
+                format!("{:.1}%", app.runtime.packet_loss),
+                loss_color,
             ),
-        ]),
+        ]);
+    } else {
+        // H7: telemetry is primary-only. Surface BOTH the n/a and the
+        // *reason* — "split tunnel" alone is a label, not an
+        // explanation. The follow-up line spells out that latency is
+        // only measured on the active exit tunnel, so the user
+        // understands why this particular profile doesn't show a
+        // value and can pick the active-exit row to see real numbers.
+        rows.push(helpers::detail_row(
+            "Latency: ",
+            "n/a",
+            theme::current().inactive,
+        ));
+        rows.push(Line::from(vec![
+            Span::styled("         ", Style::default()),
+            Span::styled(
+                "only measured on the active exit",
+                Style::default()
+                    .fg(theme::current().text_secondary)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    rows
+}
+
+/// The `Stats` row: worker PID and the session's drop count.
+fn stats_line(app: &App, details: &DetailedConnectionInfo) -> Line<'static> {
+    let rel_spans = vec![
+        Span::styled(
+            "Stats   : ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled("PID ", Style::default().fg(theme::current().text_secondary)),
+        Span::styled(
+            details.pid.map_or("-".to_string(), |p| p.to_string()),
+            Style::default().fg(theme::current().text_primary),
+        ),
+        Span::styled(
+            " | Drops ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(
+            format!("{}", app.runtime.connection_drops),
+            Style::default().fg(if app.runtime.connection_drops > 0 {
+                theme::current().error
+            } else {
+                theme::current().text_primary
+            }),
+        ),
+    ];
+    Line::from(rel_spans)
+}
+
+fn render_connected(
+    frame: &mut Frame,
+    app: &App,
+    inner: Rect,
+    snap: &TunnelSnapshot,
+    details: &DetailedConnectionInfo,
+    is_focused_primary: bool,
+) {
+    let is_openvpn = details.public_key == "OpenVPN" || details.public_key.is_empty();
+
+    let mtu_str = helpers::nonempty_or(&details.mtu, "-");
+
+    let mut text = vec![
+        vpn_ip_line(details),
+        helpers::detail_row(
+            "Server  : ",
+            details.endpoint.as_str(),
+            theme::current().text_primary,
+        ),
     ];
 
     // `Exit` reflects the ASN/location of the public IPv4 returned by
@@ -186,38 +322,26 @@ fn render_connected(
         ]));
     }
 
-    let (proto_label, proto_value, proto_color) = if is_openvpn {
-        let cipher = if details.latest_handshake.starts_with("Cipher:") {
-            details.latest_handshake.replace("Cipher: ", "")
-        } else if details.latest_handshake.is_empty() {
-            "AES-256-GCM".to_string()
-        } else {
-            details.latest_handshake.clone()
-        };
-        ("Crypto  : ", cipher, theme::current().yellow)
+    let crypto = if is_openvpn {
+        match details.latest_handshake.as_str() {
+            h if h.starts_with("Cipher:") => h.replace("Cipher: ", ""),
+            "" => "AES-256-GCM".to_string(),
+            h => h.to_string(),
+        }
+    } else if details.latest_handshake.is_empty() {
+        "ChaCha20-Poly1305".to_string()
     } else {
-        let handshake_str = if details.latest_handshake.is_empty() {
-            "ChaCha20-Poly1305".to_string()
-        } else {
-            format!("ChaCha20 ({})", details.latest_handshake)
-        };
-        ("Crypto  : ", handshake_str, theme::current().yellow)
+        format!("ChaCha20 ({})", details.latest_handshake)
     };
-
-    text.push(Line::from(vec![
-        Span::styled(
-            proto_label,
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled(
-            if proto_value.is_empty() {
-                "-"
-            } else {
-                &proto_value
-            },
-            Style::default().fg(proto_color),
-        ),
-    ]));
+    text.push(helpers::detail_row(
+        "Crypto  : ",
+        if crypto.is_empty() {
+            "-".to_string()
+        } else {
+            crypto
+        },
+        theme::current().yellow,
+    ));
 
     if let crate::vortix_core::engine::state::ConnectionHealth::Degraded {
         reason:
@@ -229,180 +353,21 @@ fn render_connected(
     } = &snap.health
     {
         let route = allowed_routes.first().map_or("route", String::as_str);
-        text.push(Line::from(vec![
-            Span::styled(
-                "Health  : ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled(
-                format!("Handshake stale {seconds_since_last_handshake}s ({route})"),
-                Style::default().fg(theme::current().warning),
-            ),
-        ]));
+        text.push(helpers::detail_row(
+            "Health  : ",
+            format!("Handshake stale {seconds_since_last_handshake}s ({route})"),
+            theme::current().warning,
+        ));
     }
 
-    text.push(Line::from(vec![
-        Span::styled(
-            "Transfer: ",
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
-        Span::styled(
-            if details.transfer_rx.is_empty() {
-                "0"
-            } else {
-                &details.transfer_rx
-            },
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(" ↑", Style::default().fg(theme::current().success)),
-        Span::styled(
-            if details.transfer_tx.is_empty() {
-                "0"
-            } else {
-                &details.transfer_tx
-            },
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(
-            " (MTU:",
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled(
-            mtu_str,
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled(")", Style::default().fg(theme::current().text_secondary)),
-    ]));
+    text.push(transfer_line(details, mtu_str));
 
     text.push(Line::from(""));
 
-    if is_focused_primary {
-        let quality_status = match QualityLevel::from_metrics(
-            app.runtime.latency_ms,
-            app.runtime.packet_loss,
-            app.runtime.jitter_ms,
-        ) {
-            QualityLevel::Unknown => ("UNKNOWN", theme::current().text_secondary),
-            QualityLevel::Poor => ("POOR", theme::current().error),
-            QualityLevel::Fair => ("FAIR", theme::current().yellow),
-            QualityLevel::Excellent => ("EXCELLENT", theme::current().success),
-        };
-
-        text.push(Line::from(vec![
-            Span::styled(
-                "Quality: ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled(
-                quality_status.0,
-                Style::default()
-                    .fg(quality_status.1)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-
-        let latency_color = if app.runtime.latency_ms < 50 {
-            theme::current().success
-        } else if app.runtime.latency_ms < 150 {
-            theme::current().yellow
-        } else {
-            theme::current().error
-        };
-        text.push(Line::from(vec![
-            Span::styled(
-                "  ├─ Ping (Latency)   : ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled(
-                format!("{}ms", app.runtime.latency_ms),
-                Style::default().fg(latency_color),
-            ),
-        ]));
-
-        let jitter_color = if app.runtime.jitter_ms < 5 {
-            theme::current().success
-        } else if app.runtime.jitter_ms < 15 {
-            theme::current().yellow
-        } else {
-            theme::current().error
-        };
-        text.push(Line::from(vec![
-            Span::styled(
-                "  ├─ Stability (Jitter): ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled(
-                format!("±{}ms", app.runtime.jitter_ms),
-                Style::default().fg(jitter_color),
-            ),
-        ]));
-
-        text.push(Line::from(vec![
-            Span::styled(
-                "  └─ Reliability (Loss): ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled(
-                format!("{:.1}%", app.runtime.packet_loss),
-                Style::default().fg(if app.runtime.packet_loss < 1.0 {
-                    theme::current().success
-                } else {
-                    theme::current().error
-                }),
-            ),
-        ]));
-    } else {
-        // H7: telemetry is primary-only. Surface BOTH the n/a and the
-        // *reason* — "split tunnel" alone is a label, not an
-        // explanation. The follow-up line spells out that latency is
-        // only measured on the active exit tunnel, so the user
-        // understands why this particular profile doesn't show a
-        // value and can pick the active-exit row to see real numbers.
-        text.push(Line::from(vec![
-            Span::styled(
-                "Latency: ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled("n/a", Style::default().fg(theme::current().inactive)),
-        ]));
-        text.push(Line::from(vec![
-            Span::styled("         ", Style::default()),
-            Span::styled(
-                "only measured on the active exit",
-                Style::default()
-                    .fg(theme::current().text_secondary)
-                    .add_modifier(Modifier::DIM),
-            ),
-        ]));
-    }
+    text.extend(quality_rows(app, is_focused_primary));
 
     text.push(Line::from(""));
-    let rel_spans = vec![
-        Span::styled(
-            "Stats   : ",
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled("PID ", Style::default().fg(theme::current().text_secondary)),
-        Span::styled(
-            details.pid.map_or("-".to_string(), |p| p.to_string()),
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(
-            " | Drops ",
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled(
-            format!("{}", app.runtime.connection_drops),
-            Style::default().fg(if app.runtime.connection_drops > 0 {
-                theme::current().error
-            } else {
-                theme::current().text_primary
-            }),
-        ),
-    ];
-
-    text.push(Line::from(rel_spans));
+    text.push(stats_line(app, details));
 
     // Role line — declared role drawn from the snapshot.
     text.push(role_line(&snap.role));
@@ -469,26 +434,16 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
 
     if let Some(idx) = app.profile_list_state.selected() {
         if let Some(profile) = app.runtime.profiles.get(idx) {
-            text.push(Line::from(vec![
-                Span::styled(
-                    "Profile : ",
-                    Style::default().fg(theme::current().text_secondary),
-                ),
-                Span::styled(
-                    &profile.name,
-                    Style::default().fg(theme::current().accent_primary),
-                ),
-            ]));
-            text.push(Line::from(vec![
-                Span::styled(
-                    "Protocol: ",
-                    Style::default().fg(theme::current().text_secondary),
-                ),
-                Span::styled(
-                    profile.protocol.to_string(),
-                    Style::default().fg(theme::current().text_primary),
-                ),
-            ]));
+            text.push(helpers::detail_row(
+                "Profile : ",
+                profile.name.as_str(),
+                theme::current().accent_primary,
+            ));
+            text.push(helpers::detail_row(
+                "Protocol: ",
+                profile.protocol.to_string(),
+                theme::current().text_primary,
+            ));
         }
     }
 
@@ -689,13 +644,7 @@ fn role_line(role: &Role) -> Line<'static> {
         ),
         Role::AwaitingInput => ("n/a (awaiting input)".to_string(), theme::current().warning),
     };
-    Line::from(vec![
-        Span::styled(
-            "Role    : ",
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled(value, Style::default().fg(color)),
-    ])
+    helpers::detail_row("Role    : ", value, color)
 }
 
 /// Short label for a role used inside "Reconnecting via …".
@@ -832,13 +781,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let latency_color = if app.runtime.latency_ms < 50 {
-        theme::current().success
-    } else if app.runtime.latency_ms < 150 {
-        theme::current().yellow
-    } else {
-        theme::current().error
-    };
+    let latency_color = helpers::latency_color(app.runtime.latency_ms);
 
     let text = vec![
         Line::from(Span::styled(
@@ -848,36 +791,21 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  Latency : ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled(
-                format!("{}ms", app.runtime.latency_ms),
-                Style::default().fg(latency_color),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Jitter  : ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled(
-                format!("±{}ms", app.runtime.jitter_ms),
-                Style::default().fg(theme::current().text_primary),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Loss    : ",
-                Style::default().fg(theme::current().text_secondary),
-            ),
-            Span::styled(
-                format!("{:.1}%", app.runtime.packet_loss),
-                Style::default().fg(theme::current().text_primary),
-            ),
-        ]),
+        helpers::detail_row(
+            "  Latency : ",
+            format!("{}ms", app.runtime.latency_ms),
+            latency_color,
+        ),
+        helpers::detail_row(
+            "  Jitter  : ",
+            format!("±{}ms", app.runtime.jitter_ms),
+            theme::current().text_primary,
+        ),
+        helpers::detail_row(
+            "  Loss    : ",
+            format!("{:.1}%", app.runtime.packet_loss),
+            theme::current().text_primary,
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "  Sparkline history & session stats",

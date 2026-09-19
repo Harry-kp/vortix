@@ -604,7 +604,6 @@ impl Verdict {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Security);
     let border_style = if is_focused {
@@ -1112,7 +1111,6 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
     lines
 }
 
-#[allow(clippy::too_many_lines)]
 fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::with_capacity(14);
     let w = inner_width as usize;

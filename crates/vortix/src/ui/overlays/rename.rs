@@ -44,23 +44,15 @@ pub fn render(frame: &mut Frame, name: &str, cursor: usize) {
         .map_or_else(|| "\u{2588}".to_string(), |c| c.to_string());
     let after: String = name.chars().skip(cursor + 1).collect();
 
-    let mut spans = vec![
-        Span::styled("> ", Style::default().fg(theme::current().accent_primary)),
-        Span::styled(before, Style::default().fg(theme::current().text_primary)),
-        Span::styled(
-            cursor_char,
-            Style::default()
-                .fg(theme::current().accent_secondary)
-                .add_modifier(Modifier::REVERSED)
-                .add_modifier(Modifier::SLOW_BLINK),
-        ),
-    ];
-    if !after.is_empty() {
-        spans.push(Span::styled(
-            after,
-            Style::default().fg(theme::current().text_primary),
-        ));
-    }
+    let mut spans = vec![Span::styled(
+        "> ",
+        Style::default().fg(theme::current().accent_primary),
+    )];
+    spans.extend(crate::ui::helpers::text_entry_spans(
+        before,
+        cursor_char,
+        after,
+    ));
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(ratatui::layout::Alignment::Left),

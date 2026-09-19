@@ -2,27 +2,6 @@
 
 use std::io;
 
-use crate::vortix_core::ports::process::KernelProcessIdentity;
-
-pub fn observe(pid: u32) -> io::Result<Option<KernelProcessIdentity>> {
-    if pid == 0 {
-        return Ok(None);
-    }
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let stat = parse_proc_stat(pid, &stat)?;
-    if is_dead_state(stat.state) {
-        return Ok(None);
-    }
-    Ok(KernelProcessIdentity::new(
-        stat.start_token,
-        stat.process_group == pid,
-    ))
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcStat {
     state: char,

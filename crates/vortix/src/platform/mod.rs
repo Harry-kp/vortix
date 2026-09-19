@@ -6,7 +6,8 @@
 //! over to the `Platform` aggregate.
 
 pub mod aggregate;
-pub(crate) mod anonymous_material;
+#[cfg(target_os = "macos")]
+// xtask:allow-platform-cfg: the only remaining caller is the macOS DNS adapter
 pub(crate) mod fixed_root_command;
 pub(crate) mod route_probe;
 
@@ -19,87 +20,6 @@ pub use aggregate::{
     DnsResolverKind, InterfaceKind, KillswitchKind, MockDns, MockInterface, MockKillswitch,
     MockNetworkStats, MockRouteTable, NetworkStatsKind, Platform, RouteTableKind,
 };
-
-#[allow(
-    dead_code,
-    reason = "the opposite family is constructed on its target OS"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlatformFamily {
-    Linux,
-    MacOs,
-}
-
-use crate::vortix_core::ports::owned_dns::OwnedDns;
-use crate::vortix_core::ports::owned_firewall::OwnedFirewall;
-use crate::vortix_core::ports::owned_routes::OwnedRoutes;
-
-#[cfg(target_os = "linux")]
-pub(crate) const fn current_platform_family() -> PlatformFamily {
-    PlatformFamily::Linux
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) const fn current_platform_family() -> PlatformFamily {
-    PlatformFamily::MacOs
-}
-
-pub(crate) fn helper_owned_firewall() -> Box<dyn OwnedFirewall> {
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(crate::vortix_platform_linux::owned_firewall::LinuxOwnedFirewall::new())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(crate::vortix_platform_macos::owned_firewall::MacOsOwnedFirewall::new())
-    }
-}
-
-pub(crate) fn helper_owned_dns() -> Box<dyn OwnedDns> {
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(crate::vortix_platform_linux::owned_dns::LinuxOwnedDns::new())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(crate::vortix_platform_macos::dns::MacDnsPolicy::system())
-    }
-}
-
-pub(crate) fn helper_owned_routes() -> Box<dyn OwnedRoutes> {
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(crate::vortix_platform_linux::owned_routes::LinuxOwnedRoutes)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(crate::vortix_platform_macos::owned_routes::MacOsOwnedRoutes)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DesktopNetworkError;
-
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(
-        clippy::unnecessary_wraps,
-        reason = "the cross-platform helper boundary preserves Linux failure semantics"
-    )
-)]
-pub(crate) fn detach_helper_interface_from_desktop_manager(
-    interface: &str,
-) -> Result<(), DesktopNetworkError> {
-    #[cfg(target_os = "linux")]
-    {
-        crate::vortix_platform_linux::network_manager::detach(interface)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = interface;
-        Ok(())
-    }
-}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Process-global platform — the consumer-migration seam.
@@ -153,19 +73,6 @@ pub(crate) fn wireguard_staging_dir() -> Option<&'static std::path::Path> {
     const STAGING_DIR: Option<&str> = None;
 
     STAGING_DIR.map(std::path::Path::new)
-}
-
-pub(crate) fn observe_process_identity(
-    pid: u32,
-) -> std::io::Result<Option<crate::vortix_core::ports::process::KernelProcessIdentity>> {
-    #[cfg(target_os = "linux")]
-    {
-        crate::vortix_platform_linux::process_identity::observe(pid)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        crate::vortix_platform_macos::process_identity::observe(pid)
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -418,10 +325,4 @@ sudo dnf install {pkg}  # Fedora"
 }
 
 #[cfg(test)]
-mod external_interface_tests {
-    #[test]
-    fn non_linux_helper_interface_detach_is_explicitly_not_applicable() {
-        #[cfg(not(target_os = "linux"))]
-        super::detach_helper_interface_from_desktop_manager("vxabcdefghijklm").unwrap();
-    }
-}
+mod external_interface_tests {}

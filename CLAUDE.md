@@ -70,52 +70,20 @@ There are **no aliases**. `vortix killswitch auto` and `vortix killswitch always
 
 The header bar uses short abbreviations of the same labels (`KS:Off` / `KS:Watch` / `KS:VPN-only` / `KS:DROPPED`) because of the 80-col budget. The display-name labels (`Off` / `Block on drop` / `VPN-only`) are the long-form rendering of the same three slugs — just title-cased for prose. Slug everywhere, prose only in the long-form Security Guard / `vortix killswitch` output.
 
-## Background mode is built but dormant — do not re-derive this
+## Background mode was removed — the daemon is passive-only
 
-Roughly 19,000 lines across 15 files are a complete, unit-tested,
-privilege-separated execution path that **nothing reaches from any shipped
-binary's `main()`**. It is staged for a future "Background mode" (running
-without root via an enrolled helper). It is not dead code to delete, and it
-is not a bug to fix.
+Vortix runs as root directly. There is no helper, no enrolled daemon, no
+remote mutation. That path — a privilege-separated execution model behind an
+enrolled root helper — was built but never reachable from any shipped
+`main()`, and was removed. The full tree is preserved on the
+`archive/background-mode` branch if it is ever revived.
 
-What is dormant: all of `helper/`, and in `daemon/` the control host,
-remote session, both helper-backed executors, tunnel material and helper
-client — plus `vortix_protocol_{openvpn,wireguard}/execution.rs`, which only
-the helper renders through.
-
-Four gates keep it dormant. Check these before concluding anything is
-reachable:
-
-| Gate | Where |
-|---|---|
-| `DaemonServer::bind` hardcodes `control: ControlEndpoint::Disabled` | `daemon/server.rs` |
-| `RemoteMutationGate::production()` returns `Self::Disabled` | `daemon/service.rs` |
-| `HelperBackedPolicyExecutor::new` is private; its only wrapper is `#[cfg(test)]` | `daemon/policy_executor.rs` |
-| The CLI enrollment command refuses unconditionally | `cli/commands.rs` |
-
-`ControlAuthorityHost`'s only constructor is `new_for_test`. Nothing in this
-repo's packaging runs `vortix-bootstrap`, so no enrollment record is ever
-written.
-
-Consequences for anyone working here:
-
-- Its files carry a file-level `#![allow(dead_code, reason = ...)]`. That is
-  deliberate. Do not delete items to silence it, and do not count those lines
-  as live in an audit.
-- A change there cannot be validated by running Vortix, because it does not
-  execute. Tests are the only signal.
-- If you are tracing why something does not happen at runtime, this is the
-  first thing to rule out — two separate audits in one session each spent
-  hours rediscovering it.
-
-Comments and `reason =` attributes in that code cite plan units — `U11`
-platform verification, `U12` the execution slice, `U13` enrollment. They are
-stages of the same unshipped feature, in that order. They should not be in
-runtime code at all, but rewriting 92 of them across 33 files would bury more
-diffs than it saves; decoding them here is the cheaper fix. Do not add more.
-
-Deleting it is a product decision about whether Background mode ships, not a
-cleanup. Ask before proposing it.
+What remains of `daemon/` is genuinely live and passive: `DaemonServer`
+binds an owner-only socket and serves scanner-derived snapshots and
+diagnostics subscriptions; the CLI's `status`/`list` route through
+`daemon/client.rs` when a socket is present. Mutation requests answer
+`CapabilityUnavailable`. Do not re-introduce a control-mutation path here
+without a product decision to ship Background mode.
 
 ## Planning artifacts
 

@@ -19,20 +19,32 @@
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
 #[cfg(unix)]
-use std::fs::{DirBuilder, File};
+use std::fs::File;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 const AUTHORITY_LOCK_MODE: u32 = 0o400;
-#[cfg(unix)]
-const TEMPORARY_NAME: &CStr = c".authority.lock.installing";
+
+/// Where a packaged install puts its root-owned lock. Absent on any OS
+/// Vortix has no package layout for, which makes the lock a no-op there.
+#[cfg(target_os = "linux")]
+// xtask:allow-platform-cfg: package layout is selected by the build target
+const AUTHORITY_LOCK_PATH: Option<&str> = Some("/var/lib/vortix-public/authority.lock");
+#[cfg(target_os = "macos")]
+// xtask:allow-platform-cfg: package layout is selected by the build target
+const AUTHORITY_LOCK_PATH: Option<&str> =
+    Some("/Library/Application Support/Vortix/Public/authority.lock");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const AUTHORITY_LOCK_PATH: Option<&str> = None;
+
+const AUTHORITY_LOCK_DIR_MODE: u32 = 0o755;
 
 #[cfg(unix)]
 struct AuthorityLockStore {
@@ -44,12 +56,12 @@ struct AuthorityLockStore {
 
 #[cfg(unix)]
 impl AuthorityLockStore {
-    fn installed(layout: crate::helper::validate::PlatformLayout, owner_uid: u32) -> Self {
+    fn installed(path: &str, owner_uid: u32) -> Self {
         Self {
-            path: PathBuf::from(layout.authority_lock()),
+            path: PathBuf::from(path),
             expected_parent_owner_uid: 0,
             expected_file_owner_uid: owner_uid,
-            expected_parent_mode: layout.authority_lock_dir_mode(),
+            expected_parent_mode: AUTHORITY_LOCK_DIR_MODE,
         }
     }
 
@@ -71,73 +83,6 @@ impl AuthorityLockStore {
     #[cfg(test)]
     fn path(&self) -> &Path {
         &self.path
-    }
-
-    fn install(&self) -> std::io::Result<()> {
-        let parent = self.parent()?;
-        let created_parent = match DirBuilder::new()
-            .mode(self.expected_parent_mode)
-            .create(parent)
-        {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(error) => return Err(error),
-        };
-        if created_parent {
-            if let Some(ancestor) = parent.parent() {
-                File::open(ancestor)?.sync_all()?;
-            }
-        }
-
-        let parent_metadata = std::fs::symlink_metadata(parent)?;
-        if !parent_metadata.is_dir() || parent_metadata.uid() != self.expected_parent_owner_uid {
-            return Err(unsafe_path());
-        }
-        std::fs::set_permissions(
-            parent,
-            std::fs::Permissions::from_mode(self.expected_parent_mode),
-        )?;
-
-        let directory = self.open_parent()?;
-        directory.sync_all()?;
-        match self.open_file(&directory) {
-            Ok(file) => {
-                self.remove_recoverable_temporary(&directory, Some(&file))?;
-                return self.repair_existing(&file);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-
-        self.remove_recoverable_temporary(&directory, None)?;
-        let temporary = Self::create_temporary(&directory)?;
-        let result = (|| {
-            self.initialize_temporary(&temporary)?;
-            temporary.sync_all()?;
-            self.validate_file(&temporary)?;
-
-            let name = self.name()?;
-            if unsafe {
-                libc::linkat(
-                    directory.as_raw_fd(),
-                    TEMPORARY_NAME.as_ptr(),
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    0,
-                )
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Self::unlink_temporary(&directory)?;
-            directory.sync_all()?;
-            let installed = self.open_file(&directory)?;
-            self.validate_file(&installed)
-        })();
-        if result.is_err() {
-            let _ = Self::unlink_temporary(&directory);
-        }
-        result
     }
 
     fn acquire(&self) -> std::io::Result<Option<File>> {
@@ -204,105 +149,6 @@ impl AuthorityLockStore {
         openat_read(directory, &name)
     }
 
-    fn create_temporary(directory: &File) -> std::io::Result<File> {
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                TEMPORARY_NAME.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                AUTHORITY_LOCK_MODE,
-            )
-        };
-        if fd < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            let file = unsafe { File::from_raw_fd(fd) };
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(file)
-        }
-    }
-
-    fn initialize_temporary(&self, file: &File) -> std::io::Result<()> {
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(unsafe_path());
-        }
-        if metadata.uid() != self.expected_file_owner_uid
-            && unsafe {
-                libc::fchown(
-                    file.as_raw_fd(),
-                    self.expected_file_owner_uid,
-                    !0 as libc::gid_t,
-                )
-            } != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        set_mode(file, AUTHORITY_LOCK_MODE)
-    }
-
-    fn repair_existing(&self, file: &File) -> std::io::Result<()> {
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != self.expected_file_owner_uid
-            || metadata.nlink() != 1
-        {
-            return Err(unsafe_path());
-        }
-        set_mode(file, AUTHORITY_LOCK_MODE)?;
-        self.validate_file(file)?;
-        file.sync_all()
-    }
-
-    fn remove_recoverable_temporary(
-        &self,
-        directory: &File,
-        installed: Option<&File>,
-    ) -> std::io::Result<()> {
-        let temporary = match openat_read(directory, TEMPORARY_NAME) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        if unsafe { libc::flock(temporary.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let temporary_metadata = temporary.metadata()?;
-        let expected_links = if let Some(installed) = installed {
-            let installed_metadata = installed.metadata()?;
-            if temporary_metadata.dev() == installed_metadata.dev()
-                && temporary_metadata.ino() == installed_metadata.ino()
-            {
-                2
-            } else {
-                1
-            }
-        } else {
-            1
-        };
-        if !temporary_metadata.is_file()
-            || !matches!(
-                temporary_metadata.uid(),
-                uid if uid == 0 || uid == self.expected_file_owner_uid
-            )
-            || temporary_metadata.nlink() != expected_links
-        {
-            return Err(unsafe_path());
-        }
-        Self::unlink_temporary(directory)?;
-        directory.sync_all()
-    }
-
-    fn unlink_temporary(directory: &File) -> std::io::Result<()> {
-        if unsafe { libc::unlinkat(directory.as_raw_fd(), TEMPORARY_NAME.as_ptr(), 0) } != 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
     fn validate_file(&self, file: &File) -> std::io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_file()
@@ -333,16 +179,6 @@ fn openat_read(directory: &File, name: &CStr) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
-fn set_mode(file: &File, mode: u32) -> std::io::Result<()> {
-    let mode = libc::mode_t::try_from(mode).expect("authority lock mode fits mode_t");
-    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
 fn unsafe_path() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
@@ -351,37 +187,11 @@ fn unsafe_path() -> std::io::Error {
 }
 
 #[cfg(unix)]
-pub(crate) fn install_and_acquire(
-    layout: crate::helper::validate::PlatformLayout,
-    owner_uid: u32,
-) -> std::io::Result<File> {
-    let store = AuthorityLockStore::installed(layout, owner_uid);
-    store.install()?;
-    store.acquire()?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "installed Vortix authority lock disappeared before acquisition",
-        )
-    })
-}
-
-#[cfg(unix)]
 pub(crate) fn acquire_installed(owner_uid: u32) -> std::io::Result<Option<File>> {
-    let Some(layout) = crate::helper::validate::PlatformLayout::current() else {
+    let Some(path) = AUTHORITY_LOCK_PATH else {
         return Ok(None);
     };
-    AuthorityLockStore::installed(layout, owner_uid).acquire()
-}
-
-#[cfg(not(unix))]
-pub(crate) fn install_and_acquire(
-    _layout: crate::helper::validate::PlatformLayout,
-    _owner_uid: u32,
-) -> std::io::Result<std::fs::File> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "installed authority lock is unavailable on this platform",
-    ))
+    AuthorityLockStore::installed(path, owner_uid).acquire()
 }
 
 #[cfg(not(unix))]
@@ -404,42 +214,12 @@ mod tests {
     }
 
     #[test]
-    fn root_controlled_transition_lock_serializes_writers() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = test_store(&directory);
-        store.install().unwrap();
-        let metadata = std::fs::metadata(store.path()).unwrap();
-        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
-        assert_eq!(metadata.permissions().mode() & 0o777, AUTHORITY_LOCK_MODE);
-
-        let _first = store.acquire().unwrap().unwrap();
-        let second = store.acquire().unwrap_err();
-
-        assert_eq!(second.kind(), std::io::ErrorKind::WouldBlock);
-    }
-
-    #[test]
     fn unsafe_installed_lock_never_falls_back_to_legacy_authority() {
         let directory = tempfile::tempdir().unwrap();
         let store = test_store(&directory);
         std::os::unix::fs::symlink(directory.path().join("victim"), store.path()).unwrap();
 
         assert!(store.acquire().is_err());
-    }
-
-    #[test]
-    fn linked_or_loose_installed_lock_is_rejected() {
-        let loose_directory = tempfile::tempdir().unwrap();
-        let loose = test_store(&loose_directory);
-        loose.install().unwrap();
-        std::fs::set_permissions(loose.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(loose.acquire().is_err());
-
-        let linked_directory = tempfile::tempdir().unwrap();
-        let linked = test_store(&linked_directory);
-        linked.install().unwrap();
-        std::fs::hard_link(linked.path(), linked_directory.path().join("alias")).unwrap();
-        assert!(linked.acquire().is_err());
     }
 
     #[test]
@@ -468,39 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn trusted_install_repairs_owner_mode_tampering() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = test_store(&directory);
-        store.install().unwrap();
-        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        assert!(store.acquire().is_err());
-        store.install().unwrap();
-        assert_eq!(
-            std::fs::metadata(store.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            AUTHORITY_LOCK_MODE
-        );
-        assert!(store.acquire().unwrap().is_some());
-    }
-
-    #[test]
-    fn interrupted_temporary_install_is_recovered_before_publication() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = test_store(&directory);
-        let temporary = directory.path().join(".authority.lock.installing");
-        std::fs::write(&temporary, []).unwrap();
-
-        store.install().unwrap();
-
-        assert!(store.path().is_file());
-        assert!(!temporary.exists());
-    }
-
-    #[test]
     fn parent_expectations_are_not_derived_from_the_path_under_test() {
         let directory = tempfile::tempdir().unwrap();
         let metadata = directory.path().metadata().unwrap();
@@ -513,27 +260,5 @@ mod tests {
         );
 
         assert!(store.acquire().is_err());
-    }
-
-    #[test]
-    fn trusted_install_repairs_an_interrupted_parent_mode() {
-        let outer = tempfile::tempdir().unwrap();
-        let parent = outer.path().join("public");
-        std::fs::create_dir(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let metadata = parent.metadata().unwrap();
-        let store = AuthorityLockStore::for_test(
-            parent.join("authority.lock"),
-            metadata.uid(),
-            metadata.uid(),
-            0o755,
-        );
-
-        store.install().unwrap();
-
-        assert_eq!(
-            parent.metadata().unwrap().permissions().mode() & 0o777,
-            0o755
-        );
     }
 }

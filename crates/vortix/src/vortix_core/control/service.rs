@@ -2666,22 +2666,7 @@ fn drive_supervision(
                 result.result,
                 Err(WorkFailure::AuthenticationFailed | WorkFailure::InvalidProfile)
             ) {
-                let rollback_profiles = snapshot
-                    .operations
-                    .get(&result.operation_id)
-                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
-                    .map_or_else(
-                        || vec![result.profile_id.clone()],
-                        |tunnels| {
-                            tunnels
-                                .iter()
-                                .filter(|(_, requested)| {
-                                    **requested == RequestedTunnelState::Connected
-                                })
-                                .map(|(profile_id, _)| profile_id.clone())
-                                .collect::<Vec<_>>()
-                        },
-                    );
+                let rollback_profiles = connect_targets_to_roll_back(snapshot, &result);
                 let operation_failure = if result.result == Err(WorkFailure::AuthenticationFailed) {
                     OperationFailure::AuthenticationFailed
                 } else {
@@ -2791,22 +2776,7 @@ fn drive_supervision(
                 }
             } else if wireguard_handshake_failure {
                 let was_recovery = owner.recovery_operations.contains(&result.operation_id);
-                let rollback_profiles = snapshot
-                    .operations
-                    .get(&result.operation_id)
-                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
-                    .map_or_else(
-                        || vec![result.profile_id.clone()],
-                        |tunnels| {
-                            tunnels
-                                .iter()
-                                .filter(|(_, requested)| {
-                                    **requested == RequestedTunnelState::Connected
-                                })
-                                .map(|(profile_id, _)| profile_id.clone())
-                                .collect::<Vec<_>>()
-                        },
-                    );
+                let rollback_profiles = connect_targets_to_roll_back(snapshot, &result);
                 events.push(ControlEvent::ConnectAttemptFailed {
                     profile_id: result.profile_id.clone(),
                     attempt: 1,
@@ -2876,22 +2846,7 @@ fn drive_supervision(
                 // proves teardown before it reports a timeout. Do not preserve
                 // Connected intent and silently launch another attempt after
                 // telling the user that this one reached its terminal bound.
-                let rollback_profiles = snapshot
-                    .operations
-                    .get(&result.operation_id)
-                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
-                    .map_or_else(
-                        || vec![result.profile_id.clone()],
-                        |tunnels| {
-                            tunnels
-                                .iter()
-                                .filter(|(_, requested)| {
-                                    **requested == RequestedTunnelState::Connected
-                                })
-                                .map(|(profile_id, _)| profile_id.clone())
-                                .collect::<Vec<_>>()
-                        },
-                    );
+                let rollback_profiles = connect_targets_to_roll_back(snapshot, &result);
                 let retired = supervisor
                     .retire_cleaned_connect_timeout(
                         &result.profile_id,
@@ -3031,11 +2986,7 @@ fn drive_supervision(
                     supervisor,
                     snapshot,
                     owner,
-                    ControlRevision {
-                        authority_epoch: result.authority_epoch,
-                        generation: result.generation,
-                        digest: result.digest.clone(),
-                    },
+                    result.revision(),
                     result.operation_id.clone(),
                     readback,
                     now,
@@ -3050,11 +3001,7 @@ fn drive_supervision(
         {
             accept_pre_block_readback(
                 supervisor,
-                ControlRevision {
-                    authority_epoch: result.authority_epoch,
-                    generation: result.generation,
-                    digest: result.digest.clone(),
-                },
+                result.revision(),
                 result.operation_id.clone(),
                 result.verification,
                 now,
@@ -3102,6 +3049,9 @@ fn drive_supervision(
         if let Some((operation_id, generation, failure, failure_detail, policy)) =
             failed_transaction
         {
+            let recovered_conflict = failure_detail.as_deref().and_then(|detail| {
+                route_conflict_from_verification_detail(detail, snapshot, &policy)
+            });
             fail_policy_transaction(
                 &operation_id,
                 generation,
@@ -3116,6 +3066,15 @@ fn drive_supervision(
                 config,
                 events,
             );
+            if let Some((target, conflict)) = recovered_conflict {
+                snapshot
+                    .pending_route_conflicts
+                    .insert(target.clone(), conflict.clone());
+                events.push(ControlEvent::ConnectAttemptBlockedByConflict {
+                    conflict,
+                    profile_id: target,
+                });
+            }
         }
         if !matches!(
             effective_outcome,
@@ -3161,11 +3120,7 @@ fn drive_supervision(
     }
     let _ = supervisor.submit_policy_audit_if_due(now);
 
-    let revision = ControlRevision {
-        authority_epoch: snapshot.desired.authority_epoch,
-        generation: snapshot.desired.generation,
-        digest: snapshot.desired.policy_digest.clone(),
-    };
+    let revision = snapshot.desired.revision();
     // Tunnel truth is fenced by the supervisor's exact work receipt,
     // protocol-owned adoption/handshake, revision, and interface. Requiring
     // global policy evidence here would create a cycle: final route/DNS/
@@ -4318,13 +4273,7 @@ fn restore_prior_topology_intent(
     now: u64,
     events: &mut Vec<ControlEvent>,
 ) -> bool {
-    if policy.revision()
-        != (ControlRevision {
-            authority_epoch: snapshot.desired.authority_epoch,
-            generation: snapshot.desired.generation,
-            digest: snapshot.desired.policy_digest.clone(),
-        })
-    {
+    if policy.revision() != (snapshot.desired.revision()) {
         return false;
     }
     snapshot.desired.generation = snapshot.desired.generation.saturating_add(1);
@@ -4392,6 +4341,75 @@ const fn operation_failure_for_policy_result(
     } else {
         operation_failure_for_work(policy_outcome_failure(outcome))
     }
+}
+
+/// Split `<network> should route through <a>, but the system routes it through <b>`.
+fn parse_route_ownership_detail(detail: &str) -> Option<(crate::vortix_core::cidr::Cidr, String)> {
+    let (claim, rest) = detail.split_once(" should route through ")?;
+    let (_expected, observed) = rest.split_once(", but the system routes it through ")?;
+    let observed = observed.trim().trim_end_matches('.').trim();
+    if observed.is_empty() {
+        return None;
+    }
+    let cidr = claim
+        .trim()
+        .parse::<crate::vortix_core::cidr::Cidr>()
+        .ok()?;
+    Some((cidr, observed.to_string()))
+}
+
+/// The profiles a failed attempt has to undo.
+///
+/// Every tunnel the operation asked to connect, or just the one that reported
+/// the failure when the operation is no longer on the snapshot.
+fn connect_targets_to_roll_back(
+    snapshot: &ControlSnapshot,
+    result: &crate::vortix_core::control::worker::TunnelWorkResult,
+) -> Vec<ProfileId> {
+    snapshot
+        .operations
+        .get(&result.operation_id)
+        .and_then(|operation| operation_intent_tunnels(&operation.intent))
+        .map_or_else(
+            || vec![result.profile_id.clone()],
+            |tunnels| {
+                tunnels
+                    .iter()
+                    .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
+                    .map(|(profile_id, _)| profile_id.clone())
+                    .collect::<Vec<_>>()
+            },
+        )
+}
+
+/// Rebuild the conflict behind a route verification failure, so the dashboard
+/// can offer the takeover instead of reporting a dead end.
+fn route_conflict_from_verification_detail(
+    detail: &str,
+    snapshot: &ControlSnapshot,
+    policy: &crate::vortix_core::control::worker::TopologyPolicy,
+) -> Option<(ProfileId, crate::vortix_core::engine::Conflict)> {
+    let (cidr, observed) = parse_route_ownership_detail(detail)?;
+    let holder = snapshot
+        .observed
+        .tunnel_details
+        .iter()
+        .find(|(_, seen)| seen.details.interface == observed)
+        .map(|(profile_id, _)| profile_id.clone())?;
+
+    let target = policy
+        .tunnel_revisions
+        .keys()
+        .find(|profile_id| **profile_id != holder)
+        .cloned()?;
+
+    Some((
+        target,
+        crate::vortix_core::engine::Conflict::RouteOverlap {
+            with: holder,
+            overlapping_cidrs: vec![cidr],
+        },
+    ))
 }
 
 fn seal_final_topology_policy(
@@ -4477,11 +4495,7 @@ fn capture_topology_policy(
     transition: TopologyTransitionKind,
     now: u64,
 ) -> Option<TopologyPolicy> {
-    let revision = ControlRevision {
-        authority_epoch: snapshot.desired.authority_epoch,
-        generation: snapshot.desired.generation,
-        digest: snapshot.desired.policy_digest.clone(),
-    };
+    let revision = snapshot.desired.revision();
     let target_profiles = snapshot
         .desired
         .tunnels
@@ -7513,11 +7527,7 @@ fn derive_effective(
     };
     let age = now.saturating_sub(evidence.observed_at_millis);
     let current = evidence_matches(evidence, snapshot, now);
-    let revision = ControlRevision {
-        authority_epoch: desired.authority_epoch,
-        generation: desired.generation,
-        digest: desired.policy_digest.clone(),
-    };
+    let revision = desired.revision();
     let supervised_protection = selection != ExecutionSelection::CanonicalAuthority
         || supervisor.is_some_and(|supervisor| supervisor.protects(&revision, now));
     let protection = if current && evidence.all_gates_verified() && supervised_protection {
@@ -7654,6 +7664,39 @@ mod target_profiles_tests {
     };
     use crate::vortix_core::control::DnsSecurityStatus;
     use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
+
+    #[test]
+    fn route_ownership_detail_yields_the_network_and_the_interface_holding_it() {
+        let (cidr, observed) = super::parse_route_ownership_detail(
+            "10.250.0.0/24 should route through utun5, but the system routes it through utun4",
+        )
+        .expect("a route-ownership refusal is recognised");
+        assert_eq!(cidr.to_string(), "10.250.0.0/24");
+        assert_eq!(observed, "utun4");
+    }
+
+    #[test]
+    fn route_verification_failures_without_a_holder_are_left_alone() {
+        // No interface to disconnect, so there is no takeover to offer and the
+        // failure must be reported as it always was.
+        assert!(super::parse_route_ownership_detail(
+            "10.250.0.0/24 should route through utun5, but the system has no route for it",
+        )
+        .is_none());
+        assert!(super::parse_route_ownership_detail(
+            "could not read which interface carries 10.250.0.0/24; utun5 is unverified",
+        )
+        .is_none());
+        assert!(super::parse_route_ownership_detail(
+            "route verification deadline expired after 1 of 3 probes",
+        )
+        .is_none());
+        // A claim that is not a network cannot name a conflict.
+        assert!(super::parse_route_ownership_detail(
+            "everything should route through utun5, but the system routes it through utun4",
+        )
+        .is_none());
+    }
 
     #[test]
     fn restart_caps_client_deadline_without_shortening_service_recovery() {

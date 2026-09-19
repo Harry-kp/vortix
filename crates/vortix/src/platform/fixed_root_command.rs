@@ -26,10 +26,14 @@ pub(crate) enum FixedCommandError {
 
 pub(crate) struct FixedCommandOutput {
     pub(crate) status: ExitStatus,
+    #[allow(
+        dead_code,
+        reason = "drained to avoid pipe deadlock; only status is inspected today"
+    )]
     pub(crate) stdout: String,
     #[allow(
         dead_code,
-        reason = "nft classifies a missing table from bounded stderr on Linux"
+        reason = "drained to avoid pipe deadlock; only status is inspected today"
     )]
     pub(crate) stderr: String,
 }

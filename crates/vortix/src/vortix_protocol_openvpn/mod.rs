@@ -9,7 +9,6 @@
 pub mod parser;
 pub mod tunnel;
 
-pub(crate) mod execution;
 pub(crate) mod management;
 pub(crate) mod push;
 

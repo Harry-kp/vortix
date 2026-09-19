@@ -18,8 +18,6 @@ mod control_recovery;
 mod control_service;
 mod daemon_ipc;
 mod dns_policy;
-mod helper_contract;
-mod helper_integration;
 mod hooks_integration;
 mod json_v2_envelope;
 mod openvpn_credential_store;
