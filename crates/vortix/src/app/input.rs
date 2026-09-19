@@ -728,7 +728,6 @@ impl crate::app::App {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn handle_normal_keys(&mut self, key: KeyEvent) {
         // Tab is reserved for panel navigation (always advances to the
         // next UI panel). Connection Details mirrors the sidebar's
@@ -857,7 +856,6 @@ impl crate::app::App {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn handle_panel_keys(&mut self, key: KeyEvent) {
         match self.focused_panel {
             FocusedPanel::Sidebar => match key.code {

@@ -40,7 +40,6 @@ fn profile_display_name(app: &App, id: &ProfileId) -> String {
 /// current width, names are abbreviated to the first character, then
 /// dropped with a `+N` overflow suffix, then the whole strip collapses to a
 /// dot-row of badge chars (`[●●●● +1]`).
-#[allow(clippy::too_many_lines)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let tunnel_count = app.registry.tunnel_count();
     let primary = app.registry.primary().cloned();

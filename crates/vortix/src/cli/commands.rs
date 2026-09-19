@@ -145,7 +145,6 @@ fn prompt_masked_otp(prompt: &str, expires_at_millis: u64) -> std::io::Result<St
 
 /// Dispatch a CLI command. Returns `true` if handled (program should exit).
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn handle_command(
     command: &Commands,
     config_dir: &Path,

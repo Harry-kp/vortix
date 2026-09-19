@@ -659,7 +659,6 @@ impl ProtocolStatus for OvpnStatus {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 /// Anchor phrases `OpenVPN` writes to its log when it brings the kernel
 /// interface up. The device name immediately follows the anchor and is
 /// extracted as a single whitespace-delimited token.
