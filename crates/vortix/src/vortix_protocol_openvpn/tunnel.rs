@@ -683,7 +683,7 @@ impl ProtocolStatus for OvpnStatus {
 /// Windows is not yet covered. The `OpenVPN`-Windows log format and the
 /// TAP-Windows / wintun adapter naming model are different enough
 /// (`Local Area Connection 3`, GUIDs) that this needs a separate
-/// extractor — track via `vortix_platform_windows` when Windows lands.
+/// extractor if Windows ever lands.
 const OVPN_IFACE_ANCHORS: &[(&str, &str)] = &[
     ("Opened utun device ", ""),
     ("TUN/TAP device ", " opened"),

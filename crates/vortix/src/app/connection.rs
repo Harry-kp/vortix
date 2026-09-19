@@ -1098,7 +1098,11 @@ impl App {
             (
                 PendingControlSubject::Connection | PendingControlSubject::Reconnection,
                 OperationStatus::Failed,
-                Some(OperationResult::Failed(OperationFailure::Rejected))
+                // Admission refuses as `Rejected`; the final read-back fails
+                // as `Internal`. The recorded conflict is the real gate.
+                Some(OperationResult::Failed(
+                    OperationFailure::Rejected | OperationFailure::Internal
+                ))
             )
         ) {
             return false;

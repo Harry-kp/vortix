@@ -29,8 +29,6 @@ pub enum Event {
 /// a channel. Also generates periodic tick events for time-based updates.
 pub struct EventHandler {
     receiver: mpsc::Receiver<Event>,
-    #[allow(dead_code)]
-    handler: thread::JoinHandle<()>,
 }
 
 impl EventHandler {
@@ -44,7 +42,9 @@ impl EventHandler {
         let tick_rate = Duration::from_millis(tick_rate_ms);
         let (sender, receiver) = mpsc::channel();
 
-        let handler = thread::spawn(move || {
+        // Detached on purpose: the thread exits on its own once every
+        // sender-side send fails, which is what dropping the receiver does.
+        thread::spawn(move || {
             let mut last_tick = Instant::now();
             loop {
                 let timeout = tick_rate
@@ -83,7 +83,7 @@ impl EventHandler {
             }
         });
 
-        Self { receiver, handler }
+        Self { receiver }
     }
 
     /// Blocks until the next event is available.

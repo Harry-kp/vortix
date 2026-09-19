@@ -26,7 +26,6 @@ pub enum LogLevel {
     Error = 3,
 }
 
-#[allow(dead_code)]
 impl LogLevel {
     /// Get the prefix string for this log level
     #[must_use]
@@ -36,18 +35,6 @@ impl LogLevel {
             Self::Info => "INFO ",
             Self::Warning => "WARN ",
             Self::Error => "ERROR",
-        }
-    }
-
-    /// Get the color for this log level (Nord theme)
-    #[must_use]
-    pub const fn color(self) -> ratatui::style::Color {
-        use ratatui::style::Color;
-        match self {
-            Self::Debug => Color::DarkGray,
-            Self::Info => Color::Cyan,
-            Self::Warning => Color::Yellow,
-            Self::Error => Color::Red,
         }
     }
 }

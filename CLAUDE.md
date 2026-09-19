@@ -72,7 +72,8 @@ The header bar uses short abbreviations of the same labels (`KS:Off` / `KS:Watch
 
 ## Background mode is built but dormant — do not re-derive this
 
-Roughly 19,000 lines across 15 files are a complete, unit-tested,
+Roughly 24,500 lines across 27 files — about 15,100 of them production, the
+rest tests — are a complete, unit-tested,
 privilege-separated execution path that **nothing reaches from any shipped
 binary's `main()`**. It is staged for a future "Background mode" (running
 without root via an enrolled helper). It is not dead code to delete, and it
