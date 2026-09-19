@@ -607,32 +607,6 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
     })
 }
 
-/// Negotiate an enrolled canonical-control connection. Schema three is the
-/// floor containing the complete control vocabulary, and the exact live
-/// authority binding is authenticated independently on every connection.
-pub fn negotiate_control(
-    hello: &ClientHello,
-    authority_binding: AuthorityBinding,
-) -> Result<ServerHello, IpcError> {
-    let (protocol, schema) = negotiate_versions(hello, 3)?;
-    for capability in &hello.required_capabilities {
-        if !CONTROL_CAPABILITIES.contains(capability) {
-            return Err(IpcError::CapabilityUnavailable {
-                capability: *capability,
-            });
-        }
-    }
-    Ok(ServerHello {
-        product: "vortix".into(),
-        product_version: env!("CARGO_PKG_VERSION").into(),
-        protocol,
-        schema,
-        capabilities: CONTROL_CAPABILITIES.to_vec(),
-        passive: false,
-        authority_binding: Some(authority_binding),
-    })
-}
-
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
@@ -672,53 +646,6 @@ mod handshake_tests {
         let selected = negotiate_passive(&ClientHello::current(Vec::new())).unwrap();
         assert_eq!(selected.capabilities, PASSIVE_CAPABILITIES);
         assert!(selected.passive);
-    }
-
-    #[test]
-    fn enrolled_handshake_is_bound_to_exact_authority() {
-        let binding = AuthorityBinding::new(
-            crate::vortix_core::control::AuthorityEpoch(7),
-            crate::vortix_core::privileged::BootScope::new([1; 16]),
-            crate::vortix_core::privileged::LeaseId::new([2; 32]),
-            crate::vortix_core::privileged::OperationDigest::of_bytes(b"daemon"),
-        )
-        .unwrap();
-        let selected = negotiate_control(
-            &ClientHello::current(vec![IpcCapability::ControlMutation]),
-            binding,
-        )
-        .unwrap();
-        assert!(!selected.passive);
-        assert_eq!(selected.schema, 3);
-        assert_eq!(selected.capabilities, CONTROL_CAPABILITIES);
-        assert_eq!(selected.authority_binding, Some(binding));
-    }
-
-    #[test]
-    fn enrolled_handshake_rejects_old_schema_and_passive_capabilities() {
-        let binding = AuthorityBinding::new(
-            crate::vortix_core::control::AuthorityEpoch(7),
-            crate::vortix_core::privileged::BootScope::new([1; 16]),
-            crate::vortix_core::privileged::LeaseId::new([2; 32]),
-            crate::vortix_core::privileged::OperationDigest::of_bytes(b"daemon"),
-        )
-        .unwrap();
-        let mut old = ClientHello::current(vec![IpcCapability::ControlMutation]);
-        old.schema = CompatibilityRange { min: 1, max: 2 };
-        assert!(matches!(
-            negotiate_control(&old, binding),
-            Err(IpcError::Incompatible { .. })
-        ));
-
-        assert!(matches!(
-            negotiate_control(
-                &ClientHello::current(vec![IpcCapability::PassiveSnapshot]),
-                binding,
-            ),
-            Err(IpcError::CapabilityUnavailable {
-                capability: IpcCapability::PassiveSnapshot
-            })
-        ));
     }
 
     #[test]
