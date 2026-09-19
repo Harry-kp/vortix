@@ -109,8 +109,6 @@ pub enum LocalControlError {
     ChallengeEmpty { profile: String },
     #[error("interactive challenge expired before it was answered")]
     ChallengeExpired,
-    #[error("remote control failed: {0}")]
-    Remote(#[from] crate::daemon::service::RemoteControlError),
 }
 
 fn map_challenge_response_error(
@@ -183,14 +181,6 @@ pub(crate) struct LocalCatalogUpdate {
 
 pub(crate) enum TuiControlCompletion {
     Admission(Result<OperationId, LocalControlError>),
-    ChallengeResponse {
-        challenge_id: crate::vortix_core::control::ChallengeId,
-        result: Result<(), LocalControlError>,
-    },
-    ChallengeCancellation {
-        challenge_id: crate::vortix_core::control::ChallengeId,
-        result: Result<(), LocalControlError>,
-    },
 }
 
 /// A durable admission result produced off the terminal thread. The permit is
@@ -714,278 +704,9 @@ fn honor_emergency_release_fence(
         .map_err(|error| LocalControlError::Persistence(error.to_string()))
 }
 
-enum RemoteTuiWork {
-    Command {
-        command: UserCommand,
-        wait: Duration,
-        idempotency_key: String,
-    },
-    Import {
-        path: std::path::PathBuf,
-        wait: Duration,
-        idempotency_key: String,
-    },
-    RespondChallenge {
-        challenge_id: crate::vortix_core::control::ChallengeId,
-        answer: crate::vortix_core::control::Secret,
-    },
-    CancelChallenge {
-        challenge_id: crate::vortix_core::control::ChallengeId,
-    },
-}
-
-struct RemoteTuiJob {
-    work: RemoteTuiWork,
-    permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-struct RemoteTuiQueue {
-    jobs: Option<std::sync::mpsc::SyncSender<RemoteTuiJob>>,
-    results: RefCell<Option<std::sync::mpsc::Receiver<LocalTuiAdmissionResult>>>,
-    permits: Arc<tokio::sync::Semaphore>,
-    worker: Option<std::thread::JoinHandle<()>>,
-    submitted_profile_operations: Arc<Mutex<BTreeMap<OperationId, RemoteProfileMutationContext>>>,
-    staged_cli_profiles: Mutex<BTreeMap<ProfileId, String>>,
-    pending_challenges:
-        Arc<Mutex<std::collections::BTreeSet<crate::vortix_core::control::ChallengeId>>>,
-    profiles_dir: Option<std::path::PathBuf>,
-}
-
-#[derive(Debug)]
-struct RemoteProfileMutationContext {
-    display_name: Option<String>,
-}
-
-impl RemoteTuiQueue {
-    fn enqueue(&self, work: RemoteTuiWork) -> Result<(), LocalControlError> {
-        let permit = Arc::clone(&self.permits)
-            .try_acquire_owned()
-            .map_err(|_| LocalControlError::Busy)?;
-        self.jobs
-            .as_ref()
-            .ok_or(LocalControlError::Stopped)?
-            .try_send(RemoteTuiJob { work, permit })
-            .map_err(|error| match error {
-                std::sync::mpsc::TrySendError::Full(_) => LocalControlError::Busy,
-                std::sync::mpsc::TrySendError::Disconnected(_) => LocalControlError::Stopped,
-            })
-    }
-}
-
-fn remote_profile_mutation_context(
-    command: &UserCommand,
-    import_display_name: Option<&str>,
-) -> Option<RemoteProfileMutationContext> {
-    match command {
-        UserCommand::ImportProfile { .. } => Some(RemoteProfileMutationContext {
-            display_name: import_display_name.map(str::to_owned),
-        }),
-        UserCommand::RenameProfile {
-            new_display_name, ..
-        } => Some(RemoteProfileMutationContext {
-            display_name: Some(new_display_name.clone()),
-        }),
-        UserCommand::DeleteProfile { .. } => {
-            Some(RemoteProfileMutationContext { display_name: None })
-        }
-        _ => None,
-    }
-}
-
-fn submit_remote_tui_command(
-    session: &crate::daemon::service::RemoteControlSession,
-    command: &UserCommand,
-    wait: Duration,
-    idempotency_key: String,
-    import_display_name: Option<&str>,
-    submitted_profile_operations: &Mutex<BTreeMap<OperationId, RemoteProfileMutationContext>>,
-) -> Result<OperationId, LocalControlError> {
-    let admitted = session
-        .submit(command.clone(), wait, idempotency_key)
-        .map_err(LocalControlError::Remote)?;
-    if let Some(context) = remote_profile_mutation_context(command, import_display_name) {
-        submitted_profile_operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(admitted.operation_id.clone(), context);
-    }
-    Ok(admitted.operation_id)
-}
-
-fn execute_remote_tui_work(
-    session: &crate::daemon::service::RemoteControlSession,
-    work: RemoteTuiWork,
-    profile_operations: &Mutex<BTreeMap<OperationId, RemoteProfileMutationContext>>,
-    pending_challenges: &Mutex<
-        std::collections::BTreeSet<crate::vortix_core::control::ChallengeId>,
-    >,
-) -> (
-    Option<UserCommand>,
-    Option<String>,
-    Option<String>,
-    TuiControlCompletion,
-) {
-    match work {
-        RemoteTuiWork::Command {
-            command,
-            wait,
-            idempotency_key,
-        } => {
-            let operation_id = submit_remote_tui_command(
-                session,
-                &command,
-                wait,
-                idempotency_key,
-                None,
-                profile_operations,
-            );
-            (
-                Some(command),
-                None,
-                None,
-                TuiControlCompletion::Admission(operation_id),
-            )
-        }
-        RemoteTuiWork::Import {
-            path,
-            wait,
-            idempotency_key,
-        } => {
-            let import_request_key = idempotency_key.clone();
-            match session.stage_profile_import(&path) {
-                Ok((profile_id, display_name)) => {
-                    let command = UserCommand::ImportProfile { profile_id };
-                    let operation_id = submit_remote_tui_command(
-                        session,
-                        &command,
-                        wait,
-                        idempotency_key,
-                        Some(&display_name),
-                        profile_operations,
-                    );
-                    (
-                        Some(command),
-                        Some(display_name),
-                        Some(import_request_key),
-                        TuiControlCompletion::Admission(operation_id),
-                    )
-                }
-                Err(error) => (
-                    None,
-                    path.file_stem()
-                        .and_then(std::ffi::OsStr::to_str)
-                        .map(str::to_owned),
-                    Some(import_request_key),
-                    TuiControlCompletion::Admission(Err(LocalControlError::Remote(error))),
-                ),
-            }
-        }
-        RemoteTuiWork::RespondChallenge {
-            challenge_id,
-            answer,
-        } => {
-            let result = session
-                .respond_challenge(challenge_id, answer)
-                .map_err(LocalControlError::Remote);
-            if result.is_err() {
-                pending_challenges
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&challenge_id);
-            }
-            (
-                None,
-                None,
-                None,
-                TuiControlCompletion::ChallengeResponse {
-                    challenge_id,
-                    result,
-                },
-            )
-        }
-        RemoteTuiWork::CancelChallenge { challenge_id } => {
-            let result = session
-                .cancel_challenge(challenge_id)
-                .map_err(LocalControlError::Remote);
-            if result.is_err() {
-                pending_challenges
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&challenge_id);
-            }
-            (
-                None,
-                None,
-                None,
-                TuiControlCompletion::ChallengeCancellation {
-                    challenge_id,
-                    result,
-                },
-            )
-        }
-    }
-}
-
-fn start_remote_tui_worker(
-    session: Arc<crate::daemon::service::RemoteControlSession>,
-    receiver: std::sync::mpsc::Receiver<RemoteTuiJob>,
-    result_sender: std::sync::mpsc::SyncSender<LocalTuiAdmissionResult>,
-    profile_operations: Arc<Mutex<BTreeMap<OperationId, RemoteProfileMutationContext>>>,
-    pending_challenges: Arc<
-        Mutex<std::collections::BTreeSet<crate::vortix_core::control::ChallengeId>>,
-    >,
-) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("vortix-remote-control".into())
-        .spawn(move || {
-            while let Ok(job) = receiver.recv() {
-                let (command, import_display_name, import_request_key, completion) =
-                    execute_remote_tui_work(
-                        &session,
-                        job.work,
-                        &profile_operations,
-                        &pending_challenges,
-                    );
-                if result_sender
-                    .send(LocalTuiAdmissionResult {
-                        command,
-                        completion,
-                        import_display_name,
-                        import_request_key,
-                        _permit: Some(job.permit),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .expect("remote control worker thread")
-}
-
-impl Drop for RemoteTuiQueue {
-    fn drop(&mut self) {
-        self.jobs.take();
-        self.results.get_mut().take();
-        if let Some(worker) = self.worker.take() {
-            // A transport call has its own deadline, but terminal teardown
-            // must never wait for a remote daemon. Join only when the worker
-            // has already observed channel closure; otherwise detach it and
-            // let its owned session expire at the transport boundary.
-            if worker.is_finished() {
-                let _ = worker.join();
-            }
-        }
-    }
-}
-
 enum ClientControlSessionKind {
     StandardLifecycle(Box<LocalControlSession>),
     StandardProfile(LocalProfileMutationSession),
-    Remote {
-        session: Arc<crate::daemon::service::RemoteControlSession>,
-        queue: RemoteTuiQueue,
-    },
 }
 
 /// One CLI/TUI-facing client adapter. U19 prepares both transports behind
@@ -1040,47 +761,10 @@ impl ClientControlSession {
         Ok((session, profile_id))
     }
 
-    #[doc(hidden)]
-    #[must_use]
-    pub fn remote_for_parity(session: crate::daemon::service::RemoteControlSession) -> Self {
-        Self::remote(session)
-    }
-
-    fn remote(session: crate::daemon::service::RemoteControlSession) -> Self {
-        let session = Arc::new(session);
-        let (jobs, receiver) =
-            std::sync::mpsc::sync_channel::<RemoteTuiJob>(TUI_ADMISSION_CAPACITY);
-        let (result_sender, results) = std::sync::mpsc::sync_channel(TUI_ADMISSION_CAPACITY);
-        let permits = Arc::new(tokio::sync::Semaphore::new(TUI_ADMISSION_CAPACITY));
-        let submitted_profile_operations = Arc::new(Mutex::new(BTreeMap::new()));
-        let pending_challenges = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
-        let worker = start_remote_tui_worker(
-            Arc::clone(&session),
-            receiver,
-            result_sender,
-            Arc::clone(&submitted_profile_operations),
-            Arc::clone(&pending_challenges),
-        );
-        Self(ClientControlSessionKind::Remote {
-            session,
-            queue: RemoteTuiQueue {
-                jobs: Some(jobs),
-                results: RefCell::new(Some(results)),
-                permits,
-                worker: Some(worker),
-                submitted_profile_operations,
-                staged_cli_profiles: Mutex::new(BTreeMap::new()),
-                pending_challenges,
-                profiles_dir: crate::vpn::get_profiles_dir().ok(),
-            },
-        })
-    }
-
     pub fn progress(&self) -> Result<(), LocalControlError> {
         match &self.0 {
             ClientControlSessionKind::StandardLifecycle(session) => session.progress(),
-            ClientControlSessionKind::StandardProfile(_)
-            | ClientControlSessionKind::Remote { .. } => Ok(()),
+            ClientControlSessionKind::StandardProfile(_) => Ok(()),
         }
     }
 
@@ -1089,9 +773,6 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardLifecycle(session) => session.current_snapshot(),
             ClientControlSessionKind::StandardProfile(session) => {
                 session.service.client().snapshot()
-            }
-            ClientControlSessionKind::Remote { session, queue } => {
-                project_remote_snapshot(session, queue, session.current_snapshot())
             }
         }
     }
@@ -1103,32 +784,6 @@ impl ClientControlSession {
         match &self.0 {
             ClientControlSessionKind::StandardLifecycle(session) => session.validate(command),
             ClientControlSessionKind::StandardProfile(_) => Ok(()),
-            ClientControlSessionKind::Remote { session, queue } => {
-                let snapshot = project_remote_snapshot(session, queue, session.current_snapshot());
-                if !snapshot.readiness.reconciliation_complete
-                    || !snapshot.readiness.authority_verified
-                {
-                    return Err(LocalControlError::Remote(
-                        crate::daemon::service::RemoteControlError::Admission(
-                            AdmissionError::NotReady,
-                        ),
-                    ));
-                }
-                if let UserCommand::Connect {
-                    profile_id,
-                    conflict_acknowledgement: None,
-                } = command
-                {
-                    if snapshot.topology_conflict(profile_id).is_some() {
-                        return Err(LocalControlError::Remote(
-                            crate::daemon::service::RemoteControlError::Admission(
-                                AdmissionError::RouteConflict,
-                            ),
-                        ));
-                    }
-                }
-                Ok(())
-            }
         }
     }
 
@@ -1141,39 +796,7 @@ impl ClientControlSession {
                 session.is_canonically_owned_active(profile_id)
             }
             ClientControlSessionKind::StandardProfile(_) => false,
-            ClientControlSessionKind::Remote { session, queue } => {
-                let snapshot = project_remote_snapshot(session, queue, session.current_snapshot());
-                snapshot.tunnels.get(profile_id).is_some_and(|tunnel| {
-                    !matches!(
-                        tunnel.state,
-                        crate::vortix_core::engine::state::Connection::Disconnected { .. }
-                    )
-                })
-            }
         }
-    }
-
-    /// Stage private profile material through the selected remote adapter.
-    /// Production cannot reach this branch before the closed enrollment gate
-    /// opens; Standard import continues to use its prepared in-process port.
-    pub fn stage_profile_import(
-        &self,
-        path: &Path,
-    ) -> Result<(ProfileId, String), LocalControlError> {
-        let ClientControlSessionKind::Remote { session, queue } = &self.0 else {
-            return Err(LocalControlError::Observation(
-                "profile staging is only required by the remote client adapter".into(),
-            ));
-        };
-        let (profile_id, display_name) = session
-            .stage_profile_import(path)
-            .map_err(LocalControlError::Remote)?;
-        queue
-            .staged_cli_profiles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(profile_id.clone(), display_name.clone());
-        Ok((profile_id, display_name))
     }
 
     /// Run a one-shot CLI command through the selected client adapter.
@@ -1214,14 +837,6 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardProfile(session) => {
                 session.run(command, wait, idempotency_key)
             }
-            ClientControlSessionKind::Remote { session, queue } => run_remote_cli_command(
-                &session,
-                &queue,
-                &command,
-                wait,
-                idempotency_key,
-                answer_challenge,
-            ),
         }
     }
 
@@ -1238,13 +853,6 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardProfile(_) => Err(LocalControlError::Observation(
                 "profile-only Standard session cannot serve a TUI lifecycle request".into(),
             )),
-            ClientControlSessionKind::Remote { queue, .. } => {
-                queue.enqueue(RemoteTuiWork::Command {
-                    command,
-                    wait,
-                    idempotency_key: idempotency_key.into(),
-                })
-            }
         }
     }
 
@@ -1261,26 +869,6 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardProfile(_) => Err(LocalControlError::Observation(
                 "profile-only Standard session cannot serve a TUI import request".into(),
             )),
-            ClientControlSessionKind::Remote { queue, .. } => {
-                // This is only a provisional queue label. The daemon parses
-                // the body off-thread and its canonical display name is
-                // returned in the admission completion and terminal receipt.
-                let display_name = path
-                    .file_stem()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| LocalControlError::Profile {
-                        profile: path.display().to_string(),
-                        reason: "invalid profile file name".into(),
-                    })?
-                    .to_owned();
-                queue.enqueue(RemoteTuiWork::Import {
-                    path: path.to_path_buf(),
-                    wait,
-                    idempotency_key: idempotency_key.into(),
-                })?;
-                Ok(display_name)
-            }
         }
     }
 
@@ -1290,13 +878,6 @@ impl ClientControlSession {
                 session.take_tui_admission_results()
             }
             ClientControlSessionKind::StandardProfile(_) => Vec::new(),
-            ClientControlSessionKind::Remote { queue, .. } => {
-                let mut results = queue.results.borrow_mut();
-                let Some(receiver) = results.as_mut() else {
-                    return Vec::new();
-                };
-                std::iter::from_fn(|| receiver.try_recv().ok()).collect()
-            }
         }
     }
 
@@ -1304,12 +885,6 @@ impl ClientControlSession {
         match &self.0 {
             ClientControlSessionKind::StandardLifecycle(session) => session.take_changed_snapshot(),
             ClientControlSessionKind::StandardProfile(_) => Ok(None),
-            ClientControlSessionKind::Remote { session, queue } => session
-                .take_changed_snapshot()
-                .map(|snapshot| {
-                    snapshot.map(|snapshot| project_remote_snapshot(session, queue, snapshot))
-                })
-                .map_err(LocalControlError::Remote),
         }
     }
 
@@ -1322,59 +897,6 @@ impl ClientControlSession {
                 session.take_catalog_update(snapshot)
             }
             ClientControlSessionKind::StandardProfile(_) => None,
-            ClientControlSessionKind::Remote { queue, .. } => {
-                let mut outcomes = Vec::new();
-                let mut submitted = queue
-                    .submitted_profile_operations
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let terminal = submitted
-                    .keys()
-                    .filter_map(|operation_id| {
-                        snapshot
-                            .operations
-                            .get(operation_id)
-                            .filter(|operation| operation.status.is_terminal())
-                            .map(|operation| (operation_id.clone(), operation.clone()))
-                    })
-                    .collect::<Vec<_>>();
-                for (operation_id, operation) in terminal {
-                    let context = submitted
-                        .remove(&operation_id)
-                        .expect("terminal operation came from the submitted map");
-                    if matches!(
-                        operation.result,
-                        Some(
-                            OperationResult::ProfileMutationApplied
-                                | OperationResult::ProfileMutationAppliedAfterDeadline
-                        )
-                    ) {
-                        outcomes.push(LocalCatalogOutcome::Applied {
-                            operation_id,
-                            receipt: LocalProfileMutationReceipt::RemoteApplied {
-                                display_name: context.display_name,
-                            },
-                        });
-                    } else {
-                        outcomes.push(LocalCatalogOutcome::Terminal {
-                            operation_id,
-                            status: operation.status,
-                            result: operation.result,
-                        });
-                    }
-                }
-                if outcomes.is_empty() {
-                    return None;
-                }
-                Some(LocalCatalogUpdate {
-                    revision: snapshot.generation,
-                    profiles: queue
-                        .profiles_dir
-                        .as_deref()
-                        .map(crate::vpn::load_profiles_from),
-                    outcomes,
-                })
-            }
         }
     }
 
@@ -1390,28 +912,6 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardProfile(_) => Err(LocalControlError::Observation(
                 "profile-only Standard session cannot answer a challenge".into(),
             )),
-            ClientControlSessionKind::Remote { queue, .. } => {
-                if !queue
-                    .pending_challenges
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(challenge_id)
-                {
-                    return Ok(());
-                }
-                let queued = queue.enqueue(RemoteTuiWork::RespondChallenge {
-                    challenge_id,
-                    answer: crate::vortix_core::control::Secret::new(answer),
-                });
-                if queued.is_err() {
-                    queue
-                        .pending_challenges
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&challenge_id);
-                }
-                queued
-            }
         }
     }
 
@@ -1427,8 +927,7 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardLifecycle(session) => {
                 session.load_openvpn_credentials(profile_id, legacy_display_name)
             }
-            ClientControlSessionKind::StandardProfile(_)
-            | ClientControlSessionKind::Remote { .. } => {
+            ClientControlSessionKind::StandardProfile(_) => {
                 Err(LocalControlError::CredentialManagementUnsupported)
             }
         }
@@ -1446,8 +945,7 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardLifecycle(session) => {
                 session.remember_openvpn_credentials(profile_id, username, password)
             }
-            ClientControlSessionKind::StandardProfile(_)
-            | ClientControlSessionKind::Remote { .. } => {
+            ClientControlSessionKind::StandardProfile(_) => {
                 Err(LocalControlError::CredentialManagementUnsupported)
             }
         }
@@ -1464,8 +962,7 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardLifecycle(session) => {
                 session.clear_openvpn_credentials(profile_id, legacy_display_name)
             }
-            ClientControlSessionKind::StandardProfile(_)
-            | ClientControlSessionKind::Remote { .. } => {
+            ClientControlSessionKind::StandardProfile(_) => {
                 Err(LocalControlError::CredentialManagementUnsupported)
             }
         }
@@ -1482,155 +979,8 @@ impl ClientControlSession {
             ClientControlSessionKind::StandardProfile(_) => Err(LocalControlError::Observation(
                 "profile-only Standard session cannot cancel a challenge".into(),
             )),
-            ClientControlSessionKind::Remote { queue, .. } => {
-                if !queue
-                    .pending_challenges
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(challenge_id)
-                {
-                    return Ok(());
-                }
-                let queued = queue.enqueue(RemoteTuiWork::CancelChallenge { challenge_id });
-                if queued.is_err() {
-                    queue
-                        .pending_challenges
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&challenge_id);
-                }
-                queued
-            }
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn is_remote(&self) -> bool {
-        matches!(self.0, ClientControlSessionKind::Remote { .. })
-    }
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the remote CLI loop keeps admission, authorized challenges, and terminal truth in one bounded flow"
-)]
-fn run_remote_cli_command<F>(
-    session: &crate::daemon::service::RemoteControlSession,
-    queue: &RemoteTuiQueue,
-    command: &UserCommand,
-    wait: Duration,
-    idempotency_key: String,
-    mut answer_challenge: F,
-) -> Result<ClientOperationOutcome, LocalControlError>
-where
-    F: FnMut(
-        &crate::vortix_core::control::ChallengeRecord,
-    ) -> Result<crate::vortix_core::control::Secret, LocalControlError>,
-{
-    let admitted = session
-        .submit(command.clone(), wait, idempotency_key)
-        .map_err(LocalControlError::Remote)?;
-    let wall_deadline = Instant::now() + wait + SHUTDOWN_GRACE;
-    let mut handled = std::collections::BTreeSet::new();
-    loop {
-        let snapshot = session
-            .take_changed_snapshot()
-            .map_err(LocalControlError::Remote)?
-            .unwrap_or_else(|| session.current_snapshot());
-        let challenges = snapshot
-            .challenges
-            .values()
-            .filter(|challenge| {
-                challenge.operation_id == admitted.operation_id
-                    && challenge.authorized_client == *session.client_id()
-                    && !handled.contains(&challenge.id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for challenge in challenges {
-            handled.insert(challenge.id);
-            match answer_challenge(&challenge) {
-                Ok(answer) => session
-                    .respond_challenge(challenge.id, answer)
-                    .map_err(LocalControlError::Remote)?,
-                Err(error) => {
-                    let _ = session.cancel_challenge(challenge.id);
-                    return Err(error);
-                }
-            }
-        }
-        if let Some(operation) = snapshot.operations.get(&admitted.operation_id) {
-            if operation.status.is_terminal() {
-                let profile_mutation = remote_profile_mutation_receipt(queue, command, operation);
-                return Ok(ClientOperationOutcome {
-                    operation_id: admitted.operation_id,
-                    status: operation.status,
-                    result: operation.result,
-                    snapshot: project_remote_snapshot(session, queue, snapshot),
-                    profile_mutation,
-                });
-            }
-        }
-        if Instant::now() >= wall_deadline {
-            return Err(LocalControlError::Remote(
-                crate::daemon::service::RemoteControlError::Protocol(format!(
-                    "operation {} did not reach a terminal snapshot before the client deadline",
-                    admitted.operation_id
-                )),
-            ));
-        }
-        std::thread::sleep(CONTROL_PROGRESS_INTERVAL);
-    }
-}
-
-fn remote_profile_mutation_receipt(
-    queue: &RemoteTuiQueue,
-    command: &UserCommand,
-    operation: &OperationRecord,
-) -> Option<Result<LocalProfileMutationReceipt, ProfileMutationFailure>> {
-    if !matches!(
-        operation.result,
-        Some(
-            OperationResult::ProfileMutationApplied
-                | OperationResult::ProfileMutationAppliedAfterDeadline
-        )
-    ) {
-        return None;
-    }
-    let display_name = match command {
-        UserCommand::ImportProfile { profile_id } => queue
-            .staged_cli_profiles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(profile_id),
-        UserCommand::RenameProfile {
-            new_display_name, ..
-        } => Some(new_display_name.clone()),
-        UserCommand::DeleteProfile { .. } => None,
-        _ => return None,
-    };
-    Some(Ok(LocalProfileMutationReceipt::RemoteApplied {
-        display_name,
-    }))
-}
-
-fn project_remote_snapshot(
-    session: &crate::daemon::service::RemoteControlSession,
-    queue: &RemoteTuiQueue,
-    mut snapshot: ControlSnapshot,
-) -> ControlSnapshot {
-    snapshot
-        .challenges
-        .retain(|_, challenge| &challenge.authorized_client == session.client_id());
-    let mut pending = queue
-        .pending_challenges
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pending.retain(|challenge_id| snapshot.challenges.contains_key(challenge_id));
-    snapshot
-        .challenges
-        .retain(|challenge_id, _| !pending.contains(challenge_id));
-    snapshot
 }
 
 impl From<LocalControlSession> for ClientControlSession {
@@ -3523,467 +2873,6 @@ mod tests {
         OperationId::parse(format!("op-0000000000000001-{sequence:016x}")).unwrap()
     }
 
-    struct EmptyRemoteSubscription;
-
-    impl crate::daemon::service::RemoteControlSubscription for EmptyRemoteSubscription {
-        fn try_recv(
-            &mut self,
-        ) -> Result<
-            Option<crate::daemon::service::RemoteControlUpdate>,
-            crate::daemon::service::RemoteControlError,
-        > {
-            Ok(None)
-        }
-    }
-
-    struct SnapshotRemoteTransport {
-        next_client: AtomicU64,
-        snapshot: ControlSnapshot,
-    }
-
-    impl SnapshotRemoteTransport {
-        fn new(snapshot: ControlSnapshot) -> Self {
-            Self {
-                next_client: AtomicU64::new(0),
-                snapshot,
-            }
-        }
-    }
-
-    impl crate::daemon::service::RemoteControlTransport for SnapshotRemoteTransport {
-        fn exchange(
-            &self,
-            op: crate::vortix_core::ipc::IpcOp,
-        ) -> Result<crate::vortix_core::ipc::IpcResult, crate::daemon::service::RemoteControlError>
-        {
-            if !matches!(op, crate::vortix_core::ipc::IpcOp::ControlOpen) {
-                return Err(crate::daemon::service::RemoteControlError::Protocol(
-                    format!("unexpected projection operation: {op:?}"),
-                ));
-            }
-            let sequence = self.next_client.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(crate::vortix_core::ipc::IpcResult::ControlOpened {
-                session_id: crate::vortix_core::ipc::RemoteSessionId::parse(format!(
-                    "session-{sequence:032x}"
-                ))
-                .unwrap(),
-                client_id: client_id(sequence),
-            })
-        }
-
-        fn subscribe(
-            &self,
-            _session_id: &crate::vortix_core::ipc::RemoteSessionId,
-        ) -> Result<
-            (
-                Box<dyn crate::daemon::service::RemoteControlSubscription>,
-                ControlSnapshot,
-            ),
-            crate::daemon::service::RemoteControlError,
-        > {
-            Ok((Box::new(EmptyRemoteSubscription), self.snapshot.clone()))
-        }
-    }
-
-    #[derive(Default)]
-    struct AdmissionRemoteTransport {
-        next_operation: AtomicU64,
-    }
-
-    impl crate::daemon::service::RemoteControlTransport for AdmissionRemoteTransport {
-        fn exchange(
-            &self,
-            op: crate::vortix_core::ipc::IpcOp,
-        ) -> Result<crate::vortix_core::ipc::IpcResult, crate::daemon::service::RemoteControlError>
-        {
-            match op {
-                crate::vortix_core::ipc::IpcOp::ControlOpen => {
-                    Ok(crate::vortix_core::ipc::IpcResult::ControlOpened {
-                        session_id: crate::vortix_core::ipc::RemoteSessionId::parse(format!(
-                            "session-{}",
-                            "a".repeat(32)
-                        ))
-                        .unwrap(),
-                        client_id: client_id(1),
-                    })
-                }
-                crate::vortix_core::ipc::IpcOp::ControlSubmit { .. } => {
-                    let sequence = self.next_operation.fetch_add(1, Ordering::SeqCst) + 1;
-                    Ok(crate::vortix_core::ipc::IpcResult::ControlAccepted {
-                        admitted: crate::vortix_core::control::AdmittedOperation {
-                            operation_id: operation_id(sequence),
-                        },
-                    })
-                }
-                crate::vortix_core::ipc::IpcOp::ControlStageProfileImport {
-                    final_chunk: true,
-                    ..
-                } => Ok(
-                    crate::vortix_core::ipc::IpcResult::ControlProfileImportStaged {
-                        profile_id: profile_id('d'),
-                        display_name: "daemon-canonical".into(),
-                    },
-                ),
-                other => Err(crate::daemon::service::RemoteControlError::Protocol(
-                    format!("unexpected admission operation: {other:?}"),
-                )),
-            }
-        }
-
-        fn subscribe(
-            &self,
-            _session_id: &crate::vortix_core::ipc::RemoteSessionId,
-        ) -> Result<
-            (
-                Box<dyn crate::daemon::service::RemoteControlSubscription>,
-                ControlSnapshot,
-            ),
-            crate::daemon::service::RemoteControlError,
-        > {
-            Ok((
-                Box::new(EmptyRemoteSubscription),
-                ControlSnapshot::default(),
-            ))
-        }
-    }
-
-    #[derive(Default)]
-    struct BlockingChallengeTransport {
-        entered: (Mutex<bool>, std::sync::Condvar),
-        released: (Mutex<bool>, std::sync::Condvar),
-        responses: AtomicU64,
-    }
-
-    impl BlockingChallengeTransport {
-        fn wait_until_blocked(&self) {
-            let entered = self.entered.0.lock().unwrap();
-            let (entered, timeout) = self
-                .entered
-                .1
-                .wait_timeout_while(entered, Duration::from_secs(1), |entered| !*entered)
-                .unwrap();
-            assert!(
-                *entered && !timeout.timed_out(),
-                "challenge call did not block"
-            );
-        }
-
-        fn release(&self) {
-            *self.released.0.lock().unwrap() = true;
-            self.released.1.notify_all();
-        }
-    }
-
-    impl crate::daemon::service::RemoteControlTransport for BlockingChallengeTransport {
-        fn exchange(
-            &self,
-            op: crate::vortix_core::ipc::IpcOp,
-        ) -> Result<crate::vortix_core::ipc::IpcResult, crate::daemon::service::RemoteControlError>
-        {
-            match op {
-                crate::vortix_core::ipc::IpcOp::ControlOpen => {
-                    Ok(crate::vortix_core::ipc::IpcResult::ControlOpened {
-                        session_id: crate::vortix_core::ipc::RemoteSessionId::parse(format!(
-                            "session-{}",
-                            "b".repeat(32)
-                        ))
-                        .unwrap(),
-                        client_id: client_id(1),
-                    })
-                }
-                crate::vortix_core::ipc::IpcOp::ControlRespondChallenge { .. } => {
-                    self.responses.fetch_add(1, Ordering::SeqCst);
-                    *self.entered.0.lock().unwrap() = true;
-                    self.entered.1.notify_all();
-                    let released = self.released.0.lock().unwrap();
-                    drop(
-                        self.released
-                            .1
-                            .wait_while(released, |released| !*released)
-                            .unwrap(),
-                    );
-                    Ok(crate::vortix_core::ipc::IpcResult::ChallengeAccepted)
-                }
-                other => Err(crate::daemon::service::RemoteControlError::Protocol(
-                    format!("unexpected challenge operation: {other:?}"),
-                )),
-            }
-        }
-
-        fn subscribe(
-            &self,
-            _session_id: &crate::vortix_core::ipc::RemoteSessionId,
-        ) -> Result<
-            (
-                Box<dyn crate::daemon::service::RemoteControlSubscription>,
-                ControlSnapshot,
-            ),
-            crate::daemon::service::RemoteControlError,
-        > {
-            Ok((
-                Box::new(EmptyRemoteSubscription),
-                ControlSnapshot::default(),
-            ))
-        }
-    }
-
-    fn profile_operation(
-        id: OperationId,
-        profile_id: ProfileId,
-        status: OperationStatus,
-        result: Option<OperationResult>,
-    ) -> OperationRecord {
-        OperationRecord {
-            id,
-            idempotency_key: IdempotencyKey::new("remote-profile-test"),
-            client_id: client_id(1),
-            command_digest: crate::vortix_core::control::PolicyDigest("test".into()),
-            authority_epoch: AuthorityEpoch(1),
-            desired_generation: 1,
-            admitted_at_millis: 1,
-            deadline_millis: 10,
-            intent: OperationIntent::ProfileMutation { profile_id },
-            status,
-            result,
-            failure_detail: None,
-        }
-    }
-
-    #[test]
-    fn remote_snapshot_projects_challenges_to_each_session_client() {
-        let challenge_id = serde_json::from_str("1").unwrap();
-        let mut snapshot = ControlSnapshot::default();
-        snapshot.challenges.insert(
-            challenge_id,
-            crate::vortix_core::control::ChallengeRecord {
-                id: challenge_id,
-                profile_id: profile_id('a'),
-                operation_id: operation_id(1),
-                kind: crate::vortix_core::control::ChallengeKind::TwoFactorCode,
-                label: "OTP".into(),
-                authorized_client: client_id(1),
-                created_at_millis: 1,
-                expires_at_millis: 10,
-            },
-        );
-        let transport = Arc::new(SnapshotRemoteTransport::new(snapshot));
-        let first = ClientControlSession::remote_for_parity(
-            crate::daemon::service::RemoteControlSession::open_for_parity(transport.clone())
-                .unwrap(),
-        );
-        let second = ClientControlSession::remote_for_parity(
-            crate::daemon::service::RemoteControlSession::open_for_parity(transport).unwrap(),
-        );
-
-        assert!(first
-            .current_snapshot()
-            .challenges
-            .contains_key(&challenge_id));
-        assert!(second.current_snapshot().challenges.is_empty());
-    }
-
-    #[test]
-    fn remote_catalog_reports_only_submitted_profile_terminal_truth() {
-        let transport = Arc::new(AdmissionRemoteTransport::default());
-        let session = ClientControlSession::remote_for_parity(
-            crate::daemon::service::RemoteControlSession::open_for_parity(transport).unwrap(),
-        );
-        let target = profile_id('b');
-        session
-            .enqueue_tui_command(
-                UserCommand::RenameProfile {
-                    profile_id: target.clone(),
-                    new_display_name: "canonical-name".into(),
-                },
-                Duration::from_secs(1),
-                "rename",
-            )
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let submitted_id = loop {
-            if let Some(result) = session.take_tui_admission_results().into_iter().next() {
-                let TuiControlCompletion::Admission(Ok(operation_id)) = result.completion else {
-                    panic!("remote rename was not admitted");
-                };
-                break operation_id;
-            }
-            assert!(Instant::now() < deadline, "remote rename did not settle");
-            std::thread::yield_now();
-        };
-
-        let historical_id = operation_id(99);
-        let mut snapshot = ControlSnapshot::default();
-        snapshot.operations.insert(
-            historical_id.clone(),
-            profile_operation(
-                historical_id,
-                profile_id('c'),
-                OperationStatus::Succeeded,
-                Some(OperationResult::ProfileMutationApplied),
-            ),
-        );
-        snapshot.operations.insert(
-            submitted_id.clone(),
-            profile_operation(
-                submitted_id,
-                target,
-                OperationStatus::Failed,
-                Some(OperationResult::Failed(
-                    crate::vortix_core::control::OperationFailure::Rejected,
-                )),
-            ),
-        );
-
-        let update = session.take_catalog_update(&snapshot).unwrap();
-        assert_eq!(update.outcomes.len(), 1);
-        assert!(matches!(
-            update.outcomes.as_slice(),
-            [LocalCatalogOutcome::Terminal {
-                operation_id: _,
-                status: OperationStatus::Failed,
-                result: Some(OperationResult::Failed(
-                    crate::vortix_core::control::OperationFailure::Rejected
-                )),
-            }]
-        ));
-        assert!(session.take_catalog_update(&snapshot).is_none());
-    }
-
-    #[test]
-    fn remote_import_reconciles_provisional_file_name_to_daemon_name() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("upload.conf");
-        write_test_wireguard_config(&source);
-        let session = ClientControlSession::remote_for_parity(
-            crate::daemon::service::RemoteControlSession::open_for_parity(Arc::new(
-                AdmissionRemoteTransport::default(),
-            ))
-            .unwrap(),
-        );
-        assert_eq!(
-            session
-                .enqueue_tui_profile_import(&source, Duration::from_secs(1), "import")
-                .unwrap(),
-            "upload"
-        );
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let submitted_id = loop {
-            if let Some(result) = session.take_tui_admission_results().into_iter().next() {
-                assert_eq!(
-                    result.import_display_name.as_deref(),
-                    Some("daemon-canonical")
-                );
-                let TuiControlCompletion::Admission(Ok(operation_id)) = result.completion else {
-                    panic!("remote import was not admitted");
-                };
-                break operation_id;
-            }
-            assert!(Instant::now() < deadline, "remote import did not settle");
-            std::thread::yield_now();
-        };
-        let mut snapshot = ControlSnapshot::default();
-        snapshot.operations.insert(
-            submitted_id.clone(),
-            profile_operation(
-                submitted_id,
-                profile_id('d'),
-                OperationStatus::Succeeded,
-                Some(OperationResult::ProfileMutationApplied),
-            ),
-        );
-
-        let update = session.take_catalog_update(&snapshot).unwrap();
-        assert!(matches!(
-            update.outcomes.as_slice(),
-            [LocalCatalogOutcome::Applied {
-                operation_id: _,
-                receipt: LocalProfileMutationReceipt::RemoteApplied {
-                    display_name: Some(display_name),
-                },
-            }] if display_name == "daemon-canonical"
-        ));
-    }
-
-    #[test]
-    fn remote_import_validation_failure_is_delivered_after_nonblocking_enqueue() {
-        let temp = tempfile::tempdir().unwrap();
-        let missing = temp.path().join("missing.conf");
-        let session = ClientControlSession::remote_for_parity(
-            crate::daemon::service::RemoteControlSession::open_for_parity(Arc::new(
-                AdmissionRemoteTransport::default(),
-            ))
-            .unwrap(),
-        );
-        let started = Instant::now();
-        assert_eq!(
-            session
-                .enqueue_tui_profile_import(&missing, Duration::from_secs(1), "missing")
-                .unwrap(),
-            "missing"
-        );
-        assert!(started.elapsed() < Duration::from_millis(50));
-
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if let Some(result) = session.take_tui_admission_results().into_iter().next() {
-                assert_eq!(result.import_display_name.as_deref(), Some("missing"));
-                assert!(matches!(
-                    result.completion,
-                    TuiControlCompletion::Admission(Err(LocalControlError::Remote(
-                        crate::daemon::service::RemoteControlError::Protocol(_)
-                    )))
-                ));
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "remote import failure did not settle"
-            );
-            std::thread::yield_now();
-        }
-    }
-
-    #[test]
-    fn remote_challenge_response_uses_bounded_background_queue() {
-        let transport = Arc::new(BlockingChallengeTransport::default());
-        let session = ClientControlSession::remote_for_parity(
-            crate::daemon::service::RemoteControlSession::open_for_parity(transport.clone())
-                .unwrap(),
-        );
-        let challenge_id = serde_json::from_str("1").unwrap();
-        let started = Instant::now();
-        session
-            .respond_challenge(challenge_id, b"123456".to_vec())
-            .unwrap();
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "terminal thread waited for remote challenge I/O"
-        );
-        transport.wait_until_blocked();
-        assert!(session.take_tui_admission_results().is_empty());
-        session
-            .respond_challenge(challenge_id, b"duplicate".to_vec())
-            .unwrap();
-
-        transport.release();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if let Some(result) = session.take_tui_admission_results().into_iter().next() {
-                assert!(matches!(
-                    result.completion,
-                    TuiControlCompletion::ChallengeResponse {
-                        challenge_id: completed,
-                        result: Ok(()),
-                    } if completed == challenge_id
-                ));
-                break;
-            }
-            assert!(Instant::now() < deadline, "challenge result did not settle");
-            std::thread::yield_now();
-        }
-        assert_eq!(transport.responses.load(Ordering::SeqCst), 1);
-    }
-
     #[test]
     fn scanner_refresh_is_bounded_independently_of_fast_control_ticks() {
         let started = Instant::now();
@@ -4187,30 +3076,6 @@ mod tests {
             .load_openvpn_credentials(&profile_id, "renamed-corp")
             .unwrap()
             .is_none());
-    }
-
-    #[test]
-    fn remote_credential_management_is_explicitly_unsupported_without_local_fallback() {
-        let session = ClientControlSession::remote_for_parity(
-            crate::daemon::service::RemoteControlSession::open_for_parity(Arc::new(
-                SnapshotRemoteTransport::new(ControlSnapshot::default()),
-            ))
-            .unwrap(),
-        );
-        let profile_id = profile_id('a');
-
-        assert!(matches!(
-            session.load_openvpn_credentials(&profile_id, "corp"),
-            Err(LocalControlError::CredentialManagementUnsupported)
-        ));
-        assert!(matches!(
-            session.remember_openvpn_credentials(&profile_id, "alice", "secret"),
-            Err(LocalControlError::CredentialManagementUnsupported)
-        ));
-        assert!(matches!(
-            session.clear_openvpn_credentials(&profile_id, "corp"),
-            Err(LocalControlError::CredentialManagementUnsupported)
-        ));
     }
 
     #[test]

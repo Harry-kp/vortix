@@ -1046,22 +1046,9 @@ fn local_control_error_category(
     match error {
         crate::cli::control::LocalControlError::Admission(
             crate::vortix_core::control::AdmissionError::RouteConflict,
-        )
-        | crate::cli::control::LocalControlError::Remote(
-            crate::daemon::service::RemoteControlError::Admission(
-                crate::vortix_core::control::AdmissionError::RouteConflict,
-            ),
         ) => ("state_conflict_route_overlap", ExitCode::StateConflict),
         crate::cli::control::LocalControlError::Admission(
             crate::vortix_core::control::AdmissionError::DeadlineExpired,
-        )
-        | crate::cli::control::LocalControlError::Remote(
-            crate::daemon::service::RemoteControlError::Admission(
-                crate::vortix_core::control::AdmissionError::DeadlineExpired,
-            )
-            | crate::daemon::service::RemoteControlError::Challenge(
-                crate::vortix_core::control::ChallengeError::Expired,
-            ),
         )
         | crate::cli::control::LocalControlError::ChallengeExpired => {
             ("timeout", ExitCode::Timeout)
@@ -1070,12 +1057,9 @@ fn local_control_error_category(
         | crate::cli::control::LocalControlError::Owner(_) => {
             ("permission_denied", ExitCode::PermissionDenied)
         }
-        crate::cli::control::LocalControlError::ChallengeCancelled
-        | crate::cli::control::LocalControlError::Remote(
-            crate::daemon::service::RemoteControlError::Challenge(
-                crate::vortix_core::control::ChallengeError::Cancelled,
-            ),
-        ) => ("user_cancelled", ExitCode::GeneralError),
+        crate::cli::control::LocalControlError::ChallengeCancelled => {
+            ("user_cancelled", ExitCode::GeneralError)
+        }
         crate::cli::control::LocalControlError::ChallengeNonInteractive { .. }
         | crate::cli::control::LocalControlError::ChallengeEmpty { .. } => {
             ("auth_required", ExitCode::GeneralError)
@@ -3870,47 +3854,6 @@ mod tests {
         assert_eq!(code, "completed_after_deadline");
         assert_eq!(exit.code(), ExitCode::Timeout.code());
         assert!(message.contains("was applied and must not be retried"));
-    }
-
-    #[test]
-    fn remote_challenge_categories_match_standard_cli_output() {
-        use crate::daemon::service::RemoteControlError;
-        use crate::vortix_core::control::ChallengeError;
-
-        let cases = [
-            (
-                crate::cli::control::LocalControlError::ChallengeCancelled,
-                crate::cli::control::LocalControlError::Remote(RemoteControlError::Challenge(
-                    ChallengeError::Cancelled,
-                )),
-                "user_cancelled",
-                ExitCode::GeneralError,
-            ),
-            (
-                crate::cli::control::LocalControlError::ChallengeExpired,
-                crate::cli::control::LocalControlError::Remote(RemoteControlError::Challenge(
-                    ChallengeError::Expired,
-                )),
-                "timeout",
-                ExitCode::Timeout,
-            ),
-        ];
-
-        for (standard, remote, expected_code, expected_exit) in cases {
-            let standard_category = local_control_error_category(&standard);
-            let remote_category = local_control_error_category(&remote);
-            assert_eq!(standard_category.0, expected_code);
-            assert_eq!(remote_category.0, expected_code);
-            assert_eq!(standard_category.1.code(), expected_exit.code());
-            assert_eq!(remote_category.1.code(), expected_exit.code());
-        }
-
-        let unauthorized = crate::cli::control::LocalControlError::Remote(
-            RemoteControlError::Challenge(ChallengeError::Unauthorized),
-        );
-        let (code, exit) = local_control_error_category(&unauthorized);
-        assert_eq!(code, "control_failed");
-        assert_eq!(exit.code(), ExitCode::GeneralError.code());
     }
 
     #[test]
