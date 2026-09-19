@@ -11,6 +11,22 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::theme;
 
+/// The dim vertical rule between panel segments.
+pub(crate) fn divider() -> Span<'static> {
+    Span::styled(
+        " │",
+        Style::default().fg(theme::current().nord_polar_night_4),
+    )
+}
+
+/// `divider`, padded on the right for segments that don't lead with a space.
+pub(crate) fn divider_padded() -> Span<'static> {
+    Span::styled(
+        " │ ",
+        Style::default().fg(theme::current().nord_polar_night_4),
+    )
+}
+
 /// A `label: value` detail row — label in secondary, value in `color`.
 pub(crate) fn detail_row<'a>(
     label: &'a str,
@@ -21,6 +37,15 @@ pub(crate) fn detail_row<'a>(
         Span::styled(label, Style::default().fg(theme::current().text_secondary)),
         Span::styled(value, Style::default().fg(color)),
     ])
+}
+
+/// `value`, or `fallback` when the backend reported the field blank.
+pub(crate) fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
 }
 
 /// Green under 50ms, yellow under 150ms, red beyond.

@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::ui::helpers;
 use crate::vortix_core::engine::state::Connection;
 use crate::{constants, theme, utils};
 use ratatui::{
@@ -19,7 +20,50 @@ use ratatui::{
 /// on `app.runtime` because it's measured from the host's network stats
 /// rather than per-tunnel — secondary tunnels add to the same byte
 /// counters per H7.
-#[allow(clippy::too_many_lines)]
+/// Current up/down rates and the session's cumulative transfer.
+fn stats_line<'a>(app: &App, session_rx: &'a str, session_tx: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(" ▲ UP: ", Style::default().fg(theme::current().success)),
+        Span::styled(
+            format!("{:<10}", utils::format_bytes_speed(app.runtime.current_up)),
+            Style::default().fg(theme::current().text_primary),
+        ),
+        Span::styled(
+            " │ ",
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ),
+        Span::styled(
+            " ▼ DOWN: ",
+            Style::default().fg(theme::current().accent_primary),
+        ),
+        Span::styled(
+            format!(
+                "{:<10}",
+                utils::format_bytes_speed(app.runtime.current_down)
+            ),
+            Style::default().fg(theme::current().text_primary),
+        ),
+        Span::styled(
+            " │ ",
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ),
+        Span::styled(
+            " Session: ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
+        Span::styled(
+            session_rx,
+            Style::default().fg(theme::current().text_primary),
+        ),
+        Span::styled(" ↑", Style::default().fg(theme::current().success)),
+        Span::styled(
+            session_tx,
+            Style::default().fg(theme::current().text_primary),
+        ),
+    ])
+}
+
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Chart);
     let border_style = if is_focused {
@@ -75,64 +119,15 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .primary()
         .and_then(|id| app.registry.snapshot(id));
     let (session_rx, session_tx) = match primary_snap.as_ref().map(|s| &s.state) {
-        Some(Connection::Connected { details, .. }) => {
-            let rx = if details.transfer_rx.is_empty() {
-                "0B".to_string()
-            } else {
-                details.transfer_rx.clone()
-            };
-            let tx = if details.transfer_tx.is_empty() {
-                "0B".to_string()
-            } else {
-                details.transfer_tx.clone()
-            };
-            (rx, tx)
-        }
+        Some(Connection::Connected { details, .. }) => (
+            helpers::nonempty_or(&details.transfer_rx, "0B").to_string(),
+            helpers::nonempty_or(&details.transfer_tx, "0B").to_string(),
+        ),
         _ => ("0B".to_string(), "0B".to_string()),
     };
 
-    let stats_line = Line::from(vec![
-        Span::styled(" ▲ UP: ", Style::default().fg(theme::current().success)),
-        Span::styled(
-            format!("{:<10}", utils::format_bytes_speed(app.runtime.current_up)),
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(
-            " │ ",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        ),
-        Span::styled(
-            " ▼ DOWN: ",
-            Style::default().fg(theme::current().accent_primary),
-        ),
-        Span::styled(
-            format!(
-                "{:<10}",
-                utils::format_bytes_speed(app.runtime.current_down)
-            ),
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(
-            " │ ",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        ),
-        Span::styled(
-            " Session: ",
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
-        Span::styled(
-            &session_rx,
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(" ↑", Style::default().fg(theme::current().success)),
-        Span::styled(
-            &session_tx,
-            Style::default().fg(theme::current().text_primary),
-        ),
-    ]);
     frame.render_widget(
-        Paragraph::new(stats_line).alignment(Alignment::Center),
+        Paragraph::new(stats_line(app, &session_rx, &session_tx)).alignment(Alignment::Center),
         chunks[0],
     );
 
@@ -145,33 +140,21 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .x_bounds([0.0, x_max])
         .y_bounds([0.0, peak])
         .paint(|ctx| {
-            if hist_len > 1 {
+            // Down first so the up series wins wherever the two overlap.
+            for (history, color) in [
+                (&app.runtime.down_history, theme::current().accent_primary),
+                (&app.runtime.up_history, theme::current().success),
+            ] {
                 #[allow(clippy::cast_precision_loss)]
-                for i in 0..hist_len - 1 {
-                    let x1 = i as f64;
-                    let x2 = (i + 1) as f64;
-
-                    let dy1 = app.runtime.down_history[i];
-                    let dy2 = app.runtime.down_history[i + 1];
-                    if dy1 > 0.0 || dy2 > 0.0 {
+                for i in 0..hist_len.saturating_sub(1) {
+                    let (y1, y2) = (history[i], history[i + 1]);
+                    if y1 > 0.0 || y2 > 0.0 {
                         ctx.draw(&CanvasLine {
-                            x1,
-                            y1: dy1,
-                            x2,
-                            y2: dy2,
-                            color: theme::current().accent_primary,
-                        });
-                    }
-
-                    let uy1 = app.runtime.up_history[i];
-                    let uy2 = app.runtime.up_history[i + 1];
-                    if uy1 > 0.0 || uy2 > 0.0 {
-                        ctx.draw(&CanvasLine {
-                            x1,
-                            y1: uy1,
-                            x2,
-                            y2: uy2,
-                            color: theme::current().success,
+                            x1: i as f64,
+                            y1,
+                            x2: (i + 1) as f64,
+                            y2,
+                            color,
                         });
                     }
                 }

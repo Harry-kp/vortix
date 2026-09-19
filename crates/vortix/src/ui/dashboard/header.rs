@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::state::QualityLevel;
+use crate::ui::helpers;
 use crate::vortix_core::engine::state::Connection;
 use crate::vortix_core::engine::TunnelSnapshot;
 use crate::vortix_core::profile::ProfileId;
@@ -12,22 +13,6 @@ use ratatui::{
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
-
-/// The dim vertical rule between header segments.
-fn divider() -> Span<'static> {
-    Span::styled(
-        " │",
-        Style::default().fg(theme::current().nord_polar_night_4),
-    )
-}
-
-/// `divider`, padded on the right for segments that don't lead with a space.
-fn divider_padded() -> Span<'static> {
-    Span::styled(
-        " │ ",
-        Style::default().fg(theme::current().nord_polar_night_4),
-    )
-}
 
 fn profile_display_name(app: &App, id: &ProfileId) -> String {
     app.runtime
@@ -179,7 +164,7 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
                 .fg(theme::current().warning)
                 .add_modifier(Modifier::BOLD),
         ),
-        divider_padded(),
+        helpers::divider_padded(),
         Span::styled(
             "Real: ",
             Style::default().fg(theme::current().text_secondary),
@@ -188,7 +173,7 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
             app.runtime.public_ip.clone(),
             Style::default().fg(theme::current().text_primary),
         ),
-        divider(),
+        helpers::divider(),
         ks_indicator,
     ])
 }
@@ -207,7 +192,7 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
                 .fg(theme::current().error)
                 .add_modifier(Modifier::BOLD),
         ),
-        divider_padded(),
+        helpers::divider_padded(),
         Span::styled(
             "Real: ",
             Style::default().fg(theme::current().text_secondary),
@@ -216,7 +201,7 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
             app.runtime.public_ip.clone(),
             Style::default().fg(theme::current().text_primary),
         ),
-        divider(),
+        helpers::divider(),
         ks_indicator,
     ])
 }
@@ -302,7 +287,7 @@ fn connected_line(
             proto_suffix,
             Style::default().fg(theme::current().accent_primary),
         ),
-        divider_padded(),
+        helpers::divider_padded(),
         Span::styled(
             "VPN: ",
             Style::default().fg(theme::current().text_secondary),
@@ -337,7 +322,7 @@ fn connected_line(
     }
 
     header_spans.extend_from_slice(&[
-        divider_padded(),
+        helpers::divider_padded(),
         Span::styled(
             uptime,
             Style::default().fg(theme::current().accent_secondary),
@@ -345,14 +330,14 @@ fn connected_line(
     ]);
     if !compact {
         header_spans.extend_from_slice(&[
-            divider_padded(),
+            helpers::divider_padded(),
             Span::styled(
                 quality_indicator.0,
                 Style::default().fg(quality_indicator.1),
             ),
         ]);
     }
-    header_spans.extend_from_slice(&[divider(), ks_indicator]);
+    header_spans.extend_from_slice(&[helpers::divider(), ks_indicator]);
 
     Line::from(header_spans)
 }
@@ -412,7 +397,7 @@ fn render_primary_line(
                     format!(" {elapsed}s"),
                     Style::default().fg(theme::current().accent_secondary),
                 ),
-                divider(),
+                helpers::divider(),
                 ks_indicator,
             ])
         }
@@ -423,7 +408,7 @@ fn render_primary_line(
                     .fg(theme::current().warning)
                     .add_modifier(Modifier::BOLD),
             ),
-            divider(),
+            helpers::divider(),
             ks_indicator,
         ]),
         Connection::Connected { details, since, .. } => {
@@ -690,7 +675,7 @@ fn build_dotrow(
 
 /// Push the assembled strip spans onto the trailing edge of the header line.
 fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>]) {
-    line.spans.push(divider_padded());
+    line.spans.push(helpers::divider_padded());
     if with_label {
         line.spans.push(Span::styled(
             "Tunnels: ",

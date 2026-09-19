@@ -99,15 +99,6 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     render_disconnected(frame, app, inner);
 }
 
-/// `value`, or `fallback` when the backend reported the field blank.
-fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
-    if value.is_empty() {
-        fallback
-    } else {
-        value
-    }
-}
-
 /// The `VPN IP` row: tunnel address and the interface carrying it.
 fn vpn_ip_line(details: &DetailedConnectionInfo) -> Line<'_> {
     let iface_display = if details.interface.is_empty() {
@@ -148,12 +139,12 @@ fn transfer_line<'a>(details: &'a DetailedConnectionInfo, mtu_str: &'a str) -> L
         ),
         Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
         Span::styled(
-            nonempty_or(&details.transfer_rx, "0"),
+            helpers::nonempty_or(&details.transfer_rx, "0"),
             Style::default().fg(theme::current().text_primary),
         ),
         Span::styled(" ↑", Style::default().fg(theme::current().success)),
         Span::styled(
-            nonempty_or(&details.transfer_tx, "0"),
+            helpers::nonempty_or(&details.transfer_tx, "0"),
             Style::default().fg(theme::current().text_primary),
         ),
         Span::styled(
@@ -289,7 +280,7 @@ fn render_connected(
 ) {
     let is_openvpn = details.public_key == "OpenVPN" || details.public_key.is_empty();
 
-    let mtu_str = nonempty_or(&details.mtu, "-");
+    let mtu_str = helpers::nonempty_or(&details.mtu, "-");
 
     let mut text = vec![
         vpn_ip_line(details),
