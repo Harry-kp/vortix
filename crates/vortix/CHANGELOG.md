@@ -4,6 +4,166 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-09-19
+
+### Bug Fixes
+
+- **tui:** Disconnect completes on kernel confirmation, not the worker's word ([#253](https://github.com/Harry-kp/vortix/pull/253))
+- Stabilize desktop integration, themes, and recovery ([#279](https://github.com/Harry-kp/vortix/pull/279))
+- **killswitch:** Fail closed across recovery and release ([#281](https://github.com/Harry-kp/vortix/pull/281))
+- **control:** Make VPN lifecycle transitions exact ([#282](https://github.com/Harry-kp/vortix/pull/282))
+- **tui:** Keep large profile imports within deadlines ([#283](https://github.com/Harry-kp/vortix/pull/283))
+- **tui:** Reopen the credential prompt after a rejected password
+- **control:** Stop replaying past profile imports as startup failures
+- Repair four defects found auditing a fresh Ubuntu install
+- Stop a sudo dashboard run from locking the user out, and stop panicking without a TTY
+- A missing VPN tool should warn once, not fail every poll
+- Create the config directory private, not at the caller's umask
+- **dns:** A link that is already gone is a finished release, not a failure
+- **wireguard:** Stage configs where a confined wg-quick can read them
+- **tui:** Stop rapid kill-switch presses timing out and reporting Degraded
+- Stop a WireGuard disconnect looking like a network failure
+- **killswitch:** Report the firewall's own truth, and stop degradation latching
+- **telemetry:** Never present a remembered or wrong-family reading as current
+- Create every Vortix directory private, whatever the umask
+- **killswitch:** Report the emergency block that block-on-drop engages
+- Clear the two Linux-only clippy errors failing CI
+- Repair directory permissions on an install that already exists
+- **cli:** Tell the user how to clear a stray profile metadata file
+- **test:** Stop the suite writing profiles into the real config directory
+- **tui:** Offer the takeover confirmation when a route conflict is refused
+- Terminalise a connect whose route conflict could not be retired
+- Give the real-IP cache gates the writers they lost
+- One undescribed peer no longer hides every other route conflict
+- Release supervisor ownership when the credential prompt is refused
+- A full tunnel beside a split tunnel is not a route overlap
+- **tui:** Say what the route-overlap dialog actually does
+- Admission agrees with the overlay about what a conflict is
+- Stop discarding the result of tightening file permissions
+- Clippy lints in the reproduction added by 52d6e1f
+- Stop a superseded teardown leaving a fence that times out every later operation
+- Show the profile name, not its digest, when routes overlap
+- Clippy clone-on-copy in the barrier diagnostic
+- Keep a live tunnel's fact fresh so later operations can complete
+- Stop a repeated tunnel fact tearing down protection
+- Stop the route-overlap dialog promising something the kernel cannot do
+- Stop one superseded reading discarding a whole system scan
+- Make failure messages say what broke, why, and what to do
+- Report a full-tunnel OpenVPN session as connected, not "no exit"
+- Stop a reconnect leaving the tunnel resolving through the LAN
+- Widen the resolved re-apply window past the interface churn
+- Say when an orphaned tunnel scratch directory cannot be removed
+- Let a replaced tunnel interface be programmed with the VPN's DNS
+- Settle the resolved read-back across the interface swap
+- Stop the headline saying PROTECTED over its own v6-exposed row
+- Stop a degraded kill switch describing protection it is not giving
+- The expired toast is the one the user sees, so explain it there
+- Engage block-on-drop for a tunnel that is gone, not only as it goes
+- Stop staged OpenVPN configs piling up beside the profiles
+- Clippy case-sensitive extension comparison in the staged-config sweep
+- Stop a refused rename printing a Rust variant at the user
+- Cast the signal handler through a pointer
+- Keep session journals in the user's config dir, not root's home
+- Count an OpenVPN profile imported as .conf in the right column
+- Open a topology transaction after a rollback moves the generation on
+- Clippy line limit from the recovery-start diagnostic
+- Keep looking for a lost tunnel after the first recovery is cancelled
+- Stop a refused profile change reporting only an operation id
+- Elect a primary tunnel again so a full tunnel stops reading "NO EXIT"
+- Stop three surfaces reporting a state the system is not in
+- Keep the protection row when the Security Guard runs out of height
+- Stop telling users their kill switch rules are missing when they are not
+- Shed the reader's own address before the protection rows
+- Two credential-prompt surfaces that misdirected the reader
+- Stop a reconnect deadlocking on the fence its own disconnect wrote
+- Keep the block-on-drop barrier up until a tunnel is actually back
+- Stop promising a Ctrl-C that cancels nothing
+- Stop a VPN Vortix did not start being recorded as the real IP
+- Hold the block-on-drop barrier until the VPN is actually back
+- A failing block-on-drop recovery must not fail open
+- Do not release the drop barrier on a reading taken before the drop
+- Require fresh drop evidence only where a drop happened
+- Never install a pre-tunnel barrier that allows no VPN path
+- Engage the kill switch on an unexpected drop
+- Say why an unprivileged profile change is refused
+- Tear down a tunnel whose daemon was still starting when the attempt died
+- Stop a test's env mutation from aborting the cli_integration binary
+- Onboarding details that misdirect a first-time Linux user
+- Backtick the distro names in the install-hint docs
+- Serialise the integration imports that share one profile store
+- Explain a refused connect when another service owns the resolver
+- Wait for the admission results the capacity test asserts on
+- Print the reason a connect was refused, and stop the sweep test flaking
+- Let a stranded user disconnect when the profile directory disagrees
+- Re-apply DNS on reconnect/recovery when the tunnel link is recreated ([#298](https://github.com/Harry-kp/vortix/pull/298))
+
+### Documentation
+
+- **readme:** Fix broken star history chart ([#275](https://github.com/Harry-kp/vortix/pull/275))
+- Make README a concise project entry point ([#280](https://github.com/Harry-kp/vortix/pull/280))
+- Add independent Vortix features
+- Name the dormant Background mode so nobody re-derives it
+- Replace the manual-test backlog with a runnable release gate
+- Tell Arch users how to install the protocol tools
+
+### Features
+
+- **control:** Establish canonical lifecycle authority ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- **control:** Cut local CLI over to canonical service ([#267](https://github.com/Harry-kp/vortix/pull/267))
+- **control:** Cut TUI over to canonical service ([#269](https://github.com/Harry-kp/vortix/pull/269))
+- **control:** Add bounded background diagnostics ([#270](https://github.com/Harry-kp/vortix/pull/270))
+- **control:** Prepare dormant remote adapters ([#271](https://github.com/Harry-kp/vortix/pull/271))
+- **control:** Prepare background mode UX ([#272](https://github.com/Harry-kp/vortix/pull/272))
+- **helper:** Authenticate privileged execution ([#276](https://github.com/Harry-kp/vortix/pull/276))
+- **control:** Own exact policy and OpenVPN credentials ([#277](https://github.com/Harry-kp/vortix/pull/277))
+- **tui:** Reveal the password while typing it
+
+### Miscellaneous
+
+- **deps:** Bump base64 from 0.22.1 to 0.23.1 ([#266](https://github.com/Harry-kp/vortix/pull/266))
+- **deps:** Bump system-configuration from 0.7.0 to 0.8.0 ([#274](https://github.com/Harry-kp/vortix/pull/274))
+
+### Performance
+
+- Cut the release binary 42% and the test build 34%
+
+### Refactor
+
+- Remove internal plan vocabulary from code, comments, and examples ([#255](https://github.com/Harry-kp/vortix/pull/255))
+- Consolidate shared runtime plumbing ([#256](https://github.com/Harry-kp/vortix/pull/256))
+- **wireguard:** Stage in Vortix's own namespace under /etc/wireguard
+- Delete the remote profile staging that never had a backend
+- Delete three abstractions nothing constructs
+- Drop three abstractions that carry no weight
+- Remove the dormant remote-control-mutation path ([#297](https://github.com/Harry-kp/vortix/pull/297))
+
+### Testing
+
+- **telemetry:** Pin the two fixes nothing was holding
+- Reproduce the superseded-connect disconnect timeout
+
+### Diag
+
+- Name the convergence gate that leaves an operation to expire
+- Report the topology transaction and tunnel barrier decision
+- Name the profile that blocks the tunnel barrier
+- Record what resolved was asked for when a read-back disagrees
+- Say why an absent tunnel started no loss recovery
+- Record when a system scan is discarded or accepted
+- Record a reading skipped as superseded
+- Record the tunnel readings each scan publishes and any refusal
+- Name the operation that holds the loss-recovery gate shut
+- Report every desired-connected profile at the loss gate
+- Say why a service operation could not be reserved
+- Record when a loss recovery is actually started
+- Record how a loss recovery ends
+
+### Revert
+
+- The resolved read-back retry, which measured identical either way
+
+
+
 ## [0.4.3] - 2026-07-18
 
 ### Highlights
