@@ -13,7 +13,7 @@ use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::service::ProfileTopology;
 use crate::vortix_core::control::worker::{
     gate_verified, PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage,
-    TopologyPolicy, TopologyState,
+    TopologyPolicy, TopologyState, TopologyTransitionKind,
 };
 use crate::vortix_core::control::BootEligibility;
 use crate::vortix_core::control::PolicyDigest;
@@ -410,6 +410,16 @@ fn digest_of(value: &impl serde::Serialize) -> Result<PolicyDigest, String> {
 /// Only protection-installing transitions need exclusive global authority.
 /// Root-authenticated `off` and `block-on-drop` transitions reduce or remove
 /// Vortix-owned blocking and remain available as recovery operations.
+/// A reconnect or recovery destroys and recreates the tunnel interface, so the
+/// resolver on the old link is gone even when the desired DNS policy is
+/// unchanged; those transitions must re-apply DNS rather than trust a read-back.
+const fn reapplies_dns(policy: &TopologyPolicy) -> bool {
+    matches!(
+        policy.transition,
+        TopologyTransitionKind::Reconnect | TopologyTransitionKind::Recovery
+    )
+}
+
 const fn firewall_transition_requires_authority(mode: KillSwitchMode) -> bool {
     matches!(mode, KillSwitchMode::AlwaysOn)
 }
@@ -670,13 +680,24 @@ impl CanonicalPolicyExecutor {
         Ok(intents)
     }
 
-    fn reconcile_dns(&self, state: &TopologyState, force_verify: bool) -> Result<(), String> {
+    fn reconcile_dns(
+        &self,
+        state: &TopologyState,
+        force_verify: bool,
+        force_reapply: bool,
+    ) -> Result<(), String> {
         self.require_global_authority()?;
         let intents = self.dns_intents(state)?;
         let _lock = crate::core::dns_policy::acquire_policy_lock(&self.config_dir)
             .map_err(|error| format!("DNS policy lock failed: {error}"))?;
         let mut coordinator = self.dns.lock().map_err(|_| "DNS policy mutex poisoned")?;
-        if force_verify {
+        if force_reapply {
+            // A reconnect/recovery destroys and recreates the tunnel link, so
+            // the resolver applied to the old link is gone even though the
+            // desired policy is unchanged. Drop the effective proof so the
+            // reconcile re-applies instead of trusting the recreated link.
+            coordinator.invalidate_effective("tunnel link recreated; DNS must be re-applied");
+        } else if force_verify {
             coordinator.invalidate_verification();
         }
         coordinator
@@ -1043,7 +1064,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
                 Ok(())
             }
             PolicyBarrier::Dns => {
-                self.reconcile_dns(&policy.target, false)?;
+                self.reconcile_dns(&policy.target, false, reapplies_dns(policy))?;
                 self.verify_current_dns_routes(policy.deadline)?;
                 self.with_readback(policy, |evidence| evidence.dns_verified = true);
                 Ok(())
@@ -1051,7 +1072,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
             PolicyBarrier::Observation => {
                 self.verify_tunnels(policy)?;
                 self.verify_routes(policy)?;
-                self.reconcile_dns(&policy.target, true)?;
+                self.reconcile_dns(&policy.target, true, reapplies_dns(policy))?;
                 self.verify_current_dns_routes(policy.deadline)?;
                 self.with_readback(policy, |evidence| {
                     evidence.interface_verified = true;
@@ -1076,7 +1097,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
 
     fn compensate(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
         match barrier {
-            PolicyBarrier::Dns => self.reconcile_dns(&policy.prior, false),
+            PolicyBarrier::Dns => self.reconcile_dns(&policy.prior, false, false),
             PolicyBarrier::Blocking | PolicyBarrier::EffectivePublication => {
                 match firewall_compensation_target(policy, barrier) {
                     FirewallCompensationTarget::Prior => self.restore_firewall(&policy.prior),
