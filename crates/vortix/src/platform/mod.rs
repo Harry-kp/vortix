@@ -6,6 +6,8 @@
 //! over to the `Platform` aggregate.
 
 pub mod aggregate;
+#[cfg(target_os = "macos")]
+// xtask:allow-platform-cfg: the only remaining caller is the macOS DNS adapter
 pub(crate) mod fixed_root_command;
 pub(crate) mod route_probe;
 
