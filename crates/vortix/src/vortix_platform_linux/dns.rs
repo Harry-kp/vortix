@@ -22,6 +22,11 @@ const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 /// surfaces the timeout as degraded effective DNS rather than blocking the
 /// tunnel data path.
 const RESOLVECTL_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+// A freshly re-created link can read back empty for a beat before resolved
+// commits the re-applied resolver. Bound the wait so a real rejection still
+// fails promptly: up to ~1s of re-reads.
+const DNS_READBACK_SETTLE_ATTEMPTS: u32 = 10;
+const DNS_READBACK_SETTLE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Linux DNS resolution with fallback chain:
 /// 1. `resolvectl` (systemd-resolved)
@@ -867,7 +872,23 @@ fn verify_resolved_state<R: DnsCommandRunner>(
     interface: &str,
     expected: &ResolvedLinkState,
 ) -> Result<(), String> {
-    let actual = read_resolved_state(runner, interface)?;
+    // resolved can lag a freshly (re)created link by a beat: right after a
+    // reconnect tears the interface down and brings it back, the read-back can
+    // return an empty resolver before resolved has committed the re-apply. An
+    // empty read while a resolver is expected is a not-yet-settled link, not a
+    // rejection, so re-read a few times before trusting the emptiness. A
+    // genuine mismatch (wrong or extra servers) is non-empty and fails at once.
+    let mut actual = read_resolved_state(runner, interface)?;
+    let mut attempts = 0;
+    while actual != *expected
+        && actual.servers.is_empty()
+        && !expected.servers.is_empty()
+        && attempts < DNS_READBACK_SETTLE_ATTEMPTS
+    {
+        std::thread::sleep(DNS_READBACK_SETTLE_INTERVAL);
+        actual = read_resolved_state(runner, interface)?;
+        attempts += 1;
+    }
     if actual == *expected {
         Ok(())
     } else {
