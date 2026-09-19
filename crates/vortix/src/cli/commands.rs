@@ -1319,10 +1319,14 @@ fn handle_down(
         targets.retain(|s| s.name == name);
     }
 
-    let requested_profiles = profile_filter
-        .and_then(|name| engine.profiles.iter().find(|profile| profile.name == name))
-        .map(|profile| BTreeSet::from([profile.id.clone()]))
-        .unwrap_or_default();
+    let profile_id = profile_filter.and_then(|name| {
+        engine
+            .profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .map(|profile| profile.id.clone())
+    });
+    let requested_profiles: BTreeSet<_> = profile_id.clone().into_iter().collect();
     let durable_disconnect_required = if targets.is_empty() {
         crate::cli::control::durable_disconnect_required(config_dir, &requested_profiles)
             .unwrap_or_else(|error| local_control_error_or_exit(mode, "down", &error))
@@ -1354,13 +1358,6 @@ fn handle_down(
         );
     }
 
-    let profile_id = profile_filter.and_then(|name| {
-        engine
-            .profiles
-            .iter()
-            .find(|profile| profile.name == name)
-            .map(|profile| profile.id.clone())
-    });
     let control = crate::cli::control::ClientControlSession::start_production(
         config,
         config_dir,
