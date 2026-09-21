@@ -465,74 +465,49 @@ fn add_stored_profile(
 // ====================================================================
 // VPN switching tests
 // ====================================================================
-#[test]
-fn confirm_default_route_takeover_message_runs_multi_connect_path() {
-    // Message-handler-level test (not keybinding): when
-    // `Message::ConfirmDefaultRouteTakeover` fires directly, the
-    // multi-connect path runs without a Disconnecting state. The
-    // "primary inverts" scenario: both
-    // tunnels stay connected, the new one claims the default
-    // route. This message is what the overlay's [B] key produces;
-    // the keybinding test covers the input path.
-    let mut app = test_app();
-    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
-    set_connected(&mut app, "vpn-a");
-
-    app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
-
-    assert!(
-        !matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
-        "multi-connect path must not transition to Disconnecting; got {:?}",
-        app.legacy_state()
-    );
-    // Note: `connection_state` is the legacy single-tunnel mirror —
-    // it can only hold one profile at a time, so vpn-b's connect
-    // necessarily overwrites vpn-a's slot. Once a later stage retires
-    // this enum entirely, both tunnels' states will be visible via
-    // the registry exclusively.
+fn takeover_overlay(to: &str) -> InputMode {
+    InputMode::ConfirmDefaultRouteTakeover {
+        from: "vpn-a".to_string(),
+        to_profile_id: crate::vortix_core::profile::ProfileId::new(to),
+        to_name: to.to_string(),
+        confirm_selected: true,
+    }
 }
 #[test]
-fn takeover_b_key_dispatches_multi_connect_path() {
-    // [B]/[b] on the takeover overlay fires the opt-in multi-connect
-    // path: both tunnels stay connected, the new one becomes the
-    // active exit, the prior primary becomes split-tunnel-yielded.
-    // No Disconnecting state.
-    let mut app = test_app();
-    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
-    set_connected(&mut app, "vpn-a");
-    // connect_profile_forced (the multi-connect path's downstream)
-    // checks `is_root`; without it we'd hit InputMode::PermissionDenied
-    // instead of Normal. The test cares about the behavioral path,
-    // not the privilege check.
-    app.runtime.is_root = true;
-    app.toggle_connection(1);
+fn takeover_overlay_ignores_the_b_key() {
+    // "Keep both" was removed: two tunnels cannot both hold the default
+    // route. [b]/[B] is no longer a shortcut, so the overlay stays open and
+    // waits for Switch or Cancel rather than forcing an unsatisfiable
+    // both-default-route topology.
+    for key in [key_char('b'), key_shift_char('B')] {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+        app.input_mode = takeover_overlay("vpn-b");
 
-    app.handle_key(key_char('b'));
+        app.handle_key(key);
 
-    // Behavior contract: NO disconnect of the existing tunnel.
-    assert!(
-        !matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
-        "multi-connect path must not transition to Disconnecting; got {:?}",
-        app.legacy_state()
-    );
-    assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(
+            matches!(
+                app.input_mode,
+                InputMode::ConfirmDefaultRouteTakeover { .. }
+            ),
+            "[b]/[B] must be inert now; got {:?}",
+            app.input_mode
+        );
+    }
 }
-
 #[test]
-fn takeover_capital_b_also_dispatches_multi_connect() {
-    // Case-insensitive: [B] should work whether shift is held or not.
+fn takeover_overlay_esc_cancels() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
-    set_connected(&mut app, "vpn-a");
-    app.runtime.is_root = true;
-    app.toggle_connection(1);
+    app.input_mode = takeover_overlay("vpn-b");
 
-    app.handle_key(key_char('B'));
-
-    assert!(!matches!(
-        app.legacy_state(),
-        ConnectionState::Disconnecting { .. }
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
     ));
+
+    assert!(matches!(app.input_mode, InputMode::Normal));
 }
 #[test]
 fn test_toggle_while_connecting_is_rejected() {
@@ -2868,7 +2843,7 @@ fn force_disconnect_without_exact_projection_never_submits_disconnect_all() {
 }
 
 #[test]
-fn attached_control_requires_and_consumes_exact_topology_confirmation() {
+fn default_route_takeover_switches_exclusively_instead_of_keeping_both() {
     let temp = tempfile::tempdir().unwrap();
     let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
     std::fs::create_dir(&profiles_dir).unwrap();
@@ -2900,7 +2875,7 @@ fn attached_control_requires_and_consumes_exact_topology_confirmation() {
     )
     .unwrap();
     let mut app = test_app();
-    app.runtime.profiles = vec![first, second.clone()];
+    app.runtime.profiles = vec![first.clone(), second.clone()];
     app.attach_control_session(control).unwrap();
 
     app.toggle_connection(0);
@@ -2927,7 +2902,9 @@ fn attached_control_requires_and_consumes_exact_topology_confirmation() {
         .tunnels
         .contains_key(&second.id));
 
-    app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
+    // Switch is the only resolution: disconnect the first default-route
+    // tunnel, then connect the second. Both cannot hold the default route.
+    app.handle_message(Message::SwitchExclusiveAndConnect { idx: 1 });
     for _ in 0..20 {
         app.process_external();
         if app
@@ -2947,11 +2924,12 @@ fn attached_control_requires_and_consumes_exact_topology_confirmation() {
         app.toast.as_ref().map(|toast| &toast.message),
         app.control_session.as_ref().unwrap().current_snapshot()
     );
-    assert!(app
-        .control_snapshot
-        .desired
-        .conflict_acknowledgements
-        .contains_key(&second.id));
+    // The prior default-route tunnel is not kept alongside it.
+    assert_ne!(
+        app.control_snapshot.desired.tunnels.get(&first.id),
+        Some(&crate::vortix_core::control::RequestedTunnelState::Connected),
+        "the first tunnel must be disconnected by an exclusive switch"
+    );
 }
 
 #[test]

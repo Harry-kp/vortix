@@ -531,6 +531,7 @@ impl CanonicalTunnelExecutor {
                     .adoption
                     .ok_or_else(|| "recovered owner has no adoption evidence".to_string())?,
                 receipt.handshake,
+                receipt.openvpn_dns,
                 receipt.probe_receipts,
                 handle.process_ownership.as_ref(),
                 revision,

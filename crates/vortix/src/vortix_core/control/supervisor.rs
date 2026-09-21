@@ -35,6 +35,10 @@ pub struct ProfileSupervision {
     pub mutation: TunnelMutation,
     pub adoption: Option<AdoptionEvidence>,
     pub handshake: Option<HandshakeEvidence>,
+    /// DNS the `OpenVPN` server pushed, recovered on adoption so the projection
+    /// can show it. The live-connect path publishes this via the work result;
+    /// recovery bypasses that path, so it is carried here instead.
+    pub openvpn_dns: Option<crate::vortix_core::ports::dns::DnsRequest>,
     pub probe_receipts: Vec<ProbeReceipt>,
     pub truth: SupervisedTruth,
 }
@@ -335,6 +339,7 @@ impl Supervisor {
             mutation: work.mutation,
             adoption: None,
             handshake: None,
+            openvpn_dns: None,
             probe_receipts: Vec::new(),
             truth: if work.mutation == TunnelMutation::Disconnect {
                 SupervisedTruth::DisconnectedTombstone
@@ -415,6 +420,7 @@ impl Supervisor {
             mutation: work.mutation,
             adoption: None,
             handshake: None,
+            openvpn_dns: None,
             probe_receipts: Vec::new(),
             truth: if work.mutation == TunnelMutation::Disconnect {
                 SupervisedTruth::DisconnectedTombstone
@@ -469,6 +475,7 @@ impl Supervisor {
                 mutation: TunnelMutation::Connect,
                 adoption: Some(evidence),
                 handshake: None,
+                openvpn_dns: None,
                 probe_receipts: Vec::new(),
                 truth: SupervisedTruth::ObservedPresent,
             },
@@ -480,10 +487,15 @@ impl Supervisor {
     /// one-shot client process exits. Scanner evidence alone cannot call this
     /// seam: `WireGuard` requires its generation-bound handshake, while
     /// `OpenVPN` requires the authenticated custodian identity.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "recovered ownership is one atomic set of adoption facts; bundling them into a struct would only move the argument list"
+    )]
     pub fn restore_owned_tunnel(
         &self,
         evidence: AdoptionEvidence,
         handshake: Option<HandshakeEvidence>,
+        openvpn_dns: Option<crate::vortix_core::ports::dns::DnsRequest>,
         probe_receipts: Vec<ProbeReceipt>,
         process_ownership: Option<&crate::vortix_core::ports::process::ManagedProcessId>,
         revision: TunnelRevision,
@@ -540,6 +552,7 @@ impl Supervisor {
                 mutation: TunnelMutation::Connect,
                 adoption: Some(evidence),
                 handshake,
+                openvpn_dns,
                 probe_receipts,
                 truth: SupervisedTruth::ObservedPresent,
             },
@@ -1051,6 +1064,7 @@ impl Supervisor {
                         mutation: TunnelMutation::Disconnect,
                         adoption: None,
                         handshake: None,
+                        openvpn_dns: None,
                         probe_receipts: Vec::new(),
                         truth: if tombstone.teardown_failed {
                             SupervisedTruth::OutcomeUnknown

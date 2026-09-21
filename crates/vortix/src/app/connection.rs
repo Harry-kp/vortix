@@ -1489,26 +1489,20 @@ impl App {
             .position(|profile| &profile.id == profile_id)
     }
 
-    fn control_connect_profile(&mut self, idx: usize, acknowledge_conflict: bool) {
+    fn control_connect_profile(&mut self, idx: usize) {
         let Some(profile) = self.runtime.profiles.get(idx).cloned() else {
             return;
         };
-        let conflict = self.control_snapshot.topology_conflict(&profile.id);
-        if let Some(conflict) = conflict.clone() {
-            if !acknowledge_conflict {
-                self.fire_conflict_overlay(conflict, idx, profile.id, profile.name);
-                return;
-            }
-        } else if acknowledge_conflict {
-            self.show_toast(
-                "Tunnel topology changed; review the connection again".to_string(),
-                ToastType::Warning,
-            );
+        // A default-route takeover cannot be resolved by keeping both tunnels,
+        // so a conflict always routes to the overlay; the only way through is
+        // Switch (disconnect the other, connect this one) or Cancel.
+        if let Some(conflict) = self.control_snapshot.topology_conflict(&profile.id) {
+            self.fire_conflict_overlay(conflict, idx, profile.id, profile.name);
             return;
         }
         self.issue_control_command(crate::vortix_core::control::UserCommand::Connect {
             profile_id: profile.id,
-            conflict_acknowledgement: conflict,
+            conflict_acknowledgement: None,
         });
     }
 
@@ -1533,7 +1527,7 @@ impl App {
                 profile_id: Some(profile_id),
             });
         } else {
-            self.control_connect_profile(idx, false);
+            self.control_connect_profile(idx);
         }
     }
 
@@ -1570,14 +1564,6 @@ impl App {
             ),
             ToastType::Warning,
         );
-    }
-    /// Retry a connect after the user acknowledges the current topology conflict.
-    pub(crate) fn connect_profile_forced(&mut self, idx: usize) {
-        if self.control_session.is_some() {
-            self.control_connect_profile(idx, true);
-        } else {
-            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
-        }
     }
     /// Disconnect the primary canonical tunnel, or the first active tunnel.
     pub(crate) fn disconnect(&mut self) {
