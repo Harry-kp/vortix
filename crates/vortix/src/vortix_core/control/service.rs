@@ -9407,19 +9407,9 @@ mod target_profiles_tests {
             "precondition: the tunnel is connected but still awaiting observation"
         );
 
-        let command = UserCommand::Disconnect { profile_id: None };
-        let catalog = BTreeSet::from([profile.clone()]);
-        let targets = target_profiles_for_command(
-            &command,
-            &catalog,
-            &BTreeMap::new(),
-            ExecutionSelection::CanonicalAuthority,
-            Some(&supervisor),
-        )
-        .unwrap();
         let lifecycle = lifecycle_profiles_for_command(
-            &command,
-            &targets,
+            &UserCommand::Disconnect { profile_id: None },
+            std::slice::from_ref(&profile),
             ExecutionSelection::CanonicalAuthority,
             Some(&supervisor),
         )
