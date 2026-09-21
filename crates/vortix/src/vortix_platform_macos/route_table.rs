@@ -66,6 +66,24 @@ impl RouteTable for MacRouteTable {
         )
     }
 
+    fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
+        // `change` rebinds the route OpenVPN already installed on the wrong
+        // interface; `add` covers the race where it is not present yet. An
+        // interface-scoped route binds to the named utun no matter how a
+        // gateway would resolve.
+        for verb in ["change", "add"] {
+            let spec = CommandSpec::oneshot("route", bind_route_args(verb, cidr, interface))
+                .timeout(ROUTE_QUERY_TIMEOUT)
+                .output_limit(64 * 1024);
+            if crate::vortix_process::run_to_output(spec)
+                .is_ok_and(|output| output.status.success())
+            {
+                return Ok(());
+            }
+        }
+        Err(format!("route {cidr} could not be bound to {interface}"))
+    }
+
     fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
         let spec = CommandSpec::oneshot("route", route_get_args(target))
             .timeout(ROUTE_QUERY_TIMEOUT)
@@ -87,6 +105,19 @@ impl RouteTable for MacRouteTable {
 pub(crate) fn route_get_args(target: IpAddr) -> Vec<String> {
     let family = if target.is_ipv4() { "-inet" } else { "-inet6" };
     vec!["-n".into(), "get".into(), family.into(), target.to_string()]
+}
+
+/// Argv for `route -n <verb> -net <cidr> -interface <iface>`: an
+/// interface-scoped route that binds to the named utun regardless of gateway.
+pub(crate) fn bind_route_args(verb: &str, cidr: &str, interface: &str) -> Vec<String> {
+    vec![
+        "-n".into(),
+        verb.into(),
+        "-net".into(),
+        cidr.into(),
+        "-interface".into(),
+        interface.into(),
+    ]
 }
 
 /// Run `route -n get <ROUTE_PROBE_TARGET>` and return its stdout as
@@ -225,6 +256,23 @@ destination: default
         assert_eq!(
             route_get_args("2606:4700:4700::1111".parse().unwrap()),
             ["-n", "get", "-inet6", "2606:4700:4700::1111"]
+        );
+    }
+
+    #[test]
+    fn bind_route_is_interface_scoped_not_gateway_scoped() {
+        // `-interface utunN` (not a gateway) is the whole point: it binds the
+        // route to the named tunnel regardless of how a gateway would resolve.
+        assert_eq!(
+            bind_route_args("change", "10.250.0.0/24", "utun5"),
+            [
+                "-n",
+                "change",
+                "-net",
+                "10.250.0.0/24",
+                "-interface",
+                "utun5"
+            ]
         );
     }
 }

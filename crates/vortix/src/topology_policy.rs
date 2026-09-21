@@ -617,18 +617,38 @@ impl CanonicalPolicyExecutor {
                     "route verification deadline expired after {index} of {total} probes"
                 ));
             }
-            let observation = route_table.route_interface_for(expectation.target);
+            let mut observation = route_table.route_interface_for(expectation.target);
             if std::time::Instant::now() >= policy.deadline {
                 return Err(format!(
                     "route verification deadline expired during probe {} of {total}",
                     index + 1
                 ));
             }
-            if !matches!(
-                &observation,
-                DefaultRouteObservation::Interface(observed)
-                    if observed == &expectation.interface
-            ) {
+            let matches_expected = |observation: &DefaultRouteObservation| {
+                matches!(
+                    observation,
+                    DefaultRouteObservation::Interface(observed)
+                        if observed == &expectation.interface
+                )
+            };
+            if !matches_expected(&observation) {
+                // macOS OpenVPN installs a pushed split route via its gateway,
+                // which — with a full tunnel already owning `0.0.0.0/1` —
+                // resolves through the full tunnel and lands the route on the
+                // wrong interface. Rebind it interface-scoped and re-probe.
+                // No-op on Linux, which already installs device-scoped.
+                let (_, claim) = expectation
+                    .claims
+                    .first()
+                    .expect("route probe expectation has at least one claim");
+                if route_table
+                    .bind_route(&claim.to_string(), &expectation.interface)
+                    .is_ok()
+                {
+                    observation = route_table.route_interface_for(expectation.target);
+                }
+            }
+            if !matches_expected(&observation) {
                 let (_, claim) = expectation
                     .claims
                     .first()

@@ -47,6 +47,12 @@ impl RouteTable for LinuxRouteTable {
         parse_gateway(&text)
     }
 
+    fn bind_route(_cidr: &str, _interface: &str) -> Result<(), String> {
+        // Linux OpenVPN installs routes device-scoped, so the more-specific
+        // split route already lands on its own interface — nothing to rebind.
+        Ok(())
+    }
+
     fn default_route_observation() -> DefaultRouteObservation {
         let Some(text) = run_ip_route_show_default() else {
             return DefaultRouteObservation::ProbeFailed;
