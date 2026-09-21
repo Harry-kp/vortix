@@ -5425,13 +5425,22 @@ fn lifecycle_profiles_for_command(
     {
         return Ok(target_profiles.to_vec());
     }
+    // Disconnect-all must reap every tunnel with a live adopted process, not
+    // only the ones the scanner has already confirmed present. A tunnel still
+    // in `WaitingForObservation` (connected, adoption proven, but not yet
+    // observed) was excluded here, so disconnect-all never reserved its
+    // teardown — it lingered until the operation's own deadline force-killed
+    // it, and the whole command reported a spurious "could not confirm settled"
+    // timeout even though teardown eventually happened.
     let managed = supervisor
         .ok_or(AdmissionError::Stopped)?
         .profiles()
         .into_iter()
         .filter_map(|(profile_id, supervision)| {
-            (supervision.truth == SupervisedTruth::ObservedPresent
-                && supervision.adoption.is_some())
+            (matches!(
+                supervision.truth,
+                SupervisedTruth::ObservedPresent | SupervisedTruth::WaitingForObservation
+            ) && supervision.adoption.is_some())
             .then_some(profile_id)
         })
         .collect::<BTreeSet<_>>();
@@ -9330,6 +9339,95 @@ mod target_profiles_tests {
         assert!(
             !snapshot.tunnels.contains_key(&disconnected),
             "an already-absent profile must not appear to be disconnecting"
+        );
+    }
+
+    #[test]
+    fn disconnect_all_reaps_a_tunnel_still_awaiting_observation() {
+        // A tunnel that connected but is not yet scanner-confirmed sits at
+        // `WaitingForObservation` with a live, adopted process. disconnect-all
+        // must still reap it: excluding it left the process running until the
+        // operation's own deadline force-killed it, so the whole command
+        // reported a spurious "could not confirm settled" timeout.
+        struct AttestedExecutor;
+        impl crate::vortix_core::control::worker::TunnelExecutor for AttestedExecutor {
+            fn execute(
+                &self,
+                work: &TunnelWork,
+                _: &crate::vortix_core::control::worker::CancellationToken,
+            ) -> Result<TunnelExecutionReceipt, String> {
+                TunnelExecutionReceipt::attested(
+                    work.profile_id.clone(),
+                    format!("tun-{}", work.profile_id.as_str()),
+                    work.protocol,
+                    Some(4242),
+                    "await-observation-attestation",
+                )
+            }
+        }
+
+        let profile = ProfileId::new("awaiting");
+        let supervisor = Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(AttestedExecutor),
+            Arc::new(NoopPolicy),
+            2,
+            4,
+        );
+        let revision = TunnelRevision {
+            authority_epoch: AuthorityEpoch(1),
+            generation: 7,
+        };
+        let admission = supervisor
+            .reserve_tunnel(&profile, std::iter::empty::<String>())
+            .expect("connect capacity reserved");
+        supervisor
+            .dispatch_reserved_tunnel(
+                TunnelWork {
+                    profile_id: profile.clone(),
+                    operation_id: OperationId::from_parts(AuthorityEpoch(1), 7),
+                    revision,
+                    resource_revision: revision,
+                    mutation: TunnelMutation::Connect,
+                    protocol: crate::vortix_core::ports::tunnel::TunnelKindTag::OpenVpn,
+                    deadline: Instant::now() + Duration::from_secs(2),
+                },
+                admission,
+            )
+            .expect("connect dispatched");
+        // Drain the connect receipt so the profile reaches the observation gate.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && supervisor.poll_tunnel().is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            supervisor.profile_truth(&profile).is_some_and(|entry| {
+                entry.truth == SupervisedTruth::WaitingForObservation && entry.adoption.is_some()
+            }),
+            "precondition: the tunnel is connected but still awaiting observation"
+        );
+
+        let command = UserCommand::Disconnect { profile_id: None };
+        let catalog = BTreeSet::from([profile.clone()]);
+        let targets = target_profiles_for_command(
+            &command,
+            &catalog,
+            &BTreeMap::new(),
+            ExecutionSelection::CanonicalAuthority,
+            Some(&supervisor),
+        )
+        .unwrap();
+        let lifecycle = lifecycle_profiles_for_command(
+            &command,
+            &targets,
+            ExecutionSelection::CanonicalAuthority,
+            Some(&supervisor),
+        )
+        .unwrap();
+
+        assert!(
+            lifecycle.contains(&profile),
+            "disconnect-all must reap a tunnel still awaiting observation; got {lifecycle:?}"
         );
     }
 
