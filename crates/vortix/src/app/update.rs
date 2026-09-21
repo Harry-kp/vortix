@@ -100,24 +100,6 @@ impl App {
                     self.confirm_delete_profile(&profile_id);
                 }
             }
-            Message::ConfirmDefaultRouteTakeover { idx } => {
-                self.input_mode = InputMode::Normal;
-                if let Some(profile) = self.runtime.profiles.get(idx) {
-                    self.log(&format!(
-                        "ACTION: Switching active exit to '{}'; both tunnels stay connected",
-                        profile.name
-                    ));
-                }
-                // The "primary inverts" scenario: both tunnels stay
-                // connected; the new one claims the kernel default
-                // route and the prior primary becomes
-                // `Split tunnel (0.0.0.0/0, yielded)` in the registry's
-                // role derivation. Symmetric with
-                // The conflict was already surfaced via the overlay, so
-                // retry the connect with the `detect_conflict` gate
-                // bypassed.
-                self.connect_profile_forced(idx);
-            }
             Message::SwitchExclusiveAndConnect { idx } => {
                 // User chose the legacy "switch VPNs" path on the
                 // takeover overlay: disconnect the current tunnel,

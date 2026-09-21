@@ -347,31 +347,11 @@ impl App {
                 mut confirm_selected,
                 ..
             } => {
-                // Key bindings on this overlay:
-                //
-                //   [Y]/Enter  -> SwitchExclusiveAndConnect (legacy:
-                //                 disconnect current, then connect new)
-                //   [B]/[b]    -> ConfirmDefaultRouteTakeover (new:
-                //                 keep both connected, new becomes
-                //                 active exit, old becomes split
-                //                 tunnel)
+                // Two default-route tunnels cannot coexist, so the only
+                // resolutions are:
+                //   [Y]/Enter  -> SwitchExclusiveAndConnect (disconnect
+                //                 current, then connect new)
                 //   [N]/Esc    -> Cancel
-                //
-                // The Y/N cursor still navigates the Yes/No buttons.
-                // [B] is a side hotkey for the multi-connect path.
-                if matches!(key.code, KeyCode::Char('b' | 'B')) {
-                    let idx = self
-                        .runtime
-                        .profiles
-                        .iter()
-                        .position(|p| p.id == to_profile_id);
-                    if let Some(i) = idx {
-                        self.handle_message(Message::ConfirmDefaultRouteTakeover { idx: i });
-                    } else {
-                        self.handle_message(Message::CloseOverlay);
-                    }
-                    return;
-                }
                 match handle_confirm_keys(key, &mut confirm_selected) {
                     ConfirmAction::Confirmed => {
                         // [Y]es fires the exclusive canonical switch. The

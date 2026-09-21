@@ -368,40 +368,29 @@ fn render_default_route_takeover_confirm(
 ) {
     use super::overlays::confirm_dialog::{self, ConfirmDialogConfig};
 
-    // Multi-connect is a NEW feature — most users
-    // running into this overlay want the familiar pre-existing
-    // "switch VPN" behavior (disconnect old, connect new). So
-    // [Y]/Enter is wired to Switch (the recommended/default
-    // action) and the new Connect-both path is gated behind
-    // an opt-in [B] hotkey. Y/N nav still works as expected;
-    // the cursor defaults to [Y]es.
-    //
-    // The popup fires when both VPNs declare a default route
-    // (0.0.0.0/0) — only one can actually hold the kernel
-    // default route at a time. Either flavor of resolution
-    // (Switch or Both) acknowledges that constraint; Both
-    // keeps the demoted VPN connected as a split tunnel for
-    // failover or per-subnet routing.
+    // Both VPNs declare a default route (0.0.0.0/0), and only one can hold the
+    // kernel default route at a time, so the two cannot both be the exit.
+    // Switch (disconnect the old, connect the new) or cancel — there is no
+    // "keep both" here; a second full-tunnel cannot coexist with the first.
     let inner_width = usize::from(
         64_u16
             .min(frame.area().width.saturating_sub(4))
             .saturating_sub(2),
     );
-    let to_width =
-        inner_width.saturating_sub("[B] Keep both — use ".width() + " as the active exit".width());
-    let from_width =
-        inner_width.saturating_sub("    ".width() + " stays connected as split tunnel".width());
     let switch_from_width = inner_width.saturating_sub("[Y] Switch — disconnect ".width());
-    let to = crate::ui::helpers::truncate_to_width(to_name, to_width);
-    let split_from = crate::ui::helpers::truncate_to_width(from, from_width);
+    let cancel_from_width = inner_width.saturating_sub("[Esc] Cancel — keep ".width());
     let switch_from = crate::ui::helpers::truncate_to_width(from, switch_from_width);
+    let cancel_from = crate::ui::helpers::truncate_to_width(from, cancel_from_width);
     confirm_dialog::render(
         frame,
         ConfirmDialogConfig {
             title: " Already connected ",
             body: vec![
                 Line::from(vec![
-                    Span::styled(to.clone(), Style::default().fg(theme::current().success)),
+                    Span::styled(
+                        crate::ui::helpers::truncate_to_width(to_name, inner_width),
+                        Style::default().fg(theme::current().success),
+                    ),
                     Span::styled(
                         " also wants to handle all",
                         Style::default().fg(theme::current().text_secondary),
@@ -426,30 +415,12 @@ fn render_default_route_takeover_confirm(
                 ]),
                 Line::from(vec![
                     Span::styled(
-                        "[B] Keep both ",
-                        Style::default()
-                            .fg(theme::current().accent_primary)
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "— use ",
+                        "[Esc] Cancel — keep ",
                         Style::default().fg(theme::current().text_secondary),
                     ),
-                    Span::styled(to, Style::default().fg(theme::current().success)),
                     Span::styled(
-                        " as the active exit",
-                        Style::default().fg(theme::current().text_secondary),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("    ", Style::default()),
-                    Span::styled(
-                        split_from,
+                        cancel_from,
                         Style::default().fg(theme::current().accent_primary),
-                    ),
-                    Span::styled(
-                        " stays connected as split tunnel",
-                        Style::default().fg(theme::current().text_secondary),
                     ),
                 ]),
             ],
@@ -457,7 +428,7 @@ fn render_default_route_takeover_confirm(
             confirm_selected,
             confirm_label: "Switch",
             width: 64,
-            height: 12,
+            height: 10,
         },
     );
 }
@@ -581,7 +552,7 @@ mod overlay_tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
-    fn takeover_dialog_keeps_both_profile_names_and_choices_visible() {
+    fn takeover_dialog_offers_only_switch_or_cancel() {
         let mut app = App::new_test();
         app.input_mode = InputMode::ConfirmDefaultRouteTakeover {
             from: "existing-primary-profile-with-a-deliberately-long-name".to_string(),
@@ -602,10 +573,11 @@ mod overlay_tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(output.contains("existing-primary-profile"), "{output}");
-        assert!(output.contains("incoming-primary-pro..."), "{output}");
+        assert!(output.contains("incoming-primary-pro"), "{output}");
         assert!(output.contains("[Y] Switch — disconnect"), "{output}");
-        assert!(output.contains("[B] Keep both"), "{output}");
-        assert!(output.contains("[N] Cancel"), "{output}");
+        assert!(output.contains("[Esc] Cancel — keep"), "{output}");
+        // "Keep both" was removed: a second default-route tunnel cannot coexist.
+        assert!(!output.contains("Keep both"), "{output}");
     }
 
     /// The overlap dialog used to read "Route Overlap / Connect X / Overlaps

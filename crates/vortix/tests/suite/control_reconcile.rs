@@ -422,6 +422,7 @@ fn supervisor_restores_only_protocol_correct_owned_tunnels() {
         .restore_owned_tunnel(
             adoption.adoption.unwrap(),
             adoption.handshake,
+            None,
             Vec::new(),
             None,
             wg_revision,
@@ -450,6 +451,7 @@ fn supervisor_restores_only_protocol_correct_owned_tunnels() {
         supervisor.restore_owned_tunnel(
             wrong_generation.adoption.unwrap(),
             wrong_generation.handshake,
+            None,
             Vec::new(),
             None,
             tunnel_revision(7),
@@ -489,6 +491,7 @@ fn supervisor_requires_matching_openvpn_custodian_capability() {
         supervisor.restore_owned_tunnel(
             adoption.clone(),
             None,
+            None,
             Vec::new(),
             Some(&wrong_owner),
             tunnel_revision(7),
@@ -505,6 +508,7 @@ fn supervisor_requires_matching_openvpn_custodian_capability() {
     assert_eq!(
         supervisor.restore_owned_tunnel(
             adoption,
+            None,
             None,
             Vec::new(),
             Some(&wrong_generation),
@@ -1633,6 +1637,7 @@ async fn restarted_local_service_dispatches_down_for_restored_owned_tunnel() {
         .restore_owned_tunnel(
             receipt.adoption.unwrap(),
             receipt.handshake,
+            None,
             Vec::new(),
             None,
             tunnel_revision(7),

@@ -86,17 +86,10 @@ pub enum Message {
     OpenDelete(Option<usize>),
     /// Confirm deletion
     ConfirmDelete,
-    /// Confirm default-route takeover (—
-    /// formerly `ConfirmSwitch`). User accepted the overlay; retry the
-    /// connect with `force=true`. Both tunnels stay connected per
-    /// the "primary inverts" scenario.
-    ConfirmDefaultRouteTakeover {
-        idx: usize,
-    },
-    /// User chose the legacy single-tunnel "switch" path on the
-    /// default-route takeover overlay: disconnect the current tunnel
-    /// first, then connect the new one. Fired by the `[Y] Switch` choice on
-    /// the overlay (distinct from `[B] Keep both`).
+    /// User resolved the default-route takeover overlay by switching:
+    /// disconnect the current tunnel first, then connect the new one. Two
+    /// tunnels cannot both hold the default route, so switch is the only
+    /// way to proceed. Fired by the `[Y] Switch` choice on the overlay.
     SwitchExclusiveAndConnect {
         idx: usize,
     },
