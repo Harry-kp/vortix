@@ -4438,43 +4438,9 @@ async fn unanswered_interactive_challenge_fails_closed_without_recovery_connect(
     .await;
 }
 
-/// Refusing the credential prompt is as definitive as a rejected password,
-/// so it must release supervisor ownership the same way. It did not: the
-/// profile stayed `Degraded(ChallengeFailed)` for good, and a profile that is
-/// desired-absent yet still supervised is the one state the tunnel barrier
-/// refuses to pass — so no policy could publish for any profile afterwards.
-/// The sibling test above covers the intent rollback; only ownership was
-/// unchecked, which is exactly where the defect lived.
-/// Reproduction, not yet a fix. Disconnecting a profile while its own connect
-/// is still in flight leaves BOTH operations stuck at `WaitingForObservation`,
-/// which the user sees as "disconnection timed out" ~32s later.
-///
-/// Measured state at the point of failure:
-///   disconnect and connect both `WaitingForObservation`,
-///   supervised truth `DisconnectedTombstone`, desired `Disconnected`
-///
-/// Mechanism, as far as it is established: submitting the disconnect finds the
-/// connect's entry in flight with a different revision, so `submit_tunnel`
-/// cancels it and returns `Busy` without submitting. `poll_tunnel` then sees
-/// the cancelled connect's result is no longer exact — the entry has been
-/// replaced — and rewrites it to `Err(Stale)`. The result chain in
-/// `drive_supervision` has no `Stale` arm, so it matches nothing and the
-/// operation never terminalises.
-///
-/// A fix aimed at `WorkFailure::Cancelled` does NOT work: that variant never
-/// arrives on this path. Left `#[ignore]`d rather than shipping a third guess
-/// into the control plane.
-#[ignore = "reproduction for the superseded-connect disconnect timeout; no fix yet"]
-/// Disconnecting a profile while its own connect is still in flight cancels
-/// that connect. Nothing handled a cancelled tunnel result, so it fell past
-/// every arm of the result chain: the operation never terminalised and the
-/// supervisor kept owning the profile — supervised while desired-absent,
-/// which the tunnel barrier refuses to pass. The disconnect that superseded
-/// it then could not converge and timed out at its deadline.
-///
-/// The executor must genuinely block until its token fires; an instant
-/// executor finishes the connect before the disconnect lands and never
-/// exercises the cancel path at all.
+/// A newer disconnect must cancel both an older connect's intent and its
+/// worker. The worker deliberately blocks so the cancellation race cannot be
+/// skipped, and its per-profile result may be coalesced by the disconnect.
 #[tokio::test]
 async fn a_disconnect_superseding_its_own_connect_settles() {
     struct BlockUntilCancelled;
@@ -4499,10 +4465,12 @@ async fn a_disconnect_superseding_its_own_connect_settles() {
     }
 
     let target = profile("superseded-connect");
+    let policy = Arc::new(TopologyCapture::default());
+    policy.publish_readback();
     let supervisor = Arc::new(Supervisor::new(
         AuthorityEpoch(1),
         Arc::new(BlockUntilCancelled),
-        Arc::new(OkPolicy),
+        policy,
         2,
         8,
     ));
@@ -4520,7 +4488,7 @@ async fn a_disconnect_superseding_its_own_connect_settles() {
     );
     let client = service.client();
 
-    client
+    let connect = client
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
@@ -4550,9 +4518,24 @@ async fn a_disconnect_superseding_its_own_connect_settles() {
 
     wait_for_condition(
         || {
-            client.snapshot().operations[&disconnect.operation_id]
-                .status
-                .is_terminal()
+            supervisor.profile_truth(&target).is_none()
+                && client
+                    .snapshot()
+                    .observed
+                    .tunnels
+                    .get(&target)
+                    .is_some_and(|tunnel| !tunnel.active)
+        },
+        "superseding disconnect did not publish authenticated absence",
+    )
+    .await;
+
+    wait_for_condition(
+        || {
+            let snapshot = client.snapshot();
+            snapshot.operations[&connect.operation_id].status == OperationStatus::Cancelled
+                && snapshot.operations[&disconnect.operation_id].status
+                    == OperationStatus::Succeeded
         },
         "the superseding disconnect never settled",
     )

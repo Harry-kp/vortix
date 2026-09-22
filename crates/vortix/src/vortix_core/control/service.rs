@@ -2485,6 +2485,34 @@ fn drive_supervision(
         );
     }
 
+    // New desired state is sufficient to retire incompatible older intent;
+    // the per-profile worker result slot may coalesce its cancellation receipt.
+    let superseded = snapshot
+        .operations
+        .values()
+        .filter(|operation| {
+            !operation.status.is_terminal()
+                && operation.desired_generation < snapshot.desired.generation
+                && !operation_intent_is_compatible(operation, snapshot)
+        })
+        .map(|operation| (operation.id.clone(), operation.desired_generation))
+        .collect::<Vec<_>>();
+    for (operation_id, desired_generation) in superseded {
+        let _ = complete_operation(
+            OperationCompletion {
+                operation_id,
+                desired_generation,
+                outcome: CompletionOutcome::Cancelled,
+            },
+            snapshot,
+            owner,
+            admission,
+            now,
+            config,
+            events,
+        );
+    }
+
     while let Some(result) = supervisor.poll_tunnel() {
         if result.result.is_ok() {
             if result.mutation == TunnelMutation::Disconnect {
@@ -2557,6 +2585,24 @@ fn drive_supervision(
                 handshake_at_millis: system_time_millis(handshake.handshake_at),
                 observed_at_millis: system_time_millis(handshake.observed_at),
             });
+        }
+        if result.result == Err(WorkFailure::Stale) {
+            // A newer revision owns this profile. Do not let the old result
+            // invalidate its observation gates or start recovery work.
+            let _ = complete_operation(
+                OperationCompletion {
+                    operation_id: result.operation_id,
+                    desired_generation: result.revision.generation,
+                    outcome: CompletionOutcome::Cancelled,
+                },
+                snapshot,
+                owner,
+                admission,
+                now,
+                config,
+                events,
+            );
+            continue;
         }
         if result.result.is_err() {
             let unexpected_retry = schedule_unexpected_recovery_backoff(

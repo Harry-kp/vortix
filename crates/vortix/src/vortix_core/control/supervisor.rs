@@ -112,6 +112,7 @@ struct State {
     policy_degraded: Option<WorkFailure>,
     protected: Option<(ControlRevision, OperationId, u64)>,
     last_policy_audit: Option<(ControlRevision, OperationId, u64)>,
+    cancellations: BTreeMap<ProfileId, (TunnelRevision, OperationId, CancellationToken)>,
 }
 
 impl State {
@@ -131,6 +132,7 @@ impl State {
             policy_degraded: None,
             protected: None,
             last_policy_audit: None,
+            cancellations: BTreeMap::new(),
         }
     }
 }
@@ -321,7 +323,9 @@ impl Supervisor {
                     | SupervisedTruth::DisconnectedTombstone
             ) {
                 if entry.revision != work.revision {
-                    self.tunnels.cancel_profile(&work.profile_id);
+                    if let Some((_, _, cancellation)) = state.cancellations.get(&work.profile_id) {
+                        cancellation.cancel();
+                    }
                 }
                 return Err(WorkFailure::Busy);
             }
@@ -348,6 +352,14 @@ impl Supervisor {
             },
         };
         let cancellation = self.tunnels.dispatch(work, routes)?;
+        state.cancellations.insert(
+            profile_id.clone(),
+            (
+                entry.revision,
+                entry.operation_id.clone(),
+                cancellation.clone(),
+            ),
+        );
         state.profiles.insert(profile_id.clone(), entry.clone());
         if entry.mutation == TunnelMutation::Disconnect {
             state.tombstones.insert(profile_id, entry);
@@ -413,6 +425,15 @@ impl Supervisor {
             return Err(WorkFailure::Stale);
         }
         let profile_id = work.profile_id.clone();
+        if state
+            .profiles
+            .get(&profile_id)
+            .is_some_and(|entry| entry.revision != work.revision)
+        {
+            if let Some((_, _, cancellation)) = state.cancellations.get(&profile_id) {
+                cancellation.cancel();
+            }
+        }
         let entry = ProfileSupervision {
             revision: work.revision,
             resource_revision: work.resource_revision,
@@ -429,6 +450,14 @@ impl Supervisor {
             },
         };
         let cancellation = self.tunnels.dispatch_admitted(work, admission)?;
+        state.cancellations.insert(
+            profile_id.clone(),
+            (
+                entry.revision,
+                entry.operation_id.clone(),
+                cancellation.clone(),
+            ),
+        );
         state.profiles.insert(profile_id.clone(), entry.clone());
         if entry.mutation == TunnelMutation::Disconnect {
             state.tombstones.insert(profile_id, entry);
@@ -606,6 +635,15 @@ impl Supervisor {
     pub fn poll_tunnel(&self) -> Option<TunnelWorkResult> {
         let mut result = self.tunnels.try_result()?;
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        if state
+            .cancellations
+            .get(&result.profile_id)
+            .is_some_and(|(revision, operation, _)| {
+                *revision == result.revision && *operation == result.operation_id
+            })
+        {
+            state.cancellations.remove(&result.profile_id);
+        }
         let exact = state.profiles.get(&result.profile_id).is_some_and(|entry| {
             entry.revision == result.revision
                 && entry.operation_id == result.operation_id
