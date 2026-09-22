@@ -523,7 +523,7 @@ impl RouteTableKind {
     }
 
     /// Bind `cidr` to `interface` (macOS re-scopes a gateway-installed route;
-    /// Linux is a no-op). See [`RouteTable::bind_route`].
+    /// Linux is a no-op). See [`crate::vortix_core::ports::route_table::RouteTable::bind_route`].
     pub fn bind_route(&self, cidr: &str, interface: &str) -> Result<(), String> {
         use crate::vortix_core::ports::route_table::RouteTable;
         match self {
