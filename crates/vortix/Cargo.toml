@@ -50,7 +50,7 @@ ratatui-flip-panel = "0.1"
 time = { workspace = true }
 
 # Error Handling
-color-eyre = { workspace = true }
+eyre = { workspace = true }
 
 # CLI Argument Parsing
 clap = { workspace = true }

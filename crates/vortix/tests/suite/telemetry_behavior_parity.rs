@@ -1,4 +1,4 @@
-//! behavior-parity tests for the `reqwest`-based telemetry
+//! behavior-parity tests for the `ureq`-based telemetry
 //! HTTP helper. Locks in the contract before the curl swap: timeouts,
 //! redirect policy, non-2xx mapping, and JSON deserialization all match
 //! what the prior `curl -s --max-time N <url>` invocation produced.
@@ -111,7 +111,7 @@ fn write_response(stream: &mut TcpStream, path: &str) {
         }
         "/slow" => {
             // Read response slowly enough to trip the client timeout.
-            thread::sleep(Duration::from_secs(3));
+            thread::sleep(Duration::from_millis(400));
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
         }
         _ => {
@@ -161,16 +161,16 @@ fn get_text_does_not_follow_redirects() {
 
 #[test]
 fn get_text_times_out_within_budget() {
-    // Curl's `--max-time 1` translates to reqwest's `.timeout(1s)`. A
-    // server that takes 3s to respond must trip the timeout in ~1s.
+    // The server delay is four times the client budget, which is enough to
+    // prove the timeout without making every suite run wait three seconds.
     let server = spawn_mock_server();
     let start = std::time::Instant::now();
-    let result = telemetry_http::get_text_v4(&server.url("/slow"), Duration::from_secs(1));
+    let result = telemetry_http::get_text_v4(&server.url("/slow"), Duration::from_millis(100));
     let elapsed = start.elapsed();
     assert!(result.is_none(), "expected timeout None, got {result:?}");
     assert!(
-        elapsed < Duration::from_millis(2500),
-        "timeout should fire within ~1s budget, elapsed: {elapsed:?}"
+        elapsed < Duration::from_millis(350),
+        "timeout should fire within the 100ms budget, elapsed: {elapsed:?}"
     );
 }
 

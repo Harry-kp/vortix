@@ -234,3 +234,23 @@ The warm suite's slowest test repeated a five-second TERM-resistant process-grou
 already covered by both a focused custodian unit test and a later real-process case. Removing
 that duplicate reduced the test from 9.09 s to 3.35 s without removing SIGKILL/group-containment
 coverage.
+
+### Error-report and tracing trim
+
+`color-eyre` unconditionally compiled a symbolizing backtrace stack even though Vortix owns its
+panic hook. Using its underlying `eyre` report type keeps chained errors and leaves panic
+backtraces available through Rust's standard `RUST_BACKTRACE`, while removing decorative error
+colors and 10 backtrace/color packages. Disabling tracing-subscriber's unused ANSI and `log`
+bridge features removes two more packages.
+
+Cold A/B builds against commit `361210d`, each with its own empty target directory:
+
+| Step | Before | After | Delta |
+|---|---:|---:|---:|
+| `cargo check --workspace --all-targets` | 34.84 s | 25.58 s | -26.6% |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 53.94 s | 58.05 s | noise; CPU differed by 0.4% |
+| release `vortix` | 6,089,472 B | 5,855,904 B | -233,568 B (-3.84%) |
+
+The telemetry timeout test also joined a mock server that slept for three seconds after the
+client had already timed out. A 400 ms server delay against a 100 ms client deadline proves the
+same contract and cuts that test from 3.00 s to 0.40 s; ten consecutive runs passed.

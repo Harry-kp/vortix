@@ -1,7 +1,7 @@
 use clap::Parser;
 use cli::args::Args;
-use color_eyre::Result;
 use event::{Event, EventHandler};
+use eyre::Result;
 use vortix::app::App;
 use vortix::{cli, config, constants, event, ui};
 
@@ -14,10 +14,6 @@ fn main() -> Result<()> {
         std::process::exit(exit_code);
     }
 
-    // Initialize error handling first — color_eyre::install() sets its own
-    // panic hook, so we must call it before installing ours.
-    color_eyre::install()?;
-
     // Subprocess runner + tracing. Both live behind env-driven
     // toggles so production startup is silent; `RUST_LOG=vortix::process=info`
     // surfaces every subprocess invocation as a structured event.
@@ -29,9 +25,9 @@ fn main() -> Result<()> {
     // branching on `cfg(target_os)`.
     vortix::platform::set_global_platform(vortix::platform::Platform::detect_current());
 
-    // Now capture color_eyre's hook and wrap it with terminal restoration
-    // and recovery instructions. Drop glue on App will still run to release
-    // kill switch rules and VPN processes.
+    // Wrap Rust's default panic hook with terminal restoration and recovery
+    // instructions. Drop glue on App will still run to release kill switch
+    // rules and VPN processes.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
@@ -72,7 +68,7 @@ fn main() -> Result<()> {
     // Resolve config directory (CLI flag > SUDO_USER > XDG > default)
     let explicit_override = args.config_dir.is_some();
     let mut config_dir = config::resolve_config_dir(args.config_dir.as_ref())
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to resolve config directory: {e}"))?;
+        .map_err(|e| eyre::eyre!("Failed to resolve config directory: {e}"))?;
 
     // Emergency release must remain available when settings, journals,
     // profile migrations, or the normal control service cannot start. The
@@ -559,7 +555,7 @@ fn run_tui(
             );
             let _ = control_tx.send(result);
         })
-        .map_err(|error| color_eyre::eyre::eyre!("cannot start control bootstrap: {error}"))?;
+        .map_err(|error| eyre::eyre!("cannot start control bootstrap: {error}"))?;
     let mut control_rx = Some(control_rx);
     let events = EventHandler::new(tick_rate);
     let size = terminal.size()?;
@@ -597,21 +593,15 @@ fn run_tui(
                     app.attach_client_control_session(
                         vortix::cli::control::ClientControlSession::standard(control),
                     )
-                    .map_err(|error| {
-                        color_eyre::eyre::eyre!("cannot attach TUI control service: {error}")
-                    })?;
+                    .map_err(|error| eyre::eyre!("cannot attach TUI control service: {error}"))?;
                     control_rx = None;
                 }
                 Ok(Err(error)) => {
-                    return Err(color_eyre::eyre::eyre!(
-                        "cannot start TUI control service: {error}"
-                    ));
+                    return Err(eyre::eyre!("cannot start TUI control service: {error}"));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(color_eyre::eyre::eyre!(
-                        "TUI control service stopped during startup"
-                    ));
+                    return Err(eyre::eyre!("TUI control service stopped during startup"));
                 }
             }
         }
