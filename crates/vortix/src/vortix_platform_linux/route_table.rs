@@ -26,6 +26,7 @@ use crate::vortix_process::CommandSpec;
 /// routing-policy rules, contention during a tunnel transition) can
 /// stall the query. 1s is generous for any healthy run.
 const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+const INTERNET_ROUTE_PROBE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
 
 /// Process-wide backoff for the route-default probe. See the macOS
 /// `route_table.rs` for the full rationale; same shape applies here so
@@ -84,13 +85,7 @@ impl RouteTable for LinuxRouteTable {
     }
 
     fn default_route_observation() -> DefaultRouteObservation {
-        let Some(text) = run_ip_route_show_default() else {
-            return DefaultRouteObservation::ProbeFailed;
-        };
-        parse_interface(&text).map_or(
-            DefaultRouteObservation::NoDefaultRoute,
-            DefaultRouteObservation::Interface,
-        )
+        Self::route_interface_for(INTERNET_ROUTE_PROBE)
     }
 
     fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {

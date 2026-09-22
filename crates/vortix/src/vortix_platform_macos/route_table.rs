@@ -32,6 +32,7 @@ use crate::vortix_process::CommandSpec;
 /// uncapped query freezes the entire `rtmsg` retry budget (30s on
 /// macOS).
 const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+const INTERNET_ROUTE_PROBE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
 
 /// Process-wide backoff for the route-default probe. Without this,
 /// the scanner thread and network-monitor thread each call this
@@ -53,13 +54,7 @@ impl RouteTable for MacRouteTable {
     }
 
     fn default_route_observation() -> DefaultRouteObservation {
-        let Some(text) = run_route_get_default() else {
-            return DefaultRouteObservation::ProbeFailed;
-        };
-        parse_interface(&text).map_or(
-            DefaultRouteObservation::NoDefaultRoute,
-            DefaultRouteObservation::Interface,
-        )
+        Self::route_interface_for(INTERNET_ROUTE_PROBE)
     }
 
     fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {

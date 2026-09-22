@@ -485,19 +485,6 @@ impl RouteTableKind {
     pub fn default_route_observation(
         &self,
     ) -> crate::vortix_core::ports::route_table::DefaultRouteObservation {
-        use crate::vortix_core::ports::route_table::DefaultRouteObservation;
-        match self.route_interface_for(INTERNET_ROUTE_PROBE) {
-            DefaultRouteObservation::ProbeFailed => self.declared_default_route(),
-            selected => selected,
-        }
-    }
-
-    /// The literal `default` route entry. Only a fallback: it misses the `/1`
-    /// pair above and any policy-routing rule.
-    #[must_use]
-    fn declared_default_route(
-        &self,
-    ) -> crate::vortix_core::ports::route_table::DefaultRouteObservation {
         use crate::vortix_core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
@@ -596,10 +583,6 @@ impl RouteTableKind {
         }
     }
 }
-
-/// Address used to ask the kernel which interface carries public traffic.
-const INTERNET_ROUTE_PROBE: std::net::IpAddr =
-    std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
 
 /// Scriptable mock for the `SocketAudit` port.
 #[derive(Debug, Default, Clone)]
