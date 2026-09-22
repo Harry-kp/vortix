@@ -67,21 +67,23 @@ impl RouteTable for MacRouteTable {
     }
 
     fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
-        // `change` rebinds the route OpenVPN already installed on the wrong
-        // interface; `add` covers the race where it is not present yet. An
-        // interface-scoped route binds to the named utun no matter how a
-        // gateway would resolve.
+        // Run BOTH verbs and ignore their exit status: macOS `route` exits 0
+        // even on "not in table" (`change`, route missing) or "File exists"
+        // (`add`, route present), so it can't tell create from no-op. `change`
+        // repoints a wrong-interface route; `add` recreates a deleted one. The
+        // caller re-probes to confirm.
+        let mut ran = false;
         for verb in ["change", "add"] {
             let spec = CommandSpec::oneshot("route", bind_route_args(verb, cidr, interface))
                 .timeout(ROUTE_QUERY_TIMEOUT)
                 .output_limit(64 * 1024);
-            if crate::vortix_process::run_to_output(spec)
-                .is_ok_and(|output| output.status.success())
-            {
-                return Ok(());
-            }
+            ran |= crate::vortix_process::run_to_output(spec).is_ok();
         }
-        Err(format!("route {cidr} could not be bound to {interface}"))
+        if ran {
+            Ok(())
+        } else {
+            Err(format!("route {cidr} could not be bound to {interface}"))
+        }
     }
 
     fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
