@@ -536,25 +536,6 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     second_stop.join().unwrap().unwrap();
     third_stop.join().unwrap().unwrap();
 
-    // TERM-resistant leader and descendant require group SIGKILL, and the
-    // group must be absent before stop is acknowledged.
-    let stubborn = real_identity('d');
-    let stubborn_handshake = vortix::vortix_process::start_managed_foreground(
-        stubborn.clone(),
-        CommandSpec::oneshot(
-            "/bin/sh",
-            vec![
-                "-c".into(),
-                "trap '' TERM; (trap '' TERM; exec sleep 30) & wait".into(),
-            ],
-        ),
-        Vec::new(),
-    )
-    .unwrap();
-    thread::sleep(Duration::from_millis(50));
-    vortix::vortix_process::stop_managed_foreground(&stubborn).unwrap();
-    assert!(!group_has_live_members(stubborn_handshake.pid));
-
     // Natural exit releases the exact receipt and permits reconnect.
     let natural = real_identity('e');
     let natural_handshake = vortix::vortix_process::start_managed_foreground(

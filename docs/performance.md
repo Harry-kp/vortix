@@ -113,6 +113,7 @@ re-initialised it will try to put `lto = "thin"` back, and that must be rejected
 | `color-eyre` without `capture-spantrace` | `color-spantrace`, `tracing-error` |
 | `ratatui` with `default-features = false` | `ratatui-macros`, the unused Calendar widget |
 | `time` without `macros` | `time-macros` |
+| `clap` without `color` | `anstream`, `anstyle-parse`, `anstyle-query`, `anstyle-wincon`, `colorchoice`, `is_terminal_polyfill`, `once_cell_polyfill` |
 | `xtask` without `clap` and `ignore` | `ignore`, `globset`, `walkdir`, `bstr`, `same-file`, `winapi-util`, `crossbeam-{deque,epoch,utils}` |
 
 `env-filter` is the notable one: it pulls a regex engine so `RUST_LOG` can carry span and field
@@ -216,3 +217,20 @@ justifies it.
 cargo build --release -p vortix --locked
 VORTIX_SIZE_BUDGET_BYTES=7000000 bash tests/integration/release_smoke.sh
 ```
+
+## 2026-09-22 follow-up
+
+Cold builds on `aarch64-apple-darwin` with Rust 1.91, before and after disabling Clap's unused
+color feature:
+
+| Step | Before | After | Delta |
+|---|---:|---:|---:|
+| `cargo check --workspace --all-targets` | 25.26 s | 23.30 s | -7.8% |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 29.91 s | 27.29 s | -8.8% |
+| `cargo build --release -p vortix --locked` | 102.35 s | 105.94 s | noise; fat LTO dominates |
+| release `vortix` | 6,106,032 B | 6,089,472 B | -16,560 B (-0.27%) |
+
+The warm suite's slowest test repeated a five-second TERM-resistant process-group escalation
+already covered by both a focused custodian unit test and a later real-process case. Removing
+that duplicate reduced the test from 9.09 s to 3.35 s without removing SIGKILL/group-containment
+coverage.

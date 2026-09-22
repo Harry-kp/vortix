@@ -36,7 +36,15 @@ color-eyre = { version = "0.6", default-features = false, features = ["track-cal
 thiserror = "2"
 
 # CLI Argument Parsing
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", default-features = false, features = [
+    "derive",
+    "env",
+    "error-context",
+    "help",
+    "std",
+    "suggestions",
+    "usage",
+] }
 clap_complete = "4"
 
 # Serialization (for state persistence and API parsing)
