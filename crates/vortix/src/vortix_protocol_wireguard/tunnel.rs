@@ -618,13 +618,11 @@ pub fn parse_wg_dump(
 /// interface name; converting each bounded block through [`parse_wg_dump`]
 /// keeps the single-interface parser as the one validation authority.
 ///
-/// `wg show all dump` reports every `WireGuard` interface on the host, including
-/// ones vortix never created — `NetBird`, `Tailscale` and corporate meshes are
-/// all `WireGuard` underneath and can carry peer tables far larger than any
-/// vortix-managed tunnel. An interface whose block fails to parse is skipped,
-/// not fatal: vortix's own tunnels still parse, and failing the whole
-/// observation over a foreign interface would report every tunnel unverifiable
-/// and refuse startup.
+/// A foreign interface (`NetBird`, `Tailscale`, a corporate mesh — all
+/// `WireGuard` underneath) can carry a peer table too large for the per-interface
+/// caps; skip an interface whose block fails to parse rather than failing the
+/// whole observation, which would report every tunnel unverifiable and refuse
+/// startup.
 pub fn parse_wg_all_dump(
     dump: &str,
     observed_at: SystemTime,
@@ -640,9 +638,8 @@ pub fn parse_wg_all_dump(
     let mut current_interface: Option<String> = None;
     for line in dump.lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
-        // No per-field size check here: an oversized field belongs to one
-        // interface's block and is caught by `parse_wg_dump` below, which skips
-        // that interface rather than failing every interface in the dump.
+        // Oversized fields are caught per-block by parse_wg_dump, which skips
+        // just that interface.
         match fields.as_slice() {
             [interface, private_key, public_key, listen_port, fwmark] => {
                 if blocks.len() >= MAX_WG_INTERFACES || blocks.contains_key(*interface) {
