@@ -522,6 +522,19 @@ impl RouteTableKind {
             .map(ToOwned::to_owned)
     }
 
+    /// Bind `cidr` to `interface` (macOS re-scopes a gateway-installed route;
+    /// Linux is a no-op). See [`crate::vortix_core::ports::route_table::RouteTable::bind_route`].
+    pub fn bind_route(&self, cidr: &str, interface: &str) -> Result<(), String> {
+        use crate::vortix_core::ports::route_table::RouteTable;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::MacRouteTable::bind_route(cidr, interface),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::LinuxRouteTable::bind_route(cidr, interface),
+            Self::Mock(_) => Ok(()),
+        }
+    }
+
     /// Tri-state route selected by the kernel for one concrete destination.
     #[must_use]
     pub fn route_interface_for(

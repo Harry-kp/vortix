@@ -46,4 +46,13 @@ pub trait RouteTable {
     /// Protocol probes use this before emitting traffic so a configured
     /// split-tunnel destination cannot silently escape over a physical link.
     fn route_interface_for(target: IpAddr) -> DefaultRouteObservation;
+
+    /// Bind `cidr` to `interface`, regardless of how a gateway would resolve.
+    ///
+    /// macOS `OpenVPN` installs a pushed split route via its gateway; when a full
+    /// tunnel already owns `0.0.0.0/1` that gateway resolves through the full
+    /// tunnel, so the split route lands on the wrong interface. Re-scoping it to
+    /// the named interface fixes it. Linux already installs device-scoped, so
+    /// its implementation is a no-op.
+    fn bind_route(cidr: &str, interface: &str) -> Result<(), String>;
 }

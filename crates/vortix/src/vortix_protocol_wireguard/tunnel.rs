@@ -15,7 +15,7 @@ use crate::vortix_core::ports::tunnel::{
 };
 use crate::vortix_core::profile::Profile;
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
 
@@ -617,6 +617,12 @@ pub fn parse_wg_dump(
 /// The all-interface form prefixes every interface and peer line with the
 /// interface name; converting each bounded block through [`parse_wg_dump`]
 /// keeps the single-interface parser as the one validation authority.
+///
+/// A foreign interface (`NetBird`, `Tailscale`, a corporate mesh — all
+/// `WireGuard` underneath) can carry a peer table too large for the per-interface
+/// caps; skip an interface whose block fails to parse rather than failing the
+/// whole observation, which would report every tunnel unverifiable and refuse
+/// startup.
 pub fn parse_wg_all_dump(
     dump: &str,
     observed_at: SystemTime,
@@ -632,11 +638,8 @@ pub fn parse_wg_all_dump(
     let mut current_interface: Option<String> = None;
     for line in dump.lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.iter().any(|field| field.len() > MAX_WG_FIELD_BYTES) {
-            return Err(TunnelError::MalformedStatus(
-                "WireGuard all-interface field".into(),
-            ));
-        }
+        // Oversized fields are caught per-block by parse_wg_dump, which skips
+        // just that interface.
         match fields.as_slice() {
             [interface, private_key, public_key, listen_port, fwmark] => {
                 if blocks.len() >= MAX_WG_INTERFACES || blocks.contains_key(*interface) {
@@ -668,13 +671,23 @@ pub fn parse_wg_all_dump(
             }
         }
     }
-    blocks
+    Ok(blocks
         .into_iter()
-        .map(|(interface, block)| {
-            parse_wg_dump(&interface, &block, observed_at, generation)
-                .map(|status| (interface, status))
+        .filter_map(|(interface, block)| {
+            match parse_wg_dump(&interface, &block, observed_at, generation) {
+                Ok(status) => Some((interface, status)),
+                Err(error) => {
+                    debug!(
+                        target: "vortix::registry",
+                        interface = %interface,
+                        %error,
+                        "skipping unparseable WireGuard interface during all-interface observation"
+                    );
+                    None
+                }
+            }
         })
-        .collect()
+        .collect())
 }
 
 fn observe_all_interfaces_with(
@@ -2372,6 +2385,30 @@ mod tests {
             "wg1\tpeer1\t(none)\t(none)\t10.0.0.0/8\t0\t30\t40\t25\n",
         );
         assert!(parse_wg_all_dump(dump, SystemTime::now(), 0).is_err());
+    }
+
+    #[test]
+    fn all_dump_skips_foreign_interface_with_oversized_peer_table() {
+        // NetBird, Tailscale and corporate meshes are WireGuard underneath and
+        // surface in `wg show all dump` with peer tables far larger than any
+        // vortix tunnel. Such an interface must be skipped, not fail the whole
+        // observation — which would report every real vortix tunnel
+        // unverifiable and refuse startup.
+        let huge_routes = "10.0.0.0/8,".repeat(600);
+        let dump = format!(
+            concat!(
+                "wg0\tprivate0\tpublic0\t51820\toff\n",
+                "wg0\tpeer0\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t900\t10\t20\t0\n",
+                "utun100\tprivbird\tpubbird\t51820\toff\n",
+                "utun100\tpeerbird\t(none)\t(none)\t{routes}\t0\t0\t0\t25\n",
+            ),
+            routes = huge_routes,
+        );
+        let statuses =
+            parse_wg_all_dump(&dump, SystemTime::now(), 0).expect("observation stays complete");
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses.contains_key("wg0"));
+        assert!(!statuses.contains_key("utun100"));
     }
 
     #[test]
