@@ -469,6 +469,22 @@ fn rebind_targets(claim: crate::vortix_core::control::worker::RouteClaim) -> Vec
     }
 }
 
+fn openvpn_default_endpoints(state: &TopologyState) -> BTreeSet<std::net::IpAddr> {
+    state
+        .profiles
+        .iter()
+        .filter(|profile| {
+            state.protocols.get(*profile)
+                == Some(&crate::vortix_core::profile::ProtocolKind::OpenVpn)
+                && state
+                    .routes
+                    .get(*profile)
+                    .is_some_and(|claims| claims.iter().any(|claim| claim.is_default()))
+        })
+        .flat_map(|profile| state.server_ips.get(profile).into_iter().flatten().copied())
+        .collect()
+}
+
 impl CanonicalPolicyExecutor {
     #[must_use]
     pub fn new(
@@ -623,9 +639,20 @@ impl CanonicalPolicyExecutor {
     fn verify_routes(&self, policy: &TopologyPolicy) -> Result<(), String> {
         // Route and Observation invoke this separately on purpose: the latter
         // is the fresh final read-back required for protection publication.
+        let route_table = &crate::platform::current_platform().route_table;
+        let endpoints = openvpn_default_endpoints(&policy.target);
+        if !endpoints.is_empty() {
+            let gateway = route_table.default_gateway().ok_or_else(|| {
+                "cannot preserve the physical gateway for OpenVPN default-route ownership"
+                    .to_owned()
+            })?;
+            for endpoint in endpoints {
+                route_table.bind_host_route(endpoint, &gateway)?;
+            }
+        }
+
         let plan = self.route_probe_plan(policy)?;
         let total = plan.len();
-        let route_table = &crate::platform::current_platform().route_table;
         for (index, expectation) in plan.into_iter().enumerate() {
             if std::time::Instant::now() >= policy.deadline {
                 return Err(format!(
@@ -1260,6 +1287,57 @@ mod tests {
         assert_eq!(
             rebind_targets(RouteClaim::parse("10.250.0.0/24").unwrap()),
             vec!["10.250.0.0/24".to_owned()]
+        );
+    }
+
+    #[test]
+    fn only_full_openvpn_endpoints_need_physical_escape_routes() {
+        let full = ProfileId::new("full");
+        let split = ProfileId::new("split");
+        let wireguard = ProfileId::new("wireguard");
+        let mut state = TopologyState {
+            profiles: BTreeSet::from([full.clone(), split.clone(), wireguard.clone()]),
+            protocols: BTreeMap::from([
+                (
+                    full.clone(),
+                    crate::vortix_core::profile::ProtocolKind::OpenVpn,
+                ),
+                (
+                    split.clone(),
+                    crate::vortix_core::profile::ProtocolKind::OpenVpn,
+                ),
+                (
+                    wireguard.clone(),
+                    crate::vortix_core::profile::ProtocolKind::WireGuard,
+                ),
+            ]),
+            ..TopologyState::default()
+        };
+        state.routes.insert(
+            full.clone(),
+            BTreeSet::from([RouteClaim::parse("0.0.0.0/0").unwrap()]),
+        );
+        state.routes.insert(
+            split.clone(),
+            BTreeSet::from([RouteClaim::parse("10.0.0.0/8").unwrap()]),
+        );
+        state.routes.insert(
+            wireguard.clone(),
+            BTreeSet::from([RouteClaim::parse("0.0.0.0/0").unwrap()]),
+        );
+        state
+            .server_ips
+            .insert(full, BTreeSet::from(["198.51.100.1".parse().unwrap()]));
+        state
+            .server_ips
+            .insert(split, BTreeSet::from(["198.51.100.2".parse().unwrap()]));
+        state
+            .server_ips
+            .insert(wireguard, BTreeSet::from(["198.51.100.3".parse().unwrap()]));
+
+        assert_eq!(
+            openvpn_default_endpoints(&state),
+            BTreeSet::from(["198.51.100.1".parse().unwrap()])
         );
     }
 

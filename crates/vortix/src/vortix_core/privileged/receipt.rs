@@ -253,12 +253,14 @@ impl OpenVpnRouteEvidence {
         mut self,
         selected_remote: Option<IpAddr>,
     ) -> Result<Self, ReceiptError> {
-        let requires_selected_remote = self
-            .configured
-            .routes()
-            .iter()
-            .chain(self.pushed.routes())
-            .any(|route| route.gateway() == OpenVpnRouteGateway::RemoteHost);
+        let requires_selected_remote = self.configured.redirect_gateway().is_some()
+            || self.pushed.redirect_gateway().is_some()
+            || self
+                .configured
+                .routes()
+                .iter()
+                .chain(self.pushed.routes())
+                .any(|route| route.gateway() == OpenVpnRouteGateway::RemoteHost);
         if requires_selected_remote != selected_remote.is_some()
             || selected_remote.as_ref().is_some_and(invalid_unicast_ip)
         {

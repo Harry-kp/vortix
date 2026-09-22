@@ -1252,7 +1252,9 @@ mod canonical_tests {
         handle.openvpn_routes = Some(
             crate::vortix_protocol_openvpn::push::openvpn_route_evidence(
                 &crate::vortix_protocol_openvpn::parser::parse_ovpn_conf("client\n").unwrap(),
-                "PUSH_REPLY,redirect-gateway def1\nInitialization Sequence Completed\n",
+                "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+                 PUSH_REPLY,redirect-gateway def1\n\
+                 Initialization Sequence Completed\n",
                 false,
             )
             .unwrap(),

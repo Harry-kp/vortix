@@ -809,6 +809,10 @@ fn build_ovpn_args(
         log_path.to_string_lossy().into_owned(),
         "--verb".to_string(),
         verbosity.to_string(),
+        // OpenVPN may learn routes only after PUSH_REPLY. Keep discovery
+        // harmless: the topology transaction installs the authenticated
+        // route evidence after conflict admission succeeds.
+        "--route-noexec".to_string(),
     ];
 
     for option in [
@@ -1525,6 +1529,7 @@ mod tests {
             .windows(3)
             .any(|window| { window == ["--pull-filter", "ignore", "dhcp-option DOMAIN-SEARCH"] }));
         assert!(!args.iter().any(|arg| arg == "--daemon"));
+        assert!(args.iter().any(|arg| arg == "--route-noexec"));
     }
 
     #[test]

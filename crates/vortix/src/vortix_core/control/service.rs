@@ -1211,23 +1211,15 @@ impl ControlHandle {
                     .as_ref()
                     .ok_or(AdmissionError::Stopped)?;
                 for profile_id in &lifecycle_profiles {
-                    // An exclusive switch reserves teardown capacity now, but
-                    // deliberately reserves the target connect only after all
-                    // competing tunnels are absent. That prevents the old
-                    // routes from rejecting (or racing) the future target.
-                    if matches!(
-                        &request.command,
-                        UserCommand::ConnectExclusive { profile_id: target }
-                            if target == profile_id
-                    ) {
-                        continue;
-                    }
-                    let disconnecting = matches!(
-                        request.command,
-                        UserCommand::ConnectExclusive { .. }
-                            | UserCommand::Disconnect { .. }
-                            | UserCommand::ForceDisconnect { .. }
-                    );
+                    let disconnecting = match &request.command {
+                        UserCommand::ConnectExclusive { profile_id: target } => {
+                            target != profile_id
+                        }
+                        UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
+                            true
+                        }
+                        _ => false,
+                    };
                     let reserved = if disconnecting {
                         supervisor.reserve_disconnect(profile_id)
                     } else {
@@ -1757,6 +1749,22 @@ struct ReconnectOperation {
 struct ExclusiveSwitchOperation {
     target: ProfileId,
     teardown: BTreeSet<ProfileId>,
+}
+
+fn exclusive_teardown_ready(
+    switches: &BTreeMap<OperationId, ExclusiveSwitchOperation>,
+    profile_id: &ProfileId,
+    target_truth: impl Fn(&ProfileId) -> Option<SupervisedTruth>,
+) -> bool {
+    switches
+        .values()
+        .find(|exclusive| exclusive.teardown.contains(profile_id))
+        .is_none_or(|exclusive| {
+            matches!(
+                target_truth(&exclusive.target),
+                Some(SupervisedTruth::WaitingForObservation | SupervisedTruth::ObservedPresent)
+            )
+        })
 }
 
 impl ReconnectOperation {
@@ -3257,10 +3265,10 @@ fn drive_supervision(
         if !transaction_is_current {
             let transition = transition_for_plan(
                 &plan.actions,
-                owner.reconnect_operations.contains_key(&operation.id)
-                    || owner
-                        .exclusive_switch_operations
-                        .contains_key(&operation.id),
+                owner.reconnect_operations.contains_key(&operation.id),
+                owner
+                    .exclusive_switch_operations
+                    .contains_key(&operation.id),
                 owner.recovery_operations.contains(&operation.id),
             );
             if let Some(policy) = capture_topology_policy(
@@ -3357,23 +3365,17 @@ fn drive_supervision(
                 target_revision: action_revision,
                 ..
             } => {
-                if matches!(action, ReconcileAction::Connect { .. }) {
-                    let exclusive_ready = owner
-                        .exclusive_switch_operations
-                        .values()
-                        .find(|exclusive| &exclusive.target == profile_id)
-                        .is_none_or(|exclusive| {
-                            exclusive.teardown.iter().all(|teardown| {
-                                snapshot
-                                    .observed
-                                    .tunnels
-                                    .get(teardown)
-                                    .is_none_or(|fact| !fact.active)
-                                    && supervisor.profile_truth(teardown).is_none()
-                                    && !supervisor.is_tombstoned(teardown)
-                            })
-                        });
-                    if !exclusive_ready {
+                if matches!(
+                    action,
+                    ReconcileAction::Disconnect { .. }
+                        | ReconcileAction::CleanupStaleManaged { .. }
+                ) {
+                    let exclusive_target_ready = exclusive_teardown_ready(
+                        &owner.exclusive_switch_operations,
+                        profile_id,
+                        |target| supervisor.profile_truth(target).map(|target| target.truth),
+                    );
+                    if !exclusive_target_ready {
                         continue;
                     }
                 }
@@ -4467,6 +4469,14 @@ fn seal_final_topology_policy(
             .target
             .openvpn_routes
             .insert(profile_id.clone(), observed.evidence.clone());
+        if let Some(remote) = observed.evidence.selected_remote() {
+            final_policy
+                .target
+                .server_ips
+                .entry(profile_id.clone())
+                .or_default()
+                .insert(remote);
+        }
 
         // Compare against this profile's own tunnel revision, not the policy
         // generation. Connecting a second tunnel bumps the global generation
@@ -4618,7 +4628,7 @@ fn transition_requires_blocking(
     use crate::vortix_core::state::killswitch::KillSwitchMode;
 
     match kill_switch {
-        KillSwitchMode::Off => false,
+        KillSwitchMode::Off => transition == TopologyTransitionKind::PrimaryTransfer,
         KillSwitchMode::AlwaysOn => true,
         KillSwitchMode::Auto => matches!(
             transition,
@@ -4632,8 +4642,12 @@ fn transition_requires_blocking(
 fn transition_for_plan(
     actions: &[ReconcileAction],
     reconnect: bool,
+    primary_transfer: bool,
     recovery: bool,
 ) -> TopologyTransitionKind {
+    if primary_transfer {
+        return TopologyTransitionKind::PrimaryTransfer;
+    }
     if reconnect {
         return TopologyTransitionKind::Reconnect;
     }
@@ -5594,12 +5608,15 @@ fn validate_topology_conflict_admission(
     snapshot: &ControlSnapshot,
     _config: &ControlServiceConfig,
 ) -> Result<Option<Conflict>, AdmissionError> {
-    let UserCommand::Connect {
-        profile_id,
-        conflict_acknowledgement,
-    } = command
-    else {
-        return Ok(None);
+    let (profile_id, conflict_acknowledgement) = match command {
+        UserCommand::Connect {
+            profile_id,
+            conflict_acknowledgement,
+        } => (profile_id, conflict_acknowledgement.as_ref()),
+        UserCommand::ConnectExclusive { profile_id } => {
+            return Ok(snapshot.topology_conflict(profile_id));
+        }
+        _ => return Ok(None),
     };
     let canonical = snapshot.topology_conflict(profile_id);
     match (&canonical, conflict_acknowledgement) {
@@ -8292,6 +8309,40 @@ mod target_profiles_tests {
     }
 
     struct NoopTunnel;
+
+    #[test]
+    fn exclusive_switch_is_a_fail_closed_primary_transfer() {
+        assert_eq!(
+            transition_for_plan(&[], false, true, false),
+            TopologyTransitionKind::PrimaryTransfer
+        );
+        assert!(transition_requires_blocking(
+            crate::vortix_core::state::killswitch::KillSwitchMode::Off,
+            TopologyTransitionKind::PrimaryTransfer
+        ));
+    }
+
+    #[test]
+    fn exclusive_switch_holds_teardown_until_the_replacement_is_ready() {
+        let operation = OperationId::from_parts(AuthorityEpoch(7), 1);
+        let old = ProfileId::new("old");
+        let target = ProfileId::new("target");
+        let switches = BTreeMap::from([(
+            operation,
+            ExclusiveSwitchOperation {
+                target: target.clone(),
+                teardown: BTreeSet::from([old.clone()]),
+            },
+        )]);
+
+        assert!(!exclusive_teardown_ready(&switches, &old, |_| None));
+        assert!(!exclusive_teardown_ready(&switches, &old, |_| {
+            Some(SupervisedTruth::Reserved)
+        }));
+        assert!(exclusive_teardown_ready(&switches, &old, |profile| {
+            (profile == &target).then_some(SupervisedTruth::WaitingForObservation)
+        }));
+    }
 
     #[test]
     fn exclusive_switch_ordering_is_recovered_from_durable_intent() {

@@ -101,3 +101,19 @@ suppressed. Resolver suppression must never remove its CIDR/AllowedIPs routes.
 During scenarios 6–8 (primary transfer/disconnect), record the DNS policy
 generation before and after, verify only prior-generation Vortix resources
 were released, and repeat the final reconcile/release to prove idempotency.
+
+## OpenVPN route-authority gate
+
+Run these checks in both directions with two full profiles before release:
+
+1. Connect F1, attempt F2, and cancel the takeover. Capture a frame showing F1
+   still primary plus a kernel probe showing F1's interface. Neither `/1`
+   route may disappear during the prompt or cancellation.
+2. Repeat and choose Switch. Capture one frame while F2 is preparing and one
+   after completion. F1 must remain present until F2 has a live interface; the
+   final kernel probe and header must both name F2.
+3. With F1 active, connect S. Probe one address inside S's CIDR and one public
+   address. The split address must use S; public traffic must continue through
+   F1.
+4. Disconnect every tunnel. Confirm neither platform retains a route scoped to
+   the former `tun`/`utun` interfaces.

@@ -34,10 +34,6 @@ const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// every couple of seconds.
 static ROUTE_PROBE: RouteProbe = RouteProbe::new();
 
-/// Public-internet probe target. See module-level docs for why this is
-/// preferred over `ip route show default`.
-const ROUTE_PROBE_TARGET: &str = "8.8.8.8";
-
 /// Linux routing-table reader using `ip route get <target>`.
 pub struct LinuxRouteTable;
 
@@ -47,10 +43,33 @@ impl RouteTable for LinuxRouteTable {
         parse_gateway(&text)
     }
 
-    fn bind_route(_cidr: &str, _interface: &str) -> Result<(), String> {
-        // Linux OpenVPN installs routes device-scoped, so the more-specific
-        // split route already lands on its own interface — nothing to rebind.
-        Ok(())
+    fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
+        // xtask:allow-shell-regression: `ip route replace ... dev` is the native Linux route mutation interface; the process layer provides bounded execution.
+        let spec = CommandSpec::oneshot("ip", bind_route_args(cidr, interface))
+            .timeout(ROUTE_QUERY_TIMEOUT)
+            .output_limit(64 * 1024);
+        match crate::vortix_process::run_to_output(spec) {
+            Ok(output) if output.status.success() => Ok(()),
+            _ => Err(format!("route {cidr} could not be bound to {interface}")),
+        }
+    }
+
+    fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String> {
+        // xtask:allow-shell-regression: `ip route replace ... via` is the native Linux route mutation interface; the process layer provides bounded execution.
+        let spec = CommandSpec::oneshot("ip", bind_host_route_args(destination, gateway))
+            .timeout(ROUTE_QUERY_TIMEOUT)
+            .output_limit(64 * 1024);
+        match crate::vortix_process::run_to_output(spec) {
+            Ok(output)
+                if output.status.success()
+                    && selected_gateway(destination).as_deref() == Some(gateway) =>
+            {
+                Ok(())
+            }
+            _ => Err(format!(
+                "host route for {destination} via {gateway} could not be installed"
+            )),
+        }
     }
 
     fn default_route_observation() -> DefaultRouteObservation {
@@ -83,18 +102,49 @@ impl RouteTable for LinuxRouteTable {
     }
 }
 
-/// Run `ip route get <ROUTE_PROBE_TARGET>` and return stdout as UTF-8
-/// (lossy).
+fn selected_gateway(target: IpAddr) -> Option<String> {
+    // xtask:allow-shell-regression: `ip route get <target>` is the supported Linux route-selection proof; no existing libc port exposes policy-routing resolution.
+    let spec = CommandSpec::oneshot("ip", vec!["route".into(), "get".into(), target.to_string()])
+        .timeout(ROUTE_QUERY_TIMEOUT)
+        .output_limit(64 * 1024);
+    let output = crate::vortix_process::run_to_output(spec).ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_gateway(&String::from_utf8_lossy(&output.stdout)))
+        .flatten()
+}
+
+pub(crate) fn bind_route_args(cidr: &str, interface: &str) -> Vec<String> {
+    vec![
+        "route".into(),
+        "replace".into(),
+        cidr.into(),
+        "dev".into(),
+        interface.into(),
+    ]
+}
+
+pub(crate) fn bind_host_route_args(destination: IpAddr, gateway: &str) -> Vec<String> {
+    let prefix = if destination.is_ipv4() { 32 } else { 128 };
+    vec![
+        "route".into(),
+        "replace".into(),
+        format!("{destination}/{prefix}"),
+        "via".into(),
+        gateway.into(),
+    ]
+}
+
+/// Read the literal default-route slot. `def1` leaves this on the physical
+/// network, which is the gateway needed for VPN server escape routes.
 ///
 /// Returns `None` if the subprocess fails so callers can degrade gracefully.
 fn run_ip_route_show_default() -> Option<String> {
     match ROUTE_PROBE.run(
-        // xtask:allow-shell-regression: `ip route get <ip>` is the canonical Linux routing-table inspection — no libc equivalent that returns the chosen egress dev without rolling our own netlink RTNETLINK parser.
-        CommandSpec::oneshot(
-            "ip",
-            vec!["route".into(), "get".into(), ROUTE_PROBE_TARGET.into()],
-        )
-        .timeout(ROUTE_QUERY_TIMEOUT),
+        // xtask:allow-shell-regression: `ip route show default` is the canonical Linux default-gateway inspection.
+        CommandSpec::oneshot("ip", vec!["route".into(), "show".into(), "default".into()])
+            .timeout(ROUTE_QUERY_TIMEOUT),
     ) {
         ProbeOutcome::Success(stdout) => Some(stdout),
         ProbeOutcome::BackedOff => None,
@@ -218,5 +268,21 @@ mod tests {
     fn parse_gateway_still_works_on_sample() {
         let text = "default via 192.168.1.1 dev wlan0 proto dhcp\n";
         assert_eq!(parse_gateway(text), Some("192.168.1.1".into()));
+    }
+
+    #[test]
+    fn bind_route_replaces_the_prefix_on_the_tunnel_device() {
+        assert_eq!(
+            bind_route_args("10.250.0.0/24", "tun5"),
+            ["route", "replace", "10.250.0.0/24", "dev", "tun5"]
+        );
+    }
+
+    #[test]
+    fn host_route_keeps_the_openvpn_server_on_the_physical_gateway() {
+        assert_eq!(
+            bind_host_route_args("198.51.100.7".parse().unwrap(), "192.168.1.1"),
+            ["route", "replace", "198.51.100.7/32", "via", "192.168.1.1"]
+        );
     }
 }

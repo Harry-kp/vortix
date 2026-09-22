@@ -522,8 +522,7 @@ impl RouteTableKind {
             .map(ToOwned::to_owned)
     }
 
-    /// Bind `cidr` to `interface` (macOS re-scopes a gateway-installed route;
-    /// Linux is a no-op). See [`crate::vortix_core::ports::route_table::RouteTable::bind_route`].
+    /// Bind `cidr` to `interface`.
     pub fn bind_route(&self, cidr: &str, interface: &str) -> Result<(), String> {
         use crate::vortix_core::ports::route_table::RouteTable;
         match self {
@@ -531,6 +530,22 @@ impl RouteTableKind {
             Self::Macos => platform_impl::MacRouteTable::bind_route(cidr, interface),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxRouteTable::bind_route(cidr, interface),
+            Self::Mock(_) => Ok(()),
+        }
+    }
+
+    /// Keep a VPN server outside the tunnel's default-route claim.
+    pub fn bind_host_route(
+        &self,
+        destination: std::net::IpAddr,
+        gateway: &str,
+    ) -> Result<(), String> {
+        use crate::vortix_core::ports::route_table::RouteTable;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::MacRouteTable::bind_host_route(destination, gateway),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::LinuxRouteTable::bind_host_route(destination, gateway),
             Self::Mock(_) => Ok(()),
         }
     }

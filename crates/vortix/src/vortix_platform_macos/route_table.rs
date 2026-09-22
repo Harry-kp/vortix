@@ -43,10 +43,6 @@ const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// scanner ticks at 1Hz so state updates land slow).
 static ROUTE_PROBE: RouteProbe = RouteProbe::new();
 
-/// Public-internet probe target. See module-level docs for why this is
-/// preferred over `route get default`.
-const ROUTE_PROBE_TARGET: &str = "8.8.8.8";
-
 /// macOS routing-table reader using `route -n get <target>`.
 pub struct MacRouteTable;
 
@@ -67,21 +63,40 @@ impl RouteTable for MacRouteTable {
     }
 
     fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
-        // `change` rebinds the route OpenVPN already installed on the wrong
-        // interface; `add` covers the race where it is not present yet. An
-        // interface-scoped route binds to the named utun no matter how a
-        // gateway would resolve.
+        // Run both verbs: `change` transfers an existing prefix and `add`
+        // creates a route suppressed by OpenVPN's --route-noexec. macOS route
+        // can exit successfully while reporting either no entry or an
+        // existing entry, so read-back remains the authority.
+        let mut ran = false;
         for verb in ["change", "add"] {
             let spec = CommandSpec::oneshot("route", bind_route_args(verb, cidr, interface))
                 .timeout(ROUTE_QUERY_TIMEOUT)
                 .output_limit(64 * 1024);
-            if crate::vortix_process::run_to_output(spec)
-                .is_ok_and(|output| output.status.success())
-            {
-                return Ok(());
-            }
+            ran |= crate::vortix_process::run_to_output(spec).is_ok();
         }
-        Err(format!("route {cidr} could not be bound to {interface}"))
+        if ran {
+            Ok(())
+        } else {
+            Err(format!("route {cidr} could not be bound to {interface}"))
+        }
+    }
+
+    fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String> {
+        let mut ran = false;
+        for verb in ["change", "add"] {
+            let spec =
+                CommandSpec::oneshot("route", bind_host_route_args(verb, destination, gateway))
+                    .timeout(ROUTE_QUERY_TIMEOUT)
+                    .output_limit(64 * 1024);
+            ran |= crate::vortix_process::run_to_output(spec).is_ok();
+        }
+        if ran && selected_gateway(destination).as_deref() == Some(gateway) {
+            Ok(())
+        } else {
+            Err(format!(
+                "host route for {destination} via {gateway} could not be installed"
+            ))
+        }
     }
 
     fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
@@ -102,6 +117,18 @@ impl RouteTable for MacRouteTable {
     }
 }
 
+fn selected_gateway(target: IpAddr) -> Option<String> {
+    let spec = CommandSpec::oneshot("route", route_get_args(target))
+        .timeout(ROUTE_QUERY_TIMEOUT)
+        .output_limit(64 * 1024);
+    let output = crate::vortix_process::run_to_output(spec).ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_gateway(&String::from_utf8_lossy(&output.stdout)))
+        .flatten()
+}
+
 pub(crate) fn route_get_args(target: IpAddr) -> Vec<String> {
     let family = if target.is_ipv4() { "-inet" } else { "-inet6" };
     vec!["-n".into(), "get".into(), family.into(), target.to_string()]
@@ -120,18 +147,31 @@ pub(crate) fn bind_route_args(verb: &str, cidr: &str, interface: &str) -> Vec<St
     ]
 }
 
-/// Run `route -n get <ROUTE_PROBE_TARGET>` and return its stdout as
-/// UTF-8 (lossy).
+pub(crate) fn bind_host_route_args(verb: &str, destination: IpAddr, gateway: &str) -> Vec<String> {
+    vec![
+        "-n".into(),
+        verb.into(),
+        if destination.is_ipv4() {
+            "-inet"
+        } else {
+            "-inet6"
+        }
+        .into(),
+        "-host".into(),
+        destination.to_string(),
+        gateway.into(),
+    ]
+}
+
+/// Read the literal default-route slot. `def1` leaves this on the physical
+/// network, which is the gateway needed for VPN server escape routes.
 ///
 /// Returns `None` if the subprocess fails (binary missing, non-zero exit,
 /// I/O error) so callers can degrade gracefully without panicking.
 fn run_route_get_default() -> Option<String> {
     match ROUTE_PROBE.run(
-        CommandSpec::oneshot(
-            "route",
-            vec!["-n".into(), "get".into(), ROUTE_PROBE_TARGET.into()],
-        )
-        .timeout(ROUTE_QUERY_TIMEOUT),
+        CommandSpec::oneshot("route", vec!["-n".into(), "get".into(), "default".into()])
+            .timeout(ROUTE_QUERY_TIMEOUT),
     ) {
         ProbeOutcome::Success(stdout) => Some(stdout),
         ProbeOutcome::BackedOff => None,
@@ -272,6 +312,21 @@ destination: default
                 "10.250.0.0/24",
                 "-interface",
                 "utun5"
+            ]
+        );
+    }
+
+    #[test]
+    fn host_route_keeps_the_openvpn_server_on_the_physical_gateway() {
+        assert_eq!(
+            bind_host_route_args("change", "198.51.100.7".parse().unwrap(), "192.168.1.1"),
+            [
+                "-n",
+                "change",
+                "-inet",
+                "-host",
+                "198.51.100.7",
+                "192.168.1.1"
             ]
         );
     }

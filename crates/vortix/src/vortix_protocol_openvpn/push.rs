@@ -76,8 +76,8 @@ pub(crate) enum SelectedRemoteEvidenceError {
 
 #[derive(Debug, Error)]
 pub(crate) enum OpenVpnRouteEvidenceError {
-    #[error("OpenVPN profile contains unsupported route semantics")]
-    UnsupportedConfiguredRoute,
+    #[error("OpenVPN negotiation contains route semantics Vortix cannot safely own")]
+    UnsupportedRouteSemantics,
     #[error(transparent)]
     Pushed(#[from] PushedRouteEvidenceError),
     #[error(transparent)]
@@ -96,7 +96,7 @@ pub(crate) fn openvpn_route_evidence(
     log_truncated: bool,
 ) -> Result<OpenVpnRouteEvidence, OpenVpnRouteEvidenceError> {
     if parsed.unsupported_route_semantics {
-        return Err(OpenVpnRouteEvidenceError::UnsupportedConfiguredRoute);
+        return Err(OpenVpnRouteEvidenceError::UnsupportedRouteSemantics);
     }
     let configured = parsed
         .routes
@@ -112,10 +112,37 @@ pub(crate) fn openvpn_route_evidence(
         .iter()
         .map(canonical_openvpn_route)
         .collect::<Result<Vec<_>, _>>()?;
-    let selected_remote_required = configured
+    let supported_redirect = |redirect: &OpenVpnRedirectGateway| {
+        redirect.flags().iter().all(|flag| {
+            matches!(
+                flag,
+                OpenVpnRedirectFlag::Def1
+                    | OpenVpnRedirectFlag::Local
+                    | OpenVpnRedirectFlag::AutoLocal
+                    | OpenVpnRedirectFlag::BypassDhcp
+                    | OpenVpnRedirectFlag::BypassDns
+                    | OpenVpnRedirectFlag::Ipv6
+                    | OpenVpnRedirectFlag::DisableIpv4
+            )
+        })
+    };
+    if configured
         .iter()
         .chain(&pushed_routes)
-        .any(|route| route.gateway() == OpenVpnRouteGateway::RemoteHost);
+        .any(|route| route.gateway() != OpenVpnRouteGateway::VpnDefault)
+        || [parsed.redirect_gateway.as_ref(), pushed.redirect_gateway()]
+            .into_iter()
+            .flatten()
+            .any(|redirect| !supported_redirect(redirect))
+    {
+        return Err(OpenVpnRouteEvidenceError::UnsupportedRouteSemantics);
+    }
+    let selected_remote_required = parsed.redirect_gateway.is_some()
+        || pushed.redirect_gateway().is_some()
+        || configured
+            .iter()
+            .chain(&pushed_routes)
+            .any(|route| route.gateway() == OpenVpnRouteGateway::RemoteHost);
     let selected_remote = if selected_remote_required {
         Some(selected_remote_address(log)?.ok_or(OpenVpnRouteEvidenceError::Invalid)?)
     } else {
@@ -364,6 +391,31 @@ mod tests {
         let redirect = evidence.pushed().redirect_gateway().unwrap();
         assert!(redirect.ipv4());
         assert!(redirect.flags().contains(&OpenVpnRedirectFlag::Def1));
+        assert_eq!(
+            evidence.selected_remote(),
+            Some("198.51.100.7".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn route_noexec_rejects_semantics_the_policy_writer_cannot_reproduce() {
+        let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(
+            "client\nremote 198.51.100.7 1194 udp\n",
+        )
+        .unwrap();
+        let error = openvpn_route_evidence(
+            &parsed,
+            "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+             PUSH_REPLY,route 192.0.2.0 255.255.255.0 net_gateway\n\
+             Initialization Sequence Completed\n",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::OpenVpnRouteEvidenceError::UnsupportedRouteSemantics
+        ));
     }
 
     #[test]

@@ -1,8 +1,4 @@
-//! `RouteTable` port — system routing inspection.
-//!
-//! Today vortix only reads the default gateway. The port shape leaves room
-//! for `list`/`add`/`remove` once split-tunnelling and route manipulation
-//! land (deliberately deferred).
+//! `RouteTable` port — system route inspection and exact scoped writes.
 
 use std::net::IpAddr;
 
@@ -55,4 +51,8 @@ pub trait RouteTable {
     /// the named interface fixes it. Linux already installs device-scoped, so
     /// its implementation is a no-op.
     fn bind_route(cidr: &str, interface: &str) -> Result<(), String>;
+
+    /// Keep a VPN server reachable through the pre-tunnel gateway before a
+    /// default-route claim is transferred to that VPN.
+    fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String>;
 }
