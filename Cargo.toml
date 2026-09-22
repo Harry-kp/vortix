@@ -30,9 +30,9 @@ crossterm = "0.29"
 # command working for end users on crates.io.
 time = { version = ">=0.3, <0.3.56", features = ["local-offset", "formatting"] }
 
-# Error Handling
-# `capture-spantrace` renders nothing without a `tracing_error::ErrorLayer`, and we install none.
-color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
+# Error handling. Vortix installs its own panic hook, so the report type does
+# not need color-eyre's unconditional symbolizing backtrace stack.
+eyre = "0.6"
 thiserror = "2"
 
 # CLI Argument Parsing
@@ -61,7 +61,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros", "sync", "io-util", "fs", "signal"] }
 tracing = "0.1"
 # `filter::Targets` reads the same `target=level` RUST_LOG syntax without env-filter's regex engine.
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 # Unicode display-width (for footer hint budgeting with multi-byte glyphs)
 unicode-width = "0.2"
 

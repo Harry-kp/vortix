@@ -50,7 +50,7 @@ ratatui-flip-panel = "0.1"
 time = { workspace = true }
 
 # Error Handling
-color-eyre = { workspace = true }
+eyre = { workspace = true }
 
 # CLI Argument Parsing
 clap = { workspace = true }
@@ -88,10 +88,6 @@ zeroize = "1.8"
 # `vortix_protocol_openvpn::tunnel` consumers and the plan's Key Tech
 # Decisions for the URL_SAFE-vs-STANDARD reasoning.
 base64 = "0.23"
-# Plan 002 U8: text-only clipboard. Image features pull in `image` /
-# `x11rb` / `zune-*` deps for clipboard image support we don't use;
-# disable defaults to keep binary lean.
-arboard = { version = "3.6.1", default-features = false }
 # Plan 002 U10: raw socket for ICMP echo (replaces `ping` shell-out).
 # Thin libc wrapper; we hand-roll the 8-byte ICMP packet + RFC 792
 # checksum and fall back to TCP-connect-port-443 when the kernel

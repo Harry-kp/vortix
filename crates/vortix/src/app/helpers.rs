@@ -2,6 +2,8 @@
 
 use std::path::Path;
 use std::time::Instant;
+
+use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 use time::OffsetDateTime;
 
 use super::{App, FocusedPanel, Toast, ToastType};
@@ -412,24 +414,19 @@ impl App {
             self.show_toast("No valid IPv4 available yet".to_string(), ToastType::Error);
             return;
         }
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => match clipboard.set_text(ip_str.clone()) {
-                Ok(()) => {
-                    self.show_toast(format!("Copied IPv4: {ip_str}"), ToastType::Success);
-                }
-                Err(e) => {
-                    self.show_toast(
-                        format!("Failed to copy to clipboard: {e}"),
-                        ToastType::Error,
-                    );
-                }
-            },
-            Err(e) => {
-                // Common in headless environments (CI, SSH without
-                // X-forwarding). Match the prior implementation's
-                // soft-fail behavior.
-                self.show_toast(format!("Clipboard unavailable: {e}"), ToastType::Error);
-            }
+        let result = {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(osc52_clipboard(&ip_str).as_bytes())
+                .and_then(|()| stdout.flush())
+        };
+        match result {
+            Ok(()) => self.show_toast(format!("Copied IPv4: {ip_str}"), ToastType::Success),
+            Err(error) => self.show_toast(
+                format!("Failed to copy to clipboard: {error}"),
+                ToastType::Error,
+            ),
         }
     }
 
@@ -548,4 +545,19 @@ fn classify_log_message(message: &str) -> (&str, &str, LogLevel) {
         _ => LogLevel::Info,
     };
     (category, content, level)
+}
+
+fn osc52_clipboard(text: &str) -> String {
+    format!("\x1b]52;c;{}\x1b\\", BASE64.encode(text))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn clipboard_sequence_targets_terminal_host_clipboard() {
+        assert_eq!(
+            super::osc52_clipboard("203.0.113.5"),
+            "\x1b]52;c;MjAzLjAuMTEzLjU=\x1b\\"
+        );
+    }
 }

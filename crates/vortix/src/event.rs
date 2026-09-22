@@ -4,8 +4,8 @@
 //! events, and periodic tick events for UI updates. Events are processed in a
 //! background thread and delivered through a channel.
 
-use color_eyre::Result;
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent};
+use eyre::Result;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,9 +103,7 @@ impl EventHandler {
         match self.receiver.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err(color_eyre::eyre::eyre!("Event channel disconnected"))
-            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(eyre::eyre!("Event channel disconnected")),
         }
     }
 }
