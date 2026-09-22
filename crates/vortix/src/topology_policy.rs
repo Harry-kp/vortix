@@ -454,21 +454,12 @@ pub struct CanonicalPolicyExecutor {
     readback: Mutex<Option<Readback>>,
 }
 
-/// The concrete CIDRs to interface-bind so `claim`'s probe target lands on its
-/// owning interface.
-///
-/// A full tunnel's default is installed by `redirect-gateway def1` as two `/1`
-/// halves, not `0.0.0.0/0`, so binding `0.0.0.0/0` never touches the routes the
-/// probe actually rides. The `/1` halves are more specific than any `/0`, so
-/// binding them wins the probe's longest-prefix match whether the tunnel used
-/// `def1` or a plain `redirect-gateway`. A non-default (split) claim installs
-/// its own CIDR, which is already the right thing to rebind.
-fn rebind_targets(
-    claim: crate::vortix_core::control::worker::RouteClaim,
-    target: std::net::IpAddr,
-) -> Vec<String> {
+/// CIDRs to interface-bind so the claim's probe target lands on the right utun.
+/// A default rides `def1`'s two `/1` halves (more specific than any `/0`), not
+/// `0.0.0.0/0`; a split claim installs its own CIDR.
+fn rebind_targets(claim: crate::vortix_core::control::worker::RouteClaim) -> Vec<String> {
     if claim.is_default() {
-        if target.is_ipv4() {
+        if claim.network().is_ipv4() {
             vec!["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()]
         } else {
             vec!["::/1".to_owned(), "8000::/1".to_owned()]
@@ -665,7 +656,7 @@ impl CanonicalPolicyExecutor {
                     .first()
                     .expect("route probe expectation has at least one claim");
                 let mut rebound = false;
-                for cidr in rebind_targets(*claim, expectation.target) {
+                for cidr in rebind_targets(*claim) {
                     if route_table
                         .bind_route(&cidr, &expectation.interface)
                         .is_ok()
@@ -1258,25 +1249,16 @@ mod tests {
         // binding `0.0.0.0/0` would miss the routes the probe actually uses and
         // leave a full-on-top-of-split connect failing its route read-back.
         assert_eq!(
-            rebind_targets(
-                RouteClaim::parse("0.0.0.0/0").unwrap(),
-                "8.8.8.8".parse().unwrap()
-            ),
+            rebind_targets(RouteClaim::parse("0.0.0.0/0").unwrap()),
             vec!["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()]
         );
         assert_eq!(
-            rebind_targets(
-                RouteClaim::parse("::/0").unwrap(),
-                "2001:4860:4860::8888".parse().unwrap()
-            ),
+            rebind_targets(RouteClaim::parse("::/0").unwrap()),
             vec!["::/1".to_owned(), "8000::/1".to_owned()]
         );
         // A split claim already names the route that was installed.
         assert_eq!(
-            rebind_targets(
-                RouteClaim::parse("10.250.0.0/24").unwrap(),
-                "10.250.0.1".parse().unwrap()
-            ),
+            rebind_targets(RouteClaim::parse("10.250.0.0/24").unwrap()),
             vec!["10.250.0.0/24".to_owned()]
         );
     }
