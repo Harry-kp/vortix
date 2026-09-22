@@ -1,7 +1,7 @@
 //! Structured output formatting for CLI commands.
 //!
 //! Provides three output modes:
-//! - **Human** (default): colored, aligned, Unicode indicators
+//! - **Human** (default): aligned text with Unicode indicators
 //! - **Json**: consistent JSON envelope with `schema_version`, `ok`,
 //!   `command`, `data`, `error`, `next_actions`
 //! - **Quiet**: no stdout; errors on stderr; exit code is the signal
