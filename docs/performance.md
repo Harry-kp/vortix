@@ -254,3 +254,21 @@ Cold A/B builds against commit `361210d`, each with its own empty target directo
 The telemetry timeout test also joined a mock server that slept for three seconds after the
 client had already timed out. A 400 ms server delay against a 100 ms client deadline proves the
 same contract and cuts that test from 3.00 s to 0.40 s; ten consecutive runs passed.
+
+### Terminal-native clipboard
+
+The TUI copied one IPv4 string through `arboard`, which compiled native clipboard bindings for
+macOS, Windows and Linux. Crossterm applications can instead address the terminal host clipboard
+with OSC 52; Vortix builds the sequence with its existing Base64 dependency. This also gives an
+SSH session the local terminal's clipboard rather than trying to reach a display server on the
+remote host.
+
+Cold A/B checks against commit `f5576f5`, each with an empty target directory:
+
+| Step | Before | After | Delta |
+|---|---:|---:|---:|
+| `cargo check --workspace --all-targets` | 34.43 s | 26.87 s | -22.0% |
+| release `vortix` | 5,855,904 B | 5,855,424 B | -480 B |
+
+Eighteen packages leave `Cargo.lock`. The exact encoded sequence has a unit test; real terminal
+acceptance is covered by [`manual-testing/clipboard.md`](manual-testing/clipboard.md).
