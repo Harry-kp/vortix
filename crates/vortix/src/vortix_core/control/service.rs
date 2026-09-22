@@ -4447,11 +4447,17 @@ fn seal_final_topology_policy(
         if *protocol != crate::vortix_core::profile::ProtocolKind::OpenVpn {
             continue;
         }
+        // A second tunnel changes the policy generation, not the revision of
+        // an already-live tunnel. Preserve that tunnel's negotiated routes,
+        // endpoint and DNS using its own revision.
+        let profile_generation = tunnel_revisions
+            .get(profile_id)
+            .map_or(final_policy.generation, |revision| revision.generation);
         let Some(observed) = snapshot
             .observed
             .openvpn_routes
             .get(profile_id)
-            .filter(|observed| observed.desired_generation == final_policy.generation)
+            .filter(|observed| observed.desired_generation == profile_generation)
         else {
             // Standard mode has no helper-authenticated negotiated evidence
             // yet, so its existing configured-route contract remains intact.
@@ -4478,14 +4484,6 @@ fn seal_final_topology_policy(
                 .insert(remote);
         }
 
-        // Compare against this profile's own tunnel revision, not the policy
-        // generation. Connecting a second tunnel bumps the global generation
-        // while a still-connected tunnel keeps its own — matching on the global
-        // dropped the primary's pushed DNS from the applied policy and reverted
-        // its resolver, leaking DNS to the ISP while the VPN was up.
-        let profile_generation = tunnel_revisions
-            .get(profile_id)
-            .map_or(final_policy.generation, |revision| revision.generation);
         if let Some(observed_dns) = snapshot
             .observed
             .openvpn_dns
@@ -7732,6 +7730,25 @@ mod target_profiles_tests {
     use crate::vortix_core::control::DnsSecurityStatus;
     use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
 
+    fn redirect_evidence() -> crate::vortix_core::privileged::OpenVpnRouteEvidence {
+        use crate::vortix_core::privileged::{
+            OpenVpnRedirectFlag, OpenVpnRedirectGateway, OpenVpnRouteEvidence,
+            OpenVpnRouteSetEvidence,
+        };
+
+        OpenVpnRouteEvidence::new(
+            OpenVpnRouteSetEvidence::new(Vec::new(), None).unwrap(),
+            OpenVpnRouteSetEvidence::new(
+                Vec::new(),
+                Some(OpenVpnRedirectGateway::new(vec![OpenVpnRedirectFlag::Def1]).unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .with_selected_remote(Some("198.51.100.7".parse().unwrap()))
+        .unwrap()
+    }
+
     #[test]
     fn route_ownership_detail_yields_the_network_and_the_interface_holding_it() {
         let (cidr, observed) = super::parse_route_ownership_detail(
@@ -8298,6 +8315,59 @@ mod target_profiles_tests {
             "a second tunnel's generation bump must not drop the primary's pushed DNS"
         );
         assert_ne!(snapshot.dns.status, DnsSecurityStatus::NotRequested);
+    }
+
+    #[test]
+    fn final_policy_keeps_an_existing_tunnels_negotiated_routes() {
+        let primary = ProfileId::new("primary");
+        let evidence = redirect_evidence();
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.desired.generation = 12;
+        snapshot.observed.openvpn_routes.insert(
+            primary.clone(),
+            crate::vortix_core::control::model::ObservedOpenVpnRoutes {
+                desired_generation: 11,
+                evidence: evidence.clone(),
+            },
+        );
+        let pre_policy = TopologyPolicy {
+            generation: 12,
+            authority_epoch: AuthorityEpoch(7),
+            digest: PolicyDigest("policy".into()),
+            operation_id: OperationId::from_parts(AuthorityEpoch(7), 12),
+            deadline: Instant::now() + Duration::from_secs(1),
+            prior: TopologyState::default(),
+            target: TopologyState {
+                profiles: BTreeSet::from([primary.clone()]),
+                protocols: BTreeMap::from([(
+                    primary.clone(),
+                    crate::vortix_core::profile::ProtocolKind::OpenVpn,
+                )]),
+                ..TopologyState::default()
+            },
+            prior_tunnel_revisions: BTreeMap::new(),
+            tunnel_revisions: BTreeMap::new(),
+            transition: TopologyTransitionKind::Connect,
+            required_blocking: false,
+            target_tunnels_observed: true,
+            captured_at_millis: 0,
+            stage: PolicyStage::PreTunnelBlocking,
+        };
+        let revisions = BTreeMap::from([(
+            primary.clone(),
+            TunnelRevision {
+                authority_epoch: pre_policy.authority_epoch,
+                generation: 11,
+            },
+        )]);
+
+        let final_policy = seal_final_topology_policy(&pre_policy, &snapshot, &revisions);
+
+        assert_eq!(final_policy.target.openvpn_routes[&primary], evidence);
+        assert!(
+            final_policy.target.routes[&primary].contains(&RouteClaim::parse("0.0.0.0/0").unwrap())
+        );
+        assert!(final_policy.target.server_ips[&primary].contains(&"198.51.100.7".parse().unwrap()));
     }
 
     #[test]

@@ -550,6 +550,30 @@ impl RouteTableKind {
         }
     }
 
+    /// Remove an interface-scoped route installed by Vortix.
+    pub fn unbind_route(&self, cidr: &str, interface: &str) -> Result<(), String> {
+        use crate::vortix_core::ports::route_table::RouteTable;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::MacRouteTable::unbind_route(cidr, interface),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::LinuxRouteTable::unbind_route(cidr, interface),
+            Self::Mock(_) => Ok(()),
+        }
+    }
+
+    /// Remove a VPN-server escape route installed by Vortix.
+    pub fn unbind_host_route(&self, destination: std::net::IpAddr) -> Result<(), String> {
+        use crate::vortix_core::ports::route_table::RouteTable;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::MacRouteTable::unbind_host_route(destination),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::LinuxRouteTable::unbind_host_route(destination),
+            Self::Mock(_) => Ok(()),
+        }
+    }
+
     /// Tri-state route selected by the kernel for one concrete destination.
     #[must_use]
     pub fn route_interface_for(

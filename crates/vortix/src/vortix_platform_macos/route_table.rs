@@ -99,6 +99,17 @@ impl RouteTable for MacRouteTable {
         }
     }
 
+    fn unbind_route(cidr: &str, interface: &str) -> Result<(), String> {
+        run_route_delete(unbind_route_args(cidr, interface), &format!("route {cidr}"))
+    }
+
+    fn unbind_host_route(destination: IpAddr) -> Result<(), String> {
+        run_route_delete(
+            unbind_host_route_args(destination),
+            &format!("host route for {destination}"),
+        )
+    }
+
     fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
         let spec = CommandSpec::oneshot("route", route_get_args(target))
             .timeout(ROUTE_QUERY_TIMEOUT)
@@ -114,6 +125,20 @@ impl RouteTable for MacRouteTable {
             DefaultRouteObservation::NoDefaultRoute,
             DefaultRouteObservation::Interface,
         )
+    }
+}
+
+fn run_route_delete(args: Vec<String>, description: &str) -> Result<(), String> {
+    let spec = CommandSpec::oneshot("route", args)
+        .timeout(ROUTE_QUERY_TIMEOUT)
+        .output_limit(64 * 1024);
+    let output = crate::vortix_process::run_to_output(spec)
+        .map_err(|_| format!("{description} could not be removed"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || stderr.contains("not in table") {
+        Ok(())
+    } else {
+        Err(format!("{description} could not be removed"))
     }
 }
 
@@ -160,6 +185,25 @@ pub(crate) fn bind_host_route_args(verb: &str, destination: IpAddr, gateway: &st
         "-host".into(),
         destination.to_string(),
         gateway.into(),
+    ]
+}
+
+pub(crate) fn unbind_route_args(cidr: &str, interface: &str) -> Vec<String> {
+    bind_route_args("delete", cidr, interface)
+}
+
+pub(crate) fn unbind_host_route_args(destination: IpAddr) -> Vec<String> {
+    vec![
+        "-n".into(),
+        "delete".into(),
+        if destination.is_ipv4() {
+            "-inet"
+        } else {
+            "-inet6"
+        }
+        .into(),
+        "-host".into(),
+        destination.to_string(),
     ]
 }
 
@@ -328,6 +372,18 @@ destination: default
                 "198.51.100.7",
                 "192.168.1.1"
             ]
+        );
+    }
+
+    #[test]
+    fn teardown_deletes_only_the_owned_route_shapes() {
+        assert_eq!(
+            unbind_route_args("0.0.0.0/1", "utun5"),
+            ["-n", "delete", "-net", "0.0.0.0/1", "-interface", "utun5"]
+        );
+        assert_eq!(
+            unbind_host_route_args("198.51.100.7".parse().unwrap()),
+            ["-n", "delete", "-inet", "-host", "198.51.100.7"]
         );
     }
 }

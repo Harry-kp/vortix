@@ -72,6 +72,17 @@ impl RouteTable for LinuxRouteTable {
         }
     }
 
+    fn unbind_route(cidr: &str, interface: &str) -> Result<(), String> {
+        run_ip_route_delete(unbind_route_args(cidr, interface), &format!("route {cidr}"))
+    }
+
+    fn unbind_host_route(destination: IpAddr) -> Result<(), String> {
+        run_ip_route_delete(
+            unbind_host_route_args(destination),
+            &format!("host route for {destination}"),
+        )
+    }
+
     fn default_route_observation() -> DefaultRouteObservation {
         let Some(text) = run_ip_route_show_default() else {
             return DefaultRouteObservation::ProbeFailed;
@@ -99,6 +110,21 @@ impl RouteTable for LinuxRouteTable {
             DefaultRouteObservation::NoDefaultRoute,
             DefaultRouteObservation::Interface,
         )
+    }
+}
+
+fn run_ip_route_delete(args: Vec<String>, description: &str) -> Result<(), String> {
+    // xtask:allow-shell-regression: `ip route del` is the native Linux route teardown interface; the process layer provides bounded execution.
+    let spec = CommandSpec::oneshot("ip", args)
+        .timeout(ROUTE_QUERY_TIMEOUT)
+        .output_limit(64 * 1024);
+    let output = crate::vortix_process::run_to_output(spec)
+        .map_err(|_| format!("{description} could not be removed"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || stderr.contains("No such process") {
+        Ok(())
+    } else {
+        Err(format!("{description} could not be removed"))
     }
 }
 
@@ -133,6 +159,25 @@ pub(crate) fn bind_host_route_args(destination: IpAddr, gateway: &str) -> Vec<St
         format!("{destination}/{prefix}"),
         "via".into(),
         gateway.into(),
+    ]
+}
+
+pub(crate) fn unbind_route_args(cidr: &str, interface: &str) -> Vec<String> {
+    vec![
+        "route".into(),
+        "del".into(),
+        cidr.into(),
+        "dev".into(),
+        interface.into(),
+    ]
+}
+
+pub(crate) fn unbind_host_route_args(destination: IpAddr) -> Vec<String> {
+    let prefix = if destination.is_ipv4() { 32 } else { 128 };
+    vec![
+        "route".into(),
+        "del".into(),
+        format!("{destination}/{prefix}"),
     ]
 }
 
@@ -283,6 +328,18 @@ mod tests {
         assert_eq!(
             bind_host_route_args("198.51.100.7".parse().unwrap(), "192.168.1.1"),
             ["route", "replace", "198.51.100.7/32", "via", "192.168.1.1"]
+        );
+    }
+
+    #[test]
+    fn teardown_deletes_only_the_owned_route_shapes() {
+        assert_eq!(
+            unbind_route_args("0.0.0.0/1", "tun5"),
+            ["route", "del", "0.0.0.0/1", "dev", "tun5"]
+        );
+        assert_eq!(
+            unbind_host_route_args("198.51.100.7".parse().unwrap()),
+            ["route", "del", "198.51.100.7/32"]
         );
     }
 }

@@ -55,4 +55,10 @@ pub trait RouteTable {
     /// Keep a VPN server reachable through the pre-tunnel gateway before a
     /// default-route claim is transferred to that VPN.
     fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String>;
+
+    /// Remove an interface-scoped route previously installed by Vortix.
+    fn unbind_route(cidr: &str, interface: &str) -> Result<(), String>;
+
+    /// Remove a VPN-server escape route previously installed by Vortix.
+    fn unbind_host_route(destination: IpAddr) -> Result<(), String>;
 }

@@ -485,6 +485,25 @@ fn openvpn_default_endpoints(state: &TopologyState) -> BTreeSet<std::net::IpAddr
         .collect()
 }
 
+fn openvpn_route_bindings(state: &TopologyState) -> BTreeSet<(String, String)> {
+    state
+        .profiles
+        .iter()
+        .filter(|profile| {
+            state.protocols.get(*profile)
+                == Some(&crate::vortix_core::profile::ProtocolKind::OpenVpn)
+        })
+        .filter_map(|profile| Some((state.interfaces.get(profile)?, state.routes.get(profile)?)))
+        .flat_map(|(interface, claims)| {
+            claims.iter().flat_map(|claim| {
+                rebind_targets(*claim)
+                    .into_iter()
+                    .map(|cidr| (cidr, interface.clone()))
+            })
+        })
+        .collect()
+}
+
 impl CanonicalPolicyExecutor {
     #[must_use]
     pub fn new(
@@ -717,6 +736,21 @@ impl CanonicalPolicyExecutor {
             }
         }
         Ok(())
+    }
+
+    fn reconcile_routes(&self, policy: &TopologyPolicy) -> Result<(), String> {
+        let route_table = &crate::platform::current_platform().route_table;
+        let prior_bindings = openvpn_route_bindings(&policy.prior);
+        let target_bindings = openvpn_route_bindings(&policy.target);
+        for (cidr, interface) in prior_bindings.difference(&target_bindings) {
+            route_table.unbind_route(cidr, interface)?;
+        }
+        let prior_endpoints = openvpn_default_endpoints(&policy.prior);
+        let target_endpoints = openvpn_default_endpoints(&policy.target);
+        for endpoint in prior_endpoints.difference(&target_endpoints) {
+            route_table.unbind_host_route(*endpoint)?;
+        }
+        self.verify_routes(policy)
     }
 
     fn dns_intents(&self, state: &TopologyState) -> Result<Vec<DnsTunnelIntent>, String> {
@@ -1126,7 +1160,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
                 Ok(())
             }
             PolicyBarrier::Route => {
-                self.verify_routes(policy)?;
+                self.reconcile_routes(policy)?;
                 self.with_readback(policy, |evidence| evidence.route_verified = true);
                 Ok(())
             }
@@ -1338,6 +1372,32 @@ mod tests {
         assert_eq!(
             openvpn_default_endpoints(&state),
             BTreeSet::from(["198.51.100.1".parse().unwrap()])
+        );
+    }
+
+    #[test]
+    fn openvpn_route_bindings_expand_defaults_and_keep_the_owner_interface() {
+        let profile = ProfileId::new("full");
+        let state = TopologyState {
+            profiles: BTreeSet::from([profile.clone()]),
+            protocols: BTreeMap::from([(
+                profile.clone(),
+                crate::vortix_core::profile::ProtocolKind::OpenVpn,
+            )]),
+            interfaces: BTreeMap::from([(profile.clone(), "utun5".into())]),
+            routes: BTreeMap::from([(
+                profile,
+                BTreeSet::from([RouteClaim::parse("0.0.0.0/0").unwrap()]),
+            )]),
+            ..TopologyState::default()
+        };
+
+        assert_eq!(
+            openvpn_route_bindings(&state),
+            BTreeSet::from([
+                ("0.0.0.0/1".into(), "utun5".into()),
+                ("128.0.0.0/1".into(), "utun5".into()),
+            ])
         );
     }
 
