@@ -30,12 +30,9 @@ fn verify_dns_routes_with(
     deadline: Instant,
     mut observe: impl FnMut(IpAddr) -> DefaultRouteObservation,
 ) -> Result<(), String> {
-    // Every interface vortix currently assigns DNS to is a tunnel it manages.
-    // A resolver that egresses through any of them is still inside a VPN — not a
-    // leak — even if it is not the specific interface it was assigned to. This
-    // is the normal split+full case: a split tunnel's public resolver rides the
-    // primary full tunnel that owns the default route. Only egress through an
-    // interface vortix does NOT manage (a physical link) is a real DNS leak.
+    // Egress through any Vortix-managed VPN interface is still tunneled, not a
+    // leak — a split tunnel's public resolver rides the primary full tunnel that
+    // owns the default route. Only egress through an unmanaged/physical link leaks.
     let vpn_interfaces = policy
         .assignments
         .iter()

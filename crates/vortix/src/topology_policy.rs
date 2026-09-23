@@ -398,11 +398,8 @@ fn resolve_endpoint(
     }
 }
 
-/// Cap on a single endpoint `getaddrinfo`. The lookup runs through the system
-/// resolver, which can stall for the full ~30s resolver retry budget when that
-/// resolver is slow (e.g. a corporate mesh's DNS). This call sits on the
-/// control-service startup path, so an uncapped lookup freezes the TUI at
-/// "starting"; the cached endpoint is the correct fallback while it stalls.
+/// Cap on a single endpoint `getaddrinfo`; an uncapped lookup through a slow
+/// system resolver froze the TUI at "starting" for the ~30s resolver budget.
 const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Resolve `host:port` to one IP, giving up after `timeout`. `std`'s
