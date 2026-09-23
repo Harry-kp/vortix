@@ -23,7 +23,53 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::vortix_core::engine::event::{EngineEvent, EventEnvelope};
+use serde::{Deserialize, Serialize};
+
+use crate::vortix_core::engine::state::ConnectionHealth;
+use crate::vortix_core::profile::ProfileId;
+
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// One line in the session journal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JournalEvent {
+    /// Something the engine told the user.
+    Notice {
+        level: String,
+        text: String,
+    },
+    IpChanged {
+        old: Option<String>,
+        new: String,
+    },
+    ConnectionHealthChanged {
+        profile_id: ProfileId,
+        old: ConnectionHealth,
+        new: ConnectionHealth,
+    },
+    JournalRetentionApplied {
+        deleted: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub schema_version: u32,
+    pub timestamp: std::time::SystemTime,
+    pub event: JournalEvent,
+}
+
+impl EventEnvelope {
+    #[must_use]
+    pub fn new(event: JournalEvent) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            timestamp: std::time::SystemTime::now(),
+            event,
+        }
+    }
+}
 
 pub use retention::RetentionStats;
 
@@ -233,7 +279,7 @@ impl Journal {
 
         // Emit the retention-applied event as the first record of the new
         // session.
-        let _ = journal.append(EngineEvent::JournalRetentionApplied {
+        let _ = journal.append(JournalEvent::JournalRetentionApplied {
             deleted: retention_stats.deleted,
         });
 
@@ -242,7 +288,7 @@ impl Journal {
 
     /// Enqueue an event for the journal. Saturation and writer termination are
     /// explicit errors; an accepted record is never silently discarded.
-    pub fn append(&self, event: EngineEvent) -> Result<(), JournalError> {
+    pub fn append(&self, event: JournalEvent) -> Result<(), JournalError> {
         let env = EventEnvelope::new(event);
         self.sender.try_send(env).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => {
@@ -355,15 +401,11 @@ fn iso_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vortix_core::engine::event::EngineEvent;
-    use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 
-    fn sample_event() -> EngineEvent {
-        EngineEvent::TunnelUp {
-            profile_id: ProfileId::parse("c".repeat(ProfileId::HEX_LEN)).unwrap(),
-            protocol: ProtocolKind::WireGuard,
-            interface_name: "wg0".into(),
-            pid: None,
+    fn sample_event() -> JournalEvent {
+        JournalEvent::Notice {
+            level: "info".into(),
+            text: "Connected 'wg0'".into(),
         }
     }
 
@@ -439,7 +481,7 @@ mod tests {
 
         // Subscribe before appending. The retention event emitted by open()
         // may or may not have flushed through the writer task by now, so we
-        // drain everything we see and assert the TunnelUp eventually appears.
+        // drain everything we see and assert the notice eventually appears.
         let mut rx = journal.subscribe();
 
         journal.append(sample_event()).unwrap();
@@ -447,14 +489,11 @@ mod tests {
 
         let mut saw_tunnel_up = false;
         while let Ok(env) = rx.try_recv() {
-            if matches!(env.event, EngineEvent::TunnelUp { .. }) {
+            if matches!(env.event, JournalEvent::Notice { .. }) {
                 saw_tunnel_up = true;
             }
         }
-        assert!(
-            saw_tunnel_up,
-            "subscriber should have received the TunnelUp event"
-        );
+        assert!(saw_tunnel_up, "subscriber should have received the notice");
     }
 
     #[tokio::test(flavor = "current_thread")]

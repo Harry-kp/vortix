@@ -7,14 +7,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
-use crate::vortix_core::control::diagnostics::{
-    DEFAULT_FALLBACK_STALE_AFTER_MILLIS, MAX_FALLBACK_BYTES, MAX_FALLBACK_RECORDS,
-    MAX_FALLBACK_STALE_AFTER_MILLIS,
-};
-use crate::vortix_core::control::{
+use crate::vortix_core::diagnostics::{
     DiagnosticBuffer, DiagnosticCode, DiagnosticComponent, DiagnosticFields, DiagnosticSeverity,
     DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus, DiagnosticView,
     FallbackDiagnosticState,
+};
+use crate::vortix_core::diagnostics::{
+    DEFAULT_FALLBACK_STALE_AFTER_MILLIS, MAX_FALLBACK_BYTES, MAX_FALLBACK_RECORDS,
+    MAX_FALLBACK_STALE_AFTER_MILLIS,
 };
 
 const EVENT_CAPACITY: usize = 64;

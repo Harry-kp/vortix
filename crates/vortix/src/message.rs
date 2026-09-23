@@ -56,7 +56,9 @@ pub enum Message {
     OpenBackgroundRecover,
     OpenBackgroundDisable,
     OpenBackgroundDiagnostics,
-    BackgroundDiagnosticsLoaded(Result<Box<crate::vortix_core::control::DiagnosticView>, String>),
+    BackgroundDiagnosticsLoaded(
+        Result<Box<crate::vortix_core::diagnostics::DiagnosticView>, String>,
+    ),
     ConfirmBackgroundAction,
 
     // === Profile Management ===
@@ -154,8 +156,6 @@ pub enum Message {
     Quit,
     /// Background telemetry update
     Telemetry(TelemetryUpdate),
-    /// New immutable publication from the canonical control owner.
-    ControlSnapshot(Box<crate::vortix_core::control::ControlSnapshot>),
     /// Periodic heartbeat tick
     Tick,
     /// Terminal resize event

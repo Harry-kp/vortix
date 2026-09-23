@@ -23,21 +23,6 @@ pub(crate) struct PreparedProfileImport {
     profile: VpnProfile,
     stored: Profile,
     raw_body: Zeroizing<Box<[u8]>>,
-    source_path: PathBuf,
-}
-
-impl PreparedProfileImport {
-    #[must_use]
-    pub(crate) fn profile(&self) -> &VpnProfile {
-        &self.profile
-    }
-
-    #[must_use]
-    pub(crate) fn topology_profile(&self) -> VpnProfile {
-        let mut profile = self.profile.clone();
-        profile.config_path.clone_from(&self.source_path);
-        profile
-    }
 }
 
 #[allow(clippy::too_many_lines)] // validation and identity preparation are one bounded read
@@ -150,7 +135,6 @@ pub(crate) fn prepare_profile_import(
     Ok(PreparedProfileImport {
         stored,
         raw_body: Zeroizing::new(content.into_bytes().into_boxed_slice()),
-        source_path: path.to_path_buf(),
         profile: VpnProfile {
             id,
             name,

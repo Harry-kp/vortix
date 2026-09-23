@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::control::AuthorityEpoch;
+use crate::vortix_core::ids::AuthorityEpoch;
 use crate::vortix_core::privileged::operation::{
     HelperEpoch, LeaseId, NetworkPolicyOperation, OperationDigest, PrivilegedOperation,
     PrivilegedOperationId, PrivilegedRequest, RequestSequence, RootAuthorityLedger,

@@ -300,7 +300,7 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
 }
 
 fn push_dns_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
-    use crate::vortix_core::control::DnsSecurityStatus;
+    use crate::control::DnsSecurityStatus;
     // Only an observed resolver can go stale; the VPN's own is policy.
     if s.dns_is_stale() {
         lines.push(audit_row(
@@ -486,7 +486,7 @@ struct PanelState {
     ipv6_status: Ipv6RowStatus,
     dns_server: String,
     dns_provider: Option<&'static str>,
-    dns_status: crate::vortix_core::control::DnsSecurityStatus,
+    dns_status: crate::control::DnsSecurityStatus,
 
     // Per-observation ages. Each probe runs on its own schedule, so one
     // panel-wide stamp would let a fresh field vouch for a stalled one.
@@ -671,8 +671,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// degraded so the title doesn't claim full protection while a row is red.
 fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Verdict {
     let ip_leaking = matches!(&app.runtime.real_ip, Some(real) if &app.runtime.public_ip == real);
-    let dns_unverified = app.control_snapshot.dns.status
-        != crate::vortix_core::control::DnsSecurityStatus::Protected;
+    let dns_unverified =
+        app.control_snapshot.dns.status != crate::control::DnsSecurityStatus::Protected;
     let ks_alarm = matches!(
         (
             app.registry.killswitch_mode(),
@@ -1365,18 +1365,23 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::state::KillSwitchMode;
-    use crate::vortix_core::engine::Engine;
     use crate::vortix_core::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::Instant;
 
     fn insert_idle_tunnel(app: &mut App, name: &str) {
-        let tunnel = crate::tunnel::TunnelKind::Mock(
-            crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
-        );
-        let engine = Engine::new(tunnel, |_| None);
-        app.registry.insert(ProfileId::new(name), engine, vec![]);
+        use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
+        app.registry.insert_for_test(TunnelSnapshot {
+            profile_id: ProfileId::new(name),
+            state: Connection::Disconnected { last_failure: None },
+            role: Role::Addressable {
+                allowed_ips: Vec::new(),
+            },
+            health: ConnectionHealth::default(),
+            interface_name: None,
+            started_at: None,
+        });
     }
 
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
@@ -1417,7 +1422,7 @@ mod tests {
             ipv6_status: Ipv6RowStatus::Absent,
             dns_server: "1.1.1.1".to_string(),
             dns_provider: Some("Cloudflare"),
-            dns_status: crate::vortix_core::control::DnsSecurityStatus::Protected,
+            dns_status: crate::control::DnsSecurityStatus::Protected,
             killswitch_mode: KillSwitchMode::AlwaysOn,
             killswitch_state: KillSwitchState::Blocking,
             encryption: "ChaCha20-Poly1305".to_string(),
@@ -1874,7 +1879,7 @@ mod tests {
 
     #[test]
     fn unverified_dns_policy_warns_without_claiming_a_leak() {
-        use crate::vortix_core::control::DnsSecurityStatus;
+        use crate::control::DnsSecurityStatus;
         let mut s = baseline_protected_state(40);
         s.dns_status = DnsSecurityStatus::Unverified;
         let lines = build_protected_audit(&s);
@@ -2053,19 +2058,8 @@ mod tests {
     }
 
     #[test]
-    fn dns_row_prefers_canonical_vpn_intent_over_stale_telemetry() {
-        let mut app = App::new_test();
-        app.runtime.dns_server = "192.168.1.100".into();
-        app.control_snapshot.dns.intended_servers =
-            vec!["10.80.0.1".parse().unwrap(), "1.1.1.1".parse().unwrap()];
-        app.control_snapshot.dns.status = crate::vortix_core::control::DnsSecurityStatus::Protected;
-
-        assert_eq!(dns_display_value(&app), "10.80.0.1, 1.1.1.1");
-    }
-
-    #[test]
     fn primary_without_vpn_dns_warns_instead_of_claiming_protection() {
-        use crate::vortix_core::control::DnsSecurityStatus;
+        use crate::control::DnsSecurityStatus;
         let mut s = baseline_protected_state(52);
         s.dns_status = DnsSecurityStatus::NotRequested;
 
@@ -2238,96 +2232,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_renders_banner_section_words_and_killswitch_row() {
-        // The PARTIAL banner sits at the top; below it the `Identity` /
-        // `Defense` section words and a single Killswitch row in the
-        // right-column layout.
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        // Deliberately diverge the obsolete runtime mirror: renderers must
-        // follow the registry's canonical policy projection exclusively.
-        app.runtime.killswitch_mode = KillSwitchMode::Off;
-        app.runtime.killswitch_state = KillSwitchState::Disabled;
-        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
-        app.registry.set_killswitch_state(KillSwitchState::Blocking);
-
-        let out = render_to_string(&app, 60, 20);
-        assert!(out.contains("PARTIAL"), "PARTIAL banner missing:\n{out}");
-        assert!(out.contains("Identity"), "PARTIAL panel:\n{out}");
-        assert!(out.contains("Defense"), "PARTIAL panel:\n{out}");
-        assert!(out.contains("Killswitch"), "PARTIAL panel:\n{out}");
-        assert!(out.contains("VPN-only"), "active mode label:\n{out}");
-        assert!(!out.contains("Legend:"), "no in-panel legend:\n{out}");
-    }
-
-    #[test]
-    fn a_leaking_ipv6_cannot_be_headlined_as_protected() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
-        app.registry.set_killswitch_state(KillSwitchState::Blocking);
-        app.control_snapshot.dns.status = crate::vortix_core::control::DnsSecurityStatus::Protected;
-        // A profile owns the default route, so IPv4 is carried by the tunnel.
-        app.registry.replace_control_projection(
-            &std::collections::BTreeMap::new(),
-            Some(ProfileId::new("alpha")),
-        );
-        // An IPv4-only tunnel leaves IPv6 on the ISP link, so every
-        // IPv6-reachable site still sees the real address.
-        app.runtime.real_ipv6 = Some("2401:4900::abcd".to_string());
-        app.runtime.public_ipv6 = Some("2401:4900::abcd".to_string());
-
-        assert!(
-            derive_ipv6_row_status(&app) == Ipv6RowStatus::Leaking,
-            "the panel itself reports this state as exposed"
-        );
-        assert!(
-            verdict_for_protected(&app, None) == Verdict::Partial,
-            "the headline must not claim protection over its own `v6 exposed` row"
-        );
-
-        // Without the leak the same state is genuinely protected, so the
-        // assertion above is about IPv6 and nothing else.
-        app.runtime.public_ipv6 = Some("2a00:1450::1".to_string());
-        assert!(
-            verdict_for_protected(&app, None) == Verdict::Protected,
-            "a masked IPv6 must still read as protected"
-        );
-    }
-
-    #[test]
-    fn partial_killswitch_off_renders_off_with_alarm() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::Off);
-        app.registry.set_killswitch_state(KillSwitchState::Disabled);
-
-        let out = render_to_string(&app, 70, 20);
-        assert!(
-            out.contains("Off"),
-            "Off mode value missing in PARTIAL:\n{out}"
-        );
-        assert!(
-            out.contains("not protecting"),
-            "Off alarm sub-line missing:\n{out}"
-        );
-    }
-
-    #[test]
-    fn partial_killswitch_auto_renders_block_on_drop() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::Auto);
-        app.registry.set_killswitch_state(KillSwitchState::Armed);
-
-        let out = render_to_string(&app, 70, 20);
-        assert!(
-            out.contains("Block on drop"),
-            "Auto mode label missing:\n{out}"
-        );
-    }
-
-    #[test]
     fn partial_with_primary_renders_real_ip_not_split_route_noexit() {
         // Regression for the "Role=Primary everywhere else but Security
         // Guard says split-route — no exit" bug. When PARTIAL fires from
@@ -2444,22 +2348,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partial_no_v6_connectivity_keeps_legacy_labels() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-
-        let out = render_to_string(&app, 70, 20);
-        assert!(
-            !out.contains("Real IPv6") && !out.contains("Exit IPv6"),
-            "no v6 connectivity must not render IPv6 rows:\n{out}"
-        );
-        assert!(
-            !out.contains("Not enforced"),
-            "old IPv6 explainer must be gone:\n{out}"
-        );
-    }
-
     /// Each row's freshness must come from its own probe. The fields share
     /// one panel but not one clock: collapsing them onto a single tick was
     /// what let a resolver reading that had not landed for minutes render
@@ -2483,6 +2371,128 @@ mod tests {
         assert!(
             state.is_stale(state.dns_age),
             "the resolver reading is older than the staleness window and must say so"
+        );
+    }
+
+    #[test]
+    fn dns_row_prefers_canonical_vpn_intent_over_stale_telemetry() {
+        let mut app = App::new_test();
+        app.runtime.dns_server = "192.168.1.100".into();
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .intended_servers = vec!["10.80.0.1".parse().unwrap(), "1.1.1.1".parse().unwrap()];
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .status = crate::control::DnsSecurityStatus::Protected;
+
+        assert_eq!(dns_display_value(&app), "10.80.0.1, 1.1.1.1");
+    }
+
+    #[test]
+    fn partial_renders_banner_section_words_and_killswitch_row() {
+        // The PARTIAL banner sits at the top; below it the `Identity` /
+        // `Defense` section words and a single Killswitch row in the
+        // right-column layout.
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        // Deliberately diverge the obsolete runtime mirror: renderers must
+        // follow the registry's canonical policy projection exclusively.
+        app.runtime.killswitch_mode = KillSwitchMode::Off;
+        app.runtime.killswitch_state = KillSwitchState::Disabled;
+        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
+        app.registry.set_killswitch_state(KillSwitchState::Blocking);
+
+        let out = render_to_string(&app, 60, 20);
+        assert!(out.contains("PARTIAL"), "PARTIAL banner missing:\n{out}");
+        assert!(out.contains("Identity"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("Defense"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("Killswitch"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("VPN-only"), "active mode label:\n{out}");
+        assert!(!out.contains("Legend:"), "no in-panel legend:\n{out}");
+    }
+
+    #[test]
+    fn a_leaking_ipv6_cannot_be_headlined_as_protected() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
+        app.registry.set_killswitch_state(KillSwitchState::Blocking);
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .status = crate::control::DnsSecurityStatus::Protected;
+        // A profile owns the default route, so IPv4 is carried by the tunnel.
+        app.registry.replace_control_projection(
+            &std::collections::BTreeMap::new(),
+            Some(ProfileId::new("alpha")),
+        );
+        // An IPv4-only tunnel leaves IPv6 on the ISP link, so every
+        // IPv6-reachable site still sees the real address.
+        app.runtime.real_ipv6 = Some("2401:4900::abcd".to_string());
+        app.runtime.public_ipv6 = Some("2401:4900::abcd".to_string());
+
+        assert!(
+            derive_ipv6_row_status(&app) == Ipv6RowStatus::Leaking,
+            "the panel itself reports this state as exposed"
+        );
+        assert!(
+            verdict_for_protected(&app, None) == Verdict::Partial,
+            "the headline must not claim protection over its own `v6 exposed` row"
+        );
+
+        // Without the leak the same state is genuinely protected, so the
+        // assertion above is about IPv6 and nothing else.
+        app.runtime.public_ipv6 = Some("2a00:1450::1".to_string());
+        assert!(
+            verdict_for_protected(&app, None) == Verdict::Protected,
+            "a masked IPv6 must still read as protected"
+        );
+    }
+
+    #[test]
+    fn partial_killswitch_off_renders_off_with_alarm() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        app.registry.set_killswitch_mode(KillSwitchMode::Off);
+        app.registry.set_killswitch_state(KillSwitchState::Disabled);
+
+        let out = render_to_string(&app, 70, 20);
+        assert!(
+            out.contains("Off"),
+            "Off mode value missing in PARTIAL:\n{out}"
+        );
+        assert!(
+            out.contains("not protecting"),
+            "Off alarm sub-line missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_killswitch_auto_renders_block_on_drop() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        app.registry.set_killswitch_mode(KillSwitchMode::Auto);
+        app.registry.set_killswitch_state(KillSwitchState::Armed);
+
+        let out = render_to_string(&app, 70, 20);
+        assert!(
+            out.contains("Block on drop"),
+            "Auto mode label missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_no_v6_connectivity_keeps_legacy_labels() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+
+        let out = render_to_string(&app, 70, 20);
+        assert!(
+            !out.contains("Real IPv6") && !out.contains("Exit IPv6"),
+            "no v6 connectivity must not render IPv6 rows:\n{out}"
+        );
+        assert!(
+            !out.contains("Not enforced"),
+            "old IPv6 explainer must be gone:\n{out}"
         );
     }
 }

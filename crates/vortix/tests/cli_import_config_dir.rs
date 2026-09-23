@@ -47,22 +47,8 @@ fn cli_import_single_file() {
     // Verify the profile landed in the temp dir, not the real config
     let profiles_dir = config_dir.path().join("profiles");
     assert!(profiles_dir.join("test.conf").exists());
-    let persisted = std::fs::read_to_string(config_dir.path().join("control/control-state.json"))
-        .expect("typed import persists its terminal operation");
-    assert!(
-        persisted.contains("\"status\": \"succeeded\""),
-        "terminal import must be durable before CLI success: {persisted}"
-    );
-
     let store = FsProfileStore::new(profiles_dir.clone());
     let stable_id = store.resolve_display_name("test").unwrap();
-    let persisted_json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
-    assert!(
-        persisted_json["requested_resources"]
-            .get(stable_id.as_str())
-            .is_some(),
-        "terminal import must persist canonical requested resources"
-    );
     let rename = handle_command(
         &Commands::Rename {
             old: "test".to_owned(),

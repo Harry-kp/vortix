@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::warn;
 
-use crate::vortix_core::engine::event::EventEnvelope;
+use super::EventEnvelope;
 
 use super::TailBuffer;
 

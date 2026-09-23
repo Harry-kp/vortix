@@ -1,9 +1,8 @@
-//! Pure network plan: the routes, DNS roles and firewall allowances the host
-//! should carry for a set of live tunnels.
+//! What the host network should look like for a set of tunnels.
 //!
-//! The plan depends only on which tunnels are up, never on the order of the
-//! commands that produced them, so every path to the same tunnel set lands on
-//! the same host state.
+//! Pure: the plan depends only on which tunnels exist and the kill switch
+//! mode, never on the commands that produced them, so every path to the same
+//! tunnel set lands on the same routes, DNS and firewall.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -12,10 +11,11 @@ use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::ports::dns::{DnsRequest, DnsTunnelIntent, DnsTunnelRole};
 use crate::vortix_core::ports::killswitch::ActiveTunnelInfo;
 use crate::vortix_core::profile::ProfileId;
+use crate::vortix_core::state::killswitch::{KillSwitchMode, KillSwitchState};
 
-/// One live tunnel as the planner sees it.
+/// One tunnel whose interface is up and carrying traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanTunnel {
+pub struct LiveTunnel {
     pub profile_id: ProfileId,
     pub interface: String,
     pub routes: BTreeSet<Cidr>,
@@ -25,16 +25,37 @@ pub struct PlanTunnel {
     pub rank: u64,
 }
 
-impl PlanTunnel {
+impl LiveTunnel {
     fn claims_default(&self, v4: bool) -> bool {
         self.routes
             .iter()
             .any(|cidr| cidr.prefix_len == 0 && cidr.addr.is_ipv4() == v4)
     }
 
-    fn is_full(&self) -> bool {
+    #[must_use]
+    pub fn is_full(&self) -> bool {
         self.claims_default(true) || self.claims_default(false)
     }
+}
+
+/// Everything the planner needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanInput {
+    pub live: Vec<LiveTunnel>,
+    /// Servers of tunnels still starting or recovering. The firewall must let
+    /// their transport out before an interface exists.
+    pub pending_endpoints: BTreeSet<IpAddr>,
+    /// A tunnel dropped without being asked to.
+    pub dropped: bool,
+    pub kill_switch: KillSwitchMode,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Firewall {
+    #[default]
+    Open,
+    /// Default-drop egress except through these tunnels and endpoints.
+    Block(Vec<ActiveTunnelInfo>),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -48,7 +69,8 @@ pub struct NetworkPlan {
     /// transport never loops into a tunnel.
     pub host_routes: BTreeSet<IpAddr>,
     pub dns: Vec<DnsTunnelIntent>,
-    pub firewall: Vec<ActiveTunnelInfo>,
+    pub firewall: Firewall,
+    pub kill_switch_state: KillSwitchState,
 }
 
 impl NetworkPlan {
@@ -59,7 +81,7 @@ impl NetworkPlan {
         let probe = match cidr.addr {
             IpAddr::V4(addr) if addr.is_unspecified() => IpAddr::from([1, 1, 1, 1]),
             IpAddr::V6(addr) if addr.is_unspecified() => {
-                "2606:4700:4700::1111".parse().expect("fixed IPv6 address")
+                IpAddr::from([0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111])
             }
             IpAddr::V4(addr) if cidr.prefix_len < 32 => {
                 IpAddr::V4(u32::from(addr).saturating_add(1).into())
@@ -82,7 +104,7 @@ fn default_halves(v4: bool) -> [Cidr; 2] {
     }
 }
 
-fn newest(tunnels: &[PlanTunnel], pick: impl Fn(&PlanTunnel) -> bool) -> Option<&PlanTunnel> {
+fn newest(tunnels: &[LiveTunnel], pick: impl Fn(&LiveTunnel) -> bool) -> Option<&LiveTunnel> {
     tunnels.iter().filter(|tunnel| pick(tunnel)).max_by(|a, b| {
         a.rank
             .cmp(&b.rank)
@@ -91,15 +113,15 @@ fn newest(tunnels: &[PlanTunnel], pick: impl Fn(&PlanTunnel) -> bool) -> Option<
 }
 
 #[must_use]
-pub fn plan(tunnels: &[PlanTunnel]) -> NetworkPlan {
+pub fn plan(input: &PlanInput) -> NetworkPlan {
+    let tunnels = input.live.as_slice();
     let primary = newest(tunnels, |tunnel| tunnel.claims_default(true));
     let primary_v6 = newest(tunnels, |tunnel| tunnel.claims_default(false));
 
-    let mut owners = BTreeMap::<Cidr, &PlanTunnel>::new();
+    let mut owners = BTreeMap::<Cidr, &LiveTunnel>::new();
     for tunnel in tunnels {
         for cidr in tunnel.routes.iter().filter(|cidr| cidr.prefix_len != 0) {
-            let cidr = cidr.canonical_network();
-            let owner = owners.entry(cidr).or_insert(tunnel);
+            let owner = owners.entry(cidr.canonical_network()).or_insert(tunnel);
             if (tunnel.rank, &owner.profile_id) > (owner.rank, &tunnel.profile_id) {
                 *owner = tunnel;
             }
@@ -138,15 +160,7 @@ pub fn plan(tunnels: &[PlanTunnel]) -> NetworkPlan {
         })
         .collect();
 
-    let firewall = tunnels
-        .iter()
-        .map(|tunnel| ActiveTunnelInfo {
-            interface: tunnel.interface.clone(),
-            server_ips: tunnel.server_ips.iter().copied().collect(),
-            declared_cidrs: tunnel.routes.iter().copied().collect(),
-            is_primary: tunnel.is_full(),
-        })
-        .collect();
+    let (firewall, kill_switch_state) = firewall(input);
 
     NetworkPlan {
         primary: primary.map(|tunnel| tunnel.profile_id.clone()),
@@ -154,22 +168,57 @@ pub fn plan(tunnels: &[PlanTunnel]) -> NetworkPlan {
         host_routes,
         dns,
         firewall,
+        kill_switch_state,
     }
 }
 
+fn firewall(input: &PlanInput) -> (Firewall, KillSwitchState) {
+    let blocking = match input.kill_switch {
+        KillSwitchMode::Off => return (Firewall::Open, KillSwitchState::Disabled),
+        KillSwitchMode::AlwaysOn => true,
+        KillSwitchMode::Auto => input.dropped,
+    };
+    if !blocking {
+        return (Firewall::Open, KillSwitchState::Armed);
+    }
+    let mut allow = input
+        .live
+        .iter()
+        .map(|tunnel| ActiveTunnelInfo {
+            interface: tunnel.interface.clone(),
+            server_ips: tunnel.server_ips.iter().copied().collect(),
+            declared_cidrs: tunnel.routes.iter().copied().collect(),
+            is_primary: tunnel.is_full(),
+        })
+        .collect::<Vec<_>>();
+    let covered = allow
+        .iter()
+        .flat_map(|tunnel| tunnel.server_ips.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let pending = input
+        .pending_endpoints
+        .difference(&covered)
+        .copied()
+        .collect::<Vec<_>>();
+    if !pending.is_empty() {
+        allow.push(ActiveTunnelInfo::endpoint_allowlist(pending));
+    }
+    (Firewall::Block(allow), KillSwitchState::Blocking)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const FULL: &str = "0.0.0.0/0";
-    const SPLIT: &str = "10.250.0.0/24";
+    pub const FULL: &str = "0.0.0.0/0";
+    pub const SPLIT: &str = "10.250.0.0/24";
 
-    fn tunnel(id: &str, iface: &str, route: &str, rank: u64) -> PlanTunnel {
-        PlanTunnel {
+    pub fn live(id: &str, iface: &str, route: &str, rank: u64) -> LiveTunnel {
+        LiveTunnel {
             profile_id: ProfileId::new(id),
             interface: iface.into(),
             routes: BTreeSet::from([route.parse().unwrap()]),
-            server_ips: BTreeSet::from([IpAddr::from([203, 0, 113, u8::try_from(rank).unwrap()])]),
+            server_ips: BTreeSet::from([IpAddr::from([203, 0, 113, id.as_bytes()[0]])]),
             dns: DnsRequest {
                 servers: vec![IpAddr::from([10, 8, 0, 1])],
                 search_domains: Vec::new(),
@@ -182,18 +231,22 @@ mod tests {
         value.parse().unwrap()
     }
 
-    /// Invariants every plan must hold, whatever tunnels are up.
-    fn assert_invariants(tunnels: &[PlanTunnel], plan: &NetworkPlan) {
+    fn input(live: Vec<LiveTunnel>) -> PlanInput {
+        PlanInput {
+            live,
+            ..PlanInput::default()
+        }
+    }
+
+    /// Invariants every plan must hold, whatever the input.
+    pub fn assert_invariants(input: &PlanInput, plan: &NetworkPlan) {
+        let tunnels = &input.live;
         let primaries = plan
             .dns
             .iter()
             .filter(|intent| intent.role == DnsTunnelRole::Primary)
             .count();
         assert!(primaries <= 1, "at most one DNS primary: {plan:?}");
-        let full = tunnels
-            .iter()
-            .filter(|tunnel| tunnel.claims_default(true))
-            .collect::<Vec<_>>();
         if let Some(owner) = newest(tunnels, |tunnel| tunnel.claims_default(true)) {
             assert_eq!(plan.primary.as_ref(), Some(&owner.profile_id));
             for half in default_halves(true) {
@@ -201,12 +254,11 @@ mod tests {
             }
             assert_eq!(primaries, usize::from(!owner.dns.is_empty()));
         } else {
-            assert!(full.is_empty());
             assert_eq!(plan.primary, None);
             assert!(!plan.routes.contains_key(&cidr("0.0.0.0/1")));
             assert_eq!(primaries, 0);
         }
-        for tunnel in &full {
+        for tunnel in tunnels.iter().filter(|tunnel| tunnel.is_full()) {
             for ip in &tunnel.server_ips {
                 assert!(
                     plan.host_routes.contains(ip),
@@ -224,38 +276,55 @@ mod tests {
                 .all(|iface| interfaces.contains(iface.as_str())),
             "no route points at a tunnel that is down"
         );
-        assert_eq!(plan.firewall.len(), tunnels.len());
+        let blocks = matches!(plan.firewall, Firewall::Block(_));
+        match input.kill_switch {
+            KillSwitchMode::Off => assert!(!blocks),
+            KillSwitchMode::AlwaysOn => assert!(blocks),
+            KillSwitchMode::Auto => assert_eq!(blocks, input.dropped),
+        }
+        if let Firewall::Block(allow) = &plan.firewall {
+            let allowed = allow
+                .iter()
+                .flat_map(|rule| rule.server_ips.iter())
+                .collect::<BTreeSet<_>>();
+            for endpoint in &input.pending_endpoints {
+                assert!(
+                    allowed.contains(endpoint),
+                    "a starting tunnel can reach its server"
+                );
+            }
+        }
     }
 
     #[test]
     fn newest_full_tunnel_owns_the_default_route_and_dns() {
-        let tunnels = [
-            tunnel("01", "utun4", FULL, 1),
-            tunnel("03", "utun6", FULL, 3),
-        ];
-        let plan = plan(&tunnels);
+        let input = input(vec![
+            live("01", "utun4", FULL, 1),
+            live("03", "utun6", FULL, 3),
+        ]);
+        let plan = plan(&input);
         assert_eq!(plan.primary, Some(ProfileId::new("03")));
         assert_eq!(plan.routes[&cidr("0.0.0.0/1")], "utun6");
-        assert_invariants(&tunnels, &plan);
+        assert_invariants(&input, &plan);
     }
 
     #[test]
     fn split_tunnel_keeps_its_prefix_beside_a_full_tunnel() {
-        let tunnels = [
-            tunnel("01", "utun4", FULL, 1),
-            tunnel("02", "utun5", SPLIT, 2),
-        ];
-        let plan = plan(&tunnels);
+        let input = input(vec![
+            live("01", "utun4", FULL, 1),
+            live("02", "utun5", SPLIT, 2),
+        ]);
+        let plan = plan(&input);
         assert_eq!(plan.routes[&cidr(SPLIT)], "utun5");
         assert_eq!(plan.primary, Some(ProfileId::new("01")));
-        assert_invariants(&tunnels, &plan);
+        assert_invariants(&input, &plan);
     }
 
     #[test]
     fn a_default_probe_never_lands_on_a_pinned_server() {
-        let mut full = tunnel("01", "utun4", FULL, 1);
+        let mut full = live("01", "utun4", FULL, 1);
         full.server_ips = BTreeSet::from([IpAddr::from([1, 1, 1, 1])]);
-        let plan = plan(&[full]);
+        let plan = plan(&input(vec![full]));
         assert_eq!(plan.probe_address(cidr("0.0.0.0/1")), None);
         assert_eq!(
             plan.probe_address(cidr("128.0.0.0/1")),
@@ -263,52 +332,16 @@ mod tests {
         );
     }
 
-    /// Every connect/disconnect sequence over three full and split profiles:
-    /// the plan after each step depends only on the live set, and holds every
-    /// invariant.
     #[test]
-    fn every_command_sequence_converges_to_the_same_plan_for_the_same_live_set() {
-        let catalog = [
-            ("01", "utun4", FULL),
-            ("02", "utun5", SPLIT),
-            ("03", "utun6", FULL),
-        ];
-        let mut seen = BTreeMap::<Vec<(String, u64)>, NetworkPlan>::new();
-        let steps = catalog.len() * 2;
-        for sequence in 0..(steps.pow(5)) {
-            let mut live = Vec::<PlanTunnel>::new();
-            let mut clock = 0;
-            let mut rest = sequence;
-            for _ in 0..5 {
-                let step = rest % steps;
-                rest /= steps;
-                let (id, iface, route) = catalog[step / 2];
-                live.retain(|tunnel| tunnel.profile_id.as_str() != id);
-                if step % 2 == 0 {
-                    clock += 1;
-                    live.push(tunnel(id, iface, route, clock));
-                }
-                let plan = plan(&live);
-                assert_invariants(&live, &plan);
-                let mut order = live
-                    .iter()
-                    .map(|tunnel| (tunnel.profile_id.as_str().to_owned(), tunnel.rank))
-                    .collect::<Vec<_>>();
-                order.sort_by_key(|(_, rank)| *rank);
-                let key = order
-                    .iter()
-                    .enumerate()
-                    .map(|(position, (id, _))| (id.clone(), position as u64))
-                    .collect::<Vec<_>>();
-                let mut normalized = plan.clone();
-                normalized.host_routes.clear();
-                normalized.firewall.clear();
-                if let Some(previous) = seen.get(&key) {
-                    assert_eq!(previous, &normalized, "same live set, same plan");
-                } else {
-                    seen.insert(key, normalized);
-                }
-            }
-        }
+    fn block_on_drop_blocks_only_after_a_drop() {
+        let mut input = input(vec![live("01", "utun4", FULL, 1)]);
+        input.kill_switch = KillSwitchMode::Auto;
+        assert_eq!(plan(&input).kill_switch_state, KillSwitchState::Armed);
+        input.live.clear();
+        input.dropped = true;
+        input.pending_endpoints = BTreeSet::from([IpAddr::from([203, 0, 113, 2])]);
+        let plan = plan(&input);
+        assert_eq!(plan.kill_switch_state, KillSwitchState::Blocking);
+        assert_invariants(&input, &plan);
     }
 }

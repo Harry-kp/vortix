@@ -84,27 +84,6 @@ impl CachedConfigView {
     }
 }
 
-pub(crate) struct PendingProfileImports {
-    source: std::path::PathBuf,
-    remaining: std::collections::VecDeque<std::path::PathBuf>,
-    queued: usize,
-    failed: usize,
-    active: Option<PendingProfileImport>,
-}
-
-pub(crate) enum PendingProfileImport {
-    AwaitingAdmission(String),
-    Admitted(crate::vortix_core::control::OperationId),
-}
-
-/// Credentials awaiting the server's verdict, held in memory only.
-pub(crate) struct PendingCredentialSave {
-    pub(crate) profile_id: crate::vortix_core::profile::ProfileId,
-    pub(crate) profile_name: String,
-    pub(crate) username: crate::state::SecretText,
-    pub(crate) password: crate::state::SecretText,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingThemeChange {
     previous: crate::theme::ThemeChoice,
@@ -116,7 +95,6 @@ use std::collections::HashMap;
 use crate::constants;
 use crate::logger;
 use crate::message::Message;
-use crate::tunnel::TunnelKind;
 use crate::vortix_core::engine::TunnelRegistry;
 use crate::vpn_runtime::VpnRuntime;
 
@@ -145,84 +123,24 @@ pub struct App {
     /// `self.registry`.
     pub runtime: VpnRuntime,
 
-    /// Optional plan-005 `EngineHandle`. Non-load-bearing today — kept for
-    /// IPC / remote-control surfaces that drive a single tunnel through the
-    /// FSM actor. Multi-tunnel callers bypass this and use `self.registry`.
-    pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
-
     /// The `TunnelRegistry` owns active tunnel
     /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
     /// `connection_details`, security, chart).
-    pub registry: TunnelRegistry<TunnelKind>,
+    pub registry: TunnelRegistry,
 
-    /// Long-lived Standard-mode canonical authority used by the TUI. Tests
-    /// that characterize presentation-only helpers may leave it detached.
-    pub(crate) control_session: Option<crate::cli::control::ClientControlSession>,
-
-    /// True while production is preparing the canonical control owner. This
-    /// is presentation-only: the control session remains the authority once
-    /// attached.
+    /// The connection engine. `None` while it is starting.
+    pub(crate) control: Option<crate::control::Control>,
     pub(crate) control_starting: bool,
-
-    /// Last complete immutable publication received from the control owner.
-    pub control_snapshot: crate::vortix_core::control::ControlSnapshot,
-
-    /// Service-owned challenge currently displayed by the existing auth
-    /// overlay. The answer is returned directly to the service and never
-    /// journaled or persisted in this client.
-    pub(crate) control_challenge: Option<crate::vortix_core::control::ChallengeId>,
-
-    /// Credentials the user asked to remember, held until the server accepts
-    /// them. Writing at submit time persisted rejected passwords, and a
-    /// profile with stored credentials raises no challenge — so the next
-    /// connect reused the bad pair and never reopened the prompt.
-    pub(crate) pending_credential_save: Option<PendingCredentialSave>,
-
-    /// Last control-service failure already surfaced, so a persistent one is
-    /// reported on transition instead of on every poll. A missing
-    /// `wireguard-tools` produced roughly two identical error toasts per
-    /// second, which buried the startup warning that named the fix.
-    pub(crate) last_control_error: Option<String>,
-
-    /// Kill-switch mode the user has cycled to while an earlier change is
-    /// still running. Presses used to submit an operation each, and the
-    /// worker is serial, so a few quick taps left later ones to expire — the
-    /// "kill switch change timed out" the user actually saw. The target is
-    /// coalesced here and submitted once the in-flight change settles.
-    pub(crate) queued_killswitch_target: Option<crate::state::KillSwitchMode>,
-
-    /// Stable identity retained when the canonical projection becomes empty,
-    /// so reconnect means "the last tunnel I used" rather than "all".
+    /// Last snapshot received from the engine.
+    pub control_snapshot: std::sync::Arc<crate::control::Snapshot>,
+    /// Engine prompt the credential overlay is answering.
+    pub(crate) control_prompt: Option<u64>,
+    /// Highest engine notice already shown.
+    pub(crate) notices_seen: u64,
+    /// Kept when every tunnel is gone, so reconnect means "the last one".
     pub(crate) last_control_connected_profile: Option<crate::vortix_core::profile::ProfileId>,
-
-    /// Latest admitted-but-not-yet-published kill-switch intent. Rapid key
-    /// presses compose from this value until the snapshot acknowledges it.
+    /// Kill switch mode sent but not yet in a snapshot.
     pub(crate) pending_control_killswitch_mode: Option<crate::state::KillSwitchMode>,
-
-    /// TUI-originated durable operations awaiting terminal truth. This is
-    /// client presentation state only; the control snapshot remains the
-    /// authority for completion and failure.
-    pub(crate) pending_control_operations: std::collections::BTreeMap<
-        crate::vortix_core::control::OperationId,
-        connection::PendingControlOperation,
-    >,
-
-    control_request_sequence: u64,
-
-    /// Directory imports advance after each serial profile mutation settles.
-    /// This gives every durable write its own execution deadline without
-    /// blocking unrelated TUI commands.
-    pub(crate) pending_profile_imports: Option<PendingProfileImports>,
-
-    /// Short quiet-window aggregation for profile mutations. Directory
-    /// imports can complete over several control publications; presenting
-    /// one truthful summary is calmer than replacing the toast per file.
-    pub(crate) catalog_feedback: Option<connection::CatalogFeedback>,
-
-    /// Last catalog revision presented in the Event Log. Terminal mutation
-    /// outcomes may arrive in separate snapshots without changing the
-    /// catalog, so logging only revision changes preserves a no-change signal.
-    pub(crate) presented_catalog_revision: Option<u64>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -295,22 +213,14 @@ impl App {
 
         let mut app = Self {
             runtime,
-            engine_handle: None,
             registry,
-            control_session: None,
+            control: None,
             control_starting: true,
-            control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
-            control_challenge: None,
-            pending_credential_save: None,
-            last_control_error: None,
-            queued_killswitch_target: None,
+            control_snapshot: std::sync::Arc::default(),
+            control_prompt: None,
+            notices_seen: 0,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
-            pending_control_operations: std::collections::BTreeMap::new(),
-            control_request_sequence: 0,
-            pending_profile_imports: None,
-            catalog_feedback: None,
-            presented_catalog_revision: None,
 
             should_quit: false,
 
@@ -378,48 +288,14 @@ impl App {
         self.handle_message(Message::Tick);
     }
 
-    /// Surface a control-service failure once per transition.
-    ///
-    /// The service is polled continuously, so a persistent fault used to
-    /// raise an identical toast on every poll — a missing `wireguard-tools`
-    /// produced roughly two per second, which buried the single startup
-    /// warning that actually named the fix. Reporting only on change keeps
-    /// that warning readable and still shows every distinct failure.
-    pub(crate) fn report_control_failure(&mut self, error: &str) {
-        let message = format!("Control service unavailable: {error}");
-        if self.last_control_error.as_deref() == Some(message.as_str()) {
-            return;
-        }
-        self.last_control_error = Some(message.clone());
-        self.handle_message(Message::Toast(message, ToastType::Error));
-    }
-
     /// Process all pending external events (telemetry and background commands).
     pub fn process_external(&mut self) {
-        let control_update = self.control_session.as_ref().map(|control| {
-            control.progress().and_then(|()| {
-                let admissions = control.take_tui_admission_results();
-                let snapshot = control.take_changed_snapshot()?;
-                let catalog = snapshot
-                    .as_ref()
-                    .and_then(|snapshot| control.take_catalog_update(snapshot));
-                Ok((admissions, snapshot, catalog))
-            })
-        });
-        match control_update {
-            Some(Ok((admissions, snapshot, catalog))) => {
-                self.handle_control_admission_results(admissions);
-                if let Some(catalog) = catalog {
-                    self.apply_local_catalog_update(catalog);
-                }
-                self.last_control_error = None;
-                self.pump_pending_profile_imports();
-                if let Some(snapshot) = snapshot {
-                    self.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-                }
-            }
-            Some(Err(error)) => self.report_control_failure(&error.to_string()),
-            None => {}
+        if let Some(snapshot) = self
+            .control
+            .as_ref()
+            .and_then(crate::control::Control::changed)
+        {
+            self.apply_control_snapshot(snapshot);
         }
         self.process_telemetry();
 
@@ -484,37 +360,20 @@ impl App {
 }
 
 impl App {
-    /// Attach an `EngineHandle` to the app. The handle is not yet load-bearing — the TUI still
-    /// mutates `self.engine` through `Deref` — but future units swap UI
-    /// reads / commands over to it.
-    #[must_use]
-    pub fn with_engine_handle(mut self, handle: crate::vortix_core::engine::EngineHandle) -> Self {
-        self.engine_handle = Some(handle);
-        self
-    }
-
     /// Lightweight constructor for testing.
     #[must_use]
     pub fn new_test() -> Self {
         let runtime = VpnRuntime::new_test();
         Self {
             runtime,
-            engine_handle: None,
             registry: TunnelRegistry::new(),
-            control_session: None,
+            control: None,
             control_starting: false,
-            control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
-            control_challenge: None,
-            pending_credential_save: None,
-            last_control_error: None,
-            queued_killswitch_target: None,
+            control_snapshot: std::sync::Arc::default(),
+            control_prompt: None,
+            notices_seen: 0,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
-            pending_control_operations: std::collections::BTreeMap::new(),
-            control_request_sequence: 0,
-            pending_profile_imports: None,
-            catalog_feedback: None,
-            presented_catalog_revision: None,
 
             should_quit: false,
 

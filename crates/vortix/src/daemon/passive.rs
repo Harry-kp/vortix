@@ -197,7 +197,7 @@ pub fn legacy_connection(snapshot: &PassiveSnapshot) -> Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vortix_core::control::DiagnosticCode;
+    use crate::vortix_core::diagnostics::DiagnosticCode;
     use crate::vortix_core::profile::ProfileId;
 
     #[test]

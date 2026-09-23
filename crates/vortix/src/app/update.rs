@@ -100,55 +100,19 @@ impl App {
                     self.confirm_delete_profile(&profile_id);
                 }
             }
-            Message::SwitchExclusiveAndConnect { idx } => {
-                // User chose the legacy "switch VPNs" path on the
-                // takeover overlay: disconnect the current tunnel,
-                // queue the new one to fire once teardown completes.
-                // This is the pre-multi-tunnel UX preserved as an
-                // opt-in `[S]` hotkey for users who don't want both
-                // VPNs active at once.
+            Message::SwitchExclusiveAndConnect { idx } | Message::ConfirmRouteOverlap { idx } => {
                 self.input_mode = InputMode::Normal;
-                if let Some(profile) = self.runtime.profiles.get(idx) {
+                if let Some(profile) = self.runtime.profiles.get(idx).cloned() {
                     self.log(&format!(
-                        "ACTION: Disconnecting current tunnel before connecting '{}'",
+                        "ACTION: Switching to '{}'; conflicting tunnels stop once it is up",
                         profile.name
                     ));
-                }
-                if let Some(profile_id) = self
-                    .runtime
-                    .profiles
-                    .get(idx)
-                    .map(|profile| profile.id.clone())
-                {
-                    self.issue_control_command(
-                        crate::vortix_core::control::UserCommand::ConnectExclusive { profile_id },
-                    );
+                    self.send(crate::control::Command::Switch(profile.id));
                 }
             }
-            Message::ConfirmRouteOverlap { idx } => {
-                self.input_mode = InputMode::Normal;
-                let Some(profile) = self.runtime.profiles.get(idx).cloned() else {
-                    return;
-                };
-                self.log(&format!(
-                    "ACTION: Disconnecting the conflicting tunnel before connecting '{}'",
-                    profile.name
-                ));
-                // The kernel routes a prefix through one interface, so two
-                // profiles claiming the same network cannot both carry it.
-                // Keeping both up meant the route read-back demanded one
-                // address resolve through two interfaces and the connect
-                // always failed. Stop the other tunnel, like a takeover.
-                self.issue_control_command(
-                    crate::vortix_core::control::UserCommand::ConnectExclusive {
-                        profile_id: profile.id,
-                    },
-                );
-            }
-            Message::DisconnectProfile { idx } => self.disconnect_profile_by_idx(idx),
-            Message::ForceDisconnectProfile { idx } => {
-                self.force_disconnect_profile_by_idx(idx);
-            }
+            Message::DisconnectProfile { idx }
+            | Message::ForceDisconnectProfile { idx }
+            | Message::CancelConnect { idx } => self.disconnect_profile_by_idx(idx),
             Message::RequestDisconnectAll => {
                 let count = self.active_tunnel_count();
                 if count > 1 {
@@ -166,7 +130,6 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 self.disconnect_all_active();
             }
-            Message::CancelConnect { idx } => self.cancel_connect(idx),
             Message::ProfileMove(mv) => match mv {
                 SelectionMove::Next => self.profile_next(),
                 SelectionMove::Prev => self.profile_previous(),
@@ -178,13 +141,7 @@ impl App {
             },
 
             // Connection
-            Message::Disconnect => {
-                if matches!(self.legacy_state(), ConnectionState::Disconnecting { .. }) {
-                    self.force_disconnect();
-                } else {
-                    self.disconnect();
-                }
-            }
+            Message::Disconnect => self.disconnect(),
             Message::Reconnect => self.reconnect(),
             Message::ConnectSelected => {
                 if let Some(idx) = self.profile_list_state.selected() {
@@ -200,11 +157,7 @@ impl App {
                                 .get(idx)
                                 .map(|profile| profile.id.clone())
                             {
-                                self.issue_control_command(
-                                    crate::vortix_core::control::UserCommand::Reconnect {
-                                        profile_id: Some(profile_id),
-                                    },
-                                );
+                                self.send(crate::control::Command::Reconnect(profile_id));
                             }
                         }
                         (_, Some(_)) => {
@@ -297,11 +250,9 @@ impl App {
                 self.input_mode = InputMode::Normal;
             }
             Message::CloseOverlay => {
-                if let Some(challenge_id) = self.control_challenge.take() {
-                    if let Some(control) = &self.control_session {
-                        if let Err(error) = control.cancel_challenge(challenge_id) {
-                            self.log(&format!("WARN: Could not cancel challenge: {error}"));
-                        }
+                if let Some(prompt) = self.control_prompt.take() {
+                    if let Some(control) = &self.control {
+                        control.answer(prompt, None);
                     }
                 }
                 self.show_config = false;
@@ -408,7 +359,6 @@ impl App {
                 self.log("APP: Logs cleared");
             }
             Message::Telemetry(update) => self.handle_telemetry(update),
-            Message::ControlSnapshot(snapshot) => self.apply_control_snapshot(*snapshot),
             Message::Tick => self.handle_tick(),
             Message::Resize(width, height) => {
                 self.terminal_size = (width, height);
@@ -578,7 +528,7 @@ impl App {
                     // this save-only overlay intentionally omits that field.
                     let profile_id = profile.id.clone();
                     let profile_name = profile.name.clone();
-                    let Some(control) = self.control_session.as_ref() else {
+                    let Some(control) = self.control.as_ref() else {
                         self.show_toast(
                             "Credential service is unavailable".to_string(),
                             ToastType::Error,
@@ -586,7 +536,7 @@ impl App {
                         return;
                     };
                     let (username, password) = match control
-                        .load_openvpn_credentials(&profile_id, &profile_name)
+                        .load_credentials(&profile_id, &profile_name)
                     {
                         Ok(Some(credentials)) => (
                             crate::state::SecretText::from(credentials.username()),
@@ -645,36 +595,24 @@ impl App {
                         ToastType::Info,
                     );
                 } else {
-                    let Some(control) = self.control_session.as_ref() else {
+                    let Some(control) = self.control.as_ref() else {
                         self.show_toast(
                             "Credential service is unavailable".to_string(),
                             ToastType::Error,
                         );
                         return;
                     };
-                    match control.clear_openvpn_credentials(&profile_id, &name) {
-                        Ok(crate::cli::control::CredentialClearOutcome::NotFound) => self
+                    match control.clear_credentials(&profile_id, &name) {
+                        Ok(crate::vortix_config::openvpn_credentials::CredentialClearOutcome::NotFound) => self
                             .show_toast(
                                 format!("No saved credentials for '{name}'"),
                                 ToastType::Info,
                             ),
-                        Ok(crate::cli::control::CredentialClearOutcome::Cleared) => {
+                        Ok(crate::vortix_config::openvpn_credentials::CredentialClearOutcome::Cleared) => {
                             self.log(&format!("AUTH: Cleared saved credentials for '{name}'"));
                             self.show_toast(
                                 format!("Credentials cleared for '{name}'"),
                                 ToastType::Success,
-                            );
-                        }
-                        Err(
-                            crate::cli::control::LocalControlError::CredentialDurabilityUncertain,
-                        ) => {
-                            self.log(&format!(
-                                "WARN: Credentials for '{name}' were removed but disk durability is uncertain"
-                            ));
-                            self.show_toast(
-                                "Credentials were cleared, but disk confirmation failed. Verify after restarting."
-                                    .to_string(),
-                                ToastType::Warning,
                             );
                         }
                         Err(error) => {
@@ -701,15 +639,20 @@ impl App {
         save: bool,
         connect_after: bool,
     ) {
-        if let Some(challenge_id) = self.control_challenge {
-            self.handle_control_auth_submit(
-                challenge_id,
-                profile_id,
-                username,
-                password,
-                otp,
-                save,
-            );
+        if let Some(prompt) = self.control_prompt.take() {
+            let answer = crate::control::Credentials {
+                username: username.expose().to_owned(),
+                password: password.expose().to_owned(),
+                otp: otp
+                    .filter(|answer| !answer.trim().is_empty())
+                    .map(|answer| answer.expose().to_owned()),
+                remember: save,
+            };
+            if let Some(control) = &self.control {
+                control.answer(prompt, Some(answer));
+            }
+            self.input_mode = InputMode::Normal;
+            self.log("AUTH: Credentials submitted");
             return;
         }
 
@@ -724,42 +667,27 @@ impl App {
         };
         if connect_after {
             self.show_toast(
-                "The connection challenge expired; start the connection again".to_string(),
+                "The connection prompt expired; start the connection again".to_string(),
                 ToastType::Warning,
             );
             self.input_mode = InputMode::Normal;
             return;
         }
         let profile_name = profile.name.clone();
-        let Some(control) = self.control_session.as_ref() else {
+        let Some(control) = self.control.as_ref() else {
             self.show_toast(
                 "Credential service is unavailable".to_string(),
                 ToastType::Error,
             );
             return;
         };
-        match control.remember_openvpn_credentials(
-            &profile_id,
-            username.expose(),
-            password.expose(),
-        ) {
+        match control.remember_credentials(&profile_id, username.expose(), password.expose()) {
             Ok(()) => {
                 self.input_mode = InputMode::Normal;
                 self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
                 self.show_toast(
                     format!("Credentials updated for '{profile_name}'"),
                     ToastType::Success,
-                );
-            }
-            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
-                self.input_mode = InputMode::Normal;
-                self.log(&format!(
-                    "WARN: Credential update for '{profile_name}' is visible but disk durability is uncertain"
-                ));
-                self.show_toast(
-                    "Credentials were updated, but disk confirmation failed. You may be asked again after a restart."
-                        .to_string(),
-                    ToastType::Warning,
                 );
             }
             Err(error) => {
@@ -774,128 +702,15 @@ impl App {
         }
     }
 
-    fn handle_control_auth_submit(
-        &mut self,
-        challenge_id: crate::vortix_core::control::ChallengeId,
-        profile_id: crate::vortix_core::profile::ProfileId,
-        username: crate::state::SecretText,
-        password: crate::state::SecretText,
-        otp: Option<crate::state::SecretText>,
-        save: bool,
-    ) {
-        let challenge_matches_profile = self
-            .control_snapshot
-            .challenges
-            .get(&challenge_id)
-            .is_some_and(|challenge| challenge.profile_id == profile_id);
-        if !challenge_matches_profile {
-            self.show_toast(
-                "The connection prompt expired; start the connection again".to_string(),
-                ToastType::Warning,
-            );
-            return;
-        }
-        let answer = otp.filter(|answer| !answer.trim().is_empty());
-        let payload = crate::vortix_core::control::Secret::openvpn_credentials(
-            username.expose(),
-            password.expose(),
-            answer.as_deref(),
-        )
-        .into_vec();
-        let control = self
-            .control_session
-            .as_ref()
-            .expect("service challenge requires attached control session");
-        if let Err(error) = control.respond_challenge(challenge_id, payload) {
-            self.show_toast(
-                format!("Challenge response failed: {error}"),
-                ToastType::Error,
-            );
-            return;
-        }
-
-        self.control_challenge = None;
-        self.input_mode = InputMode::Normal;
-        self.log("AUTH: Submitted service-owned challenge response");
-        if !save {
-            return;
-        }
-        let profile_name = self
-            .runtime
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone());
-        // Held, not written. The server has not judged this pair yet, and a
-        // profile with stored credentials raises no challenge — persisting a
-        // rejected password here is what silently suppressed the next prompt.
-        self.pending_credential_save = Some(super::PendingCredentialSave {
-            profile_id,
-            profile_name,
-            username,
-            password,
-        });
-    }
-
     fn handle_toggle_killswitch(&mut self) {
-        if self.control_session.is_none() {
-            self.show_toast(
-                super::connection::CONTROL_STARTING_MESSAGE.to_string(),
-                ToastType::Info,
-            );
-            return;
-        }
         let next = self
-            .queued_killswitch_target
-            .or(self.pending_control_killswitch_mode)
-            .unwrap_or(self.control_snapshot.desired.kill_switch)
+            .pending_control_killswitch_mode
+            .unwrap_or(self.control_snapshot.kill_switch)
             .next();
-
-        // One change at a time. Each press used to submit its own operation
-        // while the control worker applies them serially, so a few quick taps
-        // left the later ones to expire on their own deadline. That surfaced
-        // as "kill switch change timed out" and, because a timed-out change
-        // never publishes an effective state, as "Degraded" in Security Guard
-        // — while the firewall itself was applied and correct the whole time.
-        //
-        // Cycling stays responsive: the target moves immediately and is
-        // submitted once the running change settles.
-        if self.killswitch_change_in_flight() {
-            self.queued_killswitch_target = Some(next);
-            return;
-        }
-
-        if self
-            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
-                mode: next,
-            })
-            .is_some()
-        {
-            self.pending_control_killswitch_mode = Some(next);
-        }
+        self.pending_control_killswitch_mode = Some(next);
+        self.send(crate::control::Command::SetKillSwitch(next));
     }
 
-    /// Submit the coalesced kill-switch target once the running change ends.
-    pub(crate) fn submit_queued_killswitch_target(&mut self) {
-        let Some(target) = self.queued_killswitch_target else {
-            return;
-        };
-        if self.killswitch_change_in_flight() {
-            return;
-        }
-        self.queued_killswitch_target = None;
-        if target == self.control_snapshot.desired.kill_switch {
-            return;
-        }
-        if self
-            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
-                mode: target,
-            })
-            .is_some()
-        {
-            self.pending_control_killswitch_mode = Some(target);
-        }
-    }
     fn handle_quit(&mut self) {
         if let Some(pending) = &mut self.pending_theme_change {
             if pending.quit_after {
@@ -1049,7 +864,7 @@ impl App {
 
         if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
             if let Some(journal) = crate::vortix_core::journal::global_journal() {
-                let _ = journal.append(crate::vortix_core::engine::EngineEvent::IpChanged {
+                let _ = journal.append(crate::vortix_core::journal::JournalEvent::IpChanged {
                     old: Some(old_ip.clone()),
                     new: ip.clone(),
                 });
@@ -1126,7 +941,6 @@ impl App {
     }
 
     fn tick_presentation(&mut self) {
-        self.flush_catalog_feedback(false);
         if self
             .toast
             .as_ref()
@@ -1190,7 +1004,7 @@ impl App {
 }
 
 fn background_diagnostic_log_lines(
-    view: &crate::vortix_core::control::DiagnosticView,
+    view: &crate::vortix_core::diagnostics::DiagnosticView,
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(view.snapshot.records.len() + 1);
     lines.push(format!(

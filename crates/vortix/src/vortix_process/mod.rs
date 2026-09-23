@@ -136,7 +136,7 @@ pub fn start_managed_foreground_for_operation(
     identity: ManagedProcessId,
     spec: CommandSpec,
     cleanup_paths: Vec<std::path::PathBuf>,
-    operation_id: crate::vortix_core::control::OperationId,
+    operation_id: crate::vortix_core::ids::OperationId,
 ) -> Result<CustodianHandshake, CustodianError> {
     custodian::spawn_custodian_for_operation(
         identity,

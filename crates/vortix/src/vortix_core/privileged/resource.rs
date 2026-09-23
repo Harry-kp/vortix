@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::vortix_core::control::AuthorityEpoch;
+use crate::vortix_core::ids::AuthorityEpoch;
 use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

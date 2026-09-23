@@ -19,248 +19,14 @@ fn init_test_env() {
 /// Build a minimal `App` for unit testing (no filesystem / scanner / telemetry).
 fn test_app() -> App {
     init_test_env();
-    let mut runtime = crate::vpn_runtime::VpnRuntime::new_test();
-    runtime.config_dir = std::env::temp_dir().join(format!("vortix_test_{}", std::process::id()));
-    App {
-        runtime,
-        engine_handle: None,
-        registry: crate::vortix_core::engine::TunnelRegistry::new(),
-        control_session: None,
-        control_starting: false,
-        control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
-        control_challenge: None,
-        pending_credential_save: None,
-        last_control_error: None,
-        queued_killswitch_target: None,
-        last_control_connected_profile: None,
-        pending_control_killswitch_mode: None,
-        pending_control_operations: std::collections::BTreeMap::new(),
-        control_request_sequence: 0,
-        pending_profile_imports: None,
-        catalog_feedback: None,
-        presented_catalog_revision: None,
-        should_quit: false,
-        logs_scroll: 0,
-        logs_auto_scroll: true,
-        logs_max_scroll: 0,
-        log_level_filter: None,
-        last_logged_network_quality: crate::state::QualityLevel::Unknown,
-        focused_panel: FocusedPanel::Sidebar,
-        zoomed_panel: None,
-        flip_states: std::collections::HashMap::new(),
-        input_mode: InputMode::Normal,
-        show_config: false,
-        show_action_menu: false,
-        show_bulk_menu: false,
-        action_menu_state: ratatui::widgets::ListState::default(),
-        config_scroll: 0,
-        cached_config: None,
-        pending_theme_change: None,
-        search_match_count: 0,
-        profile_list_state: ratatui::widgets::TableState::default(),
-        panel_areas: std::collections::HashMap::new(),
-        toast: None,
-        terminal_size: (80, 24),
-        background_mode: crate::background::BackgroundModeRecord::default(),
-        background_diagnostics_loading: false,
-        background_diagnostics_fallback: true,
-    }
+    let mut app = App::new_test();
+    app.runtime.config_dir =
+        std::env::temp_dir().join(format!("vortix_test_{}", std::process::id()));
+    app.terminal_size = (80, 24);
+    app
 }
 
-#[test]
-fn canonical_snapshot_is_the_only_source_of_renderer_registry_truth() {
-    use crate::vortix_core::control::{ControlSnapshot, RequestedTunnelState};
-    use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
-    use crate::vortix_core::profile::ProfileId;
-    use std::collections::BTreeMap;
-    use std::time::SystemTime;
-
-    let mut app = test_app();
-    add_profiles(&mut app, &["primary", "secondary"]);
-    let primary = ProfileId::new("primary");
-    let secondary = ProfileId::new("secondary");
-    let connected = |profile_id: ProfileId, interface: &str, role: Role| {
-        let details = crate::vortix_core::engine::state::DetailedConnectionInfo {
-            interface: interface.to_string(),
-            interface_authoritative: true,
-            ..Default::default()
-        };
-        TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: Connection::Connected {
-                profile_id,
-                since: SystemTime::UNIX_EPOCH,
-                health: ConnectionHealth::Healthy,
-                details: Box::new(details),
-            },
-            role,
-            health: ConnectionHealth::Healthy,
-            interface_name: Some(interface.to_string()),
-            started_at: Some(SystemTime::UNIX_EPOCH),
-        }
-    };
-    let mut snapshot = ControlSnapshot {
-        generation: 7,
-        primary: Some(primary.clone()),
-        ..ControlSnapshot::default()
-    };
-    snapshot.desired.tunnels = BTreeMap::from([
-        (primary.clone(), RequestedTunnelState::Connected),
-        (secondary.clone(), RequestedTunnelState::Connected),
-    ]);
-    snapshot.tunnels = BTreeMap::from([
-        (
-            primary.clone(),
-            connected(
-                primary.clone(),
-                "wg0",
-                Role::Primary {
-                    allowed_ips: Vec::new(),
-                },
-            ),
-        ),
-        (
-            secondary.clone(),
-            connected(
-                secondary.clone(),
-                "wg1",
-                Role::Addressable {
-                    allowed_ips: Vec::new(),
-                },
-            ),
-        ),
-    ]);
-
-    app.apply_control_snapshot(snapshot.clone());
-
-    assert_eq!(app.control_snapshot, snapshot);
-    assert_eq!(app.registry.primary(), Some(&primary));
-    assert_eq!(
-        app.registry.snapshot_all(),
-        snapshot.tunnels.into_values().collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn security_dns_status_uses_canonical_policy_readback_not_recursor_identity() {
-    use crate::vortix_core::control::{DnsSecurityStatus, GateEvidence, ProtectionEvidence};
-
-    let mut app = test_app();
-    set_connected(&mut app, "dns-policy");
-    let mut unverified = app.control_snapshot.clone();
-    unverified.dns.status = DnsSecurityStatus::Unverified;
-    app.apply_control_snapshot(unverified);
-    assert_eq!(
-        app.control_snapshot.dns.status,
-        DnsSecurityStatus::Unverified
-    );
-
-    let mut verified = app.control_snapshot.clone();
-    verified.effective.freshness.current = true;
-    verified.observed.evidence = Some(ProtectionEvidence {
-        desired_generation: verified.desired.generation,
-        authority_epoch: verified.desired.authority_epoch,
-        policy_digest: verified.desired.policy_digest.clone(),
-        observed_at_millis: 1,
-        interface: GateEvidence::Verified,
-        route: GateEvidence::Verified,
-        dns: GateEvidence::Verified,
-        firewall: GateEvidence::Verified,
-    });
-    verified.dns.status = DnsSecurityStatus::Protected;
-    app.apply_control_snapshot(verified);
-    assert_eq!(
-        app.control_snapshot.dns.status,
-        DnsSecurityStatus::Protected
-    );
-
-    app.apply_control_snapshot(crate::vortix_core::control::ControlSnapshot::default());
-    assert_eq!(
-        app.control_snapshot.dns.status,
-        DnsSecurityStatus::NotActive
-    );
-}
-
-#[test]
-fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
-    use crate::vortix_core::engine::{Connection, Role};
-    use std::sync::mpsc;
-
-    let mut app = test_app();
-    let (nudge_tx, nudge_rx) = mpsc::channel();
-    app.runtime.telemetry_nudge = Some(nudge_tx);
-    set_connected(&mut app, "primary");
-    nudge_rx
-        .try_recv()
-        .expect("initial connection must refresh egress telemetry");
-
-    let profile_id = crate::vortix_core::profile::ProfileId::new("primary");
-    let mut statistics = app.control_snapshot.clone();
-    let tunnel = statistics.tunnels.get_mut(&profile_id).unwrap();
-    let Connection::Connected { details, .. } = &mut tunnel.state else {
-        panic!("test fixture must be connected");
-    };
-    details.transfer_rx = "12.0 MiB".to_string();
-    details.transfer_tx = "3.0 MiB".to_string();
-    statistics.generation += 1;
-
-    app.apply_control_snapshot(statistics);
-
-    assert_eq!(
-        nudge_rx.try_recv(),
-        Err(mpsc::TryRecvError::Empty),
-        "presentation-only transfer counters must not wake public-IP probes"
-    );
-    let rendered = app.registry.snapshot(&profile_id).unwrap();
-    let Connection::Connected { details, .. } = rendered.state else {
-        panic!("renderer projection must remain connected");
-    };
-    assert_eq!(details.transfer_rx, "12.0 MiB");
-
-    let mut new_path = app.control_snapshot.clone();
-    let tunnel = new_path.tunnels.get_mut(&profile_id).unwrap();
-    tunnel.interface_name = Some("utun8".to_string());
-    let Connection::Connected { details, .. } = &mut tunnel.state else {
-        panic!("test fixture must be connected");
-    };
-    details.interface = "utun8".to_string();
-    new_path.generation += 1;
-
-    app.apply_control_snapshot(new_path);
-
-    nudge_rx
-        .try_recv()
-        .expect("an interface change must refresh egress telemetry");
-
-    set_connected(&mut app, "secondary");
-    nudge_rx
-        .try_recv()
-        .expect("a new active tunnel must refresh egress telemetry");
-
-    let mut primary_handoff = app.control_snapshot.clone();
-    primary_handoff.primary = Some(profile_id.clone());
-    primary_handoff.generation += 1;
-    app.apply_control_snapshot(primary_handoff);
-    nudge_rx
-        .try_recv()
-        .expect("a primary handoff must refresh egress telemetry");
-
-    let mut route_change = app.control_snapshot.clone();
-    route_change.tunnels.get_mut(&profile_id).unwrap().role = Role::Primary {
-        allowed_ips: Vec::new(),
-    };
-    route_change.generation += 1;
-    app.apply_control_snapshot(route_change);
-    nudge_rx
-        .try_recv()
-        .expect("an active route-role change must refresh egress telemetry");
-}
-
-fn set_connected(app: &mut App, name: &str) {
-    use crate::vortix_core::control::RequestedTunnelState;
-    use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
-    use std::time::SystemTime;
-
+fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
     if !app
         .runtime
         .profiles
@@ -270,36 +36,34 @@ fn set_connected(app: &mut App, name: &str) {
         add_profiles(app, &[name]);
     }
     let profile_id = crate::vortix_core::profile::ProfileId::new(name);
-    let details = crate::vortix_core::engine::state::DetailedConnectionInfo {
-        interface: "wg0".to_string(),
-        interface_authoritative: true,
-        pid: Some(12_345),
-        ..Default::default()
-    };
-    let mut snapshot = app.control_snapshot.clone();
+    let mut snapshot = (*app.control_snapshot).clone();
     snapshot
-        .desired
         .tunnels
-        .insert(profile_id.clone(), RequestedTunnelState::Connected);
-    snapshot.tunnels.insert(
-        profile_id.clone(),
-        TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: Connection::Connected {
-                profile_id,
-                since: SystemTime::UNIX_EPOCH,
-                health: ConnectionHealth::Healthy,
-                details: Box::new(details),
-            },
-            role: Role::Addressable {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::Healthy,
-            interface_name: Some("wg0".to_string()),
-            started_at: Some(SystemTime::UNIX_EPOCH),
+        .retain(|tunnel| tunnel.profile_id != profile_id);
+    snapshot.tunnels.push(crate::control::TunnelView {
+        profile_id,
+        name: name.to_owned(),
+        phase,
+        interface: Some("wg0".to_owned()),
+        since: std::time::SystemTime::UNIX_EPOCH,
+        routes: Vec::new(),
+        dns: Vec::new(),
+        details: crate::vortix_core::engine::state::DetailedConnectionInfo {
+            interface: "wg0".to_owned(),
+            interface_authoritative: true,
+            pid: Some(12_345),
+            ..Default::default()
         },
-    );
-    app.apply_control_snapshot(snapshot);
+    });
+    snapshot
+        .tunnels
+        .sort_by(|a, b| a.profile_id.cmp(&b.profile_id));
+    snapshot.version += 1;
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
+}
+
+fn set_connected(app: &mut App, name: &str) {
+    set_phase(app, name, crate::control::Phase::Up);
 }
 
 #[test]
@@ -321,41 +85,7 @@ fn u1_multi_tunnel_no_primary_projection_is_stable_and_sorted() {
     assert_eq!(profile, "alpha");
 }
 fn set_disconnecting(app: &mut App, name: &str) {
-    use crate::vortix_core::control::RequestedTunnelState;
-    use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
-    use std::time::SystemTime;
-
-    if !app
-        .runtime
-        .profiles
-        .iter()
-        .any(|profile| profile.name == name)
-    {
-        add_profiles(app, &[name]);
-    }
-    let profile_id = crate::vortix_core::profile::ProfileId::new(name);
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot
-        .desired
-        .tunnels
-        .insert(profile_id.clone(), RequestedTunnelState::Disconnected);
-    snapshot.tunnels.insert(
-        profile_id.clone(),
-        TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: Connection::Disconnecting {
-                profile_id,
-                started_at: SystemTime::UNIX_EPOCH,
-            },
-            role: Role::Addressable {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::Unknown,
-            interface_name: Some("wg0".to_string()),
-            started_at: Some(SystemTime::UNIX_EPOCH),
-        },
-    );
-    app.apply_control_snapshot(snapshot);
+    set_phase(app, name, crate::control::Phase::Stopping);
 }
 
 // ====================================================================
@@ -380,43 +110,7 @@ fn test_d_while_disconnected_is_noop() {
 // Helpers for new tests
 // ====================================================================
 fn set_connecting(app: &mut App, name: &str) {
-    use crate::vortix_core::control::RequestedTunnelState;
-    use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
-    use std::time::SystemTime;
-
-    if !app
-        .runtime
-        .profiles
-        .iter()
-        .any(|profile| profile.name == name)
-    {
-        add_profiles(app, &[name]);
-    }
-    let profile_id = crate::vortix_core::profile::ProfileId::new(name);
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot
-        .desired
-        .tunnels
-        .insert(profile_id.clone(), RequestedTunnelState::Connected);
-    snapshot.tunnels.insert(
-        profile_id.clone(),
-        TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: Connection::Connecting {
-                profile_id,
-                started_at: SystemTime::UNIX_EPOCH,
-                attempt: 1,
-                retry_budget_remaining: std::time::Duration::ZERO,
-            },
-            role: Role::Addressable {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::Unknown,
-            interface_name: None,
-            started_at: Some(SystemTime::UNIX_EPOCH),
-        },
-    );
-    app.apply_control_snapshot(snapshot);
+    set_phase(app, name, crate::control::Phase::Starting);
 }
 
 /// Helper: add test profiles to the app.
@@ -624,72 +318,6 @@ fn test_auth_field_switching() {
     } else {
         panic!("Expected AuthPrompt");
     }
-}
-
-#[test]
-fn test_auth_delete_profile_cleans_auth_file() {
-    let mut app = test_app();
-    let tmp = tempfile::Builder::new()
-        .prefix("vortix_auth_")
-        .tempdir()
-        .unwrap();
-    let profiles_dir = tmp.path().join(crate::constants::PROFILES_DIR_NAME);
-    std::fs::create_dir(&profiles_dir).unwrap();
-    let stable_id = crate::vortix_core::profile::ProfileId::parse("11".repeat(32)).unwrap();
-    let config_path = profiles_dir.join("del-vpn.ovpn");
-    let stored = crate::vortix_core::profile::Profile::new(
-        stable_id.clone(),
-        "del-vpn",
-        crate::vortix_core::profile::ProtocolKind::OpenVpn,
-        config_path.clone(),
-    );
-    crate::vortix_config::profile_store::ProfileStore::insert(
-        &crate::vortix_config::profile_store::FsProfileStore::new(profiles_dir),
-        &stored,
-        b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
-    )
-    .unwrap();
-    app.runtime.profiles.push(VpnProfile {
-        id: stable_id.clone(),
-        name: "del-vpn".to_string(),
-        protocol: Protocol::OpenVPN,
-        config_path,
-        location: "Test".to_string(),
-        last_used: None,
-    });
-    app.runtime.config_dir = tmp.path().to_path_buf();
-    let control = crate::cli::control::LocalControlSession::start_profile_test(
-        tmp.path(),
-        app.runtime.profiles.clone(),
-    )
-    .unwrap();
-    app.attach_control_session(control).unwrap();
-    app.profile_list_state.select(Some(0));
-
-    app.control_session
-        .as_ref()
-        .unwrap()
-        .remember_openvpn_credentials(&stable_id, "user", "pass")
-        .unwrap();
-
-    app.confirm_delete(0);
-    // Canonical profile mutations are crash-safe filesystem operations whose
-    // TUI deadline is at least 30 seconds. The test must verify eventual
-    // durable completion, not impose a one-second filesystem performance SLA.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
-    while !app.runtime.profiles.is_empty() && std::time::Instant::now() < deadline {
-        app.process_external();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-
-    assert!(app.runtime.profiles.is_empty());
-    assert!(app
-        .control_session
-        .as_ref()
-        .unwrap()
-        .load_openvpn_credentials(&stable_id, "del-vpn")
-        .unwrap()
-        .is_none());
 }
 
 // ====================================================================
@@ -1935,65 +1563,6 @@ fn sidebar_d_on_inactive_row_never_disconnects_another_tunnel() {
 }
 
 #[test]
-fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
-    use crate::app::{focused_tunnel_action, FocusedTunnelAction};
-    use crate::vortix_core::control::ChallengeKind;
-    use crate::vortix_core::engine::state::{Connection, ConnectionHealth};
-    use crate::vortix_core::profile::ProfileId;
-    use std::time::{Duration, SystemTime};
-
-    let profile_id = ProfileId::new("focused");
-    let now = SystemTime::UNIX_EPOCH;
-    let transitional = [
-        Connection::Connecting {
-            profile_id: profile_id.clone(),
-            started_at: now,
-            attempt: 1,
-            retry_budget_remaining: Duration::ZERO,
-        },
-        Connection::Reconnecting {
-            profile_id: profile_id.clone(),
-            started_at: now,
-            attempt: 2,
-            retry_budget_remaining: Duration::ZERO,
-            last_error: None,
-        },
-        Connection::AwaitingUserInput {
-            profile_id: profile_id.clone(),
-            prompt_id: "prompt".to_string(),
-            prompt_kind: ChallengeKind::TwoFactorCode,
-            since: now,
-        },
-    ];
-    for state in &transitional {
-        assert_eq!(
-            focused_tunnel_action(Some(state)),
-            FocusedTunnelAction::Cancel
-        );
-    }
-
-    let connected = Connection::Connected {
-        profile_id: profile_id.clone(),
-        since: now,
-        health: ConnectionHealth::Healthy,
-        details: Box::default(),
-    };
-    assert_eq!(
-        focused_tunnel_action(Some(&connected)),
-        FocusedTunnelAction::Disconnect
-    );
-    let disconnecting = Connection::Disconnecting {
-        profile_id,
-        started_at: now,
-    };
-    assert_eq!(
-        focused_tunnel_action(Some(&disconnecting)),
-        FocusedTunnelAction::ForceDisconnect
-    );
-    assert_eq!(focused_tunnel_action(None), FocusedTunnelAction::Connect);
-}
-
-#[test]
 fn error_toast_expires_and_routine_info_does_not_replace_it_early() {
     let mut app = test_app();
     app.show_toast("Connection failed".to_string(), ToastType::Error);
@@ -2248,223 +1817,6 @@ fn real_ip_not_cached_when_scanner_has_not_ticked_yet() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
-    use crate::vortix_config::profile_store::{
-        FsProfileStore, ProfileStore, ProfileStoreError, ProfileSummary,
-    };
-    use crate::vortix_core::engine::{
-        Connection, ConnectionHealth, DetailedConnectionInfo, Role, TunnelSnapshot,
-    };
-    use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
-
-    fn list_after_worker_release(store: &FsProfileStore) -> Vec<ProfileSummary> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            match store.list() {
-                Ok(profiles) => return profiles,
-                Err(ProfileStoreError::LockBusy { .. }) if std::time::Instant::now() < deadline => {
-                    std::thread::yield_now();
-                }
-                Err(error) => panic!("profile store did not settle after mutation: {error}"),
-            }
-        }
-    }
-
-    fn process_until(app: &mut App, condition: impl Fn(&App) -> bool, failure: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            app.process_external();
-            if condition(app) {
-                return;
-            }
-            assert!(std::time::Instant::now() < deadline, "{failure}");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    let config_dir = tempfile::tempdir().unwrap();
-    let profiles_dir = config_dir.path().join("profiles");
-    let store = FsProfileStore::new(profiles_dir.clone());
-    let profile_id = ProfileId::parse("71".repeat(32)).unwrap();
-    store
-        .insert(
-            &Profile::new(
-                profile_id.clone(),
-                "corp",
-                ProtocolKind::WireGuard,
-                profiles_dir.join("corp.conf"),
-            ),
-            b"[Interface]\nPrivateKey = abc=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
-        )
-        .unwrap();
-
-    let profile = VpnProfile {
-        id: profile_id.clone(),
-        name: "corp".into(),
-        protocol: Protocol::WireGuard,
-        config_path: profiles_dir.join("corp.conf"),
-        location: "Test".into(),
-        last_used: None,
-    };
-    let mut app = test_app();
-    app.runtime.config_dir = config_dir.path().to_path_buf();
-    app.runtime.profiles = vec![profile.clone()];
-    let control = crate::cli::control::LocalControlSession::start_profile_test(
-        config_dir.path(),
-        vec![profile],
-    )
-    .unwrap();
-    app.attach_control_session(control).unwrap();
-    let service_identity = app
-        .control_session
-        .as_ref()
-        .map(std::ptr::from_ref)
-        .unwrap();
-    let initial_generation = app.control_snapshot.generation;
-
-    app.rename_profile(0, "work");
-    process_until(
-        &mut app,
-        |app| {
-            app.runtime
-                .profiles
-                .first()
-                .is_some_and(|profile| profile.name == "work")
-        },
-        "renamed profile did not reach the App catalog",
-    );
-    let renamed = list_after_worker_release(&store);
-    assert_eq!(renamed.len(), 1);
-    assert_eq!(renamed[0].display_name, "work");
-    assert_eq!(renamed[0].id, profile_id);
-    assert_eq!(app.runtime.profiles[0].id, profile_id);
-    assert!(app.control_snapshot.generation > initial_generation);
-    let rename_generation = app.control_snapshot.generation;
-    assert_eq!(
-        app.control_session.as_ref().map(std::ptr::from_ref),
-        Some(service_identity)
-    );
-
-    let mut active = app.control_snapshot.clone();
-    active.generation = active.generation.saturating_add(1);
-    active.primary = Some(profile_id.clone());
-    active.tunnels.insert(
-        profile_id.clone(),
-        TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: Connection::Connected {
-                profile_id: profile_id.clone(),
-                since: std::time::SystemTime::now(),
-                health: ConnectionHealth::Healthy,
-                details: Box::new(DetailedConnectionInfo {
-                    interface: "wg0".into(),
-                    interface_authoritative: true,
-                    ..DetailedConnectionInfo::default()
-                }),
-            },
-            role: Role::Primary {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::Healthy,
-            interface_name: Some("wg0".into()),
-            started_at: Some(std::time::SystemTime::now()),
-        },
-    );
-    app.registry
-        .replace_control_projection(&active.tunnels, active.primary.clone());
-    app.confirm_delete(0);
-    assert!(profiles_dir.join("work.conf").exists());
-
-    app.registry
-        .replace_control_projection(&std::collections::BTreeMap::new(), None);
-    app.confirm_delete(0);
-    process_until(
-        &mut app,
-        |app| app.runtime.profiles.is_empty(),
-        "deleted profile did not leave the App catalog",
-    );
-    assert!(list_after_worker_release(&store).is_empty());
-    assert!(app.control_snapshot.generation > rename_generation);
-    let delete_generation = app.control_snapshot.generation;
-    assert_eq!(
-        app.control_session.as_ref().map(std::ptr::from_ref),
-        Some(service_identity)
-    );
-
-    let source = config_dir.path().join("imported.conf");
-    std::fs::write(
-        &source,
-        b"[Interface]\nPrivateKey = def=\nAddress = 10.1.0.1/24\n\n[Peer]\nPublicKey = uvw=\nEndpoint = 2.3.4.5:51820\nAllowedIPs = 10.0.0.0/8\n",
-    )
-    .unwrap();
-    app.import_profile_from_path(source.to_str().unwrap());
-    process_until(
-        &mut app,
-        |app| app.runtime.profiles.len() == 1,
-        "imported profile did not reach the App catalog",
-    );
-    let imported = list_after_worker_release(&store);
-    assert_eq!(imported.len(), 1);
-    assert_eq!(app.runtime.profiles[0].id, imported[0].id);
-    assert!(app.control_snapshot.generation > delete_generation);
-    assert_eq!(
-        app.control_session.as_ref().map(std::ptr::from_ref),
-        Some(service_identity)
-    );
-}
-
-#[test]
-fn canonical_snapshot_retains_last_connected_identity_after_projection_empties() {
-    use crate::vortix_core::engine::{
-        Connection, ConnectionHealth, DetailedConnectionInfo, Role, TunnelSnapshot,
-    };
-    use crate::vortix_core::profile::ProfileId;
-
-    let mut app = test_app();
-    let profile_id = ProfileId::new("last-used");
-    let mut connected = app.control_snapshot.clone();
-    connected.primary = Some(profile_id.clone());
-    connected.tunnels.insert(
-        profile_id.clone(),
-        TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: Connection::Connected {
-                profile_id: profile_id.clone(),
-                since: std::time::SystemTime::now(),
-                health: ConnectionHealth::Healthy,
-                details: Box::new(DetailedConnectionInfo::default()),
-            },
-            role: Role::Primary {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::Healthy,
-            interface_name: Some("wg0".to_string()),
-            started_at: Some(std::time::SystemTime::now()),
-        },
-    );
-    app.apply_control_snapshot(connected);
-    app.apply_control_snapshot(crate::vortix_core::control::ControlSnapshot::default());
-
-    assert_eq!(app.last_control_connected_profile, Some(profile_id));
-}
-
-#[test]
-fn canonical_snapshot_updates_profile_last_connected_time() {
-    let mut app = test_app();
-    add_profiles(&mut app, &["corp"]);
-    let profile_id = app.runtime.profiles[0].id.clone();
-    let connected_at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_234);
-    app.runtime.profiles[0].last_used = Some(connected_at + std::time::Duration::from_secs(1));
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.last_connected_at.insert(profile_id, connected_at);
-
-    app.apply_control_snapshot(snapshot);
-
-    assert_eq!(app.runtime.profiles[0].last_used, Some(connected_at));
-}
-
-#[test]
 fn routine_packet_loss_and_jitter_samples_do_not_flood_the_event_log() {
     use crate::core::telemetry::TelemetryUpdate;
 
@@ -2511,25 +1863,6 @@ fn routine_packet_loss_and_jitter_samples_do_not_flood_the_event_log() {
             .count(),
         1,
         "recovery and subsequent healthy samples must emit one transition"
-    );
-}
-
-#[test]
-fn rapid_canonical_killswitch_toggles_compose_from_pending_intent() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
-    let control =
-        crate::cli::control::LocalControlSession::start_profile_test(temp.path(), Vec::new())
-            .unwrap();
-    let mut app = test_app();
-    app.attach_control_session(control).unwrap();
-
-    app.handle_message(Message::ToggleKillSwitch);
-    app.handle_message(Message::ToggleKillSwitch);
-
-    assert_eq!(
-        app.pending_control_killswitch_mode,
-        Some(crate::state::KillSwitchMode::AlwaysOn)
     );
 }
 
@@ -2674,538 +2007,6 @@ fn second_quit_does_not_wait_for_theme_persistence() {
 }
 
 #[test]
-fn connect_selected_on_active_profile_enqueues_one_typed_reconnect() {
-    let temp = tempfile::tempdir().unwrap();
-    let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
-    std::fs::create_dir(&profiles_dir).unwrap();
-    let config_path = profiles_dir.join("corp.conf");
-    std::fs::write(
-        &config_path,
-        b"[Interface]\nPrivateKey = abc=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
-    )
-    .unwrap();
-    let profile = VpnProfile {
-        id: crate::vortix_core::profile::ProfileId::new("corp"),
-        name: "corp".into(),
-        protocol: Protocol::WireGuard,
-        location: String::new(),
-        config_path,
-        last_used: None,
-    };
-    let control = crate::cli::control::LocalControlSession::start_profile_test(
-        temp.path(),
-        vec![profile.clone()],
-    )
-    .unwrap();
-    let mut app = test_app();
-    app.runtime.profiles = vec![profile.clone()];
-    app.attach_control_session(control).unwrap();
-    set_connected(&mut app, "corp");
-    app.profile_list_state.select(Some(0));
-
-    app.handle_message(Message::ConnectSelected);
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        let results = app
-            .control_session
-            .as_ref()
-            .unwrap()
-            .take_tui_admission_results();
-        if let Some(result) = results.into_iter().next() {
-            let crate::cli::control::TuiControlCompletion::Admission(admission) =
-                &result.completion;
-            let operation_id = admission
-                .as_ref()
-                .expect("expected successful reconnect admission")
-                .to_string();
-            assert!(matches!(
-                &result.command,
-                Some(crate::vortix_core::control::UserCommand::Reconnect {
-                    profile_id: Some(profile_id)
-                }) if profile_id == &profile.id
-            ));
-            app.handle_control_admission_results(vec![result]);
-            let queued = crate::logger::get_logs()
-                .into_iter()
-                .filter(|entry| entry.message == "Reconnection queued for 'corp'")
-                .collect::<Vec<_>>();
-            assert!(!queued.is_empty(), "reconnect admission must be logged");
-            assert!(queued
-                .iter()
-                .all(|entry| !entry.message.contains(&operation_id)));
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "reconnect admission did not complete"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
-
-#[test]
-fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
-    const PROFILE_COUNT: usize = 9;
-
-    let temp = tempfile::tempdir().unwrap();
-    let config_dir = temp.path().join("config");
-    let profiles_dir = config_dir.join(crate::constants::PROFILES_DIR_NAME);
-    let source_dir = temp.path().join("imports");
-    std::fs::create_dir_all(&profiles_dir).unwrap();
-    std::fs::create_dir(&source_dir).unwrap();
-    for index in 0..PROFILE_COUNT {
-        std::fs::write(
-            source_dir.join(format!("profile-{index:02}.conf")),
-            format!(
-                "[Interface]\nPrivateKey = abc=\nAddress = 10.0.{index}.2/32\n\n\
-                 [Peer]\nPublicKey = xyz=\nEndpoint = 192.0.2.1:51820\n\
-                 AllowedIPs = 10.{index}.0.0/16\n"
-            ),
-        )
-        .unwrap();
-    }
-    std::fs::write(source_dir.join("z-invalid.conf"), "not a VPN profile\n").unwrap();
-
-    let control =
-        crate::cli::control::LocalControlSession::start_profile_test(&config_dir, Vec::new())
-            .unwrap();
-    let mut app = test_app();
-    app.runtime.config_dir = config_dir;
-    app.attach_control_session(control).unwrap();
-
-    app.import_profile_from_path(&source_dir.to_string_lossy());
-    assert_eq!(
-        app.pending_profile_imports.as_ref().map(|batch| (
-            batch.remaining.len(),
-            batch.queued,
-            batch.failed
-        )),
-        Some((9, 1, 0))
-    );
-
-    // Profile storage is intentionally serial and each admitted mutation owns
-    // a finite execution deadline. Keep only one batch import in flight so
-    // queued entries receive a fresh deadline when their predecessor settles.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
-    while app.runtime.profiles.len() < PROFILE_COUNT && std::time::Instant::now() < deadline {
-        app.process_external();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    assert_eq!(app.runtime.profiles.len(), PROFILE_COUNT);
-    for index in 0..PROFILE_COUNT {
-        assert!(app
-            .runtime
-            .profiles
-            .iter()
-            .any(|profile| profile.name == format!("profile-{index:02}")));
-    }
-    assert!(!app
-        .runtime
-        .profiles
-        .iter()
-        .any(|profile| profile.name == "invalid"));
-    assert!(app.pending_profile_imports.is_none());
-}
-
-#[test]
-fn force_disconnect_without_exact_projection_never_submits_disconnect_all() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
-    let control =
-        crate::cli::control::LocalControlSession::start_profile_test(temp.path(), Vec::new())
-            .unwrap();
-    let mut app = test_app();
-    app.attach_control_session(control).unwrap();
-    let before = app
-        .control_session
-        .as_ref()
-        .unwrap()
-        .current_snapshot()
-        .operations
-        .len();
-
-    app.force_disconnect();
-
-    assert_eq!(
-        app.control_session
-            .as_ref()
-            .unwrap()
-            .current_snapshot()
-            .operations
-            .len(),
-        before
-    );
-    assert!(app
-        .toast
-        .as_ref()
-        .is_some_and(|toast| toast.message.contains("exact tunnel")));
-}
-
-#[test]
-fn default_route_takeover_switches_exclusively_instead_of_keeping_both() {
-    let temp = tempfile::tempdir().unwrap();
-    let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
-    std::fs::create_dir(&profiles_dir).unwrap();
-    let make_profile = |seed: char, name: &str| {
-        let config_path = profiles_dir.join(format!("{name}.conf"));
-        std::fs::write(
-            &config_path,
-            b"[Interface]\nPrivateKey = abc=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
-        )
-        .unwrap();
-        VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::parse(
-                seed.to_string()
-                    .repeat(crate::vortix_core::profile::ProfileId::HEX_LEN),
-            )
-            .unwrap(),
-            name: name.to_string(),
-            protocol: Protocol::WireGuard,
-            location: String::new(),
-            config_path,
-            last_used: None,
-        }
-    };
-    let first = make_profile('8', "first");
-    let second = make_profile('9', "second");
-    let control = crate::cli::control::LocalControlSession::start_profile_test(
-        temp.path(),
-        vec![first.clone(), second.clone()],
-    )
-    .unwrap();
-    let mut app = test_app();
-    app.runtime.profiles = vec![first.clone(), second.clone()];
-    app.attach_control_session(control).unwrap();
-
-    app.toggle_connection(0);
-    for _ in 0..20 {
-        app.process_external();
-        if app.control_snapshot.tunnels.contains_key(
-            &crate::vortix_core::profile::ProfileId::parse(
-                "8".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN),
-            )
-            .unwrap(),
-        ) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    app.toggle_connection(1);
-    assert!(matches!(
-        app.input_mode,
-        InputMode::ConfirmDefaultRouteTakeover { .. }
-    ));
-    assert!(!app
-        .control_snapshot
-        .desired
-        .tunnels
-        .contains_key(&second.id));
-
-    // Switch is the only resolution: disconnect the first default-route
-    // tunnel, then connect the second. Both cannot hold the default route.
-    app.handle_message(Message::SwitchExclusiveAndConnect { idx: 1 });
-    for _ in 0..20 {
-        app.process_external();
-        if app
-            .control_snapshot
-            .desired
-            .tunnels
-            .contains_key(&second.id)
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    assert_eq!(
-        app.control_snapshot.desired.tunnels.get(&second.id),
-        Some(&crate::vortix_core::control::RequestedTunnelState::Connected),
-        "toast={:?}, snapshot={:?}",
-        app.toast.as_ref().map(|toast| &toast.message),
-        app.control_session.as_ref().unwrap().current_snapshot()
-    );
-    // The prior default-route tunnel is not kept alongside it.
-    assert_ne!(
-        app.control_snapshot.desired.tunnels.get(&first.id),
-        Some(&crate::vortix_core::control::RequestedTunnelState::Connected),
-        "the first tunnel must be disconnected by an exclusive switch"
-    );
-}
-
-#[test]
-fn blank_challenge_input_keeps_overlay_and_challenge_for_retry() {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    let mut app = test_app();
-    let challenge_id = serde_json::from_str("1").unwrap();
-    app.control_challenge = Some(challenge_id);
-    app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
-        profile_name: "corp".to_string(),
-        username: "alice".into(),
-        username_cursor: 5,
-        password: "secret".into(),
-        password_cursor: 6,
-        otp: String::new().into(),
-        otp_cursor: 0,
-        focused_field: crate::state::AuthField::Otp,
-        save_credentials: false,
-        connect_after: true,
-        static_challenge_prompt: Some("OTP".to_string()),
-        reveal_secrets: false,
-    };
-
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    assert_eq!(app.control_challenge, Some(challenge_id));
-    assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
-}
-
-#[test]
-fn challenge_for_missing_profile_is_marked_without_opening_invisible_prompt() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
-    let control =
-        crate::cli::control::LocalControlSession::start_profile_test(temp.path(), Vec::new())
-            .unwrap();
-    let mut app = test_app();
-    app.attach_control_session(control).unwrap();
-    let challenge_id = serde_json::from_str("1").unwrap();
-    let client_id = serde_json::from_str("\"client-0000000000000001-0000000000000001\"").unwrap();
-    let operation_id =
-        crate::vortix_core::control::OperationId::parse("op-0000000000000001-0000000000000001")
-            .unwrap();
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.challenges.insert(
-        challenge_id,
-        crate::vortix_core::control::ChallengeRecord {
-            id: challenge_id,
-            profile_id: crate::vortix_core::profile::ProfileId::new("missing"),
-            operation_id,
-            kind: crate::vortix_core::control::ChallengeKind::Generic {
-                label: "credentials".to_string(),
-            },
-            label: "credentials".to_string(),
-            authorized_client: client_id,
-            created_at_millis: 1,
-            expires_at_millis: u64::MAX,
-        },
-    );
-
-    app.apply_control_snapshot(snapshot);
-
-    // Retain only the challenge ID while asynchronous cancellation is in
-    // flight so repeated snapshots cannot enqueue duplicate cancellations.
-    assert_eq!(app.control_challenge, Some(challenge_id));
-    assert!(matches!(app.input_mode, InputMode::Normal));
-}
-
-#[test]
-fn failed_challenge_response_keeps_prompt_for_retry() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
-    let control =
-        crate::cli::control::LocalControlSession::start_profile_test(temp.path(), Vec::new())
-            .unwrap();
-    let mut app = test_app();
-    app.attach_control_session(control).unwrap();
-    let challenge_id = serde_json::from_str("1").unwrap();
-    app.control_challenge = Some(challenge_id);
-    app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
-        profile_name: "corp".to_string(),
-        username: "alice".into(),
-        username_cursor: 5,
-        password: "secret".into(),
-        password_cursor: 6,
-        otp: "123456".into(),
-        otp_cursor: 6,
-        focused_field: crate::state::AuthField::Otp,
-        save_credentials: false,
-        connect_after: true,
-        static_challenge_prompt: Some("OTP".to_string()),
-        reveal_secrets: false,
-    };
-
-    app.handle_message(Message::AuthSubmit {
-        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
-        username: "alice".into(),
-        password: "secret".into(),
-        otp: Some("123456".into()),
-        save: false,
-        connect_after: true,
-    });
-
-    assert_eq!(app.control_challenge, Some(challenge_id));
-    assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
-}
-
-#[test]
-fn auth_manager_uses_stable_profile_identity_through_control_session() {
-    let temp = tempfile::tempdir().unwrap();
-    let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
-    std::fs::create_dir(&profiles_dir).unwrap();
-    let profile_id = crate::vortix_core::profile::ProfileId::new("stable-corp");
-    let profile = VpnProfile {
-        id: profile_id.clone(),
-        name: "corp".into(),
-        protocol: Protocol::OpenVPN,
-        config_path: profiles_dir.join("corp.ovpn"),
-        location: String::new(),
-        last_used: None,
-    };
-    std::fs::write(&profile.config_path, "client\nauth-user-pass\n").unwrap();
-    let control = crate::cli::control::LocalControlSession::start_profile_test(
-        temp.path(),
-        vec![profile.clone()],
-    )
-    .unwrap();
-    control
-        .remember_openvpn_credentials(&profile_id, "old-user", "old-password")
-        .unwrap();
-
-    let mut app = test_app();
-    app.runtime.config_dir = temp.path().to_path_buf();
-    app.runtime.profiles = vec![profile.clone()];
-    app.attach_control_session(control).unwrap();
-    app.profile_list_state.select(Some(0));
-    app.handle_message(Message::ManageAuth);
-
-    assert!(matches!(
-        &app.input_mode,
-        InputMode::AuthPrompt {
-            profile_id: prompt_profile_id,
-            username,
-            password,
-            connect_after: false,
-            static_challenge_prompt: None,
-            reveal_secrets: false,
-            ..
-        } if prompt_profile_id == &profile_id
-            && username.expose() == "old-user"
-            && password.expose() == "old-password"
-    ));
-
-    let mut other = profile.clone();
-    other.id = crate::vortix_core::profile::ProfileId::new("other-profile");
-    other.name = "other".into();
-    app.runtime.profiles.insert(0, other);
-    app.handle_message(Message::AuthSubmit {
-        profile_id: profile_id.clone(),
-        username: "new-user".into(),
-        password: "new-password".into(),
-        otp: None,
-        save: true,
-        connect_after: false,
-    });
-
-    let loaded = app
-        .control_session
-        .as_ref()
-        .unwrap()
-        .load_openvpn_credentials(&profile_id, "corp")
-        .unwrap()
-        .unwrap();
-    assert_eq!(loaded.username(), "new-user");
-    assert_eq!(loaded.password(), "new-password");
-
-    app.profile_list_state.select(Some(1));
-    app.handle_message(Message::ClearAuth);
-    assert!(app
-        .control_session
-        .as_ref()
-        .unwrap()
-        .load_openvpn_credentials(&profile_id, "corp")
-        .unwrap()
-        .is_none());
-}
-
-#[test]
-fn remote_profile_terminal_failure_is_reported_to_the_user() {
-    let mut app = test_app();
-    app.apply_local_catalog_update(crate::cli::control::LocalCatalogUpdate {
-        revision: 9,
-        profiles: None,
-        outcomes: vec![crate::cli::control::LocalCatalogOutcome::Terminal {
-            operation_id: crate::vortix_core::control::OperationId::parse(
-                "op-0000000000000001-0000000000000001",
-            )
-            .unwrap(),
-            status: crate::vortix_core::control::OperationStatus::Failed,
-            result: Some(crate::vortix_core::control::OperationResult::Failed(
-                crate::vortix_core::control::OperationFailure::Rejected,
-            )),
-        }],
-    });
-    app.flush_catalog_feedback(true);
-
-    let toast = app.toast.as_ref().expect("profile failure must be visible");
-    assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast.message.contains("profile is busy"));
-    assert!(!toast.message.contains("Rejected"));
-}
-
-#[test]
-fn profile_mutation_burst_ends_with_one_aggregate_result() {
-    let mut app = test_app();
-    for revision in 1..=3 {
-        app.apply_local_catalog_update(crate::cli::control::LocalCatalogUpdate {
-            revision,
-            profiles: None,
-            outcomes: vec![if revision == 2 {
-                crate::cli::control::LocalCatalogOutcome::Failed {
-                    operation_id: crate::vortix_core::control::OperationId::parse(format!(
-                        "op-0000000000000001-{revision:016x}"
-                    ))
-                    .unwrap(),
-                    failure: crate::vortix_core::control::ProfileMutationFailure::Storage,
-                }
-            } else {
-                crate::cli::control::LocalCatalogOutcome::Applied {
-                    operation_id: crate::vortix_core::control::OperationId::parse(format!(
-                        "op-0000000000000001-{revision:016x}"
-                    ))
-                    .unwrap(),
-                    receipt: crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
-                        display_name: Some(format!("profile-{revision}")),
-                    },
-                }
-            }],
-        });
-    }
-    assert!(
-        app.toast.is_none(),
-        "burst should wait for its quiet window"
-    );
-
-    app.flush_catalog_feedback(true);
-
-    let toast = app.toast.as_ref().expect("aggregate result missing");
-    assert_eq!(toast.toast_type, ToastType::Error);
-    assert_eq!(
-        toast.message,
-        "2 profile updates completed; 1 failed. See Event Log."
-    );
-}
-
-#[test]
-fn actions_during_control_startup_explain_the_wait_without_an_error_alarm() {
-    let mut app = test_app();
-    add_profiles(&mut app, &["vpn"]);
-    app.profile_list_state.select(Some(0));
-    app.control_starting = true;
-
-    app.handle_message(Message::ToggleConnect(None));
-
-    let toast = app
-        .toast
-        .as_ref()
-        .expect("startup action must have feedback");
-    assert_eq!(toast.toast_type, ToastType::Info);
-    assert!(toast.message.contains("still starting"));
-}
-
-#[test]
 fn ip_only_refresh_for_same_exit_keeps_known_location() {
     let mut app = test_app();
     app.runtime.public_ip = "203.0.113.7".to_string();
@@ -3263,490 +2064,90 @@ fn unavailable_egress_probe_never_replaces_the_real_ip_cache() {
 }
 
 #[test]
-fn terminal_dns_policy_failure_is_shown_to_tui_user() {
-    use crate::vortix_core::control::{
-        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
-        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
-    };
+fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let mut app = test_app();
-    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 4_242);
-    app.track_control_operation_with_profile(
-        operation_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        None,
-    );
-    assert!(
-        app.toast.is_none(),
-        "tracking must not report a stale operation"
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.operations.insert(
-        operation_id.clone(),
-        OperationRecord {
-            id: operation_id.clone(),
-            idempotency_key: IdempotencyKey::new("managed-dns-connect"),
-            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
-            command_digest: PolicyDigest::default(),
-            authority_epoch: AuthorityEpoch(1),
-            desired_generation: 1,
-            admitted_at_millis: 1,
-            deadline_millis: 2,
-            intent: OperationIntent::default(),
-            status: OperationStatus::Failed,
-            result: Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
-            failure_detail: Some("macOS primary DNS is owned by another generation".to_string()),
-        },
-    );
-    assert_eq!(
-        snapshot.operations[&operation_id].failure_detail.as_deref(),
-        Some("macOS primary DNS is owned by another generation")
-    );
+    app.input_mode = InputMode::AuthPrompt {
+        profile_id: crate::vortix_core::profile::ProfileId::new("reveal-profile"),
+        profile_name: "reveal".into(),
+        username: "vortix".into(),
+        username_cursor: 6,
+        password: "secret".into(),
+        password_cursor: 6,
+        otp: crate::state::SecretText::default(),
+        otp_cursor: 0,
+        focused_field: AuthField::Password,
+        save_credentials: true,
+        connect_after: true,
+        static_challenge_prompt: None,
+        reveal_secrets: false,
+    };
 
-    app.apply_control_snapshot(snapshot);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: true,
+            password,
+            password_cursor: 6,
+            ..
+        } if password.expose() == "secret"
+    ));
 
-    let terminal_logs = crate::logger::get_logs()
-        .into_iter()
-        .filter(|entry| entry.message.contains("macOS primary DNS"))
+    // Toggling back hides it again.
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: false,
+            ..
+        }
+    ));
+
+    // A bare 'r' is still a password character, not a toggle.
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: false,
+            password,
+            ..
+        } if password.expose() == "secretr"
+    ));
+}
+
+#[test]
+fn diagnostic_log_batch_rotates_before_crossing_the_boundary() {
+    let config = tempfile::tempdir().unwrap();
+    let entries = vec![
+        "first-01".to_string(),
+        "second02".to_string(),
+        "third-03".to_string(),
+    ];
+    App::append_to_log_file_batch(&entries, config.path(), 10, 7);
+
+    let log_dir = config.path().join(crate::constants::LOGS_DIR_NAME);
+    let files = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
-    assert!(!terminal_logs.is_empty(), "failure detail must be logged");
-    assert!(terminal_logs
+    assert_eq!(files.len(), entries.len());
+    let mut persisted = files
         .iter()
-        .all(|entry| !entry.message.contains(&operation_id.to_string())));
-
-    let toast = app
-        .toast
-        .as_ref()
-        .expect("terminal failure must be visible");
-    assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast
-        .message
-        .starts_with("VPN DNS could not be applied safely"));
-    assert!(toast
-        .message
-        .contains("previous network settings were restored"));
-    assert!(
-        toast
-            .message
-            .contains("unfinished DNS state from an earlier connection"),
-        "{}",
-        toast.message
-    );
-
-    app.toast = None;
-    app.apply_control_snapshot(app.control_snapshot.clone());
-    assert!(
-        app.toast.is_none(),
-        "terminal failure must be reported once"
-    );
-}
-
-#[test]
-fn competing_vpn_dns_route_has_actionable_tui_copy() {
-    use crate::vortix_core::control::{
-        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
-        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
-    };
-
-    let mut app = test_app();
-    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 4_243);
-    app.track_control_operation_with_profile(
-        operation_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        Some("AWS_VPN".to_string()),
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.operations.insert(
-        operation_id.clone(),
-        OperationRecord {
-            id: operation_id,
-            idempotency_key: IdempotencyKey::new("competing-vpn-dns-route"),
-            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
-            command_digest: PolicyDigest::default(),
-            authority_epoch: AuthorityEpoch(1),
-            desired_generation: 1,
-            admitted_at_millis: 1,
-            deadline_millis: 2,
-            intent: OperationIntent::default(),
-            status: OperationStatus::Failed,
-            result: Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
-            failure_detail: Some(
-                "DNS resolver 10.64.0.2 currently routes through utun100 instead of this VPN (utun4). Another VPN or network service may own that route."
-                    .to_string(),
-            ),
-        },
-    );
-
-    app.apply_control_snapshot(snapshot);
-
-    let toast = app.toast.as_ref().expect("DNS failure must be visible");
-    assert!(toast
-        .message
-        .contains("Another VPN or network service is routing this profile's DNS traffic"));
-    assert!(toast.message.contains("Disconnect it and try again"));
-    assert!(toast
-        .message
-        .contains("Event Log shows the conflicting interface"));
-    assert!(!toast.message.contains("utun100"));
-}
-
-#[test]
-fn successful_disconnect_all_replaces_superseded_connection_cancellation() {
-    use crate::vortix_core::control::{
-        AuthorityEpoch, ClientId, IdempotencyKey, OperationId, OperationIntent, OperationRecord,
-        OperationResult, OperationStatus, PolicyDigest,
-    };
-
-    let mut app = test_app();
-    let connection_id = OperationId::from_parts(AuthorityEpoch(1), 4_244);
-    let disconnect_all_id = OperationId::from_parts(AuthorityEpoch(1), 4_245);
-    app.track_control_operation_with_profile(
-        connection_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        Some("AWS_VPN".to_string()),
-    );
-    app.track_control_operation_with_profile(
-        disconnect_all_id.clone(),
-        super::connection::PendingControlSubject::DisconnectAll,
-        None,
-    );
-
-    let mut snapshot = app.control_snapshot.clone();
-    for (id, key, status, result) in [
-        (
-            connection_id,
-            "superseded-connect",
-            OperationStatus::Cancelled,
-            Some(OperationResult::Cancelled),
-        ),
-        (
-            disconnect_all_id,
-            "disconnect-all",
-            OperationStatus::Succeeded,
-            Some(OperationResult::ObservedConvergence),
-        ),
-    ] {
-        snapshot.operations.insert(
-            id.clone(),
-            OperationRecord {
-                id,
-                idempotency_key: IdempotencyKey::new(key),
-                client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
-                command_digest: PolicyDigest::default(),
-                authority_epoch: AuthorityEpoch(1),
-                desired_generation: 1,
-                admitted_at_millis: 1,
-                deadline_millis: 2,
-                intent: OperationIntent::default(),
-                status,
-                result,
-                failure_detail: None,
-            },
-        );
-    }
-
-    app.apply_control_snapshot(snapshot);
-
-    let toast = app
-        .toast
-        .as_ref()
-        .expect("disconnect all success must be visible");
-    assert_eq!(toast.toast_type, ToastType::Success);
-    assert_eq!(toast.message, "All VPN connections disconnected");
-}
-
-#[test]
-fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
-    use crate::vortix_core::control::{
-        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
-        OperationRecord, OperationResult, OperationStatus, PolicyDigest, RequestedTunnelState,
-    };
-    use crate::vortix_core::engine::Conflict;
-    use crate::vortix_core::profile::ProfileId;
-
-    let mut app = test_app();
-    add_profiles(&mut app, &["existing", "candidate"]);
-    let existing = ProfileId::new("existing");
-    let candidate = ProfileId::new("candidate");
-    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 47);
-    app.track_control_operation_with_profile(
-        operation_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        None,
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.pending_route_conflicts.insert(
-        candidate.clone(),
-        Conflict::DefaultRouteTakeover {
-            current: existing.clone(),
-            new: candidate.clone(),
-        },
-    );
-    snapshot.operations.insert(
-        operation_id.clone(),
-        OperationRecord {
-            id: operation_id,
-            idempotency_key: IdempotencyKey::new("late-route-conflict"),
-            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
-            command_digest: PolicyDigest::default(),
-            authority_epoch: AuthorityEpoch(1),
-            desired_generation: 1,
-            admitted_at_millis: 1,
-            deadline_millis: 2,
-            intent: OperationIntent::DesiredSubset {
-                tunnels: std::collections::BTreeMap::from([(
-                    candidate.clone(),
-                    RequestedTunnelState::Connected,
-                )]),
-                kill_switch: None,
-            },
-            status: OperationStatus::Failed,
-            result: Some(OperationResult::Failed(OperationFailure::Rejected)),
-            failure_detail: None,
-        },
-    );
-
-    app.apply_control_snapshot(snapshot);
-
-    assert!(matches!(
-        app.input_mode,
-        InputMode::ConfirmDefaultRouteTakeover {
-            ref from,
-            ref to_profile_id,
-            ref to_name,
-            ..
-        } if from == "existing" && to_profile_id == &candidate && to_name == "candidate"
-    ));
-    assert!(
-        app.toast.is_none(),
-        "the dialog replaces a generic failure toast"
-    );
-}
-
-#[test]
-fn refused_route_conflict_reopens_the_confirmation_instead_of_a_dead_end_toast() {
-    use crate::vortix_core::engine::Conflict;
-    use crate::vortix_core::profile::ProfileId;
-
-    let mut app = test_app();
-    add_profiles(&mut app, &["candidate"]);
-    set_connected(&mut app, "existing");
-    let existing = ProfileId::new("existing");
-    let candidate = ProfileId::new("candidate");
-
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.pending_route_conflicts.insert(
-        candidate.clone(),
-        Conflict::DefaultRouteTakeover {
-            current: existing.clone(),
-            new: candidate.clone(),
-        },
-    );
-    app.apply_control_snapshot(snapshot);
-    // The conflict alone must not open anything: this test is about what the
-    // *refusal* does, so the dialog below has to be attributable to it.
-    assert!(matches!(app.input_mode, InputMode::Normal));
-
-    assert!(
-        app.recover_route_conflict(&candidate),
-        "a live conflict must be recoverable into a confirmation"
-    );
-    assert!(matches!(
-        app.input_mode,
-        InputMode::ConfirmDefaultRouteTakeover {
-            ref from,
-            ref to_profile_id,
-            ref to_name,
-            ..
-        } if from == "existing" && to_profile_id == &candidate && to_name == "candidate"
-    ));
-}
-
-#[test]
-fn a_cleared_route_conflict_falls_back_to_the_error_message() {
-    use crate::vortix_core::profile::ProfileId;
-
-    let mut app = test_app();
-    add_profiles(&mut app, &["candidate"]);
-
-    // No conflict in the snapshot: the peer released the route between the
-    // refusal and now. There is nothing to confirm, so the caller must be told
-    // to fall through and report the error rather than opening an empty dialog.
-    assert!(!app.recover_route_conflict(&ProfileId::new("candidate")));
-    assert!(matches!(app.input_mode, InputMode::Normal));
-}
-
-#[test]
-fn terminal_authentication_failure_is_shown_to_tui_user() {
-    use crate::vortix_core::control::{
-        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
-        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
-    };
-
-    let mut app = test_app();
-    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 43);
-    app.track_control_operation_with_profile(
-        operation_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        None,
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.operations.insert(
-        operation_id.clone(),
-        OperationRecord {
-            id: operation_id,
-            idempotency_key: IdempotencyKey::new("rejected-openvpn-auth"),
-            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
-            command_digest: PolicyDigest::default(),
-            authority_epoch: AuthorityEpoch(1),
-            desired_generation: 1,
-            admitted_at_millis: 1,
-            deadline_millis: 2,
-            intent: OperationIntent::default(),
-            status: OperationStatus::Failed,
-            result: Some(OperationResult::Failed(
-                OperationFailure::AuthenticationFailed,
-            )),
-            failure_detail: None,
-        },
-    );
-
-    app.apply_control_snapshot(snapshot);
-
-    let toast = app
-        .toast
-        .as_ref()
-        .expect("authentication failure must be visible");
-    assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast.message.contains("VPN server rejected this profile"));
-    assert!(toast
-        .message
-        .contains("certificate or username and password"));
-}
-
-#[test]
-fn invalid_wireguard_name_is_shown_as_an_actionable_terminal_error() {
-    use crate::vortix_core::control::{
-        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
-        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
-    };
-
-    let mut app = test_app();
-    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 44);
-    app.track_control_operation_with_profile(
-        operation_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        None,
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.operations.insert(
-        operation_id.clone(),
-        OperationRecord {
-            id: operation_id,
-            idempotency_key: IdempotencyKey::new("invalid-wireguard-name"),
-            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
-            command_digest: PolicyDigest::default(),
-            authority_epoch: AuthorityEpoch(1),
-            desired_generation: 1,
-            admitted_at_millis: 1,
-            deadline_millis: 2,
-            intent: OperationIntent::default(),
-            status: OperationStatus::Failed,
-            result: Some(OperationResult::Failed(OperationFailure::InvalidProfile)),
-            failure_detail: None,
-        },
-    );
-
-    app.apply_control_snapshot(snapshot);
-
-    let toast = app.toast.as_ref().expect("invalid profile must be visible");
-    assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast.message.contains("invalid filename"));
-    assert!(toast.message.contains("1–15 characters"));
-    assert!(toast.message.contains("import it again"));
-}
-
-#[test]
-fn terminal_wireguard_handshake_failure_explains_the_owned_retry() {
-    use crate::vortix_core::control::{
-        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
-        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
-    };
-
-    let mut app = test_app();
-    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 45);
-    app.track_control_operation_with_profile(
-        operation_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        None,
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.operations.insert(
-        operation_id.clone(),
-        OperationRecord {
-            id: operation_id,
-            idempotency_key: IdempotencyKey::new("wireguard-handshake-failed"),
-            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
-            command_digest: PolicyDigest::default(),
-            authority_epoch: AuthorityEpoch(1),
-            desired_generation: 7,
-            admitted_at_millis: 1,
-            deadline_millis: 2,
-            intent: OperationIntent::default(),
-            status: OperationStatus::Failed,
-            result: Some(OperationResult::Failed(OperationFailure::HandshakeFailed)),
-            failure_detail: None,
-        },
-    );
-    let recovery_id = OperationId::from_parts(AuthorityEpoch(1), 46);
-    snapshot.operations.insert(
-        recovery_id.clone(),
-        OperationRecord {
-            id: recovery_id.clone(),
-            idempotency_key: IdempotencyKey::new("service-recovery-7-2"),
-            client_id: ClientId::from_parts(AuthorityEpoch(1), 0),
-            command_digest: PolicyDigest::default(),
-            authority_epoch: AuthorityEpoch(1),
-            desired_generation: 7,
-            admitted_at_millis: 2,
-            deadline_millis: 30_002,
-            intent: OperationIntent::default(),
-            status: OperationStatus::WaitingForObservation,
-            result: None,
-            failure_detail: None,
-        },
-    );
-
-    app.apply_control_snapshot(snapshot);
-
-    let toast = app
-        .toast
-        .as_ref()
-        .expect("the user must be told that a retry is in progress");
-    assert_eq!(toast.toast_type, ToastType::Warning);
-    assert!(toast
-        .message
-        .contains("No WireGuard handshake was received"));
-    assert!(toast.message.contains("retrying once"));
-
-    let mut retry_failed = app.control_snapshot.clone();
-    let recovery = retry_failed
-        .operations
-        .get_mut(&recovery_id)
-        .expect("recovery operation missing");
-    recovery.status = OperationStatus::Failed;
-    recovery.result = Some(OperationResult::Failed(OperationFailure::HandshakeFailed));
-    app.apply_control_snapshot(retry_failed);
-
-    let toast = app
-        .toast
-        .as_ref()
-        .expect("terminal recovery failure must be visible");
-    assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast
-        .message
-        .contains("No WireGuard handshake was received"));
-    assert!(!toast.message.contains("retrying once"));
+        .flat_map(|path| {
+            assert!(std::fs::metadata(path).unwrap().len() <= 10);
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    persisted.sort();
+    let mut expected = entries;
+    expected.sort();
+    assert_eq!(persisted, expected);
 }
 
 #[test]
@@ -3826,8 +2227,8 @@ fn background_overlay_is_keyboard_only_and_cancel_is_non_destructive() {
 
 #[test]
 fn background_diagnostics_completion_clears_loading_and_logs_each_outcome() {
-    use crate::vortix_core::control::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
-    use crate::vortix_core::control::{
+    use crate::vortix_core::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
+    use crate::vortix_core::diagnostics::{
         DiagnosticCode, DiagnosticComponent, DiagnosticFields, DiagnosticRecord,
         DiagnosticSeverity, DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus, DiagnosticView,
     };
@@ -3885,39 +2286,6 @@ fn background_diagnostics_duplicate_load_is_bounded() {
 }
 
 #[test]
-fn diagnostic_log_batch_rotates_before_crossing_the_boundary() {
-    let config = tempfile::tempdir().unwrap();
-    let entries = vec![
-        "first-01".to_string(),
-        "second02".to_string(),
-        "third-03".to_string(),
-    ];
-    App::append_to_log_file_batch(&entries, config.path(), 10, 7);
-
-    let log_dir = config.path().join(crate::constants::LOGS_DIR_NAME);
-    let files = std::fs::read_dir(&log_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect::<Vec<_>>();
-    assert_eq!(files.len(), entries.len());
-    let mut persisted = files
-        .iter()
-        .flat_map(|path| {
-            assert!(std::fs::metadata(path).unwrap().len() <= 10);
-            std::fs::read_to_string(path)
-                .unwrap()
-                .lines()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    persisted.sort();
-    let mut expected = entries;
-    expected.sort();
-    assert_eq!(persisted, expected);
-}
-
-#[test]
 fn background_confirmation_refuses_authority_before_cutover() {
     let mut app = test_app();
     app.handle_message(Message::OpenBackgroundSetup);
@@ -3947,279 +2315,172 @@ fn background_status_continue_is_read_only() {
     assert!(app.toast.is_none());
 }
 
-/// Build a terminal connect operation targeting one profile.
-fn terminal_connect_operation(
-    sequence: u64,
-    profile_id: &crate::vortix_core::profile::ProfileId,
-    status: crate::vortix_core::control::OperationStatus,
-    result: crate::vortix_core::control::OperationResult,
-) -> (
-    crate::vortix_core::control::OperationId,
-    crate::vortix_core::control::OperationRecord,
-) {
-    use crate::vortix_core::control::{
-        AuthorityEpoch, ClientId, IdempotencyKey, OperationId, OperationIntent, OperationRecord,
-        PolicyDigest, RequestedTunnelState,
-    };
-
-    let operation_id = OperationId::from_parts(AuthorityEpoch(1), sequence);
-    let mut tunnels = std::collections::BTreeMap::new();
-    tunnels.insert(profile_id.clone(), RequestedTunnelState::Connected);
-    let record = OperationRecord {
-        id: operation_id.clone(),
-        idempotency_key: IdempotencyKey::new("credential-settlement"),
-        client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
-        command_digest: PolicyDigest::default(),
-        authority_epoch: AuthorityEpoch(1),
-        desired_generation: 1,
-        admitted_at_millis: 1,
-        deadline_millis: 2,
-        intent: OperationIntent::DesiredSubset {
-            tunnels,
-            kill_switch: None,
-        },
-        status,
-        result: Some(result),
-        failure_detail: None,
-    };
-    (operation_id, record)
-}
-
-/// Attach a control session over one `OpenVPN` profile that needs auth.
-fn app_with_openvpn_profile(
-    temp: &tempfile::TempDir,
-) -> (App, crate::vortix_core::profile::ProfileId, VpnProfile) {
-    let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+#[test]
+fn test_auth_delete_profile_cleans_auth_file() {
+    let mut app = test_app();
+    let tmp = tempfile::Builder::new()
+        .prefix("vortix_auth_")
+        .tempdir()
+        .unwrap();
+    let profiles_dir = tmp.path().join(crate::constants::PROFILES_DIR_NAME);
     std::fs::create_dir(&profiles_dir).unwrap();
-    let profile_id = crate::vortix_core::profile::ProfileId::new("rejected-corp");
-    let profile = VpnProfile {
-        id: profile_id.clone(),
-        name: "corp".into(),
-        protocol: Protocol::OpenVPN,
-        config_path: profiles_dir.join("corp.ovpn"),
-        location: String::new(),
-        last_used: None,
-    };
-    std::fs::write(&profile.config_path, "client\nauth-user-pass\n").unwrap();
-    let control = crate::cli::control::LocalControlSession::start_profile_test(
-        temp.path(),
-        vec![profile.clone()],
+    let stable_id = crate::vortix_core::profile::ProfileId::parse("11".repeat(32)).unwrap();
+    let config_path = profiles_dir.join("del-vpn.ovpn");
+    let stored = crate::vortix_core::profile::Profile::new(
+        stable_id.clone(),
+        "del-vpn",
+        crate::vortix_core::profile::ProtocolKind::OpenVpn,
+        config_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(
+        &crate::vortix_config::profile_store::FsProfileStore::new(profiles_dir),
+        &stored,
+        b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
     )
     .unwrap();
-
-    let mut app = test_app();
-    app.runtime.config_dir = temp.path().to_path_buf();
-    app.runtime.profiles = vec![profile.clone()];
-    app.attach_control_session(control).unwrap();
-    (app, profile_id, profile)
-}
-
-#[test]
-fn rejected_credentials_are_removed_so_the_next_connect_prompts() {
-    use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
-
-    let temp = tempfile::tempdir().unwrap();
-    let (mut app, profile_id, _profile) = app_with_openvpn_profile(&temp);
-    app.control_session
-        .as_ref()
-        .unwrap()
-        .remember_openvpn_credentials(&profile_id, "corp-user", "stale-password")
-        .unwrap();
-
-    let (operation_id, record) = terminal_connect_operation(
-        71,
-        &profile_id,
-        OperationStatus::Failed,
-        OperationResult::Failed(OperationFailure::AuthenticationFailed),
-    );
-    app.track_control_operation_with_profile(
-        operation_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        Some("corp".to_string()),
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.operations.insert(operation_id, record);
-    app.apply_control_snapshot(snapshot);
-
-    // Stored credentials the server rejected must not survive: a profile that
-    // still has them raises no challenge, so the prompt would never reopen.
-    let stored = app
-        .control_session
-        .as_ref()
-        .unwrap()
-        .load_openvpn_credentials(&profile_id, "corp")
-        .unwrap();
-    assert!(
-        stored.is_none(),
-        "rejected credentials must be discarded so the next connect prompts"
-    );
-}
-
-#[test]
-fn credentials_reach_disk_only_after_the_server_accepts_them() {
-    use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
-
-    let temp = tempfile::tempdir().unwrap();
-    let (mut app, profile_id, _profile) = app_with_openvpn_profile(&temp);
-
-    // A rejected attempt leaves nothing behind.
-    app.pending_credential_save = Some(super::PendingCredentialSave {
-        profile_id: profile_id.clone(),
-        profile_name: "corp".to_string(),
-        username: "corp-user".into(),
-        password: "wrong-password".into(),
+    app.runtime.profiles.push(VpnProfile {
+        id: stable_id.clone(),
+        name: "del-vpn".to_string(),
+        protocol: Protocol::OpenVPN,
+        config_path,
+        location: "Test".to_string(),
+        last_used: None,
     });
-    let (rejected_id, rejected) = terminal_connect_operation(
-        72,
-        &profile_id,
-        OperationStatus::Failed,
-        OperationResult::Failed(OperationFailure::AuthenticationFailed),
-    );
-    app.track_control_operation_with_profile(
-        rejected_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        Some("corp".to_string()),
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.operations.insert(rejected_id, rejected);
-    app.apply_control_snapshot(snapshot);
+    app.runtime.config_dir = tmp.path().to_path_buf();
+    let (uid, gid) = crate::config::config_owner(tmp.path()).unwrap();
+    let store =
+        crate::vortix_config::openvpn_credentials::FsOpenVpnCredentialStore::for_standard_owner(
+            tmp.path(),
+            uid,
+            gid,
+        );
+    let credentials = crate::vortix_config::openvpn_credentials::RememberedOpenVpnCredentials::new(
+        "user", "pass",
+    )
+    .unwrap();
+    store.replace(&stable_id, &credentials).unwrap();
 
-    assert!(app.pending_credential_save.is_none());
-    assert!(
-        app.control_session
-            .as_ref()
-            .unwrap()
-            .load_openvpn_credentials(&profile_id, "corp")
-            .unwrap()
-            .is_none(),
-        "a rejected password must never be persisted"
-    );
+    app.confirm_delete_profile(&stable_id);
 
-    // The accepted attempt is what commits.
-    app.pending_credential_save = Some(super::PendingCredentialSave {
-        profile_id: profile_id.clone(),
-        profile_name: "corp".to_string(),
-        username: "corp-user".into(),
-        password: "right-password".into(),
-    });
-    let (accepted_id, accepted) = terminal_connect_operation(
-        73,
-        &profile_id,
-        OperationStatus::Succeeded,
-        OperationResult::ObservedConvergence,
-    );
-    app.track_control_operation_with_profile(
-        accepted_id.clone(),
-        super::connection::PendingControlSubject::Connection,
-        Some("corp".to_string()),
-    );
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.operations.insert(accepted_id, accepted);
-    app.apply_control_snapshot(snapshot);
-
-    let stored = app
-        .control_session
-        .as_ref()
-        .unwrap()
-        .load_openvpn_credentials(&profile_id, "corp")
-        .unwrap()
-        .expect("accepted credentials must be remembered");
-    assert_eq!(stored.username(), "corp-user");
-    assert_eq!(stored.password(), "right-password");
+    assert!(app.runtime.profiles.is_empty());
+    assert!(store.load(&stable_id, "del-vpn").unwrap().is_none());
 }
 
 #[test]
-fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
+    use crate::app::{focused_tunnel_action, FocusedTunnelAction};
+    use crate::vortix_core::engine::state::{Connection, ConnectionHealth, PromptKind};
+    use crate::vortix_core::profile::ProfileId;
+    use std::time::{Duration, SystemTime};
 
-    let mut app = test_app();
-    app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::vortix_core::profile::ProfileId::new("reveal-profile"),
-        profile_name: "reveal".into(),
-        username: "vortix".into(),
-        username_cursor: 6,
-        password: "secret".into(),
-        password_cursor: 6,
-        otp: crate::state::SecretText::default(),
-        otp_cursor: 0,
-        focused_field: AuthField::Password,
-        save_credentials: true,
-        connect_after: true,
-        static_challenge_prompt: None,
-        reveal_secrets: false,
-    };
-
-    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-    assert!(matches!(
-        &app.input_mode,
-        InputMode::AuthPrompt {
-            reveal_secrets: true,
-            password,
-            password_cursor: 6,
-            ..
-        } if password.expose() == "secret"
-    ));
-
-    // Toggling back hides it again.
-    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-    assert!(matches!(
-        &app.input_mode,
-        InputMode::AuthPrompt {
-            reveal_secrets: false,
-            ..
-        }
-    ));
-
-    // A bare 'r' is still a password character, not a toggle.
-    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-    assert!(matches!(
-        &app.input_mode,
-        InputMode::AuthPrompt {
-            reveal_secrets: false,
-            password,
-            ..
-        } if password.expose() == "secretr"
-    ));
-}
-
-#[test]
-fn rapid_killswitch_presses_submit_one_change_at_a_time() {
-    let temp = tempfile::tempdir().unwrap();
-    let (mut app, _profile_id, _profile) = app_with_openvpn_profile(&temp);
-
-    app.track_control_operation_with_profile(
-        crate::vortix_core::control::OperationId::from_parts(
-            crate::vortix_core::control::AuthorityEpoch(1),
-            9001,
-        ),
-        super::connection::PendingControlSubject::KillSwitch,
-        None,
-    );
-    assert!(app.killswitch_change_in_flight());
-
-    // Presses while a change runs coalesce into one target rather than
-    // queueing an operation each: the worker is serial, so the extras used to
-    // expire on their own deadline and report "kill switch change timed out".
-    for _ in 0..5 {
-        app.handle_message(Message::ToggleKillSwitch);
+    let profile_id = ProfileId::new("focused");
+    let now = SystemTime::UNIX_EPOCH;
+    let transitional = [
+        Connection::Connecting {
+            profile_id: profile_id.clone(),
+            started_at: now,
+            attempt: 1,
+            retry_budget_remaining: Duration::ZERO,
+        },
+        Connection::Reconnecting {
+            profile_id: profile_id.clone(),
+            started_at: now,
+            attempt: 2,
+            retry_budget_remaining: Duration::ZERO,
+            last_error: None,
+        },
+        Connection::AwaitingUserInput {
+            profile_id: profile_id.clone(),
+            prompt_id: "prompt".to_string(),
+            prompt_kind: PromptKind::TwoFactorCode,
+            since: now,
+        },
+    ];
+    for state in &transitional {
+        assert_eq!(
+            focused_tunnel_action(Some(state)),
+            FocusedTunnelAction::Cancel
+        );
     }
-    assert!(
-        app.queued_killswitch_target.is_some(),
-        "the cycled target must be retained while a change is in flight"
-    );
 
-    // An unknown effective state during that window must not be reported as
-    // Degraded, which means "cannot be proven" rather than "not yet known".
-    app.runtime.killswitch_state = crate::state::KillSwitchState::Blocking;
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.desired.kill_switch = crate::state::KillSwitchMode::AlwaysOn;
-    snapshot.effective.kill_switch = None;
-    app.apply_control_snapshot(snapshot);
+    let connected = Connection::Connected {
+        profile_id: profile_id.clone(),
+        since: now,
+        health: ConnectionHealth::Healthy,
+        details: Box::default(),
+    };
     assert_eq!(
-        app.runtime.killswitch_state,
-        crate::state::KillSwitchState::Blocking,
-        "an in-flight change must not turn a working kill switch into Degraded"
+        focused_tunnel_action(Some(&connected)),
+        FocusedTunnelAction::Disconnect
     );
+    let disconnecting = Connection::Disconnecting {
+        profile_id,
+        started_at: now,
+    };
+    assert_eq!(
+        focused_tunnel_action(Some(&disconnecting)),
+        FocusedTunnelAction::ForceDisconnect
+    );
+    assert_eq!(focused_tunnel_action(None), FocusedTunnelAction::Connect);
+}
+
+#[test]
+fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
+    use crate::vortix_core::engine::Connection;
+    use std::sync::mpsc;
+
+    let mut app = test_app();
+    let (nudge_tx, nudge_rx) = mpsc::channel();
+    app.runtime.telemetry_nudge = Some(nudge_tx);
+    set_connected(&mut app, "primary");
+    nudge_rx
+        .try_recv()
+        .expect("initial connection must refresh egress telemetry");
+
+    let profile_id = crate::vortix_core::profile::ProfileId::new("primary");
+    let edit = |app: &App, change: &dyn Fn(&mut crate::control::Snapshot)| {
+        let mut next = (*app.control_snapshot).clone();
+        change(&mut next);
+        next.version += 1;
+        std::sync::Arc::new(next)
+    };
+    let statistics = edit(&app, &|snapshot| {
+        let tunnel = &mut snapshot.tunnels[0];
+        tunnel.details.transfer_rx = "12.0 MiB".to_string();
+        tunnel.details.transfer_tx = "3.0 MiB".to_string();
+    });
+    app.apply_control_snapshot(statistics);
+    assert_eq!(
+        nudge_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "presentation-only transfer counters must not wake public-IP probes"
+    );
+    let rendered = app.registry.snapshot(&profile_id).unwrap();
+    let Connection::Connected { details, .. } = rendered.state else {
+        panic!("renderer projection must remain connected");
+    };
+    assert_eq!(details.transfer_rx, "12.0 MiB");
+
+    let new_path = edit(&app, &|snapshot| {
+        snapshot.tunnels[0].interface = Some("utun8".to_string());
+    });
+    app.apply_control_snapshot(new_path);
+    nudge_rx
+        .try_recv()
+        .expect("an interface change must refresh egress telemetry");
+
+    set_connected(&mut app, "secondary");
+    nudge_rx
+        .try_recv()
+        .expect("a new active tunnel must refresh egress telemetry");
+
+    let handoff = edit(&app, &|snapshot| {
+        snapshot.primary = Some(profile_id.clone());
+    });
+    app.apply_control_snapshot(handoff);
+    nudge_rx
+        .try_recv()
+        .expect("a primary handoff must refresh egress telemetry");
 }
 
 /// Both real-IP cache gates read these fields, and for a long time nothing in
@@ -4229,35 +2490,12 @@ fn rapid_killswitch_presses_submit_one_change_at_a_time() {
 /// hand. This asserts the control snapshot actually establishes them.
 #[test]
 fn a_control_snapshot_establishes_the_real_ip_cache_gates() {
-    use crate::vortix_core::control::model::ObservedTunnel;
-    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
-    use crate::vortix_core::profile::ProfileId;
-
     let mut app = test_app();
     assert!(!app.runtime.scanner_first_tick_done, "starts unproven");
-
-    let mut snapshot = ControlSnapshot::default();
-    snapshot.observed.default_route = Some(ObservedDefaultRoute {
-        interface_name: Some("wlp3s0".into()),
-        observed_at_millis: 1,
-        received_at_millis: 1,
-    });
-    let tunnelled = ProfileId::new("carrying-traffic");
-    snapshot.observed.tunnels.insert(
-        tunnelled,
-        ObservedTunnel {
-            active: true,
-            interface_name: Some("tun0".into()),
-            observed_at_millis: 1,
-            received_at_millis: 1,
-        },
-    );
-
-    app.apply_control_snapshot(snapshot);
-
+    set_connected(&mut app, "carrying-traffic");
     assert!(
         app.runtime.scanner_first_tick_done,
-        "a default-route observation proves the scan ran"
+        "a published snapshot proves the scan ran"
     );
     assert_eq!(
         app.runtime.last_kernel_session_count, 1,
@@ -4273,8 +2511,6 @@ fn a_control_snapshot_establishes_the_real_ip_cache_gates() {
 /// Real IP equal to Exit IP and flagged a leak that was its own bookkeeping.
 #[test]
 fn an_unmanaged_tunnel_on_the_default_route_blocks_real_ip_caching() {
-    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
-
     for (interface, cacheable) in [
         ("en0", true),
         ("eth0", true),
@@ -4283,14 +2519,10 @@ fn an_unmanaged_tunnel_on_the_default_route_blocks_real_ip_caching() {
         ("tun0", false),
     ] {
         let mut app = test_app();
-        let mut snapshot = ControlSnapshot::default();
-        snapshot.observed.default_route = Some(ObservedDefaultRoute {
-            interface_name: Some(interface.to_string()),
-            observed_at_millis: 1,
-            received_at_millis: 1,
-        });
-        app.apply_control_snapshot(snapshot);
-
+        app.apply_control_snapshot(std::sync::Arc::new(crate::control::Snapshot {
+            default_route: Some(interface.to_string()),
+            ..crate::control::Snapshot::default()
+        }));
         assert_eq!(
             !app.default_route_is_tunnel(),
             cacheable,
@@ -4310,22 +2542,40 @@ fn an_unmanaged_tunnel_on_the_default_route_blocks_real_ip_caching() {
 /// canonical observation instead.
 #[test]
 fn a_control_snapshot_feeds_the_registry_default_route() {
-    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
-
     let mut app = test_app();
-    let mut snapshot = ControlSnapshot::default();
-    snapshot.observed.default_route = Some(ObservedDefaultRoute {
-        interface_name: Some("utun4".into()),
-        observed_at_millis: 1,
-        received_at_millis: 1,
-    });
+    app.apply_control_snapshot(std::sync::Arc::new(crate::control::Snapshot {
+        default_route: Some("utun4".into()),
+        ..crate::control::Snapshot::default()
+    }));
+    assert_eq!(app.registry.default_route_interface(), Some("utun4"));
+}
 
-    app.apply_control_snapshot(snapshot);
+#[test]
+fn canonical_snapshot_updates_profile_last_connected_time() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    let profile_id = app.runtime.profiles[0].id.clone();
+    let connected_at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_234);
+    app.runtime.profiles[0].last_used = Some(connected_at + std::time::Duration::from_secs(1));
+    let mut snapshot = (*app.control_snapshot).clone();
+    snapshot.last_connected.insert(profile_id, connected_at);
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
+    assert_eq!(app.runtime.profiles[0].last_used, Some(connected_at));
+}
 
-    assert_eq!(
-        app.registry.default_route_interface_for_test(),
-        Some("utun4".to_string()),
-        "the registry must see the kernel's default-route interface, or no \
-         tunnel is ever elected primary"
-    );
+#[test]
+fn actions_during_control_startup_explain_the_wait_without_an_error_alarm() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn"]);
+    app.profile_list_state.select(Some(0));
+    app.control_starting = true;
+
+    app.handle_message(Message::ToggleConnect(None));
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("startup action must have feedback");
+    assert_eq!(toast.toast_type, ToastType::Info);
+    assert!(toast.message.contains("still starting"));
 }

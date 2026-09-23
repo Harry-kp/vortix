@@ -548,11 +548,8 @@ fn run_tui(
     std::thread::Builder::new()
         .name("vortix-control-startup".into())
         .spawn(move || {
-            let result = vortix::cli::control::LocalControlSession::start_tui(
-                &control_config,
-                &control_dir,
-                control_profiles,
-            );
+            let result =
+                vortix::control::Control::start(&control_config, &control_dir, control_profiles);
             let _ = control_tx.send(result);
         })
         .map_err(|error| eyre::eyre!("cannot start control bootstrap: {error}"))?;
@@ -590,10 +587,7 @@ fn run_tui(
         if let Some(receiver) = control_rx.as_ref() {
             match receiver.try_recv() {
                 Ok(Ok(control)) => {
-                    app.attach_client_control_session(
-                        vortix::cli::control::ClientControlSession::standard(control),
-                    )
-                    .map_err(|error| eyre::eyre!("cannot attach TUI control service: {error}"))?;
+                    app.attach_control(control);
                     control_rx = None;
                 }
                 Ok(Err(error)) => {

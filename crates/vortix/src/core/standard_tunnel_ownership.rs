@@ -14,9 +14,9 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::core::scanner::ActiveSession;
-use crate::vortix_core::control::worker::TunnelRevision;
-use crate::vortix_core::control::AuthorityEpoch;
-use crate::vortix_core::control::OperationId;
+use crate::vortix_core::ids::AuthorityEpoch;
+use crate::vortix_core::ids::OperationId;
+use crate::vortix_core::ids::TunnelRevision;
 use crate::vortix_core::ports::tunnel::{HandshakeEvidence, ProbeReceipt, TunnelTeardownConfig};
 use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 

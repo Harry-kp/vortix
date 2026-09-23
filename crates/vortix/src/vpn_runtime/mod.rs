@@ -535,14 +535,15 @@ impl VpnRuntime {
         };
         let config_dir =
             utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        let mut tunnel = crate::tunnel::tunnel_for(profile.protocol, &config_dir, "3", 30);
+        let mut tunnel =
+            crate::control::tunnels::tunnel_for(profile.protocol, &config_dir, "3", 30);
         self.cleanup_vpn_resources_with(profile_name, &mut tunnel)
     }
 
     fn cleanup_vpn_resources_with(
         &self,
         profile_name: &str,
-        tunnel: &mut crate::tunnel::TunnelKind,
+        tunnel: &mut crate::control::tunnels::TunnelKind,
     ) -> Result<(), crate::vortix_core::ports::tunnel::TunnelError> {
         use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
@@ -956,7 +957,7 @@ mod cleanup_tests {
             "injected teardown failure".into(),
         ));
         let calls = mock.invocations();
-        let mut tunnel = crate::tunnel::TunnelKind::Mock(mock);
+        let mut tunnel = crate::control::tunnels::TunnelKind::Mock(mock);
 
         let error = runtime
             .cleanup_vpn_resources_with("cleanup-failure", &mut tunnel)

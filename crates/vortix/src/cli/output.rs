@@ -256,7 +256,7 @@ pub fn print_background_unavailable(mode: OutputMode, command: &str) -> ExitCode
 /// supplied and makes advisory fallback data unmistakable in every mode.
 pub fn print_background_diagnostics(
     mode: OutputMode,
-    view: &crate::vortix_core::control::DiagnosticView,
+    view: &crate::vortix_core::diagnostics::DiagnosticView,
     stream: bool,
 ) {
     match mode {
@@ -266,7 +266,7 @@ pub fn print_background_diagnostics(
         OutputMode::Json => print_success(mode, "background diagnostics", view, Vec::new()),
         OutputMode::Quiet => {}
         OutputMode::Human => {
-            use crate::vortix_core::control::DiagnosticSource;
+            use crate::vortix_core::diagnostics::DiagnosticSource;
             let source = match view.source {
                 DiagnosticSource::AuthenticatedLive => "authenticated live",
                 DiagnosticSource::UnauthenticatedAdvisoryFallback => {
@@ -293,7 +293,7 @@ pub fn print_background_diagnostics(
 }
 
 fn background_diagnostics_json(
-    view: &crate::vortix_core::control::DiagnosticView,
+    view: &crate::vortix_core::diagnostics::DiagnosticView,
     stream: bool,
 ) -> String {
     let response = CliResponse::success("background diagnostics", view, Vec::new());
@@ -465,8 +465,8 @@ mod tests {
 
     #[test]
     fn diagnostic_follow_json_is_one_compact_envelope_per_line() {
-        use crate::vortix_core::control::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
-        use crate::vortix_core::control::{
+        use crate::vortix_core::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
+        use crate::vortix_core::diagnostics::{
             DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus, DiagnosticView,
         };
         let view = DiagnosticView {

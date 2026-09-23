@@ -13,13 +13,14 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
-use crate::vortix_core::control::{OperationId, Secret};
+use crate::vortix_core::ids::OperationId;
 use crate::vortix_core::ports::process::ManagedProcessId;
 use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
     TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelStatus,
 };
 use crate::vortix_core::profile::{unambiguous_legacy_artifact_key, Profile, ProfileId};
+use crate::vortix_core::secret::Secret;
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
@@ -324,11 +325,6 @@ impl OpenVpnStaticChallengeCredentials {
             password: Zeroizing::new(password),
             answer,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn username_password_for_test(&self) -> (&str, &str) {
-        (&self.username, &self.password)
     }
 }
 
@@ -997,7 +993,7 @@ impl Tunnel for OvpnTunnel {
         let _ = std::fs::remove_file(&log_path);
 
         info!(
-            target: "vortix::tunnel::openvpn",
+            target: "vortix::control::tunnels::openvpn",
             profile = %profile.id,
             config = %profile.config_path.display(),
             pid_path = %pid_path.display(),
@@ -1009,7 +1005,7 @@ impl Tunnel for OvpnTunnel {
         let effective_config = write_managed_config(profile, &ownership_id, &validated_config)?;
         let mut args = build_ovpn_args(&effective_config, &pid_path, &log_path, &self.verbosity);
         debug!(
-            target: "vortix::tunnel::openvpn",
+            target: "vortix::control::tunnels::openvpn",
             profile = %profile.id,
             "ovpn.up: DNS mutation suppressed for coordinator-owned policy"
         );
@@ -1142,7 +1138,7 @@ impl Tunnel for OvpnTunnel {
             // Give the child a moment to drop privileges and chown its files,
             // then wait for the success marker in the log.
             thread::sleep(Duration::from_millis(OVPN_CHOWN_DELAY_MS));
-            debug!(target: "vortix::tunnel::openvpn", "polling log for ready");
+            debug!(target: "vortix::control::tunnels::openvpn", "polling log for ready");
             let (pid, kernel_iface) = poll_log_until_ready(
                 &log_path,
                 &pid_path,
@@ -1166,7 +1162,7 @@ impl Tunnel for OvpnTunnel {
             // path against the still-running daemon via PID).
             let Some(interface_name) = kernel_iface else {
                 warn!(
-                    target: "vortix::tunnel::openvpn",
+                    target: "vortix::control::tunnels::openvpn",
                     profile = %profile.id,
                     pid = pid,
                     "ovpn.up: success marker logged but kernel interface name not found in log; refusing to track this tunnel"
@@ -1212,7 +1208,7 @@ impl Tunnel for OvpnTunnel {
 
     fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
         info!(
-            target: "vortix::tunnel::openvpn",
+            target: "vortix::control::tunnels::openvpn",
             profile = %handle.profile_id,
             pid = ?handle.pid,
             "ovpn.down"
@@ -1639,53 +1635,6 @@ mod tests {
         let error =
             managed_config(&profile, &identity).expect_err("missing cache must fail closed");
         assert!(error.to_string().contains("vpn.example:1194"));
-    }
-
-    #[test]
-    fn cached_profile_resolution_reaches_openvpn_managed_config_without_dns() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("corp.ovpn");
-        let body = "client\nremote endpoint.invalid 1194 udp\n";
-        std::fs::write(&path, body).unwrap();
-        let vpn_profile = crate::state::VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new("corp"),
-            name: "Corporate".into(),
-            protocol: crate::state::Protocol::OpenVPN,
-            location: String::new(),
-            config_path: path,
-            last_used: None,
-        };
-        let digest = crate::vortix_core::control::PolicyDigest::sha256(body.as_bytes()).0;
-        let cache_json = serde_json::json!({
-            "schema_version": 1,
-            "profiles": {
-                "corp": {
-                    "profile_digest": digest,
-                    "endpoints": [{
-                        "hostname": "endpoint.invalid",
-                        "port": 1194,
-                        "address": "203.0.113.19"
-                    }]
-                }
-            }
-        });
-        let encoded = serde_json::to_vec(&cache_json).unwrap();
-        let mut cache =
-            crate::topology_policy::EndpointResolutionCache::decode(Some(&encoded)).unwrap();
-        let topology = crate::topology_policy::topology_for_profile(&vpn_profile, &mut cache)
-            .expect("exact cache entry resolves topology without DNS");
-        let profile = crate::tunnel::profile_view(&vpn_profile)
-            .with_endpoint_resolutions(topology.resolved_endpoints)
-            .require_managed_endpoint_resolution();
-        let identity = ManagedProcessId {
-            profile_id: profile.id.clone(),
-            generation: 7,
-            ownership_token: "a".repeat(64),
-        };
-        let managed = managed_config(&profile, &identity).unwrap();
-        let managed_body = std::fs::read_to_string(managed).unwrap();
-        assert!(managed_body.contains("remote 203.0.113.19 1194 udp"));
-        assert!(!managed_body.contains("endpoint.invalid"));
     }
 
     #[test]

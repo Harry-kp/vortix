@@ -837,11 +837,8 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::state::{Protocol, VpnProfile};
-    use crate::tunnel::TunnelKind;
-    use crate::vortix_core::engine::fsm::Engine;
     use crate::vortix_core::engine::state::PromptKind;
-    use crate::vortix_core::ports::tunnel::mock::{MockTunnel, ScriptedTunnelOutcome};
-    use crate::vortix_core::profile::{Profile as CoreProfile, ProfileId, ProtocolKind};
+    use crate::vortix_core::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -863,60 +860,26 @@ mod tests {
         }
     }
 
-    /// Construct a fully Connected `Engine<TunnelKind>` for the registry's
-    /// `insert` path. We avoid going through `connect_with_tunnel` because
-    /// the registry's primary refresh uses the real platform's route table
-    /// — we want the test to fully control the primary slot.
-    fn connected_engine(profile_name: &str, iface: &str) -> Engine<TunnelKind> {
-        let owned = profile_name.to_string();
-        let resolver = move |id: &ProfileId| {
-            if id.as_str() == owned {
-                Some(CoreProfile::new(
-                    id.clone(),
-                    owned.clone(),
-                    ProtocolKind::WireGuard,
-                    PathBuf::from(format!("/tmp/{owned}.conf")),
-                ))
-            } else {
-                None
-            }
-        };
-        let mock = MockTunnel::new();
-        mock.script_up(ScriptedTunnelOutcome::UpSuccess {
-            interface_name: iface.to_string(),
-            pid: Some(42),
-        });
-        let mut engine = Engine::new(TunnelKind::Mock(mock), resolver);
-        let _events = engine.handle(crate::vortix_core::engine::input::Input::UserCommand(
-            crate::vortix_core::engine::input::UserCommand::Connect {
-                profile_id: ProfileId::new(profile_name),
+    fn insert_connected(app: &mut App, name: &str, interface: &str, allowed_ips: Vec<Cidr>) {
+        use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
+        let profile_id = ProfileId::new(name);
+        app.registry.insert_for_test(TunnelSnapshot {
+            profile_id: profile_id.clone(),
+            state: Connection::Connected {
+                profile_id,
+                since: SystemTime::UNIX_EPOCH,
+                health: ConnectionHealth::default(),
+                details: Box::new(crate::vortix_core::engine::DetailedConnectionInfo {
+                    interface: interface.to_owned(),
+                    interface_authoritative: true,
+                    ..Default::default()
+                }),
             },
-        ));
-        engine
-    }
-
-    fn awaiting_engine(profile_name: &str) -> Engine<TunnelKind> {
-        // We can't drive the Engine into AwaitingUserInput via a public
-        // input today (issue #191 isn't wired). The mock-tunnel happy path
-        // lands us in Connected — for test purposes we use the
-        // Engine's public `set_state` if available, otherwise we install a
-        // hand-built engine. Inspect the Engine surface.
-        // Fallback: just return a fresh engine; the test below overrides
-        // its state via direct field mutation through a thin helper.
-        let owned = profile_name.to_string();
-        let resolver = move |id: &ProfileId| {
-            if id.as_str() == owned {
-                Some(CoreProfile::new(
-                    id.clone(),
-                    owned.clone(),
-                    ProtocolKind::WireGuard,
-                    PathBuf::from(format!("/tmp/{owned}.conf")),
-                ))
-            } else {
-                None
-            }
-        };
-        Engine::new(TunnelKind::Mock(MockTunnel::new()), resolver)
+            role: Role::Addressable { allowed_ips },
+            health: ConnectionHealth::default(),
+            interface_name: Some(interface.to_owned()),
+            started_at: Some(SystemTime::UNIX_EPOCH),
+        });
     }
 
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
@@ -1115,115 +1078,6 @@ mod tests {
     // ───────────── render: focus-driven snapshot lookup ─────────────
 
     #[test]
-    fn focused_primary_renders_primary_role_with_zero_slash_zero() {
-        let mut app = App::new_test();
-        let dir = TempDir::new().expect("tmpdir");
-        let cfg_path = dir.path().join("corp.conf");
-        std::fs::write(&cfg_path, "[Interface]\nFwMark = 51820\n").unwrap();
-        app.runtime.profiles = vec![make_profile("corp", cfg_path)];
-        app.profile_list_state.select(Some(0));
-
-        let engine = connected_engine("corp", "utun7");
-        app.registry
-            .insert(ProfileId::new("corp"), engine, vec![v4("0.0.0.0/0")]);
-        // Force the registry to treat corp as primary by faking the route
-        // probe via a fresh registry with a probe. We can't swap registry's
-        // private probe field from outside, so instead we directly invoke
-        // refresh_primary in production; here we just assert the Role line
-        // appears as Addressable (since refresh_primary will return None on
-        // host CI). The takeaway: Primary-route mapping is registry-
-        // internal — UI-side we trust whatever role the snapshot returns.
-        // To still exercise the Primary branch, we test role_line directly
-        // above; this integration test only confirms the snapshot wiring.
-        let out = render_to_string(&mut app, 80, 20);
-        assert!(out.contains("Role"), "Role line missing:\n{out}");
-        // corp's snapshot.role will be Addressable (no primary yet on
-        // route table) — assert it shows up, not "Not Connected".
-        assert!(
-            !out.contains("Not Connected"),
-            "should not render disconnected for a Connected snapshot:\n{out}"
-        );
-    }
-
-    #[test]
-    fn exit_row_hidden_when_focused_tunnel_is_not_primary() {
-        // `app.runtime.isp` / `app.runtime.location` describe the
-        // egress that the PRIMARY tunnel owns (set by the ipinfo.io
-        // telemetry that goes out through whoever holds the kernel
-        // default route). Showing the same row on a split tunnel's
-        // Connection Details would either copy the primary's info
-        // (misleading) or imply per-tunnel telemetry vortix doesn't
-        // run. Hide the row when not focused on the primary.
-        let mut app = App::new_test();
-        let dir = TempDir::new().expect("tmpdir");
-        let cfg_path = dir.path().join("split.conf");
-        std::fs::write(&cfg_path, "[Interface]\n").unwrap();
-        app.runtime.profiles = vec![make_profile("split", cfg_path)];
-        app.profile_list_state.select(Some(0));
-
-        // Seed ISP + location values that WOULD render in the row.
-        app.runtime.isp = "AS14061 DigitalOcean, LLC".to_string();
-        app.runtime.location = "Frankfurt am Main, DE".to_string();
-
-        // Insert a Connected entry whose iface doesn't match any
-        // kernel-route value the test registry knows about, so
-        // is_focused_primary stays false.
-        let engine = connected_engine("split", "utun8");
-        app.registry
-            .insert(ProfileId::new("split"), engine, vec![v4("10.0.0.0/8")]);
-
-        let out = render_to_string(&mut app, 80, 20);
-        assert!(
-            !out.contains("Exit"),
-            "Exit row must not render for a non-primary tunnel — the value would be the primary's egress, not this tunnel's:\n{out}"
-        );
-        // The Server row stays — that one IS this tunnel's endpoint.
-        assert!(
-            out.contains("Server"),
-            "Server row must still render (it's tunnel-specific):\n{out}"
-        );
-    }
-
-    #[test]
-    fn focused_secondary_with_disjoint_cidr_renders_addressable_role() {
-        let mut app = App::new_test();
-        let dir = TempDir::new().expect("tmpdir");
-        let cfg_path = dir.path().join("lab.conf");
-        std::fs::write(&cfg_path, "[Interface]\nFwMark = 51820\n").unwrap();
-        app.runtime.profiles = vec![make_profile("lab", cfg_path)];
-        app.profile_list_state.select(Some(0));
-
-        let engine = connected_engine("lab", "utun8");
-        app.registry
-            .insert(ProfileId::new("lab"), engine, vec![v4("10.0.0.0/8")]);
-
-        let out = render_to_string(&mut app, 80, 20);
-        // User-facing copy: "Split tunnel" replaces "Addressable".
-        assert!(
-            out.contains("Split tunnel"),
-            "Split tunnel role missing:\n{out}"
-        );
-        assert!(
-            !out.contains("Addressable"),
-            "internal jargon leaked to user-facing render:\n{out}"
-        );
-        assert!(out.contains("10.0.0.0/8"), "CIDR missing:\n{out}");
-        // Latency on a non-exit tunnel must show n/a AND explain
-        // why (telemetry runs only on the active exit). The bare
-        // "n/a (split tunnel)" label without explanation forced users
-        // to ask "why?".
-        assert!(out.contains("n/a"), "Latency must show n/a:\n{out}");
-        assert!(
-            out.contains("only measured on the active exit"),
-            "Latency must explain why it's n/a:\n{out}"
-        );
-        assert!(
-            !out.contains("secondary tunnel"),
-            "internal jargon leaked to user-facing render:\n{out}"
-        );
-    }
-
-    #[test]
     fn focused_awaiting_user_input_renders_enter_hint() {
         // Build an Engine and shove an AwaitingUserInput state by going
         // around the input surface: the Connection enum is in the same
@@ -1248,7 +1102,6 @@ mod tests {
         assert!(s.contains("passphrase"));
         // Silence dead-code on the helper builder until issue #191 wires
         // a real AwaitingUserInput state into the FSM.
-        let _ = awaiting_engine("ghost");
     }
 
     /// The panel's address / network / resolver rows read straight off the
@@ -1362,6 +1215,119 @@ mod tests {
     // ───────────── fwmark warning conjunctive condition ─────────────
 
     #[test]
+    fn fwmark_warning_suppressed_when_secondary_config_has_fwmark() {
+        // Even if primary holds 0/0, a secondary that *does* declare
+        // FwMark in its config should NOT trigger the warning. Pure-
+        // function check via config_has_fwmark covered above; this test
+        // documents the boolean intent.
+        let cfg = "[Interface]\nFwMark = 51820\n";
+        assert!(config_has_fwmark(cfg));
+    }
+
+    #[test]
+    fn focused_primary_renders_primary_role_with_zero_slash_zero() {
+        let mut app = App::new_test();
+        let dir = TempDir::new().expect("tmpdir");
+        let cfg_path = dir.path().join("corp.conf");
+        std::fs::write(&cfg_path, "[Interface]\nFwMark = 51820\n").unwrap();
+        app.runtime.profiles = vec![make_profile("corp", cfg_path)];
+        app.profile_list_state.select(Some(0));
+
+        insert_connected(&mut app, "corp", "utun7", vec![v4("0.0.0.0/0")]);
+        // Force the registry to treat corp as primary by faking the route
+        // probe via a fresh registry with a probe. We can't swap registry's
+        // private probe field from outside, so instead we directly invoke
+        // refresh_primary in production; here we just assert the Role line
+        // appears as Addressable (since refresh_primary will return None on
+        // host CI). The takeaway: Primary-route mapping is registry-
+        // internal — UI-side we trust whatever role the snapshot returns.
+        // To still exercise the Primary branch, we test role_line directly
+        // above; this integration test only confirms the snapshot wiring.
+        let out = render_to_string(&mut app, 80, 20);
+        assert!(out.contains("Role"), "Role line missing:\n{out}");
+        // corp's snapshot.role will be Addressable (no primary yet on
+        // route table) — assert it shows up, not "Not Connected".
+        assert!(
+            !out.contains("Not Connected"),
+            "should not render disconnected for a Connected snapshot:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exit_row_hidden_when_focused_tunnel_is_not_primary() {
+        // `app.runtime.isp` / `app.runtime.location` describe the
+        // egress that the PRIMARY tunnel owns (set by the ipinfo.io
+        // telemetry that goes out through whoever holds the kernel
+        // default route). Showing the same row on a split tunnel's
+        // Connection Details would either copy the primary's info
+        // (misleading) or imply per-tunnel telemetry vortix doesn't
+        // run. Hide the row when not focused on the primary.
+        let mut app = App::new_test();
+        let dir = TempDir::new().expect("tmpdir");
+        let cfg_path = dir.path().join("split.conf");
+        std::fs::write(&cfg_path, "[Interface]\n").unwrap();
+        app.runtime.profiles = vec![make_profile("split", cfg_path)];
+        app.profile_list_state.select(Some(0));
+
+        // Seed ISP + location values that WOULD render in the row.
+        app.runtime.isp = "AS14061 DigitalOcean, LLC".to_string();
+        app.runtime.location = "Frankfurt am Main, DE".to_string();
+
+        // Insert a Connected entry whose iface doesn't match any
+        // kernel-route value the test registry knows about, so
+        // is_focused_primary stays false.
+        insert_connected(&mut app, "split", "utun8", vec![v4("10.0.0.0/8")]);
+
+        let out = render_to_string(&mut app, 80, 20);
+        assert!(
+            !out.contains("Exit"),
+            "Exit row must not render for a non-primary tunnel — the value would be the primary's egress, not this tunnel's:\n{out}"
+        );
+        // The Server row stays — that one IS this tunnel's endpoint.
+        assert!(
+            out.contains("Server"),
+            "Server row must still render (it's tunnel-specific):\n{out}"
+        );
+    }
+
+    #[test]
+    fn focused_secondary_with_disjoint_cidr_renders_addressable_role() {
+        let mut app = App::new_test();
+        let dir = TempDir::new().expect("tmpdir");
+        let cfg_path = dir.path().join("lab.conf");
+        std::fs::write(&cfg_path, "[Interface]\nFwMark = 51820\n").unwrap();
+        app.runtime.profiles = vec![make_profile("lab", cfg_path)];
+        app.profile_list_state.select(Some(0));
+
+        insert_connected(&mut app, "lab", "utun8", vec![v4("10.0.0.0/8")]);
+
+        let out = render_to_string(&mut app, 80, 20);
+        // User-facing copy: "Split tunnel" replaces "Addressable".
+        assert!(
+            out.contains("Split tunnel"),
+            "Split tunnel role missing:\n{out}"
+        );
+        assert!(
+            !out.contains("Addressable"),
+            "internal jargon leaked to user-facing render:\n{out}"
+        );
+        assert!(out.contains("10.0.0.0/8"), "CIDR missing:\n{out}");
+        // Latency on a non-exit tunnel must show n/a AND explain
+        // why (telemetry runs only on the active exit). The bare
+        // "n/a (split tunnel)" label without explanation forced users
+        // to ask "why?".
+        assert!(out.contains("n/a"), "Latency must show n/a:\n{out}");
+        assert!(
+            out.contains("only measured on the active exit"),
+            "Latency must explain why it's n/a:\n{out}"
+        );
+        assert!(
+            !out.contains("secondary tunnel"),
+            "internal jargon leaked to user-facing render:\n{out}"
+        );
+    }
+
+    #[test]
     fn fwmark_warning_renders_for_wg_secondary_when_primary_holds_default_and_no_fwmark() {
         let mut app = App::new_test();
         let dir = TempDir::new().expect("tmpdir");
@@ -1379,12 +1345,8 @@ mod tests {
             make_profile("lab", secondary_cfg),
         ];
         // Insert two engines into the registry.
-        let corp_engine = connected_engine("corp", "utun7");
-        app.registry
-            .insert(ProfileId::new("corp"), corp_engine, vec![v4("0.0.0.0/0")]);
-        let lab_engine = connected_engine("lab", "utun8");
-        app.registry
-            .insert(ProfileId::new("lab"), lab_engine, vec![v4("10.0.0.0/8")]);
+        insert_connected(&mut app, "corp", "utun7", vec![v4("0.0.0.0/0")]);
+        insert_connected(&mut app, "lab", "utun8", vec![v4("10.0.0.0/8")]);
 
         // Build the warning line directly via the helper, since
         // `registry.primary()` depends on the host route table — we test
@@ -1416,25 +1378,13 @@ mod tests {
     }
 
     #[test]
-    fn fwmark_warning_suppressed_when_secondary_config_has_fwmark() {
-        // Even if primary holds 0/0, a secondary that *does* declare
-        // FwMark in its config should NOT trigger the warning. Pure-
-        // function check via config_has_fwmark covered above; this test
-        // documents the boolean intent.
-        let cfg = "[Interface]\nFwMark = 51820\n";
-        assert!(config_has_fwmark(cfg));
-    }
-
-    #[test]
     fn fwmark_warning_suppressed_when_focused_is_primary() {
         let mut app = App::new_test();
         let dir = TempDir::new().expect("tmpdir");
         let cfg = dir.path().join("corp.conf");
         std::fs::write(&cfg, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
         app.runtime.profiles = vec![make_profile("corp", cfg)];
-        let engine = connected_engine("corp", "utun7");
-        app.registry
-            .insert(ProfileId::new("corp"), engine, vec![v4("0.0.0.0/0")]);
+        insert_connected(&mut app, "corp", "utun7", vec![v4("0.0.0.0/0")]);
 
         let snap = app
             .registry

@@ -11,9 +11,8 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
 use crate::vortix_config::hooks_config::{validate_hooks, HookConfigError, HookSpec};
-use crate::vortix_core::control::hooks::{HookEvent, HookEventId, LifecycleFact};
-use crate::vortix_core::control::{ControlEvent, ControlSubscription, EventReceiveError};
 use crate::vortix_core::ports::process::{ProcessCredentials, ProcessError};
 use crate::vortix_process::{CommandRunner, CommandSpec};
 
@@ -321,7 +320,6 @@ struct HookJob {
 pub struct HookRunner {
     dispatcher: Option<HookDispatcher>,
     task: Option<JoinHandle<()>>,
-    source_task: Option<JoinHandle<()>>,
 }
 
 impl HookRunner {
@@ -352,7 +350,6 @@ impl HookRunner {
             Self {
                 dispatcher: Some(dispatcher),
                 task: Some(task),
-                source_task: None,
             },
             HookDiagnostics {
                 receiver: diagnostic_receiver,
@@ -374,52 +371,10 @@ impl HookRunner {
             .clone()
     }
 
-    /// Consume committed control-service facts. Lag and service restart may
-    /// lose observational hooks; neither condition is replayed.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if called while the runner is being consumed by shutdown;
-    /// safe Rust ownership prevents that state from being observed by callers.
-    pub fn attach_control(&mut self, mut subscription: ControlSubscription) {
-        if let Some(task) = self.source_task.replace(tokio::spawn({
-            let dispatcher = self
-                .dispatcher
-                .as_ref()
-                .expect("hook runner has not shut down")
-                .clone();
-            async move {
-                loop {
-                    match subscription.recv_event().await {
-                        Ok(envelope) => {
-                            if let ControlEvent::Lifecycle { fact } = envelope.event {
-                                dispatcher.dispatch(&fact);
-                            }
-                        }
-                        Err(EventReceiveError::ResyncRequired { .. }) => {
-                            // Deliberately do not reconstruct or replay arbitrary
-                            // external side effects from the newest snapshot.
-                        }
-                        Err(EventReceiveError::Stopped) => break,
-                    }
-                }
-            }
-        })) {
-            task.abort();
-        }
-    }
-
     /// Stop accepting control events and give already-queued observers a
     /// bounded opportunity to finish. Lifecycle never waits for hook success;
     /// this is only the Standard-mode process-exit drain.
     pub async fn shutdown_bounded(mut self, timeout: std::time::Duration) {
-        // Let the subscription task consume events published by the same
-        // service turn that completed the caller's operation.
-        tokio::task::yield_now().await;
-        if let Some(source_task) = self.source_task.take() {
-            source_task.abort();
-            let _ = source_task.await;
-        }
         drop(self.dispatcher.take());
         let Some(task) = self.task.take() else {
             return;
@@ -434,9 +389,6 @@ impl HookRunner {
 impl Drop for HookRunner {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
-            task.abort();
-        }
-        if let Some(task) = &self.source_task {
             task.abort();
         }
     }

@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use serde::Deserialize;
 use serde_json::json;
 use vortix::vortix_core::cidr::Cidr;
-use vortix::vortix_core::control::AuthorityEpoch;
+use vortix::vortix_core::ids::AuthorityEpoch;
 use vortix::vortix_core::privileged::{
     ChildObservation, ChildOwner, ContainmentId, CustodianAction, DnsHostname, HelperEpoch,
     ObservationState, ObservedChildIdentity, OpenVpnAuthFactors, OpenVpnChallengeKind,

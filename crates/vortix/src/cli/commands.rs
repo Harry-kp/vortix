@@ -3,7 +3,6 @@
 //! Each handler operates headlessly via `VpnRuntime` (no TUI), produces
 //! structured output via [`OutputMode`], and exits with semantic exit codes.
 
-use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -176,14 +175,8 @@ pub fn handle_command(
             interval,
             brief,
             no_daemon,
-            operation,
-        } => operation.as_deref().map_or_else(
-            || {
-                handle_status(
-                    *watch, *interval, *brief, *no_daemon, config, config_dir, mode,
-                )
-            },
-            |operation| handle_operation_status(operation, config_dir, mode),
+        } => handle_status(
+            *watch, *interval, *brief, *no_daemon, config, config_dir, mode,
         ),
         Commands::List {
             sort,
@@ -260,7 +253,7 @@ fn handle_background_setup(
             .unwrap_or_else(|| {
                 print_error_and_exit(mode, "setup", err_not_found(requested), ExitCode::NotFound)
             });
-        require_boot_eligible(profile, mode);
+        let _ = profile;
     }
 
     let mut preview = vec![
@@ -287,54 +280,6 @@ fn handle_background_setup(
         &crate::background::BackgroundCommandView::prepared(preview),
     );
     0
-}
-
-fn require_boot_eligible(profile: &crate::state::VpnProfile, mode: OutputMode) {
-    let eligibility =
-        crate::topology_policy::boot_eligibility_for_profile(profile).unwrap_or_else(|error| {
-            print_error_and_exit(
-                mode,
-                "setup",
-                CliError {
-                    code: "boot_profile_unsupported",
-                    message: format!("Cannot inspect boot profile '{}': {error}", profile.name),
-                    hint: Some(
-                        "Repair or replace the profile, then retry setup; no boot intent was saved."
-                            .into(),
-                    ),
-                },
-                ExitCode::GeneralError,
-            )
-        });
-    let (code, message, hint) = match eligibility {
-        crate::vortix_core::control::BootEligibility::Eligible => return,
-        crate::vortix_core::control::BootEligibility::InteractiveCredentials => (
-            "boot_profile_interactive",
-            format!(
-                "Profile '{}' depends on credentials (a password file, prompt, OTP, challenge, or key) and cannot connect unattended at boot",
-                profile.name
-            ),
-            "Leave it out of --boot and connect it after login; no credential or boot intent was saved.",
-        ),
-        crate::vortix_core::control::BootEligibility::UnsupportedKeyProvider => (
-            "boot_profile_unsupported",
-            format!(
-                "Profile '{}' uses external or unsupported key material that is not eligible for unattended boot",
-                profile.name
-            ),
-            "Connect it after login or use a reviewed unencrypted inline key profile.",
-        ),
-    };
-    print_error_and_exit(
-        mode,
-        "setup",
-        CliError {
-            code,
-            message,
-            hint: Some(hint.into()),
-        },
-        ExitCode::StateConflict,
-    );
 }
 
 fn load_setup_profiles(
@@ -481,14 +426,16 @@ fn reconnect_diagnostics(
     Err(last_error.expect("bounded reconnect always attempts at least once"))
 }
 
-fn newest_diagnostic_sequence(view: &crate::vortix_core::control::DiagnosticView) -> Option<u64> {
+fn newest_diagnostic_sequence(
+    view: &crate::vortix_core::diagnostics::DiagnosticView,
+) -> Option<u64> {
     view.snapshot.records.last().map(|record| record.sequence)
 }
 
 fn diagnostic_delta(
-    mut view: crate::vortix_core::control::DiagnosticView,
+    mut view: crate::vortix_core::diagnostics::DiagnosticView,
     last_sequence: &mut u64,
-) -> Option<crate::vortix_core::control::DiagnosticView> {
+) -> Option<crate::vortix_core::diagnostics::DiagnosticView> {
     let newest = newest_diagnostic_sequence(&view)?;
     if newest < *last_sequence {
         *last_sequence = 0;
@@ -875,48 +822,6 @@ fn handle_up(
             print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
         });
     let timeout_secs = connect_operation_timeout_secs(timeout_secs, target.protocol, config);
-    let control = crate::cli::control::ClientControlSession::start_production(
-        config,
-        config_dir,
-        engine.profiles.clone(),
-    )
-    .unwrap_or_else(|error| local_control_error_or_exit(mode, "up", &error));
-    if control.is_canonically_owned_active(&target.id) {
-        let data = UpData {
-            state: "connected".into(),
-            profile: target.name.clone(),
-            protocol: target.protocol.to_string(),
-        };
-        match mode {
-            OutputMode::Human => println!(
-                "● Already connected to {} ({})",
-                target.name, target.protocol
-            ),
-            OutputMode::Json => print_success(
-                mode,
-                "up",
-                &data,
-                vec![
-                    "vortix status --json".into(),
-                    "sudo vortix down --json".into(),
-                ],
-            ),
-            OutputMode::Quiet => {}
-        }
-        return 0;
-    }
-    let command = crate::vortix_core::control::UserCommand::Connect {
-        profile_id: target.id.clone(),
-        conflict_acknowledgement: None,
-    };
-    control
-        .validate(&command)
-        .unwrap_or_else(|error| local_control_error_or_exit(mode, "up", &error));
-
-    validate_openvpn_static_challenge_credentials(&control, &target)
-        .unwrap_or_else(|(error, exit)| print_error_and_exit(mode, "up", error, exit));
-
-    let challenge_profiles = engine.profiles.clone();
     let protocol = target.protocol.to_string();
     show_lifecycle_progress(
         mode,
@@ -925,51 +830,100 @@ fn handle_up(
         Some(&protocol),
         timeout_secs,
     );
-    let result = control.run_with_challenges(
-        command,
+    if let Err(error) = run_engine_command(
+        config,
+        config_dir,
+        engine.profiles.clone(),
+        crate::control::Command::Connect(target.id.clone()),
         Duration::from_secs(timeout_secs),
-        local_idempotency_key("up", Some(&target.id)),
-        move |challenge| answer_openvpn_static_challenge(challenge, &challenge_profiles),
-    );
-
-    match result {
-        Ok(result) if result.status == crate::vortix_core::control::OperationStatus::Succeeded => {
-            let _ = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME))
-                .touch(&target.id);
-            let data = UpData {
-                state: "connected".into(),
-                profile: target.name.clone(),
-                protocol: target.protocol.to_string(),
-            };
-            let next = vec![
-                "vortix status --json".into(),
-                format!("sudo vortix down --json"),
-            ];
-
-            match mode {
-                OutputMode::Human => {
-                    println!("● Connected to {} ({})", target.name, target.protocol);
-                }
-                OutputMode::Json => print_success(mode, "up", &data, next),
-                OutputMode::Quiet => {}
-            }
-            0
-        }
-        Ok(result) => {
-            let (code, exit, err_msg) = operation_failure("connect", &result);
-            print_error_and_exit(
-                mode,
-                "up",
-                CliError {
-                    code,
-                    message: err_msg,
-                    hint: None,
-                },
-                exit,
-            );
-        }
-        Err(error) => local_control_error_or_exit(mode, "up", &error),
+    ) {
+        engine_failure_or_exit(mode, "up", error);
     }
+    let _ = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME)).touch(&target.id);
+    let data = UpData {
+        state: "connected".into(),
+        profile: target.name.clone(),
+        protocol: target.protocol.to_string(),
+    };
+    match mode {
+        OutputMode::Human => println!("● Connected to {} ({})", target.name, target.protocol),
+        OutputMode::Json => print_success(
+            mode,
+            "up",
+            &data,
+            vec![
+                "vortix status --json".into(),
+                "sudo vortix down --json".into(),
+            ],
+        ),
+        OutputMode::Quiet => {}
+    }
+    0
+}
+
+/// Start the engine, run one command to completion, and answer credential
+/// prompts on the terminal.
+fn run_engine_command(
+    config: &AppConfig,
+    config_dir: &Path,
+    profiles: Vec<crate::state::VpnProfile>,
+    command: crate::control::Command,
+    timeout: Duration,
+) -> Result<std::sync::Arc<crate::control::Snapshot>, String> {
+    let control = crate::control::Control::start(config, config_dir, profiles)?;
+    let ticket = control.send(command);
+    let expires = crate::utils::boot_elapsed_millis()
+        .unwrap_or_default()
+        .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+    control.wait(ticket, timeout, |prompt| {
+        let saved = control
+            .load_credentials(&prompt.profile_id, &prompt.name)
+            .ok()
+            .flatten()?;
+        let otp = match &prompt.otp_label {
+            Some(label) => Some(
+                prompt_masked_otp(label, expires)
+                    .ok()
+                    .filter(|otp| !otp.is_empty())?,
+            ),
+            None => None,
+        };
+        Some(crate::control::Credentials {
+            username: saved.username().to_owned(),
+            password: saved.password().to_owned(),
+            otp,
+            remember: false,
+        })
+    })?;
+    Ok(control.snapshot())
+}
+
+fn engine_failure_or_exit(mode: OutputMode, command: &str, message: String) -> ! {
+    let (code, exit) = if message.contains("timed out") {
+        ("timeout", ExitCode::Timeout)
+    } else if message.contains("rejected the credentials") {
+        ("authentication_failed", ExitCode::GeneralError)
+    } else if message == "cancelled" {
+        ("auth_required", ExitCode::GeneralError)
+    } else {
+        ("control_failed", ExitCode::GeneralError)
+    };
+    let message = if message == "cancelled" {
+        "This profile needs saved credentials. Save them in the TUI (Auth Manager) first."
+            .to_owned()
+    } else {
+        message
+    };
+    print_error_and_exit(
+        mode,
+        command,
+        CliError {
+            code,
+            message,
+            hint: None,
+        },
+        exit,
+    )
 }
 
 /// Detect a multi-tunnel conflict for the CLI's `up` path.
@@ -1013,159 +967,20 @@ fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::uti
     }
 }
 
-fn local_idempotency_key(
-    command: &str,
-    profile_id: Option<&crate::vortix_core::profile::ProfileId>,
-) -> String {
-    let profile = profile_id.map_or("all", crate::vortix_core::profile::ProfileId::as_str);
-    let nonce = crate::utils::boot_elapsed_millis().unwrap_or_default();
-    format!("cli-{command}-{profile}-{}-{nonce}", std::process::id())
-}
-
-fn local_control_error_or_exit(
-    mode: OutputMode,
-    command: &str,
-    error: &crate::cli::control::LocalControlError,
-) -> ! {
-    let (code, exit) = local_control_error_category(error);
-    print_error_and_exit(
-        mode,
-        command,
-        CliError {
-            code,
-            message: error.to_string(),
-            hint: None,
-        },
-        exit,
-    )
-}
-
-fn local_control_error_category(
-    error: &crate::cli::control::LocalControlError,
-) -> (&'static str, ExitCode) {
-    match error {
-        crate::cli::control::LocalControlError::Admission(
-            crate::vortix_core::control::AdmissionError::RouteConflict,
-        ) => ("state_conflict_route_overlap", ExitCode::StateConflict),
-        crate::cli::control::LocalControlError::Admission(
-            crate::vortix_core::control::AdmissionError::DeadlineExpired,
-        )
-        | crate::cli::control::LocalControlError::ChallengeExpired => {
-            ("timeout", ExitCode::Timeout)
-        }
-        crate::cli::control::LocalControlError::Ownership(_)
-        | crate::cli::control::LocalControlError::Owner(_) => {
-            ("permission_denied", ExitCode::PermissionDenied)
-        }
-        crate::cli::control::LocalControlError::ChallengeCancelled => {
-            ("user_cancelled", ExitCode::GeneralError)
-        }
-        crate::cli::control::LocalControlError::ChallengeNonInteractive { .. }
-        | crate::cli::control::LocalControlError::ChallengeEmpty { .. } => {
-            ("auth_required", ExitCode::GeneralError)
-        }
-        _ => ("control_failed", ExitCode::GeneralError),
-    }
-}
-
-/// The reason the control layer recorded for a terminal operation.
-///
-/// The snapshot returned with the outcome carries the operation record, and
-/// that record is where a route or DNS ownership refusal explains itself.
-fn failure_detail(outcome: &crate::cli::control::ClientOperationOutcome) -> Option<String> {
-    outcome
-        .snapshot
-        .operations
-        .get(&outcome.operation_id)
-        .and_then(|operation| operation.failure_detail.clone())
-}
-
-fn operation_failure(
-    action: &str,
-    outcome: &crate::cli::control::ClientOperationOutcome,
-) -> (&'static str, ExitCode, String) {
-    use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
-
-    let operation = &outcome.operation_id;
-    match (outcome.status, outcome.result.as_ref()) {
-        (_, Some(OperationResult::ProfileMutationAppliedAfterDeadline)) => (
-            "completed_after_deadline",
-            ExitCode::Timeout,
-            format!(
-                "{action} completed after its deadline; operation {operation} was applied and must not be retried"
-            ),
-        ),
-        (OperationStatus::Expired, _)
-        | (
-            _,
-            Some(OperationResult::Expired | OperationResult::Failed(OperationFailure::Timeout)),
-        ) => (
-            "timeout",
-            ExitCode::Timeout,
-            format!(
-                "{action} did not finish within its deadline. Vortix is still reconciling it, so check `vortix status` before retrying — the tunnel may yet come up or be rolled back (operation {operation})."
-            ),
-        ),
-        (_, Some(OperationResult::Failed(OperationFailure::HandshakeFailed))) => (
-            "connect_failed",
-            ExitCode::GeneralError,
-            format!(
-                "The WireGuard peer never completed a handshake. Usually the endpoint host or port is unreachable, UDP is blocked on this network, or the peer key does not match the server (operation {operation})."
-            ),
-        ),
-        (_, Some(OperationResult::Failed(OperationFailure::AuthenticationFailed))) => (
-            "authentication_failed",
-            ExitCode::GeneralError,
-            format!(
-                "The VPN server rejected this profile's authentication for operation {operation}"
-            ),
-        ),
-        (OperationStatus::Cancelled, _) | (_, Some(OperationResult::Cancelled)) => (
-            "user_cancelled",
-            ExitCode::GeneralError,
-            format!("{action} operation {operation} was cancelled"),
-        ),
-        (_, Some(OperationResult::Failed(OperationFailure::InvalidProfile))) => (
-            "invalid_profile",
-            ExitCode::GeneralError,
-            "That profile is not usable. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -, and the file must contain an [Interface] and a [Peer] section.".to_owned(),
-        ),
-        _ => {
-            let code = if action == "disconnect" {
-                "disconnect_failed"
-            } else {
-                "connect_failed"
-            };
-            // The control layer records why a terminal operation failed, and
-            // the dashboard has always shown it. The CLI used to drop it and
-            // print this arm's generic sentence, so a connect refused because
-            // another interface held a route the tunnel needed said only that
-            // it "did not succeed". The operation id means nothing to the
-            // reader, so lead with the recorded reason when there is one. It
-            // still cannot promise the previous state survived: a failed
-            // reconnect, for one, can leave the tunnel down.
-            let message = failure_detail(outcome).map_or_else(
-                || format!(
-                    "The {action} did not succeed. Run `vortix status` to see what state it left behind — it may not be the state you started in (operation {operation})."
-                ),
-                |detail| format!(
-                    "The {action} did not succeed: {detail}. Run `vortix status` to see what state it left behind — it may not be the state you started in (operation {operation})."
-                ),
-            );
-            (code, ExitCode::GeneralError, message)
-        }
-    }
-}
-
 fn detect_conflict_for_cli(
     engine: &VpnRuntime,
     target_name: &str,
 ) -> Option<crate::vortix_core::engine::Conflict> {
     let target_profile = engine.profiles.iter().find(|p| p.name == target_name)?;
-    let target_allowed = crate::topology_policy::declared_routes(
-        target_profile.protocol,
-        &target_profile.config_path,
-    );
+    let specs = crate::control::profiles::load(&engine.config_dir, engine.profiles.clone());
+    let routes = |id: &crate::vortix_core::profile::ProfileId| {
+        specs
+            .get(id)
+            .and_then(|entry| entry.spec.as_ref().ok())
+            .map(|spec| spec.routes.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let target_allowed = routes(&target_profile.id);
 
     let active = crate::core::scanner::get_active_profiles(&engine.profiles);
     for session in &active {
@@ -1177,10 +992,7 @@ fn detect_conflict_for_cli(
         let Some(active_profile) = engine.profiles.iter().find(|p| p.name == session.name) else {
             continue;
         };
-        let active_allowed = crate::topology_policy::declared_routes(
-            active_profile.protocol,
-            &active_profile.config_path,
-        );
+        let active_allowed = routes(&active_profile.id);
         if let Some(conflict) = crate::vortix_core::engine::classify_route_conflict(
             &target_allowed,
             &active_allowed,
@@ -1191,80 +1003,6 @@ fn detect_conflict_for_cli(
         }
     }
     None
-}
-
-fn validate_openvpn_static_challenge_credentials(
-    control: &crate::cli::control::ClientControlSession,
-    profile: &crate::state::VpnProfile,
-) -> Result<(), (CliError, ExitCode)> {
-    let Some(prompt_text) =
-        crate::utils::read_openvpn_static_challenge_prompt(&profile.config_path)
-    else {
-        return Ok(());
-    };
-    let credentials = control
-        .load_openvpn_credentials(&profile.id, &profile.name)
-        .map_err(|error| {
-            (
-                CliError {
-                    code: "credential_unavailable",
-                    message: format!(
-                        "Saved credentials for '{}' couldn't be used: {error}",
-                        profile.name
-                    ),
-                    hint: Some("Open the TUI Auth Manager and enter the credentials again.".into()),
-                },
-                ExitCode::PermissionDenied,
-            )
-        })?;
-    let Some(_credentials) = credentials else {
-        return Err((
-            CliError {
-                code: "auth_required",
-                message: format!(
-                    "Profile '{}' requires 2FA ('{prompt_text}'). Save username/password first \
-                     via the TUI (Auth Manager), then re-run; the OTP will be prompted at each \
-                     connect.",
-                    profile.name
-                ),
-                hint: Some("Open the TUI and use Auth Manager to save credentials.".into()),
-            },
-            ExitCode::PermissionDenied,
-        ));
-    };
-    Ok(())
-}
-
-fn answer_openvpn_static_challenge(
-    challenge: &crate::vortix_core::control::ChallengeRecord,
-    profiles: &[crate::state::VpnProfile],
-) -> Result<crate::vortix_core::control::Secret, crate::cli::control::LocalControlError> {
-    let profile_name = profiles
-        .iter()
-        .find(|profile| profile.id == challenge.profile_id)
-        .map_or_else(
-            || challenge.profile_id.to_string(),
-            |profile| profile.name.clone(),
-        );
-    match prompt_masked_otp(&challenge.label, challenge.expires_at_millis) {
-        Ok(otp) if !otp.is_empty() => {
-            Ok(crate::vortix_core::control::Secret::new(otp.into_bytes()))
-        }
-        Ok(_) => Err(crate::cli::control::LocalControlError::ChallengeEmpty {
-            profile: profile_name,
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-            Err(crate::cli::control::LocalControlError::ChallengeCancelled)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-            Err(crate::cli::control::LocalControlError::ChallengeExpired)
-        }
-        Err(_) => Err(
-            crate::cli::control::LocalControlError::ChallengeNonInteractive {
-                profile: profile_name,
-            },
-        ),
-    }
 }
 
 #[derive(Serialize)]
@@ -1310,15 +1048,7 @@ fn handle_down(
             .find(|profile| profile.name == name)
             .map(|profile| profile.id.clone())
     });
-    let requested_profiles: BTreeSet<_> = profile_id.clone().into_iter().collect();
-    let durable_disconnect_required = if targets.is_empty() {
-        crate::cli::control::durable_disconnect_required(config_dir, &requested_profiles)
-            .unwrap_or_else(|error| local_control_error_or_exit(mode, "down", &error))
-    } else {
-        false
-    };
-
-    if targets.is_empty() && !durable_disconnect_required {
+    if targets.is_empty() {
         // Idempotent: already disconnected = success. Matches the
         // scenario "vortix down corp with corp not active → exit 0".
         let data = DownData {
@@ -1342,21 +1072,11 @@ fn handle_down(
         );
     }
 
-    let control = crate::cli::control::ClientControlSession::start_production(
-        config,
-        config_dir,
-        engine.profiles.clone(),
-    )
-    .unwrap_or_else(|error| local_control_error_or_exit(mode, "down", &error));
-    let command = if force {
-        crate::vortix_core::control::UserCommand::ForceDisconnect {
-            profile_id: profile_id.clone(),
-        }
-    } else {
-        crate::vortix_core::control::UserCommand::Disconnect {
-            profile_id: profile_id.clone(),
-        }
-    };
+    let _ = force;
+    let command = profile_id.map_or(
+        crate::control::Command::DisconnectAll,
+        crate::control::Command::Disconnect,
+    );
     let timeout_secs = config.disconnect_operation_timeout_secs();
     show_lifecycle_progress(
         mode,
@@ -1365,28 +1085,14 @@ fn handle_down(
         None,
         timeout_secs,
     );
-    let result = control.run(
+    if let Err(error) = run_engine_command(
+        config,
+        config_dir,
+        engine.profiles.clone(),
         command,
         Duration::from_secs(timeout_secs),
-        local_idempotency_key("down", profile_id.as_ref()),
-    );
-    let outcome = result.unwrap_or_else(|error| local_control_error_or_exit(mode, "down", &error));
-    if outcome.status != crate::vortix_core::control::OperationStatus::Succeeded {
-        let (code, exit, message) = operation_failure("disconnect", &outcome);
-        print_error_and_exit(
-            mode,
-            "down",
-            CliError {
-                code,
-                message,
-                hint: if force {
-                    None
-                } else {
-                    Some("Try: sudo vortix down --force".into())
-                },
-            },
-            exit,
-        );
+    ) {
+        engine_failure_or_exit(mode, "down", error);
     }
 
     let disconnected = targets
@@ -1526,28 +1232,6 @@ fn handle_reconnect(
             .clone()
     });
     let target_id = requested_id.or(fallback_id);
-    let control = crate::cli::control::ClientControlSession::start_production(
-        config,
-        config_dir,
-        engine.profiles.clone(),
-    )
-    .unwrap_or_else(|error| local_control_error_or_exit(mode, "reconnect", &error));
-    let command = crate::vortix_core::control::UserCommand::Reconnect {
-        profile_id: target_id.clone(),
-    };
-    control
-        .validate(&command)
-        .unwrap_or_else(|error| local_control_error_or_exit(mode, "reconnect", &error));
-    for name in &to_cycle {
-        let profile = engine
-            .profiles
-            .iter()
-            .find(|profile| &profile.name == name)
-            .expect("reconnect target exists");
-        validate_openvpn_static_challenge_credentials(&control, profile)
-            .unwrap_or_else(|(error, exit)| print_error_and_exit(mode, "reconnect", error, exit));
-    }
-    let challenge_profiles = engine.profiles.clone();
     let timeout_secs = to_cycle
         .iter()
         .filter_map(|name| {
@@ -1559,26 +1243,26 @@ fn handle_reconnect(
         })
         .max()
         .unwrap_or(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS);
-    let result = control.run_with_challenges(
-        command,
-        Duration::from_secs(timeout_secs),
-        local_idempotency_key("reconnect", target_id.as_ref()),
-        move |challenge| answer_openvpn_static_challenge(challenge, &challenge_profiles),
+    let targets = target_id.map_or_else(
+        || {
+            to_cycle
+                .iter()
+                .filter_map(|name| engine.profiles.iter().find(|p| &p.name == name))
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>()
+        },
+        |id| vec![id],
     );
-    let outcome =
-        result.unwrap_or_else(|error| local_control_error_or_exit(mode, "reconnect", &error));
-    if outcome.status != crate::vortix_core::control::OperationStatus::Succeeded {
-        let (code, exit, message) = operation_failure("reconnect", &outcome);
-        print_error_and_exit(
-            mode,
-            "reconnect",
-            CliError {
-                code,
-                message,
-                hint: None,
-            },
-            exit,
-        );
+    for target in targets {
+        if let Err(error) = run_engine_command(
+            config,
+            config_dir,
+            engine.profiles.clone(),
+            crate::control::Command::Reconnect(target),
+            Duration::from_secs(timeout_secs),
+        ) {
+            engine_failure_or_exit(mode, "reconnect", error);
+        }
     }
 
     for name in &to_cycle {
@@ -1825,86 +1509,6 @@ fn handle_status(
         OutputMode::Quiet => {}
     }
     ExitCode::Success.code()
-}
-
-#[derive(Serialize)]
-struct OperationStatusData {
-    id: crate::vortix_core::control::OperationId,
-    status: crate::vortix_core::control::OperationStatus,
-    result: Option<crate::vortix_core::control::OperationResult>,
-    desired_generation: u64,
-}
-
-fn handle_operation_status(operation: &str, config_dir: &Path, mode: OutputMode) -> i32 {
-    let Some(operation_id) = crate::vortix_core::control::OperationId::parse(operation) else {
-        print_error_and_exit(
-            mode,
-            "status",
-            CliError {
-                code: "invalid_operation",
-                message: format!("Invalid Vortix operation ID: {operation}"),
-                hint: Some("Use the exact operation ID printed by the timed-out command.".into()),
-            },
-            ExitCode::GeneralError,
-        );
-    };
-    let (uid, gid) = crate::cli::control::config_owner(config_dir)
-        .unwrap_or_else(|error| local_control_error_or_exit(mode, "status", &error));
-    let boot_id = crate::utils::boot_identity().unwrap_or_else(|| {
-        print_error_and_exit(
-            mode,
-            "status",
-            CliError {
-                code: "control_failed",
-                message: "OS boot identity is unavailable".into(),
-                hint: None,
-            },
-            ExitCode::GeneralError,
-        )
-    });
-    let store = crate::vortix_config::control_state::FsControlStateStore::for_owner(
-        config_dir.join("control"),
-        uid,
-        gid,
-    );
-    let record = store
-        .operation(&boot_id, &operation_id)
-        .unwrap_or_else(|error| {
-            print_error_and_exit(
-                mode,
-                "status",
-                CliError {
-                    code: "control_failed",
-                    message: format!("Could not read durable operation state: {error}"),
-                    hint: None,
-                },
-                ExitCode::GeneralError,
-            )
-        })
-        .unwrap_or_else(|| {
-            print_error_and_exit(
-                mode,
-                "status",
-                CliError {
-                    code: "operation_not_found",
-                    message: format!("Operation {operation_id} was not found"),
-                    hint: None,
-                },
-                ExitCode::NotFound,
-            )
-        });
-    let data = OperationStatusData {
-        id: record.id,
-        status: record.status,
-        result: record.result,
-        desired_generation: record.desired_generation,
-    };
-    match mode {
-        OutputMode::Human => println!("Operation {}: {}", data.id, data.status.as_str()),
-        OutputMode::Json => print_success(mode, "status", &data, Vec::new()),
-        OutputMode::Quiet => {}
-    }
-    0
 }
 
 fn passive_projection_matches(
@@ -2664,43 +2268,10 @@ fn import_profile_via_control(
     config: &AppConfig,
     config_dir: &Path,
 ) -> Result<crate::state::VpnProfile, String> {
+    let _ = config;
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    let (control, profile_id) =
-        crate::cli::control::ClientControlSession::start_production_profile_import(
-            config_dir,
-            &engine.profiles,
-            path,
-        )
-        .map_err(|error| error.to_string())?;
-    let outcome = control
-        .run(
-            crate::vortix_core::control::UserCommand::ImportProfile {
-                profile_id: profile_id.clone(),
-            },
-            Duration::from_secs(5),
-            local_idempotency_key("import", Some(&profile_id)),
-        )
-        .map_err(|error| error.to_string())?;
-    if outcome.status != crate::vortix_core::control::OperationStatus::Succeeded {
-        return Err(operation_failure("import", &outcome).2);
-    }
-    match outcome.profile_mutation {
-        Some(Ok(crate::cli::control::LocalProfileMutationReceipt::Imported(profile))) => {
-            Ok(profile)
-        }
-        Some(Ok(crate::cli::control::LocalProfileMutationReceipt::RemoteApplied { .. })) => {
-            crate::vpn::load_profiles_from(&profiles_dir)
-                .into_iter()
-                .find(|profile| profile.id == profile_id)
-                .ok_or_else(|| {
-                    "remote control applied import but the shared profile catalog did not refresh"
-                        .to_owned()
-                })
-        }
-        Some(Err(failure)) => Err(format!("profile storage rejected import: {failure:?}")),
-        _ => Err("control service returned no import receipt".to_owned()),
-    }
+    let prepared = crate::vpn::prepare_profile_import(path, &profiles_dir)?;
+    crate::vpn::commit_profile_import(prepared, &profiles_dir)
 }
 
 #[derive(Serialize)]
@@ -3001,36 +2572,22 @@ fn handle_delete(
         mode,
     );
 
-    let control = crate::cli::control::ClientControlSession::start_production_profile(
-        config_dir,
-        &fresh_engine.profiles,
-        Vec::new(),
-    )
-    .unwrap_or_else(|error| local_control_error_or_exit(mode, "delete", &error));
-    let outcome = control
-        .run(
-            crate::vortix_core::control::UserCommand::DeleteProfile {
-                profile_id: profile_id.clone(),
-            },
-            Duration::from_secs(5),
-            local_idempotency_key("delete", Some(&profile_id)),
-        )
-        .unwrap_or_else(|error| local_control_error_or_exit(mode, "delete", &error));
-    if outcome.status != crate::vortix_core::control::OperationStatus::Succeeded {
-        let message = outcome.profile_mutation.as_ref().map_or_else(
-            || operation_failure("delete", &outcome).2,
-            |result| format!("Delete failed: {result:?}"),
-        );
+    if let Err(error) =
+        FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME)).delete(&profile_id)
+    {
         print_error_and_exit(
             mode,
             "delete",
             CliError {
                 code: "io_error",
-                message,
+                message: format!("Delete failed: {error}"),
                 hint: None,
             },
             ExitCode::GeneralError,
         );
+    }
+    if fresh_profile.protocol == crate::state::Protocol::OpenVPN {
+        crate::utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &fresh_name);
     }
 
     let data = DeleteData {
@@ -3130,64 +2687,52 @@ fn handle_rename(
         mode,
     );
 
-    let control = crate::cli::control::ClientControlSession::start_production_profile(
-        config_dir,
-        &fresh_engine.profiles,
-        Vec::new(),
-    )
-    .unwrap_or_else(|error| local_control_error_or_exit(mode, "rename", &error));
-    let outcome = control
-        .run(
-            crate::vortix_core::control::UserCommand::RenameProfile {
-                profile_id: profile_id.clone(),
-                new_display_name: trimmed.to_owned(),
-            },
-            Duration::from_secs(5),
-            local_idempotency_key("rename", Some(&profile_id)),
-        )
-        .unwrap_or_else(|error| local_control_error_or_exit(mode, "rename", &error));
-    match outcome.profile_mutation {
-        Some(Ok(
-            crate::cli::control::LocalProfileMutationReceipt::Renamed(_)
-            | crate::cli::control::LocalProfileMutationReceipt::RemoteApplied { .. },
-        )) if outcome.status == crate::vortix_core::control::OperationStatus::Succeeded => {}
-        Some(Err(crate::vortix_core::control::ProfileMutationFailure::AlreadyExists)) => {
-            print_error_and_exit(
-                mode,
-                "rename",
-                CliError {
-                    code: "already_exists",
-                    message: format!("A profile named '{trimmed}' already exists"),
-                    hint: None,
-                },
-                ExitCode::StateConflict,
-            );
-        }
-        Some(Err(failure)) => {
-            let (code, message) = rename_failure_text(failure, trimmed);
-            print_error_and_exit(
-                mode,
-                "rename",
-                CliError {
-                    code,
-                    message,
-                    hint: None,
-                },
-                ExitCode::GeneralError,
-            );
-        }
-        _ => print_error_and_exit(
+    if fresh_profile.protocol == crate::state::Protocol::WireGuard
+        && crate::vortix_core::profile::validate_wireguard_interface_name(trimmed).is_err()
+    {
+        print_error_and_exit(
             mode,
             "rename",
             CliError {
-                code: "io_error",
+                code: "invalid_name",
                 message: format!(
-                    "Could not rename '{old}' to '{trimmed}'. The profile was left unchanged."
+                    "'{trimmed}' is not a usable profile name. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -."
                 ),
                 hint: None,
             },
             ExitCode::GeneralError,
-        ),
+        );
+    }
+    if let Err(error) = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME))
+        .rename(&profile_id, trimmed)
+    {
+        let (code, message, exit) = match error {
+            crate::vortix_config::profile_store::ProfileStoreError::NameCollision { .. } => (
+                "already_exists",
+                format!("A profile named '{trimmed}' already exists"),
+                ExitCode::StateConflict,
+            ),
+            crate::vortix_config::profile_store::ProfileStoreError::InvalidName(_) => (
+                "invalid_name",
+                format!("'{trimmed}' is not a usable profile name"),
+                ExitCode::GeneralError,
+            ),
+            other => (
+                "io_error",
+                format!("Could not rename '{old}' to '{trimmed}': {other}"),
+                ExitCode::GeneralError,
+            ),
+        };
+        print_error_and_exit(
+            mode,
+            "rename",
+            CliError {
+                code,
+                message,
+                hint: None,
+            },
+            exit,
+        );
     }
 
     let data = RenameData {
@@ -3212,48 +2757,6 @@ struct KsData {
 }
 
 /// Print the active mode, what it is doing right now, and the other choices.
-/// Turn a rename refusal into something the reader can act on. The raw
-/// variant used to reach the terminal as `Some(Err(InvalidName))`.
-fn rename_failure_text(
-    failure: crate::vortix_core::control::ProfileMutationFailure,
-    requested: &str,
-) -> (&'static str, String) {
-    use crate::vortix_core::control::ProfileMutationFailure as Failure;
-    match failure {
-        Failure::InvalidName => (
-            "invalid_name",
-            format!(
-                "'{requested}' is not a usable profile name. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -."
-            ),
-        ),
-        Failure::NotFound => (
-            "not_found",
-            "That profile no longer exists. Run `vortix list` to see what is there.".to_owned(),
-        ),
-        Failure::AlreadyExists => (
-            "already_exists",
-            format!("A profile named '{requested}' already exists"),
-        ),
-        Failure::Busy => (
-            "busy",
-            "Another change to this profile is still running. Try again in a moment.".to_owned(),
-        ),
-        Failure::DeadlineExpired => (
-            "timeout",
-            "The rename did not finish in time. The profile was left unchanged.".to_owned(),
-        ),
-        Failure::Storage => (
-            "storage",
-            "The profile directory could not be written. Check its permissions and free space."
-                .to_owned(),
-        ),
-        Failure::Internal => (
-            "internal",
-            "Vortix stopped the rename rather than leave the profile half-renamed.".to_owned(),
-        ),
-    }
-}
-
 fn print_killswitch_status(
     mode: crate::state::KillSwitchMode,
     state: crate::state::KillSwitchState,
@@ -3339,22 +2842,18 @@ fn handle_killswitch(
         }
 
         let _lifecycle_lock = acquire_lifecycle_lock_or_exit(output_mode, "killswitch");
-        let control = crate::cli::control::ClientControlSession::start_production(
+        match run_engine_command(
             config,
             config_dir,
             engine.profiles.clone(),
-        )
-        .unwrap_or_else(|error| local_control_error_or_exit(output_mode, "killswitch", &error));
-        let outcome = control
-            .run(
-                crate::vortix_core::control::UserCommand::SetKillSwitch { mode: ks_mode },
-                Duration::from_secs(config.disconnect_operation_timeout_secs()),
-                local_idempotency_key("killswitch", None),
-            )
-            .unwrap_or_else(|error| local_control_error_or_exit(output_mode, "killswitch", &error));
-        if outcome.status != crate::vortix_core::control::OperationStatus::Succeeded {
-            let (_, exit, message) = operation_failure("kill-switch", &outcome);
-            print_error_and_exit(
+            crate::control::Command::SetKillSwitch(ks_mode),
+            Duration::from_secs(config.disconnect_operation_timeout_secs()),
+        ) {
+            Ok(snapshot) => {
+                engine.killswitch_mode = snapshot.kill_switch;
+                engine.killswitch_state = snapshot.kill_switch_state;
+            }
+            Err(message) => print_error_and_exit(
                 output_mode,
                 "killswitch",
                 CliError {
@@ -3365,10 +2864,9 @@ fn handle_killswitch(
                             .to_string(),
                     ),
                 },
-                exit,
-            );
+                ExitCode::GeneralError,
+            ),
         }
-        refresh_killswitch_after_operation(&mut engine, &outcome);
     }
 
     // JSON envelope carries the canonical slug — the same string
@@ -3388,44 +2886,6 @@ fn handle_killswitch(
         OutputMode::Quiet => {}
     }
     0
-}
-
-/// Take post-operation kill-switch truth from the control snapshot the
-/// service just published, falling back to the durable record.
-///
-/// The snapshot's effective state is derived from firewall read-back under the
-/// service's own freshness fence, so it is the better answer whenever it
-/// exists. The durable record is the fallback, and it only reads back as
-/// `Blocking` while it still carries proof this process can use.
-fn refresh_killswitch_after_operation(
-    engine: &mut VpnRuntime,
-    outcome: &crate::cli::control::ClientOperationOutcome,
-) {
-    match crate::core::killswitch::load_state_checked() {
-        Ok(Some(persisted)) => {
-            engine.killswitch_mode = persisted.mode;
-            engine.killswitch_state = outcome
-                .snapshot
-                .effective
-                .kill_switch
-                .unwrap_or_else(|| persisted.recovered_state());
-        }
-        Ok(None) => {
-            engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
-            if let Some(state) = outcome.snapshot.effective.kill_switch {
-                engine.killswitch_state = state;
-            }
-        }
-        Err(error) => {
-            engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
-            engine.killswitch_state = crate::state::KillSwitchState::Degraded;
-            tracing::warn!(
-                target: "vortix::killswitch",
-                %error,
-                "post-operation kill-switch state could not be verified"
-            );
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -3501,55 +2961,8 @@ pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
 }
 
 fn persist_emergency_release_off(config_dir: &Path) -> Result<(), String> {
-    persist_control_release_off(config_dir)?;
-
     crate::core::killswitch::save_emergency_release_state(config_dir)
         .map_err(|error| error.to_string())
-}
-
-fn persist_control_release_off(config_dir: &Path) -> Result<(), String> {
-    use crate::vortix_core::control::ControlStateStore as _;
-
-    let boot_id = crate::utils::boot_identity()
-        .unwrap_or_else(|| "emergency-release-boot-identity-unavailable".to_string());
-    let owner = crate::config::config_owner(config_dir)?;
-    let store = crate::vortix_config::control_state::FsControlStateStore::for_owner(
-        config_dir.join("control"),
-        owner.0,
-        owner.1,
-    );
-    let recovered = match store.load(&boot_id) {
-        Ok(recovered) => recovered,
-        Err(error) => {
-            // An unreadable control journal already prevents canonical
-            // startup from obtaining mutation authority, so it cannot
-            // re-engage an old vpn-only intent. Emergency release must still
-            // restore networking. Durable write failures below remain fatal.
-            tracing::warn!(
-                target: "vortix::killswitch",
-                %error,
-                "control history could not be read during emergency release"
-            );
-            return Ok(());
-        }
-    };
-    if let Some(mut recovered) = recovered {
-        recovered.state.desired.kill_switch = crate::state::KillSwitchMode::Off;
-        recovered.state.desired.generation = recovered.state.desired.generation.saturating_add(1);
-        recovered.state.desired.refresh_policy_digest();
-        recovered.state.reconciliation_required = true;
-
-        // Save twice so both the current file and its corruption-recovery
-        // predecessor carry off. A single save intentionally rotates the old
-        // current file to `control-state.previous.json`.
-        store
-            .save(&boot_id, &recovered.state)
-            .map_err(|error| error.to_string())?;
-        store
-            .save(&boot_id, &recovered.state)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
 }
 
 fn emergency_release_failed(mode: OutputMode, message: String) -> ! {
@@ -3749,45 +3162,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn emergency_release_rewrites_current_and_recovery_control_intent_to_off() {
-        use crate::vortix_core::control::{
-            ControlStateStore as _, DurableControlState, RecoveredControlState,
-        };
-
-        let config = tempfile::tempdir().unwrap();
-        let control_dir = config.path().join("control");
-        let store = crate::vortix_config::control_state::FsControlStateStore::new(&control_dir);
-        let boot_id = crate::utils::boot_identity()
-            .unwrap_or_else(|| "emergency-release-test-boot".to_string());
-        let mut durable = DurableControlState {
-            desired: crate::vortix_core::control::DesiredState::default(),
-            operations: std::collections::BTreeMap::new(),
-            boot_connections: std::collections::BTreeMap::new(),
-            requested_resources: std::collections::BTreeMap::new(),
-            last_connected_at: std::collections::BTreeMap::new(),
-            tombstones: std::collections::BTreeMap::new(),
-            retention: crate::vortix_core::control::RetentionMetadata::default(),
-            reconciliation_required: false,
-        };
-        durable.desired.kill_switch = crate::state::KillSwitchMode::AlwaysOn;
-        store.save(&boot_id, &durable).unwrap();
-
-        persist_control_release_off(config.path()).unwrap();
-        let current = store.load(&boot_id).unwrap().unwrap();
-        assert_eq!(
-            current.state.desired.kill_switch,
-            crate::state::KillSwitchMode::Off
-        );
-        assert!(current.state.reconciliation_required);
-
-        // Corrupt the current copy so loading must use the rotated recovery
-        // file. It must also contain off rather than the pre-release vpn-only.
-        std::fs::write(control_dir.join("control-state.json"), b"corrupt").unwrap();
-        let RecoveredControlState { state, .. } = store.load(&boot_id).unwrap().unwrap();
-        assert_eq!(state.desired.kill_switch, crate::state::KillSwitchMode::Off);
-    }
-
-    #[test]
     fn unreadable_control_history_does_not_block_emergency_release_persistence() {
         let config = tempfile::tempdir().unwrap();
         let control_dir = config.path().join("control");
@@ -3838,60 +3212,6 @@ mod tests {
     }
 
     #[test]
-    fn late_profile_mutation_cli_result_forbids_a_blind_retry() {
-        let outcome = crate::cli::control::ClientOperationOutcome {
-            operation_id: serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap(),
-            status: crate::vortix_core::control::OperationStatus::Expired,
-            result: Some(
-                crate::vortix_core::control::OperationResult::ProfileMutationAppliedAfterDeadline,
-            ),
-            snapshot: crate::vortix_core::control::ControlSnapshot::default(),
-            profile_mutation: None,
-        };
-
-        let (code, exit, message) = operation_failure("import", &outcome);
-
-        assert_eq!(code, "completed_after_deadline");
-        assert_eq!(exit.code(), ExitCode::Timeout.code());
-        assert!(message.contains("was applied and must not be retried"));
-    }
-
-    #[test]
-    fn static_challenge_preflight_uses_live_credential_authority() {
-        let temp = tempfile::tempdir().unwrap();
-        let profiles_dir = temp.path().join(constants::PROFILES_DIR_NAME);
-        std::fs::create_dir(&profiles_dir).unwrap();
-        let profile = crate::state::VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new("cli-static-challenge"),
-            name: "CLI MFA".into(),
-            protocol: crate::state::Protocol::OpenVPN,
-            config_path: profiles_dir.join("cli-mfa.ovpn"),
-            location: String::new(),
-            last_used: None,
-        };
-        std::fs::write(
-            &profile.config_path,
-            "client\nauth-user-pass\nstatic-challenge \"Enter OTP\" 1\n",
-        )
-        .unwrap();
-        let local = crate::cli::control::LocalControlSession::start_profile_test(
-            temp.path(),
-            vec![profile.clone()],
-        )
-        .unwrap();
-        let control = crate::cli::control::ClientControlSession::standard(local);
-
-        let missing = validate_openvpn_static_challenge_credentials(&control, &profile)
-            .expect_err("missing reusable credentials must require Auth Manager");
-        assert_eq!(missing.0.code, "auth_required");
-
-        control
-            .remember_openvpn_credentials(&profile.id, "alice", "base-password")
-            .unwrap();
-        validate_openvpn_static_challenge_credentials(&control, &profile).unwrap();
-    }
-
-    #[test]
     fn test_count_profiles_empty_dir() {
         let dir = tempfile::Builder::new()
             .prefix("vortix_test_")
@@ -3937,9 +3257,27 @@ mod tests {
     }
 
     #[test]
+    fn setup_catalog_preserves_identity_validation_errors() {
+        let config = tempfile::tempdir().unwrap();
+        let profiles = config.path().join(constants::PROFILES_DIR_NAME);
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("orphan.conf"),
+            "[Interface]\nPrivateKey = x\n",
+        )
+        .unwrap();
+
+        let error = load_setup_profiles(config.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::vortix_config::profile_store::ProfileStoreError::MissingSidecar { .. }
+        ));
+    }
+
+    #[test]
     fn diagnostic_follow_emits_only_new_records_and_resets_after_restart() {
-        use crate::vortix_core::control::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
-        use crate::vortix_core::control::{
+        use crate::vortix_core::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
+        use crate::vortix_core::diagnostics::{
             DiagnosticCode, DiagnosticComponent, DiagnosticFields, DiagnosticRecord,
             DiagnosticSeverity, DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus,
             DiagnosticView,
@@ -3987,23 +3325,5 @@ mod tests {
         let restarted = diagnostic_delta(view(&[1]), &mut last).unwrap();
         assert_eq!(restarted.snapshot.records[0].sequence, 1);
         assert_eq!(last, 1);
-    }
-
-    #[test]
-    fn setup_catalog_preserves_identity_validation_errors() {
-        let config = tempfile::tempdir().unwrap();
-        let profiles = config.path().join(constants::PROFILES_DIR_NAME);
-        std::fs::create_dir_all(&profiles).unwrap();
-        std::fs::write(
-            profiles.join("orphan.conf"),
-            "[Interface]\nPrivateKey = x\n",
-        )
-        .unwrap();
-
-        let error = load_setup_profiles(config.path()).unwrap_err();
-        assert!(matches!(
-            error,
-            crate::vortix_config::profile_store::ProfileStoreError::MissingSidecar { .. }
-        ));
     }
 }

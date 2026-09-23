@@ -21,7 +21,6 @@ use vortix::app::{
     App, ConnectionState, FocusedPanel, InputMode, Protocol, Toast, ToastType, VpnProfile,
 };
 use vortix::message::{Message, ScrollMove, SelectionMove};
-use vortix::state::{KillSwitchMode, KillSwitchState};
 
 static INIT: Once = Once::new();
 
@@ -75,7 +74,7 @@ fn set_connected(app: &mut App, name: &str) {
     set_projection(
         app,
         name,
-        vortix::vortix_core::engine::state::Connection::Connected {
+        &vortix::vortix_core::engine::state::Connection::Connected {
             profile_id: vortix::vortix_core::profile::ProfileId::new(name),
             since: std::time::SystemTime::now(),
             health: vortix::vortix_core::engine::state::ConnectionHealth::Healthy,
@@ -84,135 +83,43 @@ fn set_connected(app: &mut App, name: &str) {
     );
 }
 
-fn set_connecting(app: &mut App, name: &str) {
-    if !app.runtime.profiles.iter().any(|p| p.name == name) {
-        add_wg_profiles(app, &[name]);
-    }
-    set_projection(
-        app,
-        name,
-        vortix::vortix_core::engine::state::Connection::Connecting {
-            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
-            started_at: std::time::SystemTime::now(),
-            attempt: 1,
-            retry_budget_remaining: std::time::Duration::ZERO,
-        },
-    );
-}
-
-fn set_disconnecting(app: &mut App, name: &str) {
-    use vortix::vortix_core::profile::ProfileId;
-    if app.registry.snapshot(&ProfileId::new(name)).is_none() {
-        set_connected(app, name);
-    }
-    set_projection(
-        app,
-        name,
-        vortix::vortix_core::engine::state::Connection::Disconnecting {
-            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
-            started_at: std::time::SystemTime::now(),
-        },
-    );
-}
-
 fn set_projection(
     app: &mut App,
     name: &str,
-    state: vortix::vortix_core::engine::state::Connection,
+    state: &vortix::vortix_core::engine::state::Connection,
 ) {
-    use vortix::vortix_core::engine::{ConnectionHealth, Role, TunnelSnapshot};
+    use vortix::control::{Phase, TunnelView};
+    use vortix::vortix_core::engine::state::Connection;
     use vortix::vortix_core::profile::ProfileId;
 
+    let phase = match state {
+        Connection::Connected { .. } => Phase::Up,
+        Connection::Disconnecting { .. } => Phase::Stopping,
+        Connection::Reconnecting { .. } => Phase::Waiting { retry_at: None },
+        Connection::AwaitingUserInput { .. } => Phase::AwaitingCredentials,
+        _ => Phase::Starting,
+    };
     let profile_id = ProfileId::new(name);
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.generation = snapshot.generation.saturating_add(1);
+    let mut snapshot = (*app.control_snapshot).clone();
+    snapshot.version += 1;
     snapshot.primary = Some(profile_id.clone());
-    snapshot.tunnels.insert(
-        profile_id.clone(),
-        TunnelSnapshot {
-            profile_id,
-            state,
-            role: Role::Primary {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::Healthy,
-            interface_name: Some("wg0".into()),
-            started_at: Some(std::time::SystemTime::now()),
+    snapshot
+        .tunnels
+        .retain(|tunnel| tunnel.profile_id != profile_id);
+    snapshot.tunnels.push(TunnelView {
+        profile_id,
+        name: name.to_owned(),
+        phase,
+        interface: Some("wg0".into()),
+        since: std::time::SystemTime::now(),
+        routes: Vec::new(),
+        dns: Vec::new(),
+        details: vortix::vortix_core::engine::state::DetailedConnectionInfo {
+            interface: "wg0".into(),
+            ..Default::default()
         },
-    );
-    app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-}
-
-mod canonical_control_projection {
-    use super::*;
-    #[test]
-    fn lifecycle_is_rendered_only_from_successive_snapshots() {
-        let mut app = test_app();
-        set_connecting(&mut app, "vpn-a");
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Connecting { .. }
-        ));
-
-        set_connected(&mut app, "vpn-a");
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Connected { .. }
-        ));
-
-        set_disconnecting(&mut app, "vpn-a");
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Disconnecting { .. }
-        ));
-
-        let mut snapshot = app.control_snapshot.clone();
-        snapshot.generation = snapshot.generation.saturating_add(1);
-        snapshot.tunnels.clear();
-        snapshot.primary = None;
-        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
-    }
-
-    #[test]
-    fn unknown_effective_policy_is_degraded_unless_the_desired_mode_is_off() {
-        let mut app = test_app();
-        let mut snapshot = app.control_snapshot.clone();
-        snapshot.generation = 1;
-        snapshot.desired.kill_switch = KillSwitchMode::AlwaysOn;
-        snapshot.effective.kill_switch = None;
-        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-        assert_eq!(app.registry.killswitch_mode(), KillSwitchMode::AlwaysOn);
-        assert_eq!(app.registry.killswitch_state(), KillSwitchState::Degraded);
-
-        let mut off = app.control_snapshot.clone();
-        off.generation = off.generation.saturating_add(1);
-        off.desired.kill_switch = KillSwitchMode::Off;
-        off.effective.kill_switch = None;
-        app.handle_message(Message::ControlSnapshot(Box::new(off)));
-        assert_eq!(app.registry.killswitch_mode(), KillSwitchMode::Off);
-        assert_eq!(app.registry.killswitch_state(), KillSwitchState::Disabled);
-    }
-
-    #[test]
-    fn protected_auto_is_armed_only_while_a_tunnel_is_connected() {
-        let mut app = test_app();
-        set_connected(&mut app, "vpn-a");
-        let mut snapshot = app.control_snapshot.clone();
-        snapshot.generation = snapshot.generation.saturating_add(1);
-        snapshot.desired.kill_switch = KillSwitchMode::Auto;
-        snapshot.effective.kill_switch = Some(KillSwitchState::Armed);
-        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Armed);
-
-        let mut blocked = app.control_snapshot.clone();
-        blocked.generation = blocked.generation.saturating_add(1);
-        blocked.effective.kill_switch = Some(KillSwitchState::Blocking);
-        blocked.tunnels.clear();
-        blocked.primary = None;
-        app.handle_message(Message::ControlSnapshot(Box::new(blocked)));
-        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Blocking);
-    }
+    });
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
 }
 
 // ============================================================================

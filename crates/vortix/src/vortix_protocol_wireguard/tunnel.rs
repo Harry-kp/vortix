@@ -1167,7 +1167,7 @@ fn resolve_kernel_iface(
     }
     #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: warn-only diagnostic for an anomalous wg-quick state on macOS
     warn!(
-        target: "vortix::tunnel::wireguard",
+        target: "vortix::control::tunnels::wireguard",
         profile = %profile_id,
         basename = %basename,
         "wg.up: resolve_wireguard_interface returned None on macOS; falling back to basename. \
@@ -1361,7 +1361,7 @@ impl Tunnel for WgTunnel {
 
         let path_str = effective_path.to_string_lossy().into_owned();
         info!(
-            target: "vortix::tunnel::wireguard",
+            target: "vortix::control::tunnels::wireguard",
             profile = %profile.id,
             config = %path_str,
             "wg.up"
@@ -1499,7 +1499,7 @@ impl Tunnel for WgTunnel {
 
     fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
         info!(
-            target: "vortix::tunnel::wireguard",
+            target: "vortix::control::tunnels::wireguard",
             profile = %handle.profile_id,
             interface = %handle.interface_name,
             "wg.down"
@@ -1535,7 +1535,7 @@ impl Tunnel for WgTunnel {
             // failed exact-attempt teardown intentionally leaves ownership
             // ambiguous and the caller must not pretend it was cleaned up.
             warn!(
-                target: "vortix::tunnel::wireguard",
+                target: "vortix::control::tunnels::wireguard",
                 profile = %handle.profile_id,
                 interface = %handle.interface_name,
                 stderr = %stderr.trim(),
@@ -1755,47 +1755,6 @@ mod tests {
         );
         let managed = managed_up_body(input, &managed_profile([resolution])).unwrap();
         assert!(managed.contains("Endpoint = [2001:db8::19]:51820"));
-    }
-
-    #[test]
-    fn cached_profile_resolution_reaches_managed_config_without_dns() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("corp.conf");
-        let body = "[Interface]\nPrivateKey = abc\n[Peer]\nPublicKey = xyz\nEndpoint = endpoint.invalid:51820\nAllowedIPs = 0.0.0.0/0\n";
-        std::fs::write(&path, body).unwrap();
-        let vpn_profile = crate::state::VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new("corp"),
-            name: "Corporate".into(),
-            protocol: crate::state::Protocol::WireGuard,
-            location: String::new(),
-            config_path: path,
-            last_used: None,
-        };
-        let digest = crate::vortix_core::control::PolicyDigest::sha256(body.as_bytes()).0;
-        let cache_json = serde_json::json!({
-            "schema_version": 1,
-            "profiles": {
-                "corp": {
-                    "profile_digest": digest,
-                    "endpoints": [{
-                        "hostname": "endpoint.invalid",
-                        "port": 51820,
-                        "address": "203.0.113.19"
-                    }]
-                }
-            }
-        });
-        let encoded = serde_json::to_vec(&cache_json).unwrap();
-        let mut cache =
-            crate::topology_policy::EndpointResolutionCache::decode(Some(&encoded)).unwrap();
-        let topology = crate::topology_policy::topology_for_profile(&vpn_profile, &mut cache)
-            .expect("exact cache entry resolves topology without DNS");
-        let profile = crate::tunnel::profile_view(&vpn_profile)
-            .with_endpoint_resolutions(topology.resolved_endpoints)
-            .require_managed_endpoint_resolution();
-        let managed = managed_up_body(body, &profile).unwrap();
-        assert!(managed.contains("Endpoint = 203.0.113.19:51820"));
-        assert!(!managed.contains("endpoint.invalid"));
     }
 
     fn wg_handle(

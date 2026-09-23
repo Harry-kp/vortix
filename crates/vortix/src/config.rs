@@ -340,12 +340,11 @@ pub(crate) fn persist_theme_choice(
     use std::str::FromStr as _;
 
     let owner = config_owner(config_dir)?;
-    let directory = crate::vortix_config::control_state::open_control_directory(
-        config_dir, false, owner.0, owner.1,
-    )
-    .map_err(|error| format!("cannot safely open the config directory: {error}"))?
-    .ok_or_else(|| "the config directory no longer exists".to_string())?;
-    let bytes = crate::vortix_config::control_state::read_owned_user_entry(
+    let directory =
+        crate::vortix_config::owned_file::open_owned_directory(config_dir, false, owner.0, owner.1)
+            .map_err(|error| format!("cannot safely open the config directory: {error}"))?
+            .ok_or_else(|| "the config directory no longer exists".to_string())?;
+    let bytes = crate::vortix_config::owned_file::read_owned_user_entry(
         &directory,
         CONFIG_FILE,
         owner.0,
@@ -376,7 +375,7 @@ pub(crate) fn persist_theme_choice(
     #[cfg(unix)]
     {
         classify_theme_write(
-            crate::vortix_config::control_state::write_owned_atomic_with_hook(
+            crate::vortix_config::owned_file::write_owned_atomic_with_hook(
                 &directory,
                 CONFIG_FILE,
                 body.as_bytes(),
@@ -388,7 +387,7 @@ pub(crate) fn persist_theme_choice(
     }
 
     #[cfg(not(unix))]
-    crate::vortix_config::control_state::write_owned_atomic(
+    crate::vortix_config::owned_file::write_owned_atomic(
         &directory,
         CONFIG_FILE,
         body.as_bytes(),
@@ -401,9 +400,9 @@ pub(crate) fn persist_theme_choice(
 
 #[cfg(unix)]
 fn classify_theme_write(
-    result: Result<(), crate::vortix_config::control_state::AtomicWriteError>,
+    result: Result<(), crate::vortix_config::owned_file::AtomicWriteError>,
 ) -> Result<ThemePersistOutcome, String> {
-    use crate::vortix_config::control_state::AtomicWriteError;
+    use crate::vortix_config::owned_file::AtomicWriteError;
 
     match result {
         Ok(()) => Ok(ThemePersistOutcome::Durable),
@@ -1029,8 +1028,8 @@ mod tests {
     #[test]
     fn published_theme_is_kept_when_directory_sync_is_uncertain() {
         let outcome = classify_theme_write(Err(
-            crate::vortix_config::control_state::AtomicWriteError::PublishedButDirectoryUnsynced(
-                crate::vortix_config::control_state::ControlStateError::Capacity,
+            crate::vortix_config::owned_file::AtomicWriteError::PublishedButDirectoryUnsynced(
+                crate::vortix_config::owned_file::FileError::Capacity,
             ),
         ))
         .unwrap();

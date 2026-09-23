@@ -252,7 +252,7 @@ impl VpnRuntime {
                     ) {
                         if let Some(journal) = crate::vortix_core::journal::global_journal() {
                             let _ = journal.append(
-                                crate::vortix_core::engine::EngineEvent::ConnectionHealthChanged {
+                                crate::vortix_core::journal::JournalEvent::ConnectionHealthChanged {
                                     profile_id: profile.id.clone(),
                                     old,
                                     new: current.clone(),

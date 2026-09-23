@@ -13,9 +13,9 @@ use zeroize::Zeroizing;
 use crate::constants::OPENVPN_AUTH_DIR;
 use crate::vortix_core::profile::{unambiguous_legacy_artifact_key, ProfileId};
 
-use super::control_state::{
-    open_control_directory, open_owned_directory_at, write_owned_atomic_with_hook,
-    AtomicWriteError, AtomicWriteStage, ControlDirectory, ControlStateError,
+use super::owned_file::{
+    open_owned_directory, open_owned_directory_at, write_owned_atomic_with_hook, AtomicWriteError,
+    AtomicWriteStage, FileError, OwnedDirectory,
 };
 
 const MAX_AUTH_BYTES: u64 = 16 * 1024;
@@ -270,10 +270,7 @@ impl FsOpenVpnCredentialStore {
         &self,
         profile_id: &ProfileId,
         credentials: &RememberedOpenVpnCredentials,
-        mut stage_hook: impl FnMut(
-            AtomicWriteStage,
-            Option<&std::fs::File>,
-        ) -> Result<(), ControlStateError>,
+        mut stage_hook: impl FnMut(AtomicWriteStage, Option<&std::fs::File>) -> Result<(), FileError>,
     ) -> Result<(), CredentialStoreError> {
         let directory = self
             .auth_directory(true)?
@@ -302,7 +299,7 @@ impl FsOpenVpnCredentialStore {
                     && !entry_matches(&directory, &name, expected)?
                 {
                     changed.set(true);
-                    return Err(ControlStateError::UnsafeFile);
+                    return Err(FileError::UnsafeFile);
                 }
                 Ok(())
             },
@@ -316,7 +313,7 @@ impl FsOpenVpnCredentialStore {
         match result {
             Ok(()) => Ok(()),
             Err(AtomicWriteError::NotPublished(error)) => {
-                Err(map_control_error(error, CredentialIoOperation::Replace))
+                Err(map_file_error(error, CredentialIoOperation::Replace))
             }
             Err(AtomicWriteError::PublishedButDirectoryUnsynced(_)) => {
                 Err(CredentialStoreError::DurabilityUncertain)
@@ -324,17 +321,14 @@ impl FsOpenVpnCredentialStore {
         }
     }
 
-    fn auth_directory(
-        &self,
-        create: bool,
-    ) -> Result<Option<ControlDirectory>, CredentialStoreError> {
-        let config = open_control_directory(
+    fn auth_directory(&self, create: bool) -> Result<Option<OwnedDirectory>, CredentialStoreError> {
+        let config = open_owned_directory(
             &self.config_directory,
             false,
             self.expected_uid,
             self.expected_gid,
         )
-        .map_err(|error| map_control_error(error, CredentialIoOperation::OpenDirectory))?
+        .map_err(|error| map_file_error(error, CredentialIoOperation::OpenDirectory))?
         .ok_or(CredentialStoreError::UnsafeArtifact(
             CredentialArtifactIssue::UnsafeDirectory,
         ))?;
@@ -345,7 +339,7 @@ impl FsOpenVpnCredentialStore {
             self.expected_uid,
             self.expected_gid,
         )
-        .map_err(|error| map_control_error(error, CredentialIoOperation::OpenDirectory))?;
+        .map_err(|error| map_file_error(error, CredentialIoOperation::OpenDirectory))?;
         if let Some(directory) = directory.as_ref() {
             normalize_private_directory(directory, self.expected_uid)?;
         }
@@ -356,7 +350,7 @@ impl FsOpenVpnCredentialStore {
     #[allow(unsafe_code)]
     fn open_entry(
         &self,
-        directory: &ControlDirectory,
+        directory: &OwnedDirectory,
         key: &str,
         canonical_stable_id: bool,
     ) -> Result<Option<OpenedCredential>, CredentialStoreError> {
@@ -423,7 +417,7 @@ impl FsOpenVpnCredentialStore {
                 return Err(CredentialStoreError::Malformed);
             }
             if !entry_matches(directory, &name, Some(identity))
-                .map_err(|error| map_control_error(error, CredentialIoOperation::OpenEntry))?
+                .map_err(|error| map_file_error(error, CredentialIoOperation::OpenEntry))?
             {
                 return Err(CredentialStoreError::UnsafeArtifact(
                     CredentialArtifactIssue::ChangedEntry,
@@ -431,7 +425,7 @@ impl FsOpenVpnCredentialStore {
             }
             adopt_descriptor(&file, self.expected_uid, self.expected_gid)?;
             if !entry_matches(directory, &name, Some(identity))
-                .map_err(|error| map_control_error(error, CredentialIoOperation::OpenEntry))?
+                .map_err(|error| map_file_error(error, CredentialIoOperation::OpenEntry))?
             {
                 return Err(CredentialStoreError::UnsafeArtifact(
                     CredentialArtifactIssue::ChangedEntry,
@@ -447,7 +441,7 @@ impl FsOpenVpnCredentialStore {
     #[cfg(not(unix))]
     fn open_entry(
         &self,
-        _directory: &ControlDirectory,
+        _directory: &OwnedDirectory,
         _key: &str,
         _canonical_stable_id: bool,
     ) -> Result<Option<OpenedCredential>, CredentialStoreError> {
@@ -458,7 +452,7 @@ impl FsOpenVpnCredentialStore {
     #[allow(unsafe_code)]
     fn clear_entry(
         &self,
-        directory: &ControlDirectory,
+        directory: &OwnedDirectory,
         key: &str,
         canonical_stable_id: bool,
     ) -> Result<bool, CredentialStoreError> {
@@ -470,7 +464,7 @@ impl FsOpenVpnCredentialStore {
         };
         let name = format!("{key}.auth");
         if !entry_matches(directory, &name, Some(opened.identity))
-            .map_err(|error| map_control_error(error, CredentialIoOperation::Clear))?
+            .map_err(|error| map_file_error(error, CredentialIoOperation::Clear))?
         {
             return Err(CredentialStoreError::UnsafeArtifact(
                 CredentialArtifactIssue::ChangedEntry,
@@ -491,7 +485,7 @@ impl FsOpenVpnCredentialStore {
     #[cfg(not(unix))]
     fn clear_entry(
         &self,
-        _directory: &ControlDirectory,
+        _directory: &OwnedDirectory,
         _key: &str,
         _canonical_stable_id: bool,
     ) -> Result<bool, CredentialStoreError> {
@@ -628,7 +622,7 @@ fn legacy_artifact_key(display_name: &str) -> Option<&str> {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn normalize_private_directory(
-    directory: &ControlDirectory,
+    directory: &OwnedDirectory,
     expected_uid: u32,
 ) -> Result<(), CredentialStoreError> {
     use std::os::fd::AsRawFd as _;
@@ -675,7 +669,7 @@ fn normalize_private_directory(
 
 #[cfg(not(unix))]
 fn normalize_private_directory(
-    _directory: &ControlDirectory,
+    _directory: &OwnedDirectory,
     _expected_uid: u32,
 ) -> Result<(), CredentialStoreError> {
     Ok(())
@@ -744,14 +738,14 @@ fn adopt_descriptor(file: &std::fs::File, uid: u32, gid: u32) -> Result<(), Cred
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn entry_matches(
-    directory: &ControlDirectory,
+    directory: &OwnedDirectory,
     name: &str,
     expected: Option<EntryIdentity>,
-) -> Result<bool, ControlStateError> {
+) -> Result<bool, FileError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
-    let name = CString::new(name).map_err(|_| ControlStateError::UnsafeFile)?;
+    let name = CString::new(name).map_err(|_| FileError::UnsafeFile)?;
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -776,27 +770,21 @@ fn entry_matches(
 
 #[cfg(not(unix))]
 fn entry_matches(
-    _directory: &ControlDirectory,
+    _directory: &OwnedDirectory,
     _name: &str,
     _expected: Option<EntryIdentity>,
-) -> Result<bool, ControlStateError> {
-    Err(ControlStateError::UnsafeFile)
+) -> Result<bool, FileError> {
+    Err(FileError::UnsafeFile)
 }
 
-fn map_control_error(
-    error: ControlStateError,
-    operation: CredentialIoOperation,
-) -> CredentialStoreError {
+fn map_file_error(error: FileError, operation: CredentialIoOperation) -> CredentialStoreError {
     match error {
-        ControlStateError::UnsafeFile => {
+        FileError::UnsafeFile => {
             CredentialStoreError::UnsafeArtifact(CredentialArtifactIssue::UnsafeDirectory)
         }
-        ControlStateError::Capacity => CredentialStoreError::Capacity,
-        ControlStateError::Io(source) => CredentialStoreError::Io { operation, source },
-        ControlStateError::UnsupportedSchema(_)
-        | ControlStateError::Invalid(_)
-        | ControlStateError::Corrupt
-        | ControlStateError::Json(_) => CredentialStoreError::Io {
+        FileError::Capacity => CredentialStoreError::Capacity,
+        FileError::Io(source) => CredentialStoreError::Io { operation, source },
+        FileError::Json(_) => CredentialStoreError::Io {
             operation,
             source: std::io::Error::other("owner-bound filesystem operation failed"),
         },
@@ -1130,7 +1118,7 @@ mod tests {
 
         let result = store.replace_with_stage_hook(&profile, &new, |stage, _| {
             if stage == AtomicWriteStage::Publish {
-                return Err(ControlStateError::Io(std::io::Error::other(
+                return Err(FileError::Io(std::io::Error::other(
                     "injected pre-publish failure",
                 )));
             }
@@ -1170,7 +1158,7 @@ mod tests {
                 }
                 let result = store.replace_with_stage_hook(&profile, &new, |stage, _| {
                     if stage == injected {
-                        return Err(ControlStateError::Io(std::io::Error::other(
+                        return Err(FileError::Io(std::io::Error::other(
                             "injected atomic stage failure",
                         )));
                     }
@@ -1194,7 +1182,7 @@ mod tests {
         store.replace(&profile, &old).unwrap();
         let result = store.replace_with_stage_hook(&profile, &new, |stage, _| {
             if stage == AtomicWriteStage::DirectorySync {
-                return Err(ControlStateError::Io(std::io::Error::other(
+                return Err(FileError::Io(std::io::Error::other(
                     "injected directory sync failure",
                 )));
             }

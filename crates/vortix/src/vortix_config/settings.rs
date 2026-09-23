@@ -372,31 +372,6 @@ disk = false
     }
 
     #[test]
-    fn lifecycle_hooks_load_as_absolute_argv_specs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.toml");
-        fs::write(
-            &path,
-            r#"
-[[hooks]]
-event = "connected"
-executable = "/usr/bin/notify-send"
-args = ["VPN connected"]
-timeout_secs = 7
-"#,
-        )
-        .unwrap();
-
-        let settings = Settings::load_from(None, Some(&path)).unwrap();
-        assert_eq!(settings.hooks.len(), 1);
-        assert_eq!(settings.hooks[0].timeout_secs, 7);
-        assert_eq!(
-            settings.hooks[0].event,
-            crate::vortix_core::control::HookEvent::Connected
-        );
-    }
-
-    #[test]
     fn invalid_hook_fails_the_settings_boundary() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.toml");
@@ -568,5 +543,27 @@ wireguard_health_targets = ["10.0.0.1"]
         let migrated = migrate_settings(s).unwrap();
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(migrated.engine.retry_budget_secs, 42);
+    }
+
+    #[test]
+    fn lifecycle_hooks_load_as_absolute_argv_specs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        fs::write(
+            &path,
+            r#"
+[[hooks]]
+event = "connected"
+executable = "/usr/bin/notify-send"
+args = ["VPN connected"]
+timeout_secs = 7
+"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load_from(None, Some(&path)).unwrap();
+        assert_eq!(settings.hooks.len(), 1);
+        assert_eq!(settings.hooks[0].timeout_secs, 7);
+        assert_eq!(settings.hooks[0].event, crate::hooks::HookEvent::Connected);
     }
 }

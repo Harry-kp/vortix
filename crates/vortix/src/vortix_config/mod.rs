@@ -8,11 +8,11 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-pub mod control_state;
 pub mod error;
 pub mod hooks_config;
 pub mod migration;
 pub mod openvpn_credentials;
+pub mod owned_file;
 pub mod profile_store;
 pub mod settings;
 

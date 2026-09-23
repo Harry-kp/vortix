@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::vortix_core::control::OperationId;
+use crate::vortix_core::ids::OperationId;
 use crate::vortix_core::ports::process::{
     CommandSpec, ManagedProcessId, ProcessError, ProcessLifecycle,
 };

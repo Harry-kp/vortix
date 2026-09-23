@@ -267,7 +267,7 @@ pub fn load_diagnostics(
     fallback: &Path,
     allow_fallback: bool,
     now_millis: u64,
-) -> Result<crate::vortix_core::control::DiagnosticView, crate::daemon::client::ClientError> {
+) -> Result<crate::vortix_core::diagnostics::DiagnosticView, crate::daemon::client::ClientError> {
     if allow_fallback {
         crate::daemon::client::diagnostics_or_fallback(socket, fallback, now_millis)
     } else {

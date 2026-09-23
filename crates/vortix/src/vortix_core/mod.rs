@@ -9,15 +9,15 @@
 
 pub mod cidr;
 pub mod cidr_subtract;
-pub mod control;
+pub mod diagnostics;
 pub mod engine;
+pub mod ids;
 pub mod ipc;
 pub mod journal;
-pub mod network_plan;
-pub(crate) mod openvpn_credentials;
 pub mod ports;
 pub mod privileged;
 pub mod profile;
+pub mod secret;
 pub mod secret_file;
 pub mod state;
 

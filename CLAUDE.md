@@ -48,13 +48,22 @@ Two rules from it that bite silently:
 
 Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. The release gate lives in [`docs/manual-testing/P0.md`](docs/manual-testing/P0.md) — numbered workflows an agent can execute against a live TUI on macOS and Linux. When you ship a feature with observable runtime behavior, add a workflow only if no automated test can answer it, and write its pass signal as something visible in a captured frame.
 
-## Multi-tunnel: registry is the truth
+## Connections: one engine, one planner
 
-The App layer's single source of truth for active VPN state is `App.registry: TunnelRegistry<TunnelKind>`. Every panel renderer (header, sidebar, Connection Details, Security Guard, footer) reads from `app.registry.snapshot_all` / `app.registry.snapshot(profile_id)` exclusively.
+`src/control/` owns every VPN connection. One engine thread (`engine.rs`) holds
+the tunnel list (`state.rs`), starts and stops protocol processes
+(`tunnels.rs`), and after every change asks the pure planner (`plan.rs`) what
+routes, DNS and firewall the host should carry, then applies the difference
+(`net.rs`). The plan depends only on which tunnels are up and the kill switch
+mode — never on the order of commands — so every path to the same tunnel set
+lands on the same host state. The newest full tunnel owns the default route
+and DNS; a switch brings the new tunnel up before stopping the ones it
+conflicts with.
 
-The legacy `ConnectionState` enum still exists in `crates/vortix/src/vpn_runtime/connection_state.rs` and is re-exported from `vpn_runtime`, but only as: (a) the CLI's blocking helpers' local single-tunnel view (one process, one tunnel), and (b) the return type of `App::legacy_state()` — a derived view from the registry primary for the few residual single-tunnel-shaped reads (kill-switch sync, delete-safety, scanner dispatch).
-
-There is **no** `connection_state` field on `VpnRuntime`. Don't add one. Multi-tunnel-aware code reads registry snapshots; single-tunnel-shaped code calls `App::legacy_state()` and matches on the variant.
+TUI and CLI send `control::Command`s and read `control::Snapshot`s; nothing
+else touches routes, DNS or pf. The dashboard's `TunnelRegistry` is only a
+render cache fed from the snapshot. New behaviour goes into the planner or a
+state transition, with a test in `plan.rs`/`state.rs` — not into a caller.
 
 ## Kill switch semantics
 

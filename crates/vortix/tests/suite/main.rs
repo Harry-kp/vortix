@@ -11,14 +11,8 @@
 mod control_scenarios;
 
 mod cli_profile_mutation;
-mod control_contract;
-mod control_parity;
-mod control_reconcile;
-mod control_recovery;
-mod control_service;
 mod daemon_ipc;
 mod dns_policy;
-mod hooks_integration;
 mod json_v2_envelope;
 mod openvpn_credential_store;
 mod privileged_contract;

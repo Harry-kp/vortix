@@ -263,7 +263,6 @@ fn cli_status_disconnected() {
             interval: 2,
             brief: true,
             no_daemon: true,
-            operation: None,
         },
         dir.path(),
         "test",
@@ -640,35 +639,6 @@ fn clap_parses_up_yes_defaults_false() {
     } else {
         panic!("Expected Up command");
     }
-}
-
-#[test]
-fn clap_parses_durable_operation_query() {
-    use clap::Parser;
-    use vortix::cli::args::{Args, Commands};
-
-    let args = Args::try_parse_from([
-        "vortix",
-        "status",
-        "--operation",
-        "op-0000000000000001-0000000000000002",
-    ])
-    .unwrap();
-    assert!(matches!(
-        args.command,
-        Some(Commands::Status {
-            operation: Some(operation),
-            ..
-        }) if operation == "op-0000000000000001-0000000000000002"
-    ));
-    assert!(Args::try_parse_from([
-        "vortix",
-        "status",
-        "--operation",
-        "op-0000000000000001-0000000000000002",
-        "--watch",
-    ])
-    .is_err());
 }
 
 #[test]

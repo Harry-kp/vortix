@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::vortix_core::control::hooks::HookEvent;
+use crate::hooks::HookEvent;
 
 pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 5;
 pub const MAX_HOOK_TIMEOUT_SECS: u64 = 60;

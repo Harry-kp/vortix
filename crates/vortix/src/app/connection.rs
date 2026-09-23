@@ -1,1478 +1,270 @@
-//! VPN connection lifecycle management and kill switch control.
+//! TUI side of the connection engine: sends commands, renders snapshots.
 
-#[cfg(test)]
-use super::Protocol;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use super::{App, InputMode, ToastType};
+use crate::control::{Command, Level, Phase, Snapshot, TunnelView};
 use crate::utils;
+use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
+use crate::vortix_core::engine::state::{Connection, ConnectionHealth, PromptKind};
 use crate::vortix_core::engine::Conflict;
 use crate::vortix_core::profile::ProfileId;
 
 pub(super) const CONTROL_STARTING_MESSAGE: &str =
     "The VPN service is still starting. Try again in a moment.";
 
-#[derive(Clone, Copy)]
-pub(crate) enum PendingControlSubject {
-    Connection,
-    Reconnection,
-    Disconnection,
-    DisconnectAll,
-    KillSwitch,
-}
-
-#[derive(Clone, Copy)]
-enum ProfileDisconnectKind {
-    Normal,
-    Force,
-}
-
-impl PendingControlSubject {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Connection => "connection",
-            Self::Reconnection => "reconnection",
-            Self::Disconnection => "disconnection",
-            Self::DisconnectAll => "disconnect all",
-            Self::KillSwitch => "kill switch change",
-        }
-    }
-
-    const fn queued_message(self) -> &'static str {
-        match self {
-            Self::Connection => "Connection queued",
-            Self::Reconnection => "Reconnection queued",
-            Self::Disconnection => "Disconnection queued",
-            Self::DisconnectAll => "Disconnecting all VPNs",
-            Self::KillSwitch => "Kill switch change queued",
-        }
-    }
-
-    fn dns_failure_message(self, detail: Option<&str>) -> String {
-        let message = match self {
-            Self::Connection | Self::Reconnection => {
-                "VPN DNS could not be applied safely. Your previous network settings were restored."
-            }
-            Self::Disconnection | Self::DisconnectAll => {
-                "Disconnect could not finish safely. Your previous network settings were restored."
-            }
-            Self::KillSwitch => {
-                "The kill switch could not be changed safely. Your previous network settings were restored."
-            }
-        };
-        friendly_dns_failure_explanation(detail).map_or_else(
-            || message.to_string(),
-            |explanation| format!("{message} {explanation}"),
-        )
-    }
-
-    const fn authentication_failure_message(self) -> &'static str {
-        match self {
-            Self::Connection | Self::Reconnection => {
-                "The VPN server rejected this profile. Check its certificate or username and password; if they are correct, the server may not authorize this profile."
-            }
-            Self::Disconnection | Self::DisconnectAll | Self::KillSwitch => {
-                "The VPN server rejected the requested authentication."
-            }
-        }
-    }
-
-    /// Say what ran out of time, why it matters, and what to do — a bare
-    /// "timed out" left the user with no idea whether the tunnel was up.
-    const fn timeout_message(self) -> &'static str {
-        match self {
-            Self::Connection | Self::Reconnection => {
-                "Connection timed out. The VPN did not come up in time, so Vortix left it disconnected. Check the server endpoint and your network, then try again."
-            }
-            Self::Disconnection | Self::DisconnectAll => {
-                "Disconnection timed out. The tunnel was torn down but Vortix could not confirm the system settled. Check the tunnel list; if the profile is still shown, disconnect it again."
-            }
-            Self::KillSwitch => {
-                "Kill switch change timed out. The firewall rules were not confirmed, so protection may not match what is shown. Re-apply the mode from the Security Guard panel."
-            }
-        }
-    }
-
-    fn failure_message(self, failure: crate::vortix_core::control::OperationFailure) -> String {
-        use crate::vortix_core::control::OperationFailure;
-        match failure {
-            OperationFailure::Timeout => self.timeout_message().to_string(),
-            OperationFailure::Rejected => format!(
-                "{} could not start because another action or route conflict is still active. Try again in a moment.",
-                self.label()
-            ),
-            OperationFailure::AuthenticationFailed => {
-                self.authentication_failure_message().to_string()
-            }
-            OperationFailure::DnsPolicyFailed => self.dns_failure_message(None),
-            OperationFailure::HandshakeFailed => {
-                "No WireGuard handshake was received. Check the server endpoint, keys, and network reachability."
-                    .to_string()
-            }
-            OperationFailure::InvalidProfile => {
-                "This WireGuard profile has an invalid filename. Delete it, rename the original file to 1–15 characters (for example, wg07.conf), and import it again."
-                    .to_string()
-            }
-            OperationFailure::ObservationFailed => format!(
-                "Vortix finished the {} but could not read back the system state to confirm it. The tunnel list may be out of date. Press [r] to refresh; if it stays wrong, disconnect and reconnect.",
-                self.label()
-            ),
-            OperationFailure::Internal => format!(
-                "Vortix hit an internal error during the {} and stopped rather than leave the tunnel half-configured. The Event Log line above this one names the step that failed.",
-                self.label()
-            ),
-        }
-    }
-}
-
-/// Turn a route-ownership refusal into something the user can act on.
-///
-/// The control layer reports a failed topology verification as `Internal`, and
-/// the generic text for that says Vortix hit an internal error. Nothing
-/// internal broke: another tunnel already owns a route this profile needs, and
-/// the profile cannot have it until that tunnel goes. Two `OpenVPN` profiles
-/// whose servers push the same subnet collide exactly this way, and neither
-/// config mentions the subnet, so the pushed route is the only place it shows.
-fn friendly_route_conflict_explanation(detail: Option<&str>) -> Option<String> {
-    let detail = detail?;
-    let lowered = detail.to_ascii_lowercase();
-    if !lowered.contains("should route through") || !lowered.contains("but the system routes it") {
-        return None;
-    }
-    Some(format!(
-        "Another active tunnel already owns a route this profile needs, so Vortix stopped rather than report protection it does not have. {detail}. Disconnect the tunnel that holds that route and connect this profile again."
-    ))
-}
-
-fn friendly_dns_failure_explanation(detail: Option<&str>) -> Option<&'static str> {
-    let detail = detail?.to_ascii_lowercase();
-    if detail.contains("another vpn or network service") || detail.contains("instead of this vpn") {
-        Some(
-            "Another VPN or network service is routing this profile's DNS traffic. Disconnect it and try again. The Event Log shows the conflicting interface and a command to inspect it.",
-        )
-    } else if [
-        "owner",
-        "owned",
-        "ownership",
-        "backup",
-        "earlier generation",
-        "interrupted",
-    ]
-    .iter()
-    .any(|needle| detail.contains(needle))
-    {
-        Some("Vortix found unfinished DNS state from an earlier connection.")
-    } else if detail.contains("route") || detail.contains("through tunnel") {
-        Some("The VPN's DNS server could not be verified through the tunnel.")
-    } else if detail.contains("lock") || detail.contains("busy") {
-        Some("Another Vortix process was updating DNS.")
-    } else if detail.contains("restore") || detail.contains("rollback") {
-        Some("Vortix could not verify restoration of the previous DNS settings.")
-    } else {
-        None
-    }
-}
-
-fn profile_mutation_failure_message(
-    failure: crate::vortix_core::control::ProfileMutationFailure,
-) -> &'static str {
-    use crate::vortix_core::control::ProfileMutationFailure;
-    match failure {
-        ProfileMutationFailure::NotFound => "The profile no longer exists",
-        ProfileMutationFailure::AlreadyExists => "A profile with that name already exists",
-        ProfileMutationFailure::InvalidName => "The profile name is invalid",
-        ProfileMutationFailure::Busy => "The profile is busy; try again in a moment",
-        ProfileMutationFailure::DeadlineExpired => "The profile update timed out",
-        ProfileMutationFailure::Storage => "The profile could not be saved safely",
-        ProfileMutationFailure::Internal => "The profile update could not be completed",
-    }
-}
-
-fn remote_profile_failure_message(
-    failure: crate::vortix_core::control::OperationFailure,
-) -> &'static str {
-    use crate::vortix_core::control::OperationFailure;
-    match failure {
-        OperationFailure::Timeout => "The profile update timed out",
-        OperationFailure::Rejected => "The profile update was refused because the profile is busy",
-        OperationFailure::AuthenticationFailed => "The profile update could not be authorized",
-        OperationFailure::InvalidProfile => "The profile is invalid",
-        OperationFailure::ObservationFailed => "Vortix could not verify the profile update",
-        OperationFailure::DnsPolicyFailed
-        | OperationFailure::HandshakeFailed
-        | OperationFailure::Internal => "The profile update could not be completed",
-    }
-}
-
-fn control_error_message(error: &crate::cli::control::LocalControlError) -> String {
-    use crate::cli::control::LocalControlError;
-    use crate::vortix_core::control::AdmissionError;
-    match error {
-        LocalControlError::Busy | LocalControlError::Admission(AdmissionError::Busy) => {
-            "Another action is still finishing. Try again in a moment.".to_string()
-        }
-        LocalControlError::Admission(AdmissionError::NotReady) => {
-            CONTROL_STARTING_MESSAGE.to_string()
-        }
-        LocalControlError::Admission(AdmissionError::RouteConflict) => {
-            // Reached only when the confirmation overlay could not be reopened
-            // - see `recover_route_conflict`. By that point the conflicting
-            // tunnel is no longer in our snapshot, so naming it would be a
-            // guess. Telling the user to "review the confirmation" was worse:
-            // there was no confirmation anywhere to review.
-            "Another tunnel claimed these routes first. Try connecting again.".to_string()
-        }
-        LocalControlError::Admission(AdmissionError::ProfileActive) => {
-            "Disconnect this profile before changing it.".to_string()
-        }
-        LocalControlError::Admission(AdmissionError::ProfileBusy) => {
-            "Another action is still using this profile. Try again in a moment.".to_string()
-        }
-        LocalControlError::Admission(AdmissionError::ProfileNotFound) => {
-            "This profile no longer exists.".to_string()
-        }
-        LocalControlError::Admission(AdmissionError::ProfileAlreadyExists) => {
-            "A profile with this identity already exists.".to_string()
-        }
-        LocalControlError::Admission(AdmissionError::DeadlineExpired)
-        | LocalControlError::ChallengeExpired => "The action timed out. Try again.".to_string(),
-        LocalControlError::Stopped | LocalControlError::Admission(AdmissionError::Stopped) => {
-            "The VPN service stopped. Restart Vortix and try again.".to_string()
-        }
-        LocalControlError::Admission(AdmissionError::Persistence) => {
-            "Vortix could not save this change safely. No action was applied.".to_string()
-        }
-        LocalControlError::Profile { reason, .. } | LocalControlError::ProfileImport(reason) => {
-            reason.clone()
-        }
-        _ => "Vortix could not start this action. See Event Log for details.".to_string(),
-    }
-}
-
-/// Whether a refusal is the service saying "these routes are already claimed".
-fn is_route_conflict(error: &crate::cli::control::LocalControlError) -> bool {
-    use crate::cli::control::LocalControlError;
-    use crate::vortix_core::control::AdmissionError;
-    matches!(
-        error,
-        LocalControlError::Admission(AdmissionError::RouteConflict)
-    )
-}
-
-/// The profile a connect-shaped command targeted, if it was one.
-///
-/// Deliberately narrower than [`lifecycle_command_profile_id`]: only a connect
-/// can be refused for a route conflict, and recovering one means re-offering
-/// the *connect*.
-fn connect_target(command: Option<&crate::vortix_core::control::UserCommand>) -> Option<ProfileId> {
-    use crate::vortix_core::control::UserCommand;
-    match command? {
-        UserCommand::Connect { profile_id, .. } | UserCommand::ConnectExclusive { profile_id } => {
-            Some(profile_id.clone())
-        }
-        _ => None,
-    }
-}
-
-pub(crate) struct PendingControlOperation {
-    subject: PendingControlSubject,
-    profile_name: Option<String>,
-    admitted_after_generation: u64,
-    recovery_retry: bool,
-}
-
-/// One tracked operation that has reached terminal truth, paired with the
-/// snapshot facts its notification needs.
-struct TerminalOperation {
-    operation_id: crate::vortix_core::control::OperationId,
-    subject: PendingControlSubject,
-    profile_name: Option<String>,
-    recovery_retry: bool,
-    status: crate::vortix_core::control::OperationStatus,
-    result: Option<crate::vortix_core::control::OperationResult>,
-    failure_detail: Option<String>,
-    owned_retry: Option<crate::vortix_core::control::OperationId>,
-    late_route_conflict: Option<(ProfileId, Conflict)>,
-    connect_profile: Option<crate::vortix_core::profile::ProfileId>,
-}
-
-/// The profile a connect operation targets, when it names exactly one.
-///
-/// Read from the operation's own intent rather than threaded through every
-/// caller, so a terminal result can act on the right credential entry.
-fn operation_connect_profile(
-    operation: &crate::vortix_core::control::OperationRecord,
-) -> Option<crate::vortix_core::profile::ProfileId> {
-    use crate::vortix_core::control::{OperationIntent, RequestedTunnelState};
-    let (OperationIntent::DesiredSubset { tunnels, .. }
-    | OperationIntent::UnexpectedRecovery { tunnels, .. }) = &operation.intent
-    else {
-        return None;
-    };
-    let mut connecting = tunnels
-        .iter()
-        .filter(|(_, state)| **state == RequestedTunnelState::Connected);
-    let (profile_id, _) = connecting.next()?;
-    connecting.next().is_none().then(|| profile_id.clone())
-}
-
-pub(crate) struct CatalogFeedback {
-    applied_count: usize,
-    first_applied_name: Option<String>,
-    failed_count: usize,
-    first_failure: Option<String>,
-    updated_at: std::time::Instant,
-}
-
-const CATALOG_FEEDBACK_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
-
-fn control_command_subject(
-    command: Option<&crate::vortix_core::control::UserCommand>,
-) -> Option<PendingControlSubject> {
-    use crate::vortix_core::control::UserCommand;
-    match command? {
-        UserCommand::Connect { .. } | UserCommand::ConnectExclusive { .. } => {
-            Some(PendingControlSubject::Connection)
-        }
-        UserCommand::Reconnect { .. } => Some(PendingControlSubject::Reconnection),
-        UserCommand::Disconnect { profile_id: None }
-        | UserCommand::ForceDisconnect { profile_id: None } => {
-            Some(PendingControlSubject::DisconnectAll)
-        }
-        UserCommand::Disconnect {
-            profile_id: Some(_),
-        }
-        | UserCommand::ForceDisconnect {
-            profile_id: Some(_),
-        } => Some(PendingControlSubject::Disconnection),
-        UserCommand::SetKillSwitch { .. } => Some(PendingControlSubject::KillSwitch),
-        UserCommand::ImportProfile { .. }
-        | UserCommand::RenameProfile { .. }
-        | UserCommand::DeleteProfile { .. } => None,
-    }
-}
-
-/// Where the cursor starts in the credential overlay.
-///
-/// Jumping to the one-time code is right when the pair above it is already
-/// filled in — that is the only box left to type. With nothing saved it put
-/// the cursor in the third box of an empty form, so typing a username filled
-/// the one-time code instead.
-fn initial_auth_focus(
-    kind: &crate::vortix_core::control::ChallengeKind,
-    credentials_prefilled: bool,
-) -> crate::state::AuthField {
-    if matches!(
-        kind,
-        crate::vortix_core::control::ChallengeKind::TwoFactorCode
-    ) && credentials_prefilled
-    {
+/// Where the cursor starts in the credential overlay: the one-time code when
+/// the pair above it is already filled in, otherwise the username.
+fn initial_auth_focus(otp: bool, credentials_prefilled: bool) -> crate::state::AuthField {
+    if otp && credentials_prefilled {
         crate::state::AuthField::Otp
     } else {
         crate::state::AuthField::Username
     }
 }
 
-#[cfg(test)]
-mod control_command_subject_tests {
-    use super::initial_auth_focus;
-    use crate::state::AuthField;
-    use crate::vortix_core::control::ChallengeKind;
-
-    #[test]
-    fn an_empty_two_factor_form_starts_at_the_username() {
-        assert_eq!(
-            initial_auth_focus(&ChallengeKind::TwoFactorCode, false),
-            AuthField::Username,
-            "with nothing saved the cursor must start at the top of the form, \
-             or the first thing typed lands in the one-time code box"
-        );
-        assert_eq!(
-            initial_auth_focus(&ChallengeKind::TwoFactorCode, true),
-            AuthField::Otp,
-            "with the pair already saved the code is the only box left to fill"
-        );
-    }
-
-    use super::{control_command_subject, PendingControlSubject};
-    use crate::vortix_core::control::UserCommand;
-    use crate::vortix_core::profile::ProfileId;
-
-    #[test]
-    fn distinguishes_bulk_from_profile_disconnects() {
-        assert!(matches!(
-            control_command_subject(Some(&UserCommand::Disconnect { profile_id: None })),
-            Some(PendingControlSubject::DisconnectAll)
-        ));
-        assert!(matches!(
-            control_command_subject(Some(&UserCommand::Disconnect {
-                profile_id: Some(ProfileId::new("profile")),
-            })),
-            Some(PendingControlSubject::Disconnection)
-        ));
-    }
-}
-
-fn lifecycle_command_profile_id(
-    command: Option<&crate::vortix_core::control::UserCommand>,
-) -> Option<&ProfileId> {
-    use crate::vortix_core::control::UserCommand;
-    match command? {
-        UserCommand::Connect { profile_id, .. }
-        | UserCommand::ConnectExclusive { profile_id }
-        | UserCommand::Reconnect {
-            profile_id: Some(profile_id),
-        }
-        | UserCommand::Disconnect {
-            profile_id: Some(profile_id),
-        }
-        | UserCommand::ForceDisconnect {
-            profile_id: Some(profile_id),
-        } => Some(profile_id),
-        UserCommand::Reconnect { profile_id: None }
-        | UserCommand::Disconnect { profile_id: None }
-        | UserCommand::ForceDisconnect { profile_id: None }
-        | UserCommand::SetKillSwitch { .. }
-        | UserCommand::ImportProfile { .. }
-        | UserCommand::RenameProfile { .. }
-        | UserCommand::DeleteProfile { .. } => None,
-    }
-}
-
-fn active_egress_paths(
-    snapshot: &crate::vortix_core::control::ControlSnapshot,
-) -> impl Iterator<Item = (&ProfileId, &crate::vortix_core::engine::Role, Option<&str>)> {
-    snapshot.tunnels.iter().filter_map(|(profile_id, tunnel)| {
-        matches!(
-            tunnel.state,
-            crate::vortix_core::engine::Connection::Connected { .. }
-                | crate::vortix_core::engine::Connection::Disconnecting { .. }
-        )
-        .then_some((profile_id, &tunnel.role, tunnel.interface_name.as_deref()))
-    })
-}
-
-fn egress_path_changed(
-    current: &crate::vortix_core::control::ControlSnapshot,
-    next: &crate::vortix_core::control::ControlSnapshot,
-) -> bool {
-    current.primary != next.primary || active_egress_paths(current).ne(active_egress_paths(next))
-}
-
-fn late_route_conflict_for_operation(
-    snapshot: &crate::vortix_core::control::ControlSnapshot,
-    operation: &crate::vortix_core::control::OperationRecord,
-) -> Option<(ProfileId, Conflict)> {
-    use crate::vortix_core::control::{OperationIntent, RequestedTunnelState};
-
-    let tunnels = match &operation.intent {
-        OperationIntent::DesiredSubset { tunnels, .. }
-        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels,
-        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
-            return None;
-        }
-    };
-    tunnels
+/// The renderer still reads the registry; this is its only feed.
+fn projection(snapshot: &Snapshot) -> BTreeMap<ProfileId, TunnelSnapshot> {
+    snapshot
+        .tunnels
         .iter()
-        .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
-        .find_map(|(profile_id, _)| {
-            snapshot
-                .pending_route_conflicts
-                .get(profile_id)
-                .cloned()
-                .map(|conflict| (profile_id.clone(), conflict))
-        })
+        .map(|tunnel| (tunnel.profile_id.clone(), tunnel_snapshot(snapshot, tunnel)))
+        .collect()
 }
 
-fn terminal_control_notification(
-    subject: PendingControlSubject,
-    recovery_retry: bool,
-    status: crate::vortix_core::control::OperationStatus,
-    result: Option<crate::vortix_core::control::OperationResult>,
-    has_owned_retry: bool,
-    failure_detail: Option<&str>,
-) -> Option<(String, ToastType)> {
-    use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
-
-    match (status, result) {
-        (
-            OperationStatus::Failed,
-            Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
-        ) => Some((
-            subject.dns_failure_message(failure_detail),
-            ToastType::Error,
-        )),
-        (
-            OperationStatus::Failed,
-            Some(OperationResult::Failed(OperationFailure::AuthenticationFailed)),
-        ) => Some((
-            subject.authentication_failure_message().to_string(),
-            ToastType::Error,
-        )),
-        (
-            OperationStatus::Failed,
-            Some(OperationResult::Failed(OperationFailure::InvalidProfile)),
-        ) => Some((
-            "This WireGuard profile has an invalid filename. Delete it, rename the original file to 1–15 characters (for example, wg07.conf), and import it again."
-                .to_string(),
-            ToastType::Error,
-        )),
-        (
-            OperationStatus::Failed,
-            Some(OperationResult::Failed(OperationFailure::HandshakeFailed)),
-        ) if has_owned_retry => Some((
-            "No WireGuard handshake was received. Vortix is retrying once; if the peer still does not respond, this profile will return to disconnected."
-                .to_string(),
-            ToastType::Warning,
-        )),
-        (OperationStatus::Failed, Some(OperationResult::Failed(OperationFailure::Internal)))
-            if friendly_route_conflict_explanation(failure_detail).is_some() =>
-        {
-            friendly_route_conflict_explanation(failure_detail)
-                .map(|message| (message, ToastType::Error))
+fn tunnel_snapshot(snapshot: &Snapshot, tunnel: &TunnelView) -> TunnelSnapshot {
+    let profile_id = tunnel.profile_id.clone();
+    let allowed_ips = tunnel.routes.clone();
+    let role = if snapshot.primary.as_ref() == Some(&profile_id) {
+        Role::Primary { allowed_ips }
+    } else if tunnel.is_full() {
+        Role::AddressableSuppressed { allowed_ips }
+    } else {
+        Role::Addressable { allowed_ips }
+    };
+    let state = match tunnel.phase {
+        Phase::Starting => Connection::Connecting {
+            profile_id,
+            started_at: tunnel.since,
+            attempt: 1,
+            retry_budget_remaining: std::time::Duration::ZERO,
+        },
+        Phase::AwaitingCredentials => Connection::AwaitingUserInput {
+            profile_id,
+            prompt_id: String::new(),
+            prompt_kind: PromptKind::Generic {
+                label: "OpenVPN credentials".into(),
+            },
+            since: tunnel.since,
+        },
+        Phase::Up => Connection::Connected {
+            profile_id,
+            since: tunnel.since,
+            health: ConnectionHealth::default(),
+            details: Box::new(tunnel.details.clone()),
+        },
+        Phase::Waiting { .. } => Connection::Reconnecting {
+            profile_id,
+            started_at: tunnel.since,
+            attempt: 1,
+            retry_budget_remaining: std::time::Duration::ZERO,
+            last_error: None,
+        },
+        Phase::Stopping => Connection::Disconnecting {
+            profile_id,
+            started_at: tunnel.since,
+        },
+    };
+    let role = if matches!(tunnel.phase, Phase::Waiting { .. }) {
+        Role::Reconnecting {
+            prior_role: Box::new(role),
         }
-        (OperationStatus::Failed, Some(OperationResult::Failed(failure))) => {
-            Some((subject.failure_message(failure), ToastType::Error))
-        }
-        (OperationStatus::Cancelled, _) => {
-            Some((format!("{} cancelled", subject.label()), ToastType::Info))
-        }
-        (OperationStatus::Expired, _) => {
-            Some((subject.timeout_message().to_string(), ToastType::Error))
-        }
-        (OperationStatus::Succeeded, _)
-            if matches!(subject, PendingControlSubject::DisconnectAll) =>
-        {
-            Some((
-                "All VPN connections disconnected".to_string(),
-                ToastType::Success,
-            ))
-        }
-        (OperationStatus::Succeeded, _) if recovery_retry => Some((
-            format!("{} succeeded after retry", subject.label()),
-            ToastType::Success,
-        )),
-        _ => None,
+    } else {
+        role
+    };
+    TunnelSnapshot {
+        profile_id: tunnel.profile_id.clone(),
+        state,
+        role,
+        health: ConnectionHealth::default(),
+        interface_name: tunnel.interface.clone(),
+        started_at: Some(tunnel.since),
     }
 }
 
 impl App {
-    /// Attach the one Standard-mode control owner used for the entire TUI
-    /// session and immediately render its current immutable publication.
-    pub fn attach_control_session(
-        &mut self,
-        control: crate::cli::control::LocalControlSession,
-    ) -> Result<(), crate::cli::control::LocalControlError> {
-        self.attach_client_control_session(crate::cli::control::ClientControlSession::standard(
-            control,
-        ))
-    }
-
-    /// Attach the already-selected client adapter. Production startup passes
-    /// only the Standard variant until U13 atomically opens the enrollment
-    /// gate; command handlers never choose or fall back between authorities.
-    pub fn attach_client_control_session(
-        &mut self,
-        control: crate::cli::control::ClientControlSession,
-    ) -> Result<(), crate::cli::control::LocalControlError> {
-        control.progress()?;
-        let snapshot = control.current_snapshot();
-        self.control_session = Some(control);
+    pub fn attach_control(&mut self, control: crate::control::Control) {
+        let snapshot = control.snapshot();
+        self.control = Some(control);
         self.control_starting = false;
         self.apply_control_snapshot(snapshot);
         self.log("SUCCESS: VPN service ready. Press [x] for actions.");
-        Ok(())
     }
 
-    pub(crate) fn issue_control_command(
-        &mut self,
-        command: crate::vortix_core::control::UserCommand,
-    ) -> Option<()> {
-        let wait = self.control_command_timeout(&command);
-        let idempotency_key = self.next_control_request_key();
-        // Captured before `command` moves into the queue: a route-conflict
-        // refusal has to know which profile was asking in order to re-offer it.
-        let conflict_target = connect_target(Some(&command));
-        let result = self
-            .control_session
-            .as_ref()
-            .expect("control command requires an attached session")
-            .enqueue_tui_command(command, wait, idempotency_key);
-        if let Err(error) = &result {
-            if is_route_conflict(error) {
-                if let Some(profile_id) = conflict_target {
-                    if self.recover_route_conflict(&profile_id) {
-                        self.log(
-                            "CONTROL: connect refused for a route conflict; reopened the confirmation",
-                        );
-                        return None;
-                    }
-                }
+    pub(crate) fn send(&mut self, command: Command) {
+        match &self.control {
+            Some(control) => {
+                control.send(command);
             }
+            None => self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info),
         }
-        self.report_control_enqueue(result)
     }
 
-    pub(crate) fn issue_control_import(&mut self, path: &std::path::Path) -> Option<String> {
-        let result = self
-            .try_issue_control_import(path)
-            .map(|(display_name, _)| display_name);
-        self.report_control_enqueue(result)
-    }
+    pub fn apply_control_snapshot(&mut self, snapshot: Arc<Snapshot>) {
+        self.sync_last_used(&snapshot);
 
-    pub(crate) fn try_issue_control_import(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<(String, String), crate::cli::control::LocalControlError> {
-        let wait =
-            std::time::Duration::from_secs(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS);
-        let idempotency_key = self.next_control_request_key();
-        let display_name = self
-            .control_session
-            .as_ref()
-            .expect("control import requires an attached session")
-            .enqueue_tui_profile_import(path, wait, idempotency_key.clone())?;
-        Ok((display_name, idempotency_key))
-    }
-
-    fn next_control_request_key(&mut self) -> String {
-        self.control_request_sequence = self.control_request_sequence.saturating_add(1);
-        format!(
-            "tui-{}-{}",
-            std::process::id(),
-            self.control_request_sequence
-        )
-    }
-
-    fn control_command_timeout(
-        &self,
-        command: &crate::vortix_core::control::UserCommand,
-    ) -> std::time::Duration {
-        use crate::vortix_core::control::UserCommand;
-
-        let protocol = |profile_id: &crate::vortix_core::profile::ProfileId| {
-            self.runtime
-                .profiles
+        let egress_changed = self.control_snapshot.primary != snapshot.primary
+            || self
+                .control_snapshot
+                .tunnels
                 .iter()
-                .find(|profile| &profile.id == profile_id)
-                .map(|profile| profile.protocol)
-        };
-        let seconds = match command {
-            UserCommand::Connect { profile_id, .. }
-            | UserCommand::ConnectExclusive { profile_id } => protocol(profile_id).map_or_else(
-                || {
-                    self.runtime
-                        .config
-                        .connect_operation_timeout_secs(crate::state::Protocol::OpenVPN)
-                },
-                |p| self.runtime.config.connect_operation_timeout_secs(p),
-            ),
-            UserCommand::Reconnect {
-                profile_id: Some(profile_id),
-            } => protocol(profile_id).map_or_else(
-                || {
-                    self.runtime
-                        .config
-                        .reconnect_operation_timeout_secs(crate::state::Protocol::OpenVPN)
-                },
-                |p| self.runtime.config.reconnect_operation_timeout_secs(p),
-            ),
-            UserCommand::Reconnect { profile_id: None } => self
-                .runtime
-                .profiles
-                .iter()
-                .map(|profile| {
-                    self.runtime
-                        .config
-                        .reconnect_operation_timeout_secs(profile.protocol)
-                })
-                .max()
-                .unwrap_or(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS),
-            UserCommand::Disconnect { .. }
-            | UserCommand::ForceDisconnect { .. }
-            | UserCommand::SetKillSwitch { .. } => {
-                self.runtime.config.disconnect_operation_timeout_secs()
-            }
-            UserCommand::ImportProfile { .. }
-            | UserCommand::RenameProfile { .. }
-            | UserCommand::DeleteProfile { .. } => {
-                crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS
-            }
-        };
-        std::time::Duration::from_secs(seconds)
-    }
-
-    fn report_control_enqueue<T>(
-        &mut self,
-        result: Result<T, crate::cli::control::LocalControlError>,
-    ) -> Option<T> {
-        match result {
-            Ok(value) => Some(value),
-            Err(crate::cli::control::LocalControlError::Profile { profile, reason })
-                if reason.contains("WireGuard name must be") =>
-            {
-                self.log(&format!(
-                    "ERR: WireGuard profile '{profile}' was rejected: {reason}"
-                ));
-                self.show_toast(reason, ToastType::Error);
-                None
-            }
-            Err(error) => {
-                self.log(&format!("ERR: Control command refused: {error}"));
-                self.show_toast(control_error_message(&error), ToastType::Error);
-                None
-            }
-        }
-    }
-
-    pub(crate) fn handle_control_admission_results(
-        &mut self,
-        results: Vec<crate::cli::control::LocalTuiAdmissionResult>,
-    ) {
-        for result in results {
-            let import_request_key = result.import_request_key.clone();
-            match result.completion {
-                crate::cli::control::TuiControlCompletion::Admission(Ok(operation_id)) => {
-                    if let Some(request_key) = import_request_key.as_deref() {
-                        self.admit_pending_profile_import(request_key, operation_id.clone());
-                    }
-                    let control_subject = control_command_subject(result.command.as_ref());
-                    let profile_name = lifecycle_command_profile_id(result.command.as_ref())
-                        .and_then(|profile_id| {
-                            self.runtime
-                                .profiles
-                                .iter()
-                                .find(|profile| profile.id == *profile_id)
-                                .map(|profile| profile.name.clone())
-                        });
-                    let activity = result.import_display_name.as_deref().map_or_else(
-                        || {
-                            control_subject.map_or_else(
-                                || "Profile update queued".to_string(),
-                                |subject| {
-                                    profile_name.as_deref().map_or_else(
-                                        || subject.queued_message().to_string(),
-                                        |name| format!("{} for '{name}'", subject.queued_message()),
-                                    )
-                                },
-                            )
-                        },
-                        |name| format!("Profile import queued: '{name}'"),
-                    );
-                    self.log(&format!("CONTROL: {activity}"));
-                    if let Some(subject) = control_subject {
-                        self.track_control_operation_with_profile(
-                            operation_id,
-                            subject,
-                            profile_name,
-                        );
-                    }
-                }
-                crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
-                    // Read before anything below can consume `result.command`.
-                    let conflict_target = connect_target(result.command.as_ref());
-                    if let Some(request_key) = import_request_key.as_deref() {
-                        self.reject_pending_profile_import(request_key);
-                    }
-                    if let Some(crate::vortix_core::control::UserCommand::SetKillSwitch { mode }) =
-                        result.command
-                    {
-                        if self.pending_control_killswitch_mode == Some(mode) {
-                            self.pending_control_killswitch_mode = None;
-                        }
-                    }
-                    let subject = result
-                        .import_display_name
-                        .as_deref()
-                        .map_or_else(|| "command".to_owned(), |name| format!("import '{name}'"));
-                    self.log(&format!("ERR: Control {subject} refused: {error}"));
-                    // A route conflict is a decision, not a failure. Offer the
-                    // takeover confirmation instead of a toast the user cannot
-                    // act on.
-                    if is_route_conflict(&error) {
-                        if let Some(profile_id) = conflict_target {
-                            if self.recover_route_conflict(&profile_id) {
-                                continue;
-                            }
-                        }
-                    }
-                    self.show_toast(control_error_message(&error), ToastType::Error);
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn apply_control_snapshot(
-        &mut self,
-        snapshot: crate::vortix_core::control::ControlSnapshot,
-    ) {
-        use crate::state::KillSwitchState;
-
-        if self.control_snapshot.last_connected_at != snapshot.last_connected_at {
-            let mut activity_changed = false;
-            for profile in &mut self.runtime.profiles {
-                let Some(connected_at) = snapshot.last_connected_at.get(&profile.id).copied()
-                else {
-                    continue;
-                };
-                if profile.last_used != Some(connected_at) {
-                    profile.last_used = Some(connected_at);
-                    activity_changed = true;
-                }
-            }
-            if activity_changed
-                && self.runtime.sort_order == crate::state::ProfileSortOrder::LastUsed
-            {
-                let selected_profile = self.selected_profile_id();
-                self.runtime.sort_profiles();
-                self.profile_list_state.select(
-                    selected_profile.and_then(|profile_id| self.profile_index(&profile_id)),
-                );
-            }
-        }
-
-        let tunnel_projection_changed = self.control_snapshot.tunnels != snapshot.tunnels
-            || self.control_snapshot.primary != snapshot.primary;
-        let egress_path_changed =
-            tunnel_projection_changed && egress_path_changed(&self.control_snapshot, &snapshot);
-        if tunnel_projection_changed {
-            self.registry
-                .replace_control_projection(&snapshot.tunnels, snapshot.primary.clone());
-        }
+                .map(|t| (&t.profile_id, t.phase, &t.interface))
+                .ne(snapshot
+                    .tunnels
+                    .iter()
+                    .map(|t| (&t.profile_id, t.phase, &t.interface)));
+        self.registry
+            .replace_control_projection(&projection(&snapshot), snapshot.primary.clone());
         if let Some(profile_id) = snapshot.primary.clone().or_else(|| {
-            snapshot.tunnels.values().find_map(|tunnel| {
-                matches!(
-                    tunnel.state,
-                    crate::vortix_core::engine::state::Connection::Connected { .. }
-                )
-                .then(|| tunnel.profile_id.clone())
-            })
+            snapshot
+                .tunnels
+                .iter()
+                .find(|tunnel| tunnel.phase == Phase::Up)
+                .map(|tunnel| tunnel.profile_id.clone())
         }) {
             self.last_control_connected_profile = Some(profile_id);
         }
-        self.runtime.killswitch_mode = snapshot.desired.kill_switch;
-        if self.pending_control_killswitch_mode == Some(snapshot.desired.kill_switch) {
+
+        self.runtime.killswitch_mode = snapshot.kill_switch;
+        if self.pending_control_killswitch_mode == Some(snapshot.kill_switch) {
             self.pending_control_killswitch_mode = None;
         }
+        self.registry.set_killswitch_mode(snapshot.kill_switch);
+        self.runtime.killswitch_state = snapshot.kill_switch_state;
         self.registry
-            .set_killswitch_mode(snapshot.desired.kill_switch);
-        // `effective.kill_switch` is None until the service publishes an
-        // observation. That is "not known yet", which is not the same as
-        // `Degraded` — documented as the no-claim state for when policy
-        // application or read-back cannot be proven. Rendering the gap as
-        // Degraded told users their kill switch was broken every time a
-        // change was in flight, including when the firewall was applied and
-        // correct.
-        //
-        // While a change is running, the last observed state is still the
-        // truth about the firewall, so it is held rather than replaced by an
-        // alarm. Only an unknown state with nothing running is a real
-        // no-claim, and that still reports Degraded.
-        let kill_switch_state = snapshot.effective.kill_switch.unwrap_or_else(|| {
-            if snapshot.desired.kill_switch == crate::state::KillSwitchMode::Off {
-                KillSwitchState::Disabled
-            } else if self.killswitch_change_in_flight() {
-                self.runtime.killswitch_state
-            } else {
-                KillSwitchState::Degraded
-            }
-        });
-        self.runtime.killswitch_state = kill_switch_state;
-        self.registry.set_killswitch_state(kill_switch_state);
+            .set_killswitch_state(snapshot.kill_switch_state);
 
-        let pending_challenge = snapshot.challenges.values().next().cloned();
-        match pending_challenge {
-            Some(challenge) if self.control_challenge != Some(challenge.id) => {
-                if let Some(profile) = self
-                    .runtime
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == challenge.profile_id)
-                {
-                    self.control_challenge = Some(challenge.id);
-                    let profile_id = profile.id.clone();
-                    let profile_name = profile.name.clone();
-                    let credentials = self
-                        .control_session
-                        .as_ref()
-                        .expect("snapshot challenge requires attached control session")
-                        .load_openvpn_credentials(&profile_id, &profile_name);
-                    let (username, password) = match credentials {
-                        Ok(Some(credentials)) => (
-                            crate::state::SecretText::from(credentials.username()),
-                            crate::state::SecretText::from(credentials.password()),
-                        ),
-                        Ok(None) => Default::default(),
-                        Err(error) => {
-                            self.log(&format!(
-                                "WARN: Remembered OpenVPN credentials are unavailable: {error}"
-                            ));
-                            self.show_toast(
-                                "Saved credentials couldn't be used. Enter them again to continue."
-                                    .to_string(),
-                                ToastType::Warning,
-                            );
-                            Default::default()
-                        }
-                    };
-                    let credentials_prefilled = !username.is_empty() && !password.is_empty();
-                    self.input_mode = InputMode::AuthPrompt {
-                        profile_id,
-                        profile_name,
-                        username_cursor: username.chars().count(),
-                        password_cursor: password.chars().count(),
-                        username,
-                        password,
-                        otp: crate::state::SecretText::default(),
-                        otp_cursor: 0,
-                        focused_field: initial_auth_focus(&challenge.kind, credentials_prefilled),
-                        save_credentials: true,
-                        connect_after: true,
-                        static_challenge_prompt: matches!(
-                            &challenge.kind,
-                            crate::vortix_core::control::ChallengeKind::TwoFactorCode
-                        )
-                        .then_some(challenge.label),
-                        reveal_secrets: false,
-                    };
-                } else {
-                    // Mark it before asynchronous cancellation so repeated
-                    // snapshots cannot enqueue the same cancellation again.
-                    self.control_challenge = Some(challenge.id);
-                    let cancelled = self
-                        .control_session
-                        .as_ref()
-                        .expect("snapshot challenge requires attached control session")
-                        .cancel_challenge(challenge.id);
-                    match cancelled {
-                        Ok(()) => self.log(&format!(
-                            "AUTH: Requested cancellation for missing profile {}",
-                            challenge.profile_id
-                        )),
-                        Err(error) => self.log(&format!(
-                            "ERR: Could not queue challenge cancellation for missing profile {}: {error}",
-                            challenge.profile_id
-                        )),
-                    }
+        self.show_prompt(&snapshot);
+        self.show_notices(&snapshot);
+
+        self.runtime.scanner_first_tick_done = true;
+        self.runtime
+            .default_route_interface
+            .clone_from(&snapshot.default_route);
+        self.registry
+            .feed_default_route_interface(snapshot.default_route.clone());
+        self.runtime.last_kernel_session_count = snapshot
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.phase == Phase::Up)
+            .count()
+            + snapshot.external.len();
+        let came_up = snapshot
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.phase == Phase::Up)
+            .filter(|tunnel| snapshot.primary.as_ref() == Some(&tunnel.profile_id))
+            .filter(|tunnel| {
+                self.control_snapshot
+                    .tunnel(&tunnel.profile_id)
+                    .is_none_or(|before| before.phase != Phase::Up)
+            })
+            .map(|tunnel| (tunnel.profile_id.clone(), tunnel.name.clone()))
+            .collect::<Vec<_>>();
+        self.control_snapshot = snapshot;
+        // A server can push a full-tunnel route the profile never declared;
+        // only now is the takeover known, so offer the switch now.
+        for (profile_id, name) in came_up {
+            let late = self
+                .control_snapshot
+                .conflicts(&profile_id)
+                .into_iter()
+                .find(|conflict| matches!(conflict, Conflict::DefaultRouteTakeover { .. }));
+            if let Some(conflict) = late {
+                if self.input_mode == InputMode::Normal {
+                    self.fire_conflict_overlay(conflict, profile_id, name);
                 }
             }
-            None if self.control_challenge.take().is_some() => {
+        }
+        if egress_changed {
+            self.refresh_telemetry();
+        }
+    }
+
+    fn sync_last_used(&mut self, snapshot: &Snapshot) {
+        let mut resort = false;
+        for profile in &mut self.runtime.profiles {
+            if let Some(at) = snapshot.last_connected.get(&profile.id) {
+                if profile.last_used != Some(*at) {
+                    profile.last_used = Some(*at);
+                    resort = true;
+                }
+            }
+        }
+        if resort && self.runtime.sort_order == crate::state::ProfileSortOrder::LastUsed {
+            let selected = self.selected_profile_id();
+            self.runtime.sort_profiles();
+            self.profile_list_state
+                .select(selected.and_then(|profile_id| self.profile_index(&profile_id)));
+        }
+    }
+
+    fn show_notices(&mut self, snapshot: &Snapshot) {
+        let seen = self.notices_seen;
+        for notice in snapshot.notices.iter().filter(|notice| notice.seq > seen) {
+            let toast = match notice.level {
+                Level::Info => ToastType::Info,
+                Level::Success => ToastType::Success,
+                Level::Warning => ToastType::Warning,
+                Level::Error => ToastType::Error,
+            };
+            self.show_toast(notice.text.clone(), toast);
+        }
+        if let Some(last) = snapshot.notices.last() {
+            self.notices_seen = self.notices_seen.max(last.seq);
+        }
+    }
+
+    fn show_prompt(&mut self, snapshot: &Snapshot) {
+        match snapshot.prompts.first() {
+            Some(prompt) if self.control_prompt != Some(prompt.id) => {
+                self.control_prompt = Some(prompt.id);
+                let (username, password) = match self
+                    .control
+                    .as_ref()
+                    .map(|control| control.load_credentials(&prompt.profile_id, &prompt.name))
+                {
+                    Some(Ok(Some(saved))) => (
+                        crate::state::SecretText::from(saved.username()),
+                        crate::state::SecretText::from(saved.password()),
+                    ),
+                    _ => Default::default(),
+                };
+                let prefilled = !username.is_empty() && !password.is_empty();
+                self.input_mode = InputMode::AuthPrompt {
+                    profile_id: prompt.profile_id.clone(),
+                    profile_name: prompt.name.clone(),
+                    username_cursor: username.chars().count(),
+                    password_cursor: password.chars().count(),
+                    username,
+                    password,
+                    otp: crate::state::SecretText::default(),
+                    otp_cursor: 0,
+                    focused_field: initial_auth_focus(prompt.otp_label.is_some(), prefilled),
+                    save_credentials: true,
+                    connect_after: true,
+                    static_challenge_prompt: prompt.otp_label.clone(),
+                    reveal_secrets: false,
+                };
+            }
+            None if self.control_prompt.take().is_some() => {
                 if matches!(self.input_mode, InputMode::AuthPrompt { .. }) {
                     self.input_mode = InputMode::Normal;
                 }
             }
             _ => {}
         }
-        self.report_terminal_control_operations(&snapshot);
-        // Both real-IP cache gates read these, and nothing wrote them: the
-        // writers went with `Message::SyncSystemState`, so
-        // `scanner_first_tick_done` was permanently false and the address was
-        // never cached at all. A published snapshot with a default-route
-        // observation is proof the scan ran, and `observed.tunnels` is the
-        // kernel's own count — which is what "no tunnel owns the egress path"
-        // was always meant to mean.
-        if snapshot.observed.default_route.is_some() {
-            self.runtime.scanner_first_tick_done = true;
-        }
-        // Primary election reads the default-route interface from the
-        // registry's cache, and this is the only place the canonical
-        // observation reaches the App. Without this feed the cache stays
-        // empty for the whole process lifetime, so no tunnel is ever
-        // elected primary: a full tunnel renders as `Split tunnel`, the
-        // header reads `NO EXIT`, and Security Guard reports
-        // `split-route — no exit` while the kernel routes everything
-        // through it.
-        let default_route_interface = snapshot
-            .observed
-            .default_route
-            .as_ref()
-            .and_then(|route| route.interface_name.clone());
-        self.runtime
-            .default_route_interface
-            .clone_from(&default_route_interface);
-        self.registry
-            .feed_default_route_interface(default_route_interface);
-        self.runtime.last_kernel_session_count = snapshot
-            .observed
-            .tunnels
-            .values()
-            .filter(|tunnel| tunnel.active)
-            .count();
-        self.control_snapshot = snapshot;
-        if egress_path_changed {
-            self.refresh_telemetry();
-        }
-    }
-
-    pub(crate) fn track_control_operation_with_profile(
-        &mut self,
-        operation_id: crate::vortix_core::control::OperationId,
-        subject: PendingControlSubject,
-        profile_name: Option<String>,
-    ) {
-        let already_terminal = self
-            .control_snapshot
-            .operations
-            .get(&operation_id)
-            .is_some_and(|operation| operation.status.is_terminal());
-        self.pending_control_operations.insert(
-            operation_id,
-            PendingControlOperation {
-                subject,
-                profile_name,
-                admitted_after_generation: self.control_snapshot.generation,
-                recovery_retry: false,
-            },
-        );
-        // The actor may reach terminal truth before the admission worker's
-        // result is drained. Recheck the already-held publication so that
-        // notification does not depend on channel scheduling order.
-        if already_terminal {
-            let current = self.control_snapshot.clone();
-            self.report_terminal_control_operations(&current);
-        }
-    }
-
-    fn present_late_route_conflict(
-        &mut self,
-        subject: PendingControlSubject,
-        status: crate::vortix_core::control::OperationStatus,
-        result: Option<crate::vortix_core::control::OperationResult>,
-        late_route_conflict: Option<(ProfileId, Conflict)>,
-    ) -> bool {
-        use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
-
-        if !matches!(
-            (subject, status, result),
-            (
-                PendingControlSubject::Connection | PendingControlSubject::Reconnection,
-                OperationStatus::Failed,
-                // Admission refuses as `Rejected`; the final read-back fails
-                // as `Internal`. The recorded conflict is the real gate.
-                Some(OperationResult::Failed(
-                    OperationFailure::Rejected | OperationFailure::Internal
-                ))
-            )
-        ) {
-            return false;
-        }
-        let Some((profile_id, conflict)) = late_route_conflict else {
-            return false;
-        };
-        let Some(idx) = self.profile_index(&profile_id) else {
-            return false;
-        };
-        let target_name = self.runtime.profiles[idx].name.clone();
-        self.fire_conflict_overlay(conflict, idx, profile_id, target_name);
-        true
-    }
-
-    /// Whether a kill-switch change is still running.
-    pub(crate) fn killswitch_change_in_flight(&self) -> bool {
-        self.pending_control_operations.values().any(|pending| {
-            matches!(
-                pending.subject,
-                super::connection::PendingControlSubject::KillSwitch
-            )
-        })
-    }
-
-    /// Commit or discard held credentials once the server has judged them.
-    ///
-    /// A rejected pair must also evict whatever is already stored: a profile
-    /// with stored credentials raises no challenge, so leaving them behind
-    /// means the next connect reuses them and the prompt never reopens. That
-    /// covers both a fresh wrong entry and a password changed server-side.
-    fn settle_credentials(
-        &mut self,
-        subject: PendingControlSubject,
-        status: crate::vortix_core::control::OperationStatus,
-        result: Option<crate::vortix_core::control::OperationResult>,
-        connect_profile: Option<&crate::vortix_core::profile::ProfileId>,
-    ) {
-        use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
-
-        if !matches!(
-            subject,
-            PendingControlSubject::Connection | PendingControlSubject::Reconnection
-        ) {
-            return;
-        }
-
-        let rejected = matches!(
-            result,
-            Some(OperationResult::Failed(
-                OperationFailure::AuthenticationFailed
-            ))
-        );
-
-        if rejected {
-            let Some(profile_id) = connect_profile else {
-                self.pending_credential_save = None;
-                return;
-            };
-            let profile_name = self
-                .pending_credential_save
-                .take()
-                .filter(|pending| &pending.profile_id == profile_id)
-                .map_or_else(
-                    || {
-                        self.runtime
-                            .profiles
-                            .iter()
-                            .find(|profile| &profile.id == profile_id)
-                            .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone())
-                    },
-                    |pending| pending.profile_name,
-                );
-            self.forget_rejected_credentials(profile_id, &profile_name);
-            return;
-        }
-
-        if status != OperationStatus::Succeeded {
-            // Timeouts and cancellations say nothing about the password, so
-            // the held pair survives for the retry rather than being dropped.
-            return;
-        }
-
-        let Some(pending) = self
-            .pending_credential_save
-            .take_if(|pending| connect_profile == Some(&pending.profile_id))
-        else {
-            return;
-        };
-        let Some(control) = self.control_session.as_ref() else {
-            return;
-        };
-        match control.remember_openvpn_credentials(
-            &pending.profile_id,
-            pending.username.expose(),
-            pending.password.expose(),
-        ) {
-            Ok(()) => self.log(&format!(
-                "AUTH: Remembered credentials for '{}'",
-                pending.profile_name
-            )),
-            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
-                self.log(&format!(
-                    "WARN: OpenVPN credentials for '{}' are visible but disk durability is uncertain",
-                    pending.profile_name
-                ));
-                self.show_toast(
-                    "Connected, but saving your credentials couldn't be confirmed. You may be asked again after a restart."
-                        .to_string(),
-                    ToastType::Warning,
-                );
-            }
-            Err(error) => {
-                self.log(&format!(
-                    "WARN: OpenVPN credentials were accepted but not remembered: {error}"
-                ));
-                self.show_toast(
-                    "Connected, but your credentials weren't saved. You'll be asked again next time."
-                        .to_string(),
-                    ToastType::Warning,
-                );
-            }
-        }
-    }
-
-    /// Evict credentials the server just rejected so the next attempt prompts.
-    fn forget_rejected_credentials(
-        &mut self,
-        profile_id: &crate::vortix_core::profile::ProfileId,
-        profile_name: &str,
-    ) {
-        use crate::cli::control::CredentialClearOutcome;
-
-        let Some(control) = self.control_session.as_ref() else {
-            return;
-        };
-        match control.clear_openvpn_credentials(profile_id, profile_name) {
-            // Nothing stored: the prompt already reopens on its own.
-            Ok(CredentialClearOutcome::NotFound) => {}
-            Ok(CredentialClearOutcome::Cleared) => {
-                self.log(&format!(
-                    "AUTH: Discarded rejected credentials for '{profile_name}'"
-                ));
-                self.show_toast(
-                    format!("Saved credentials for '{profile_name}' were rejected and removed. You'll be asked for them on the next connect."),
-                    ToastType::Warning,
-                );
-            }
-            Err(error) => {
-                self.log(&format!(
-                    "ERR: Rejected credentials for '{profile_name}' could not be removed: {error}"
-                ));
-                self.show_toast(
-                    format!("Saved credentials for '{profile_name}' were rejected but couldn't be removed. Clear them with 'A' before retrying."),
-                    ToastType::Error,
-                );
-            }
-        }
-    }
-
-    /// Pair each tracked operation that has reached terminal truth with the
-    /// snapshot facts its notification needs. Collected before the reporting
-    /// loop so the loop is free to mutate `self`.
-    fn collect_terminal_operations(
-        &self,
-        snapshot: &crate::vortix_core::control::ControlSnapshot,
-    ) -> Vec<TerminalOperation> {
-        self.pending_control_operations
-            .iter()
-            .filter_map(|(operation_id, pending)| {
-                snapshot
-                    .operations
-                    .get(operation_id)
-                    .filter(|operation| operation.status.is_terminal())
-                    .map(|operation| {
-                        let owned_retry = snapshot
-                            .operations
-                            .values()
-                            .find(|candidate| {
-                                candidate.id != operation.id
-                                    && !candidate.status.is_terminal()
-                                    && candidate.desired_generation == operation.desired_generation
-                                    && candidate.client_id.sequence() == Some(0)
-                            })
-                            .map(|candidate| candidate.id.clone());
-                        TerminalOperation {
-                            operation_id: operation_id.clone(),
-                            subject: pending.subject,
-                            profile_name: pending.profile_name.clone(),
-                            recovery_retry: pending.recovery_retry,
-                            status: operation.status,
-                            result: operation.result,
-                            failure_detail: operation.failure_detail.clone(),
-                            owned_retry,
-                            late_route_conflict: late_route_conflict_for_operation(
-                                snapshot, operation,
-                            ),
-                            connect_profile: operation_connect_profile(operation),
-                        }
-                    })
-            })
-            .collect()
-    }
-
-    fn report_terminal_control_operations(
-        &mut self,
-        snapshot: &crate::vortix_core::control::ControlSnapshot,
-    ) {
-        let disconnect_all_in_flight = self
-            .pending_control_operations
-            .values()
-            .any(|pending| matches!(pending.subject, PendingControlSubject::DisconnectAll));
-
-        for TerminalOperation {
-            operation_id,
-            subject,
-            profile_name,
-            recovery_retry,
-            status,
-            result,
-            failure_detail,
-            owned_retry,
-            late_route_conflict,
-            connect_profile,
-        } in self.collect_terminal_operations(snapshot)
-        {
-            self.pending_control_operations.remove(&operation_id);
-            self.settle_credentials(subject, status, result, connect_profile.as_ref());
-            if matches!(subject, PendingControlSubject::KillSwitch) {
-                self.submit_queued_killswitch_target();
-            }
-            if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
-                continue;
-            }
-            let superseded_connection_cancellation = disconnect_all_in_flight
-                && status == crate::vortix_core::control::OperationStatus::Cancelled
-                && matches!(
-                    subject,
-                    PendingControlSubject::Connection | PendingControlSubject::Reconnection
-                );
-            let notification = if superseded_connection_cancellation {
-                None
-            } else {
-                terminal_control_notification(
-                    subject,
-                    recovery_retry,
-                    status,
-                    result,
-                    owned_retry.is_some(),
-                    failure_detail.as_deref(),
-                )
-            };
-            if let Some((message, toast_type)) = notification {
-                self.show_toast(message, toast_type);
-            }
-            if let Some(detail) = failure_detail {
-                let profile = profile_name
-                    .as_deref()
-                    .map_or_else(String::new, |name| format!(" for '{name}'"));
-                self.log(&format!(
-                    "ERR: Control {} failed{profile}: {detail}",
-                    subject.label(),
-                ));
-            }
-            if let Some(retry_id) = owned_retry {
-                self.pending_control_operations.insert(
-                    retry_id,
-                    PendingControlOperation {
-                        subject,
-                        profile_name,
-                        admitted_after_generation: snapshot.generation,
-                        recovery_retry: true,
-                    },
-                );
-            }
-        }
-
-        self.pending_control_operations
-            .retain(|operation_id, pending| {
-                snapshot.operations.contains_key(operation_id)
-                    || snapshot.generation <= pending.admitted_after_generation
-            });
-    }
-
-    pub(crate) fn apply_local_catalog_update(
-        &mut self,
-        update: crate::cli::control::LocalCatalogUpdate,
-    ) {
-        let revision = update.revision;
-        let selected_id = self.selected_profile_id();
-        if let Some(profiles) = update.profiles {
-            self.runtime.profiles = profiles;
-            self.runtime.sort_profiles();
-            self.profile_list_state.select(
-                selected_id
-                    .and_then(|profile_id| self.profile_index(&profile_id))
-                    .or_else(|| (!self.runtime.profiles.is_empty()).then_some(0)),
-            );
-            if self.presented_catalog_revision != Some(revision) {
-                self.log(&format!(
-                    "APP: Profile catalog updated (revision {revision})"
-                ));
-                self.presented_catalog_revision = Some(revision);
-            }
-        }
-        let mut applied_names = Vec::new();
-        let mut applied_count = 0usize;
-        let mut failures = Vec::new();
-        for outcome in update.outcomes {
-            match outcome {
-                crate::cli::control::LocalCatalogOutcome::Applied {
-                    operation_id,
-                    receipt,
-                } => {
-                    self.settle_pending_profile_import(&operation_id, true);
-                    applied_count += 1;
-                    let display_name = match receipt {
-                        crate::cli::control::LocalProfileMutationReceipt::Imported(profile)
-                        | crate::cli::control::LocalProfileMutationReceipt::Renamed(profile) => {
-                            Some(profile.name)
-                        }
-                        crate::cli::control::LocalProfileMutationReceipt::Deleted {
-                            display_name,
-                            ..
-                        } => Some(display_name),
-                        crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
-                            display_name,
-                        } => display_name,
-                    };
-                    if let Some(display_name) = display_name {
-                        applied_names.push(display_name);
-                    }
-                }
-                crate::cli::control::LocalCatalogOutcome::Failed {
-                    operation_id,
-                    failure,
-                } => {
-                    self.settle_pending_profile_import(&operation_id, false);
-                    failures.push(profile_mutation_failure_message(failure).to_string());
-                }
-                crate::cli::control::LocalCatalogOutcome::Terminal {
-                    operation_id,
-                    status,
-                    result,
-                } => {
-                    self.settle_pending_profile_import(&operation_id, false);
-                    let message = match result {
-                        Some(crate::vortix_core::control::OperationResult::Failed(failure)) => {
-                            remote_profile_failure_message(failure).to_string()
-                        }
-                        _ if status == crate::vortix_core::control::OperationStatus::Expired => {
-                            "The profile update timed out".to_string()
-                        }
-                        _ => "The profile update could not be completed".to_string(),
-                    };
-                    failures.push(message);
-                }
-            }
-        }
-        for failure in &failures {
-            self.log(&format!("ERR: Profile update failed: {failure}"));
-        }
-        if applied_count > 0 || !failures.is_empty() {
-            let feedback = self
-                .catalog_feedback
-                .get_or_insert_with(|| CatalogFeedback {
-                    applied_count: 0,
-                    first_applied_name: None,
-                    failed_count: 0,
-                    first_failure: None,
-                    updated_at: std::time::Instant::now(),
-                });
-            feedback.applied_count = feedback.applied_count.saturating_add(applied_count);
-            feedback.first_applied_name = feedback
-                .first_applied_name
-                .take()
-                .or_else(|| applied_names.into_iter().next());
-            feedback.failed_count = feedback.failed_count.saturating_add(failures.len());
-            feedback.first_failure = feedback
-                .first_failure
-                .take()
-                .or_else(|| failures.into_iter().next());
-            feedback.updated_at = std::time::Instant::now();
-        }
-    }
-
-    pub(crate) fn flush_catalog_feedback(&mut self, force: bool) {
-        let ready = self.catalog_feedback.as_ref().is_some_and(|feedback| {
-            force || feedback.updated_at.elapsed() >= CATALOG_FEEDBACK_QUIET_WINDOW
-        });
-        if !ready {
-            return;
-        }
-        let feedback = self
-            .catalog_feedback
-            .take()
-            .expect("ready catalog feedback must exist");
-        let (message, toast_type) = match (feedback.applied_count, feedback.failed_count) {
-            (1, 0) => (
-                feedback.first_applied_name.map_or_else(
-                    || "Profile updated".to_string(),
-                    |name| format!("Profile '{name}' updated"),
-                ),
-                ToastType::Success,
-            ),
-            (applied, 0) => (format!("{applied} profiles updated"), ToastType::Success),
-            (0, 1) => (
-                feedback
-                    .first_failure
-                    .unwrap_or_else(|| "The profile update failed".to_string()),
-                ToastType::Error,
-            ),
-            (0, failed) => (
-                format!("{failed} profile updates failed. See Event Log."),
-                ToastType::Error,
-            ),
-            (applied, failed) => (
-                format!("{applied} profile updates completed; {failed} failed. See Event Log."),
-                ToastType::Error,
-            ),
-        };
-        self.show_toast(message, toast_type);
     }
 
     fn selected_profile_id(&self) -> Option<ProfileId> {
@@ -1489,165 +281,41 @@ impl App {
             .position(|profile| &profile.id == profile_id)
     }
 
-    fn control_connect_profile(&mut self, idx: usize) {
+    fn tunnel_active(&self, profile_id: &ProfileId) -> bool {
+        self.control_snapshot.tunnel(profile_id).is_some()
+    }
+
+    /// Connect or disconnect the selected profile.
+    pub(crate) fn toggle_connection(&mut self, idx: usize) {
         let Some(profile) = self.runtime.profiles.get(idx).cloned() else {
             return;
         };
-        // A default-route takeover cannot be resolved by keeping both tunnels,
-        // so a conflict always routes to the overlay; the only way through is
-        // Switch (disconnect the other, connect this one) or Cancel.
-        if let Some(conflict) = self.control_snapshot.topology_conflict(&profile.id) {
-            self.fire_conflict_overlay(conflict, idx, profile.id, profile.name);
-            return;
-        }
-        self.issue_control_command(crate::vortix_core::control::UserCommand::Connect {
-            profile_id: profile.id,
-            conflict_acknowledgement: None,
-        });
-    }
-
-    /// Connect or disconnect the selected profile through the canonical owner.
-    pub(crate) fn toggle_connection(&mut self, idx: usize) {
-        let Some(profile) = self.runtime.profiles.get(idx) else {
-            return;
-        };
-        let profile_id = profile.id.clone();
-        if self.control_session.is_none() {
+        if self.control.is_none() {
             self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
             return;
         }
-        let active = self.registry.snapshot(&profile_id).is_some_and(|snapshot| {
-            !matches!(
-                snapshot.state,
-                crate::vortix_core::engine::state::Connection::Disconnected { .. }
-            )
-        });
-        if active {
-            self.issue_control_command(crate::vortix_core::control::UserCommand::Disconnect {
-                profile_id: Some(profile_id),
-            });
-        } else {
-            self.control_connect_profile(idx);
-        }
-    }
-
-    /// Check for system-wide dependencies at startup and warn the user.
-    pub(crate) fn check_system_dependencies(&mut self) {
-        let mut missing: Vec<&str> = Vec::new();
-
-        if !utils::binary_exists("openvpn") {
-            missing.push("openvpn");
-        }
-
-        // wg / wg-quick both ship in wireguard-tools — single label so the
-        // install hint doesn't duplicate when both are absent.
-        if !utils::binary_exists("wg-quick") || !utils::binary_exists("wg") {
-            missing.push("wireguard-tools");
-        }
-
-        if missing.is_empty() {
+        if self.tunnel_active(&profile.id) {
+            self.send(Command::Disconnect(profile.id));
             return;
         }
-
-        for tool in &missing {
-            self.log(&format!(
-                "WARN: '{}' not found - run: {}",
-                tool,
-                crate::platform::install_hint(tool)
-            ));
-        }
-
-        self.show_toast(
-            format!(
-                "Missing tools: {}. Telemetry/VPN features may not work.",
-                missing.join(", ")
-            ),
-            ToastType::Warning,
-        );
-    }
-    /// Disconnect the primary canonical tunnel, or the first active tunnel.
-    pub(crate) fn disconnect(&mut self) {
-        if self.control_session.is_none() {
-            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
+        // A conflict needs a decision: switch (stop the other once this one
+        // is up) or cancel.
+        if let Some(conflict) = self
+            .control_snapshot
+            .conflicts(&profile.id)
+            .into_iter()
+            .next()
+        {
+            self.fire_conflict_overlay(conflict, profile.id, profile.name);
             return;
         }
-        let profile_id = self.registry.primary().cloned().or_else(|| {
-            self.registry
-                .snapshot_all()
-                .first()
-                .map(|snapshot| snapshot.profile_id.clone())
-        });
-        if let Some(profile_id) = profile_id {
-            self.issue_control_command(crate::vortix_core::control::UserCommand::Disconnect {
-                profile_id: Some(profile_id),
-            });
-        }
-    }
-    /// Force-disconnect the exact primary canonical tunnel.
-    pub(crate) fn force_disconnect(&mut self) {
-        if self.control_session.is_none() {
-            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
-            return;
-        }
-        let profile_id = self.registry.primary().cloned().or_else(|| {
-            self.registry
-                .snapshot_all()
-                .first()
-                .map(|snapshot| snapshot.profile_id.clone())
-        });
-        let Some(profile_id) = profile_id else {
-            self.show_toast(
-                "No exact tunnel is available to force-disconnect".to_string(),
-                ToastType::Warning,
-            );
-            return;
-        };
-        self.issue_control_command(crate::vortix_core::control::UserCommand::ForceDisconnect {
-            profile_id: Some(profile_id),
-        });
-    }
-
-    /// Fire the appropriate confirm overlay for a registry-reported
-    /// conflict. Logs an ACTION line so the activity panel
-    /// reflects the blocked attempt.
-    /// Turn a route-conflict refusal into the confirmation the user can act on.
-    ///
-    /// `control_connect_profile` already opens this overlay when the *local*
-    /// snapshot shows a conflict. That snapshot can lag the service, though:
-    /// the peer tunnel may claim the route between our last snapshot and the
-    /// command landing, and a connect issued from anywhere that does not route
-    /// through `control_connect_profile` never consults it at all. Either way
-    /// the service refuses with `RouteConflict` and, before this, the user got
-    /// a dead-end toast telling them to review a confirmation that was never
-    /// shown.
-    ///
-    /// Re-resolve against the now-current snapshot and open the same overlay.
-    /// Returns whether it could - a caller that gets `false` must still report
-    /// the error, because the conflict has since cleared and there is nothing
-    /// to confirm.
-    pub(super) fn recover_route_conflict(&mut self, profile_id: &ProfileId) -> bool {
-        let Some(conflict) = self.control_snapshot.topology_conflict(profile_id) else {
-            return false;
-        };
-        let Some(idx) = self.profile_index(profile_id) else {
-            return false;
-        };
-        let Some(name) = self
-            .runtime
-            .profiles
-            .get(idx)
-            .map(|profile| profile.name.clone())
-        else {
-            return false;
-        };
-        self.fire_conflict_overlay(conflict, idx, profile_id.clone(), name);
-        true
+        self.log(&format!("CONTROL: Connecting '{}'", profile.name));
+        self.send(Command::Connect(profile.id));
     }
 
     fn fire_conflict_overlay(
         &mut self,
         conflict: Conflict,
-        _idx: usize,
         target_id: ProfileId,
         target_name: String,
     ) {
@@ -1683,292 +351,88 @@ impl App {
             }
         }
     }
-    /// Disconnect the selected profile through the canonical owner.
-    pub(crate) fn disconnect_profile_by_idx(&mut self, idx: usize) {
-        self.disconnect_profile_by_idx_with_kind(idx, ProfileDisconnectKind::Normal);
+
+    /// Check for system-wide dependencies at startup and warn the user.
+    pub(crate) fn check_system_dependencies(&mut self) {
+        let mut missing: Vec<&str> = Vec::new();
+        if !utils::binary_exists("openvpn") {
+            missing.push("openvpn");
+        }
+        // wg / wg-quick both ship in wireguard-tools.
+        if !utils::binary_exists("wg-quick") || !utils::binary_exists("wg") {
+            missing.push("wireguard-tools");
+        }
+        if missing.is_empty() {
+            return;
+        }
+        for tool in &missing {
+            self.log(&format!(
+                "WARN: '{}' not found - run: {}",
+                tool,
+                crate::platform::install_hint(tool)
+            ));
+        }
+        self.show_toast(
+            format!(
+                "Missing tools: {}. Telemetry/VPN features may not work.",
+                missing.join(", ")
+            ),
+            ToastType::Warning,
+        );
     }
 
-    fn disconnect_profile_by_idx_with_kind(&mut self, idx: usize, kind: ProfileDisconnectKind) {
-        if self.control_session.is_none() {
-            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
-            return;
-        }
-        let Some(profile_id) = self
-            .runtime
-            .profiles
-            .get(idx)
-            .map(|profile| profile.id.clone())
-        else {
-            return;
-        };
-        if self.registry.snapshot(&profile_id).is_some() {
-            let command = match kind {
-                ProfileDisconnectKind::Normal => {
-                    crate::vortix_core::control::UserCommand::Disconnect {
-                        profile_id: Some(profile_id),
-                    }
-                }
-                ProfileDisconnectKind::Force => {
-                    crate::vortix_core::control::UserCommand::ForceDisconnect {
-                        profile_id: Some(profile_id),
-                    }
-                }
-            };
-            self.issue_control_command(command);
+    fn primary_or_first(&self) -> Option<ProfileId> {
+        self.control_snapshot.primary.clone().or_else(|| {
+            self.control_snapshot
+                .tunnels
+                .first()
+                .map(|tunnel| tunnel.profile_id.clone())
+        })
+    }
+
+    /// Disconnect the primary tunnel, or the first one.
+    pub(crate) fn disconnect(&mut self) {
+        if let Some(profile_id) = self.primary_or_first() {
+            self.send(Command::Disconnect(profile_id));
         }
     }
-    /// Force-disconnect the exact selected profile without falling back to a
-    /// different primary tunnel.
-    pub(crate) fn force_disconnect_profile_by_idx(&mut self, idx: usize) {
-        self.disconnect_profile_by_idx_with_kind(idx, ProfileDisconnectKind::Force);
+
+    pub(crate) fn disconnect_profile_by_idx(&mut self, idx: usize) {
+        if let Some(profile_id) = self.runtime.profiles.get(idx).map(|p| p.id.clone()) {
+            if self.tunnel_active(&profile_id) {
+                self.send(Command::Disconnect(profile_id));
+            }
+        }
     }
-    /// Disconnect every active tunnel through the canonical owner.
+
     pub(crate) fn disconnect_all_active(&mut self) {
-        if self.control_session.is_some() {
-            self.issue_control_command(crate::vortix_core::control::UserCommand::Disconnect {
-                profile_id: None,
-            });
-        } else {
-            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
-        }
+        self.send(Command::DisconnectAll);
     }
-    /// Cancel the selected in-flight connect through the canonical owner.
-    pub(crate) fn cancel_connect(&mut self, idx: usize) {
-        let Some(profile_id) = self
-            .runtime
-            .profiles
-            .get(idx)
-            .map(|profile| profile.id.clone())
-        else {
-            return;
-        };
-        if self.control_session.is_some() {
-            self.issue_control_command(crate::vortix_core::control::UserCommand::Disconnect {
-                profile_id: Some(profile_id),
-            });
-        } else {
-            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
-        }
-    }
-    /// Reconnect the primary or most recently connected canonical tunnel.
+
+    /// Reconnect the primary or most recently connected tunnel.
     pub(crate) fn reconnect(&mut self) {
-        if self.control_session.is_none() {
-            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
-            return;
-        }
-        let profile_id = self
-            .registry
-            .primary()
-            .cloned()
-            .or_else(|| {
-                self.registry
-                    .snapshot_all()
-                    .first()
-                    .map(|snapshot| snapshot.profile_id.clone())
-            })
-            .or_else(|| self.last_control_connected_profile.clone());
-        let Some(profile_id) = profile_id else {
+        let Some(profile_id) = self
+            .primary_or_first()
+            .or_else(|| self.last_control_connected_profile.clone())
+        else {
             self.show_toast(
                 "No previously connected tunnel is available".to_string(),
                 ToastType::Warning,
             );
             return;
         };
-        self.issue_control_command(crate::vortix_core::control::UserCommand::Reconnect {
-            profile_id: Some(profile_id),
-        });
+        self.send(Command::Reconnect(profile_id));
     }
 }
 
 #[cfg(test)]
-mod u7_conflict_tests {
-    //!
-    //! Coverage focuses on the App's role: extracting `AllowedIPs` from a
-    //! profile config and translating a `Conflict` variant into the right
-    //! `InputMode` overlay. The registry's `detect_conflict` itself is
-    //! tested in `vortix_core::engine::registry`.
-    use super::Protocol;
+mod tests {
+    use super::initial_auth_focus;
+    use crate::state::AuthField;
 
     #[test]
-    fn tui_connect_uses_protocol_deadline_not_background_retry_budget() {
-        let mut app = super::App::new_test();
-        app.runtime.config.connect_timeout = 35;
-        app.runtime.config.wireguard_handshake_timeout_secs = 20;
-        app.runtime.profiles.push(crate::state::VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new("openvpn"),
-            name: "openvpn".into(),
-            protocol: Protocol::OpenVPN,
-            location: String::new(),
-            config_path: "/tmp/openvpn.ovpn".into(),
-            last_used: None,
-        });
-
-        let timeout =
-            app.control_command_timeout(&crate::vortix_core::control::UserCommand::Connect {
-                profile_id: crate::vortix_core::profile::ProfileId::new("openvpn"),
-                conflict_acknowledgement: None,
-            });
-
-        assert_eq!(timeout, std::time::Duration::from_secs(37));
-        assert!(
-            timeout
-                < std::time::Duration::from_secs(
-                    crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS
-                )
-        );
-    }
-    use crate::vortix_core::cidr::claims_default_route_v4;
-    use std::io::Write;
-
-    fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("vortix_u7_tests");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).expect("create tmp config");
-        f.write_all(body.as_bytes()).expect("write tmp config");
-        path
-    }
-
-    #[test]
-    fn wg_parser_extracts_default_route_v4() {
-        let body = "\
-[Interface]
-PrivateKey = aGVsbG8=
-Address = 10.0.0.2/32
-
-[Peer]
-PublicKey = d29ybGQ=
-AllowedIPs = 0.0.0.0/0
-Endpoint = 1.2.3.4:51820
-";
-        let path = write_tmp("default-route.conf", body);
-        let cidrs = crate::topology_policy::declared_routes(Protocol::WireGuard, &path);
-        assert_eq!(cidrs.len(), 1);
-        assert_eq!(cidrs[0].prefix_len, 0);
-    }
-
-    #[test]
-    fn wg_parser_extracts_disjoint_subnet() {
-        let body = "\
-[Interface]
-PrivateKey = aGVsbG8=
-
-[Peer]
-PublicKey = d29ybGQ=
-AllowedIPs = 10.0.0.0/24, 192.168.5.0/24
-Endpoint = 1.2.3.4:51820
-";
-        let path = write_tmp("disjoint.conf", body);
-        let cidrs = crate::topology_policy::declared_routes(Protocol::WireGuard, &path);
-        assert_eq!(cidrs.len(), 2);
-        // Disjoint /24s — neither claims the default route.
-        assert!(!claims_default_route_v4(&cidrs));
-    }
-
-    #[test]
-    fn ovpn_redirect_gateway_yields_default_route() {
-        let body = "\
-client
-dev tun
-remote vpn.example.com 1194
-redirect-gateway def1
-";
-        let path = write_tmp("default-route.ovpn", body);
-        let cidrs = crate::topology_policy::declared_routes(Protocol::OpenVPN, &path);
-        assert!(!cidrs.is_empty());
-        assert!(claims_default_route_v4(&cidrs));
-    }
-
-    #[test]
-    fn ovpn_route_with_netmask_parses_to_prefix() {
-        let body = "\
-client
-dev tun
-route 10.0.0.0 255.255.255.0
-";
-        let path = write_tmp("specific-route.ovpn", body);
-        let cidrs = crate::topology_policy::declared_routes(Protocol::OpenVPN, &path);
-        assert_eq!(cidrs.len(), 1);
-        assert_eq!(cidrs[0].prefix_len, 24);
-    }
-
-    #[test]
-    fn unreadable_path_returns_empty() {
-        let p = std::path::PathBuf::from("/nonexistent/vortix_u7/never.conf");
-        let cidrs = crate::topology_policy::declared_routes(Protocol::WireGuard, &p);
-        assert!(cidrs.is_empty());
-    }
-
-    #[test]
-    fn fire_default_route_takeover_sets_overlay() {
-        use super::App;
-        use crate::vortix_core::engine::Conflict;
-        use crate::vortix_core::profile::ProfileId;
-
-        let mut app = App::new_test();
-        app.runtime.profiles.push(crate::state::VpnProfile {
-            id: ProfileId::new("home"),
-            name: "home".to_string(),
-            protocol: Protocol::WireGuard,
-            location: String::new(),
-            config_path: "/tmp/home.conf".into(),
-            last_used: None,
-        });
-        let conflict = Conflict::DefaultRouteTakeover {
-            current: ProfileId::new("home"),
-            new: ProfileId::new("corp"),
-        };
-        app.fire_conflict_overlay(conflict, 0, ProfileId::new("corp"), "corp".to_string());
-        assert!(matches!(
-            app.input_mode,
-            crate::state::InputMode::ConfirmDefaultRouteTakeover { ref from, .. }
-                if from == "home"
-        ));
-    }
-
-    #[test]
-    fn fire_route_overlap_sets_overlay() {
-        use super::App;
-        use crate::vortix_core::cidr::Cidr;
-        use crate::vortix_core::engine::Conflict;
-        use crate::vortix_core::profile::ProfileId;
-
-        let mut app = App::new_test();
-        let cidr: Cidr = "10.0.0.0/8".parse().unwrap();
-        let conflict = Conflict::RouteOverlap {
-            with: ProfileId::new("home"),
-            overlapping_cidrs: vec![cidr],
-        };
-        app.fire_conflict_overlay(conflict, 1, ProfileId::new("corp"), "corp".to_string());
-        match &app.input_mode {
-            crate::state::InputMode::ConfirmRouteOverlap {
-                with_profile_id,
-                overlapping_cidrs,
-                ..
-            } => {
-                assert_eq!(with_profile_id.as_str(), "home");
-                assert_eq!(overlapping_cidrs.len(), 1);
-            }
-            other => panic!("expected ConfirmRouteOverlap, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn connect_with_empty_registry_skips_overlay() {
-        // until the registry migration populates the
-        // registry, detect_conflict against an empty registry always
-        // returns None — the connect path proceeds without firing the
-        // overlay. This locks in the "no false-positive" invariant.
-        use super::App;
-        use crate::state::InputMode;
-        let path = write_tmp("u7_skip.conf", "[Interface]\nPrivateKey = a=\n");
-        let app = App::new_test();
-        let allowed = crate::topology_policy::declared_routes(Protocol::WireGuard, &path);
-        let conflict = app.registry.detect_conflict(
-            &crate::vortix_core::profile::ProfileId::new("any"),
-            &allowed,
-        );
-        assert!(conflict.is_none());
-        assert!(matches!(app.input_mode, InputMode::Normal));
+    fn an_empty_two_factor_form_starts_at_the_username() {
+        assert_eq!(initial_auth_focus(true, false), AuthField::Username);
+        assert_eq!(initial_auth_focus(true, true), AuthField::Otp);
     }
 }

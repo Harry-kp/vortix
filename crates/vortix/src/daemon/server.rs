@@ -14,10 +14,10 @@ use zeroize::Zeroize as _;
 
 use super::diagnostics::{DiagnosticHub, DiagnosticQueryProvider};
 use super::passive::{legacy_connection, PassiveQueryProvider};
-use crate::vortix_core::control::DiagnosticSnapshot;
+use crate::vortix_core::diagnostics::DiagnosticSnapshot;
 use crate::vortix_core::ipc::{
-    negotiate_passive, FrameError, IpcCapability, IpcError, IpcOp, IpcRequest, IpcResponse,
-    IpcResult, PassiveSnapshot, MAX_FRAME_BYTES,
+    negotiate_passive, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
+    PassiveSnapshot, MAX_FRAME_BYTES,
 };
 
 const MAX_CONNECTIONS: usize = 32;
@@ -343,16 +343,7 @@ async fn connection_loop<R: AsyncRead + Unpin>(
             return Ok(());
         }
     };
-    let control_connection = hello
-        .required_capabilities
-        .contains(&IpcCapability::ControlMutation);
-    let negotiated = if control_connection {
-        Err(IpcError::CapabilityUnavailable {
-            capability: IpcCapability::ControlMutation,
-        })
-    } else {
-        negotiate_passive(hello)
-    };
+    let negotiated = negotiate_passive(hello);
     let negotiated_contract = negotiated.as_ref().ok().map(|server_hello| {
         (
             server_hello.schema,
@@ -402,22 +393,6 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         }
         let digest = request_digest(&request.op)?;
         if respond_to_replay(&requests, output, request.id, &digest).await? {
-            continue;
-        }
-        if control_connection != request.op.is_canonical_control() {
-            let capability = if control_connection {
-                request.op.required_capability()
-            } else {
-                IpcCapability::ControlMutation
-            };
-            send_response(
-                output,
-                IpcResponse {
-                    id: request.id,
-                    result: Err(IpcError::CapabilityUnavailable { capability }),
-                },
-            )
-            .await?;
             continue;
         }
         let required = request.op.required_capability();
@@ -516,19 +491,6 @@ fn dispatch(
 ) -> IpcResponse {
     let result = match op {
         IpcOp::Handshake { .. } => Err(IpcError::HandshakeRequired),
-        IpcOp::Execute(_)
-        | IpcOp::ControlOpen
-        | IpcOp::ControlSubmit { .. }
-        | IpcOp::ControlSnapshot { .. }
-        | IpcOp::ControlRespondChallenge { .. }
-        | IpcOp::ControlCancelChallenge { .. }
-        | IpcOp::ControlStageProfileImport { .. }
-        | IpcOp::ControlCancelProfileImport { .. } => Err(IpcError::CapabilityUnavailable {
-            capability: IpcCapability::ControlMutation,
-        }),
-        IpcOp::ControlSubscribe { .. } => Err(IpcError::MalformedRequest(
-            "control subscriptions require a dedicated connection".into(),
-        )),
         IpcOp::Snapshot => Ok(IpcResult::Snapshot {
             state: legacy_connection(&provider.snapshot()),
         }),

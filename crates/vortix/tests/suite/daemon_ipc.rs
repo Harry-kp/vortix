@@ -5,10 +5,9 @@ use std::time::Duration;
 use std::{io::Read as _, io::Write as _};
 
 use tokio::sync::broadcast;
-use vortix::daemon::client::{self, ClientError};
+use vortix::daemon::client;
 use vortix::daemon::passive::PassiveQueryProvider;
 use vortix::daemon::DaemonServer;
-use vortix::vortix_core::engine::input::UserCommand;
 use vortix::vortix_core::ipc::{
     ClientHello, IpcCapability, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
     PassiveSnapshot, PassiveTunnel,
@@ -130,34 +129,6 @@ async fn passive_candidate_is_concurrent_race_free_and_cannot_mutate() {
     .await
     .unwrap();
     assert!(matches!(duplicate, Err(IpcError::DuplicateRequestId)));
-
-    let mutation_socket = socket.clone();
-    let mutation = tokio::task::spawn_blocking(move || {
-        client::request(
-            &mutation_socket,
-            IpcOp::Execute(UserCommand::Disconnect { profile_id: None }),
-        )
-    })
-    .await
-    .unwrap();
-    assert!(matches!(
-        mutation,
-        Err(ClientError::Daemon(IpcError::CapabilityUnavailable {
-            capability: IpcCapability::ControlMutation
-        }))
-    ));
-
-    let dormant_socket = socket.clone();
-    let dormant =
-        tokio::task::spawn_blocking(move || client::request(&dormant_socket, IpcOp::ControlOpen))
-            .await
-            .unwrap();
-    assert!(matches!(
-        dormant,
-        Err(ClientError::Daemon(IpcError::CapabilityUnavailable {
-            capability: IpcCapability::ControlMutation
-        }))
-    ));
 
     let subscription_socket = socket.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

@@ -33,7 +33,6 @@ cargo xtask check-subprocess
 cargo xtask check-platform-leak
 cargo xtask check-protocol-leak
 cargo xtask check-no-shell-regressions
-cargo xtask check-control-boundaries
 
 # 7. Release-profile smoke — the ONLY step that builds `release`; steps 1-6 all
 #    build dev, so a profile-only breakage is invisible to them. Mirrors the
@@ -97,7 +96,7 @@ cargo fmt --all -- --check
 
 ### Trap 5 — Forgetting the boundary checks
 
-`cargo xtask check-{subprocess,platform,protocol}-leak`, `check-no-shell-regressions`, and `check-control-boundaries` enforce architectural boundaries (no platform imports from `vortix_core`, no protocol imports from `vortix_platform_*`, no new client-side mutation imports, seed/mirror writers, misplaced root requests, or unbounded production channels). They are NOT part of `cargo test`. CI runs them as separate jobs.
+`cargo xtask check-{subprocess,platform,protocol}-leak` and `check-no-shell-regressions` enforce architectural boundaries (no platform imports from `vortix_core`, no protocol imports from `vortix_platform_*`, no new shell-outs to replaced system binaries). They are NOT part of `cargo test`. CI runs them as separate jobs.
 
 ## When to run what
 

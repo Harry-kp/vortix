@@ -171,7 +171,14 @@ impl Default for DetailedConnectionInfo {
 
 // U7/U8 compatibility name. Interactive challenge vocabulary is canonical in
 // the control model so credential-bearing flows cannot drift independently.
-pub use crate::vortix_core::control::model::ChallengeKind as PromptKind;
+/// What a mid-connect prompt asks the user for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptKind {
+    TwoFactorCode,
+    Passphrase,
+    Generic { label: String },
+}
 
 /// The connection state machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

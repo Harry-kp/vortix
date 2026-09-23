@@ -728,13 +728,10 @@ fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
             )
         })?;
     let (uid, gid) = crate::config::config_owner(parent).map_err(io::Error::other)?;
-    let directory =
-        crate::vortix_config::control_state::open_control_directory(parent, false, uid, gid)
-            .map_err(io::Error::other)?
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "config directory is missing")
-            })?;
-    crate::vortix_config::control_state::write_owned_atomic(&directory, name, contents, uid, gid)
+    let directory = crate::vortix_config::owned_file::open_owned_directory(parent, false, uid, gid)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "config directory is missing"))?;
+    crate::vortix_config::owned_file::write_owned_atomic(&directory, name, contents, uid, gid)
         .map_err(io::Error::other)
 }
 

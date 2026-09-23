@@ -16,13 +16,12 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, SockAddr, Socket, Type};
 
-use crate::vortix_core::control::{DiagnosticSnapshot, DiagnosticSource, DiagnosticView};
+use crate::vortix_core::diagnostics::{DiagnosticSnapshot, DiagnosticSource, DiagnosticView};
 use crate::vortix_core::ipc::{
     capabilities_for_schema, decode_frame, encode_frame, ClientHello, FrameError, IpcCapability,
     IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult, PassiveSnapshot, ServerHello,
     IPC_PROTOCOL_MAX, IPC_PROTOCOL_MIN, IPC_SCHEMA_MAX, IPC_SCHEMA_MIN,
 };
-use crate::vortix_core::privileged::AuthorityBinding;
 
 const IPC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -40,8 +39,6 @@ pub enum ClientError {
     /// A bounded subscription consumer fell behind. Reconnect to obtain a
     /// fresh subscribe-before-snapshot boundary.
     ResyncRequired { newest_generation: u64 },
-    /// A control-capable daemon did not present the enrolled authority.
-    AuthorityMismatch,
     /// Daemon returned a result variant we weren't expecting for the
     /// op we sent. Carries a description string for diagnostics.
     Unexpected(String),
@@ -57,9 +54,6 @@ impl std::fmt::Display for ClientError {
                 f,
                 "subscription lagged; resubscribe at generation {newest_generation}"
             ),
-            Self::AuthorityMismatch => {
-                write!(f, "daemon authority does not match enrollment")
-            }
             Self::Unexpected(s) => write!(f, "unexpected daemon response: {s}"),
         }
     }
@@ -92,20 +86,9 @@ impl From<FrameError> for ClientError {
 /// handlers treat any error here as "bypass: read directly from
 /// disk + scanner instead".
 pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> {
-    request_with_authority(socket_path, op, None)
-}
-
-fn request_with_authority(
-    socket_path: &Path,
-    op: IpcOp,
-    expected: Option<AuthorityBinding>,
-) -> Result<IpcResult, ClientError> {
     let required = op.required_capability();
-    let (mut stream, mut buffered, hello) =
+    let (mut stream, mut buffered, _) =
         connect_handshaken(socket_path, required, Instant::now() + IPC_EXCHANGE_TIMEOUT)?;
-    if expected.is_some() && hello.authority_binding != expected {
-        return Err(ClientError::AuthorityMismatch);
-    }
     let request = IpcRequest { id: 2, op };
     let result = exchange_until(
         &mut stream,
@@ -269,7 +252,6 @@ pub fn subscribe(socket_path: &Path) -> Result<PassiveSubscription, ClientError>
         socket_path,
         IpcCapability::PassiveSubscribe,
         IpcOp::PassiveSubscribe,
-        None,
     )?;
     let initial = match result {
         IpcResult::PassiveSubscribed { snapshot } => {
@@ -294,7 +276,6 @@ pub fn subscribe_diagnostics(socket_path: &Path) -> Result<DiagnosticSubscriptio
         socket_path,
         IpcCapability::DiagnosticsSubscribe,
         IpcOp::DiagnosticsSubscribe,
-        None,
     )?;
     let initial = match result {
         IpcResult::DiagnosticSubscribed { snapshot } => {
@@ -318,16 +299,12 @@ fn open_subscription(
     socket_path: &Path,
     capability: IpcCapability,
     op: IpcOp,
-    expected_authority: Option<AuthorityBinding>,
 ) -> Result<(UnixStream, Vec<u8>, IpcResult), ClientError> {
-    let (mut stream, mut buffered, hello) = connect_handshaken(
+    let (mut stream, mut buffered, _) = connect_handshaken(
         socket_path,
         capability,
         Instant::now() + IPC_EXCHANGE_TIMEOUT,
     )?;
-    if expected_authority.is_some() && hello.authority_binding != expected_authority {
-        return Err(ClientError::AuthorityMismatch);
-    }
     let result = exchange_until(
         &mut stream,
         &mut buffered,
@@ -362,17 +339,13 @@ fn remaining(deadline: Instant) -> std::io::Result<Duration> {
 }
 
 fn validate_handshake(hello: &ServerHello, required: IpcCapability) -> Result<(), ClientError> {
-    let control = required == IpcCapability::ControlMutation;
     if hello.product != "vortix"
-        || hello.passive == control
+        || !hello.passive
         || !(IPC_PROTOCOL_MIN..=IPC_PROTOCOL_MAX).contains(&hello.protocol)
         || !(IPC_SCHEMA_MIN..=IPC_SCHEMA_MAX).contains(&hello.schema)
-        || (control && hello.schema < 3)
         || !hello.capabilities.contains(&required)
         || !required.is_available_in_schema(hello.schema)
-        || (!control && hello.capabilities.as_slice() != capabilities_for_schema(hello.schema))
-        || (!control && hello.capabilities.contains(&IpcCapability::ControlMutation))
-        || (hello.authority_binding.is_some() != control)
+        || hello.capabilities.as_slice() != capabilities_for_schema(hello.schema)
     {
         return Err(ClientError::Unexpected(format!(
             "invalid daemon handshake response: {hello:?}"
@@ -487,45 +460,8 @@ pub fn diagnostics_or_fallback(
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-    use crate::vortix_core::ipc::{
-        CompatibilityRange, IPC_PROTOCOL_MAX, IPC_SCHEMA_MAX, PASSIVE_CAPABILITIES,
-    };
-
-    fn passive_hello() -> ServerHello {
-        ServerHello {
-            product: "vortix".into(),
-            product_version: env!("CARGO_PKG_VERSION").into(),
-            protocol: IPC_PROTOCOL_MAX,
-            schema: IPC_SCHEMA_MAX,
-            capabilities: PASSIVE_CAPABILITIES.to_vec(),
-            passive: true,
-            authority_binding: None,
-        }
-    }
-
-    #[test]
-    fn client_rejects_mutation_capability_from_passive_peer() {
-        let mut hello = passive_hello();
-        hello.capabilities.push(IpcCapability::ControlMutation);
-        assert!(validate_handshake(&hello, IpcCapability::PassiveSnapshot).is_err());
-    }
-
-    #[test]
-    fn client_rejects_authority_binding_from_passive_peer() {
-        let mut hello = passive_hello();
-        hello.authority_binding = Some(
-            crate::vortix_core::privileged::AuthorityBinding::new(
-                crate::vortix_core::control::AuthorityEpoch(1),
-                crate::vortix_core::privileged::BootScope::new([1; 16]),
-                crate::vortix_core::privileged::LeaseId::new([2; 32]),
-                crate::vortix_core::privileged::OperationDigest::of_bytes(b"service"),
-            )
-            .unwrap(),
-        );
-        assert!(validate_handshake(&hello, IpcCapability::PassiveSnapshot).is_err());
-    }
+    use crate::vortix_core::ipc::{CompatibilityRange, IPC_PROTOCOL_MAX};
 
     #[test]
     fn client_rejects_authoritative_passive_snapshot() {

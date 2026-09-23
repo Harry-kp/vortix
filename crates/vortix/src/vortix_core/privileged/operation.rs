@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::control::AuthorityEpoch;
+use crate::vortix_core::ids::AuthorityEpoch;
 use crate::vortix_core::privileged::protocol_plan::{
     DnsHostname, OpenVpnRedirectGateway, OpenVpnRoute, OpenVpnRouteDefaults, OpenVpnRouteGateway,
     ProtocolPlan,

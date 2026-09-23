@@ -142,7 +142,7 @@ impl PfFirewall {
         )
         .unwrap();
         for c in &rfc1918 {
-            writeln!(rules, "pass out quick to {c}").unwrap();
+            writeln!(rules, "pass out quick to {c} flags any").unwrap();
         }
         writeln!(rules).unwrap();
 
@@ -169,10 +169,18 @@ impl PfFirewall {
                     tunnel.interface, tunnel.is_primary
                 )
                 .unwrap();
-                writeln!(rules, "pass out quick on {} all", tunnel.interface).unwrap();
+                // `flags any`: a connection opened before the firewall (a TCP
+                // tunnel's own transport) has no state and is mid-stream, so
+                // the default SYN-only match would drop it.
+                writeln!(
+                    rules,
+                    "pass out quick on {} all flags any",
+                    tunnel.interface
+                )
+                .unwrap();
             }
             for ip in &tunnel.server_ips {
-                writeln!(rules, "pass out quick to {}", fmt_ip(ip)).unwrap();
+                writeln!(rules, "pass out quick to {} flags any", fmt_ip(ip)).unwrap();
             }
         }
 
@@ -321,15 +329,21 @@ fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
             "pass in quick proto udp from any port = 67 to any port = 68 keep state".into(),
         );
     }
+    if rule == "pass out quick on lo0 all" {
+        return Some("pass out quick on lo0 all flags S/SA keep state".into());
+    }
     if let Some(interface) = rule
         .strip_prefix("pass out quick on ")
-        .and_then(|rest| rest.strip_suffix(" all"))
+        .and_then(|rest| rest.strip_suffix(" all flags any"))
     {
         return Some(format!(
-            "pass out quick on {interface} all flags S/SA keep state"
+            "pass out quick on {interface} all flags any keep state"
         ));
     }
-    if let Some(destination) = rule.strip_prefix("pass out quick to ") {
+    if let Some(destination) = rule
+        .strip_prefix("pass out quick to ")
+        .and_then(|rest| rest.strip_suffix(" flags any"))
+    {
         let family = if destination
             .split_once('/')
             .map_or(destination, |(address, _)| address)
@@ -342,7 +356,7 @@ fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
             "inet6"
         };
         return Some(format!(
-            "pass out quick {family} from any to {destination} flags S/SA keep state"
+            "pass out quick {family} from any to {destination} flags any keep state"
         ));
     }
     Some(rule.to_string())
@@ -567,9 +581,9 @@ mod tests {
     fn pf_load_disables_optimizer_that_reorders_exact_policy() {
         let generated = PfFirewall::generate_pf_rules(&[]);
         let mut default_optimizer_output = vec![
-            "pass out quick inet from any to 10.0.0.0/8 flags S/SA keep state",
-            "pass out quick inet from any to 172.16.0.0/12 flags S/SA keep state",
-            "pass out quick inet from any to 192.168.0.0/16 flags S/SA keep state",
+            "pass out quick inet from any to 10.0.0.0/8 flags any keep state",
+            "pass out quick inet from any to 172.16.0.0/12 flags any keep state",
+            "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
             "pass out quick on lo0 all flags S/SA keep state",
             "pass out quick proto udp from any port = 68 to any port = 67 keep state",
             "pass in quick proto udp from any port = 67 to any port = 68 keep state",
@@ -683,13 +697,13 @@ mod tests {
         }];
         let normalized = [
             "pass out quick on lo0 all flags S/SA keep state",
-            "pass out quick inet from any to 10.0.0.0/8 flags S/SA keep state",
-            "pass out quick inet from any to 172.16.0.0/12 flags S/SA keep state",
-            "pass out quick inet from any to 192.168.0.0/16 flags S/SA keep state",
+            "pass out quick inet from any to 10.0.0.0/8 flags any keep state",
+            "pass out quick inet from any to 172.16.0.0/12 flags any keep state",
+            "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
             "pass out quick proto udp from any port = 68 to any port = 67 keep state",
             "pass in quick proto udp from any port = 67 to any port = 68 keep state",
-            "pass out quick on utun4 all flags S/SA keep state",
-            "pass out quick inet from any to 198.51.100.7 flags S/SA keep state",
+            "pass out quick on utun4 all flags any keep state",
+            "pass out quick inet from any to 198.51.100.7 flags any keep state",
         ];
         let generated = PfFirewall::generate_pf_rules(&active);
         let mut observed = normalized.to_vec();
@@ -845,7 +859,7 @@ mod tests {
             .unwrap();
         assert!(last.starts_with("block drop out quick all label \"vortix-policy:"));
         assert!(rules.find("pass out quick on utun3").unwrap() < rules.find(last).unwrap());
-        let missing_allow = rules.replace("pass out quick on utun3 all\n", "");
+        let missing_allow = rules.replace("pass out quick on utun3 all flags any\n", "");
         assert_ne!(
             PfFirewall::canonical_pf_rules(&missing_allow),
             PfFirewall::canonical_pf_rules(&rules)
@@ -906,9 +920,9 @@ mod tests {
 pass out quick on lo0 all
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
-pass out quick to 10.0.0.0/8
-pass out quick to 172.16.0.0/12
-pass out quick to 192.168.0.0/16
+pass out quick to 10.0.0.0/8 flags any
+pass out quick to 172.16.0.0/12 flags any
+pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
 pass out quick proto udp from any port 68 to any port 67
@@ -938,17 +952,17 @@ block drop out quick all
 pass out quick on lo0 all
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
-pass out quick to 10.0.0.0/8
-pass out quick to 172.16.0.0/12
-pass out quick to 192.168.0.0/16
+pass out quick to 10.0.0.0/8 flags any
+pass out quick to 172.16.0.0/12 flags any
+pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
 pass out quick proto udp from any port 68 to any port 67
 pass in quick proto udp from any port 67 to any port 68
 
 # Tunnel: utun3 (primary=true)
-pass out quick on utun3 all
-pass out quick to 1.2.3.4
+pass out quick on utun3 all flags any
+pass out quick to 1.2.3.4 flags any
 
 # Default: block all remaining egress
 block drop out quick all
@@ -980,20 +994,20 @@ block drop out quick all
 pass out quick on lo0 all
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
-pass out quick to 172.16.0.0/12
-pass out quick to 192.168.0.0/16
+pass out quick to 172.16.0.0/12 flags any
+pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
 pass out quick proto udp from any port 68 to any port 67
 pass in quick proto udp from any port 67 to any port 68
 
 # Tunnel: utun3 (primary=true)
-pass out quick on utun3 all
-pass out quick to 1.2.3.4
+pass out quick on utun3 all flags any
+pass out quick to 1.2.3.4 flags any
 
 # Tunnel: utun4 (primary=false)
-pass out quick on utun4 all
-pass out quick to 5.6.7.8
+pass out quick on utun4 all flags any
+pass out quick to 5.6.7.8 flags any
 
 # Default: block all remaining egress
 block drop out quick all
