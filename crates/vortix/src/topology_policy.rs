@@ -391,15 +391,43 @@ fn resolve_endpoint(
         output.insert(address);
         return;
     }
-    let live = (host, port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addresses| addresses.next())
-        .map(|address| address.ip());
+    let live = resolve_host_with_deadline(host, port, ENDPOINT_RESOLVE_TIMEOUT);
     if let Some(address) = live.or_else(|| cache.lookup(&profile.id, digest, host, port)) {
         output.insert(address);
         resolutions.push(ResolvedEndpoint::new(host, port, address));
     }
+}
+
+/// Cap on a single endpoint `getaddrinfo`. The lookup runs through the system
+/// resolver, which can stall for the full ~30s resolver retry budget when that
+/// resolver is slow (e.g. a corporate mesh's DNS). This call sits on the
+/// control-service startup path, so an uncapped lookup freezes the TUI at
+/// "starting"; the cached endpoint is the correct fallback while it stalls.
+const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Resolve `host:port` to one IP, giving up after `timeout`. `std`'s
+/// `to_socket_addrs` has no timeout, so run it on a detached thread and read the
+/// result through a channel. On timeout the thread is left to finish on its own
+/// (it exits when the OS resolver returns) and the caller falls back to cache.
+///
+/// ponytail: one thread per stalled lookup, bounded by the profile count; fine
+/// at this scale. A shared bounded resolver pool if that ever stops holding.
+fn resolve_host_with_deadline(
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Option<std::net::IpAddr> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host = host.to_owned();
+    std::thread::spawn(move || {
+        let resolved = (host.as_str(), port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addresses| addresses.next())
+            .map(|address| address.ip());
+        let _ = tx.send(resolved);
+    });
+    rx.recv_timeout(timeout).ok().flatten()
 }
 
 fn digest_of(value: &impl serde::Serialize) -> Result<PolicyDigest, String> {
@@ -742,13 +770,32 @@ impl CanonicalPolicyExecutor {
         let route_table = &crate::platform::current_platform().route_table;
         let prior_bindings = openvpn_route_bindings(&policy.prior);
         let target_bindings = openvpn_route_bindings(&policy.target);
+        // Route removal is best-effort. A failed delete — a `route` call that
+        // timed out during table churn, a stale interface from a concurrent
+        // transaction, an already-purged route — must never abort the reconcile:
+        // that hard-fails the Route barrier and strands a disconnect with the
+        // tunnel half-up and no working default route. A lingering route is
+        // recoverable (the kernel scrubs utun-bound routes when the interface is
+        // destroyed); a blocked teardown is not. Installs stay strict below.
         for (cidr, interface) in prior_bindings.difference(&target_bindings) {
-            route_table.unbind_route(cidr, interface)?;
+            if let Err(error) = route_table.unbind_route(cidr, interface) {
+                tracing::warn!(
+                    target: "vortix::control::policy",
+                    %cidr, %interface, %error,
+                    "route removal failed during reconcile; continuing teardown"
+                );
+            }
         }
         let prior_endpoints = openvpn_default_endpoints(&policy.prior);
         let target_endpoints = openvpn_default_endpoints(&policy.target);
         for endpoint in prior_endpoints.difference(&target_endpoints) {
-            route_table.unbind_host_route(*endpoint)?;
+            if let Err(error) = route_table.unbind_host_route(*endpoint) {
+                tracing::warn!(
+                    target: "vortix::control::policy",
+                    %endpoint, %error,
+                    "host route removal failed during reconcile; continuing teardown"
+                );
+            }
         }
         self.verify_routes(policy)
     }
@@ -1302,6 +1349,22 @@ mod tests {
 
     fn operation() -> OperationId {
         serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap()
+    }
+
+    #[test]
+    fn endpoint_resolution_never_blocks_past_the_deadline() {
+        // A slow system resolver must not freeze the startup path: the lookup
+        // returns within the deadline and the caller falls back to the cache.
+        let start = std::time::Instant::now();
+        let _ = resolve_host_with_deadline(
+            "endpoint.example.invalid",
+            443,
+            std::time::Duration::from_millis(50),
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "resolution blocked past its deadline instead of giving up"
+        );
     }
 
     #[test]
