@@ -49,8 +49,36 @@ pub struct MacRouteTable;
 
 impl RouteTable for MacRouteTable {
     fn default_gateway() -> Option<String> {
-        let text = run_route_get_default()?;
-        parse_gateway(&text)
+        // Read the literal default (/0) row, NOT `route get default`. That query
+        // resolves the destination 0.0.0.0, which longest-prefix-matches our own
+        // `0.0.0.0/1 -> utunN` once it is installed — so it answers with the
+        // tunnel's link (`index: N utunN`) instead of the physical gateway, and
+        // the VPN-server escape route built from it then points into the very
+        // tunnel it exists to bypass. The /0 slot is what `def1` deliberately
+        // leaves on the physical link, so it is the reliable source here.
+        match ROUTE_PROBE.run(
+            // xtask:allow-shell-regression: `netstat -rn` is the supported macOS read of the literal default-route slot; `route get` cannot express "the /0 entry".
+            CommandSpec::oneshot("netstat", vec!["-rn".into(), "-f".into(), "inet".into()])
+                .timeout(ROUTE_QUERY_TIMEOUT)
+                .output_limit(256 * 1024),
+        ) {
+            ProbeOutcome::Success(stdout) => parse_default_slot_gateway(&stdout),
+            ProbeOutcome::BackedOff => None,
+            ProbeOutcome::Failed {
+                consecutive_failures,
+                cooldown,
+            } => {
+                if consecutive_failures == 1 || cooldown >= Duration::from_secs(5) {
+                    tracing::warn!(
+                        target: "vortix::vortix_platform_macos::route_table",
+                        consecutive_fails = consecutive_failures,
+                        cooldown_secs = cooldown.as_secs(),
+                        "default-route slot read failed; backing off to spare the tokio runtime"
+                    );
+                }
+                None
+            }
+        }
     }
 
     fn default_route_observation() -> DefaultRouteObservation {
@@ -202,36 +230,23 @@ pub(crate) fn unbind_host_route_args(destination: IpAddr) -> Vec<String> {
     ]
 }
 
-/// Read the literal default-route slot. `def1` leaves this on the physical
-/// network, which is the gateway needed for VPN server escape routes.
+/// Gateway of the literal `default` (/0) row in `netstat -rn` output.
 ///
-/// Returns `None` if the subprocess fails (binary missing, non-zero exit,
-/// I/O error) so callers can degrade gracefully without panicking.
-fn run_route_get_default() -> Option<String> {
-    match ROUTE_PROBE.run(
-        CommandSpec::oneshot("route", vec!["-n".into(), "get".into(), "default".into()])
-            .timeout(ROUTE_QUERY_TIMEOUT),
-    ) {
-        ProbeOutcome::Success(stdout) => Some(stdout),
-        ProbeOutcome::BackedOff => None,
-        ProbeOutcome::Failed {
-            consecutive_failures,
-            cooldown,
-        } => {
-            if consecutive_failures == 1 || cooldown >= Duration::from_secs(5) {
-                tracing::warn!(
-                    target: "vortix::vortix_platform_macos::route_table",
-                    consecutive_fails = consecutive_failures,
-                    cooldown_secs = cooldown.as_secs(),
-                    "`route get default` probe failed; backing off to spare the tokio runtime"
-                );
-            }
-            None
-        }
-    }
+/// Only a real IP counts: an interface-scoped route renders its gateway as a
+/// link (`index: 20 utun4`), which is never a usable physical gateway.
+pub(crate) fn parse_default_slot_gateway(text: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let destination = fields.next()?;
+            let gateway = fields.next()?;
+            (destination == "default").then_some(gateway)
+        })
+        .find(|gateway| gateway.parse::<IpAddr>().is_ok())
+        .map(ToOwned::to_owned)
 }
 
-/// Extract the `gateway:` line from `route get default` output.
+/// Extract the `gateway:` line from `route get <target>` output.
 fn parse_gateway(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
@@ -318,6 +333,34 @@ destination: default
         // colon and around the name should still match.
         let text = "    interface:\t  en5  \n";
         assert_eq!(parse_interface(text), Some("en5".into()));
+    }
+
+    #[test]
+    fn physical_gateway_comes_from_the_default_slot_not_our_own_half_route() {
+        // `route get default` resolves 0.0.0.0, which longest-prefix-matches the
+        // `0.0.0.0/1 -> utunN` we install ourselves and answers with the tunnel's
+        // link — the escape route built from that points into the tunnel it is
+        // meant to bypass. Reading the literal default row keeps the physical gw.
+        let netstat = "\
+Destination        Gateway            Flags               Netif Expire
+0/1                utun4              UScg                utun4
+default            192.168.1.1        UGScg                 en0
+128.0/1            utun4              USc                 utun4
+";
+        assert_eq!(
+            parse_default_slot_gateway(netstat),
+            Some("192.168.1.1".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_link_gateway_is_never_reported_as_the_physical_gateway() {
+        // An interface-scoped default renders its gateway as a link, which is
+        // not routable as an escape-route gateway.
+        assert_eq!(
+            parse_default_slot_gateway("default            utun4              UGScg    utun4\n"),
+            None
+        );
     }
 
     #[test]

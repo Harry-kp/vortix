@@ -391,40 +391,15 @@ fn resolve_endpoint(
         output.insert(address);
         return;
     }
-    let live = resolve_host_with_deadline(host, port, ENDPOINT_RESOLVE_TIMEOUT);
+    let live = (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.next())
+        .map(|address| address.ip());
     if let Some(address) = live.or_else(|| cache.lookup(&profile.id, digest, host, port)) {
         output.insert(address);
         resolutions.push(ResolvedEndpoint::new(host, port, address));
     }
-}
-
-/// Cap on a single endpoint `getaddrinfo`; an uncapped lookup through a slow
-/// system resolver froze the TUI at "starting" for the ~30s resolver budget.
-const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Resolve `host:port` to one IP, giving up after `timeout`. `std`'s
-/// `to_socket_addrs` has no timeout, so run it on a detached thread and read the
-/// result through a channel. On timeout the thread is left to finish on its own
-/// (it exits when the OS resolver returns) and the caller falls back to cache.
-///
-/// ponytail: one thread per stalled lookup, bounded by the profile count; fine
-/// at this scale. A shared bounded resolver pool if that ever stops holding.
-fn resolve_host_with_deadline(
-    host: &str,
-    port: u16,
-    timeout: std::time::Duration,
-) -> Option<std::net::IpAddr> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let host = host.to_owned();
-    std::thread::spawn(move || {
-        let resolved = (host.as_str(), port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addresses| addresses.next())
-            .map(|address| address.ip());
-        let _ = tx.send(resolved);
-    });
-    rx.recv_timeout(timeout).ok().flatten()
 }
 
 fn digest_of(value: &impl serde::Serialize) -> Result<PolicyDigest, String> {
@@ -1346,22 +1321,6 @@ mod tests {
 
     fn operation() -> OperationId {
         serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap()
-    }
-
-    #[test]
-    fn endpoint_resolution_never_blocks_past_the_deadline() {
-        // A slow system resolver must not freeze the startup path: the lookup
-        // returns within the deadline and the caller falls back to the cache.
-        let start = std::time::Instant::now();
-        let _ = resolve_host_with_deadline(
-            "endpoint.example.invalid",
-            443,
-            std::time::Duration::from_millis(50),
-        );
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "resolution blocked past its deadline instead of giving up"
-        );
     }
 
     #[test]
