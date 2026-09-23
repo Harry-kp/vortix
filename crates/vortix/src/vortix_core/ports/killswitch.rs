@@ -50,7 +50,7 @@ pub enum KillswitchError {
 /// do **not** contribute to RFC1918 subtraction — their interface allow
 /// rule covers all egress, and subtracting `0.0.0.0/0` would strip
 /// loopback.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveTunnelInfo {
     /// VPN tunnel interface name, e.g. `"utun3"` (macOS) or `"wg0"` (Linux).
     pub interface: String,

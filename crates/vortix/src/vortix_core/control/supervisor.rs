@@ -39,6 +39,10 @@ pub struct ProfileSupervision {
     /// can show it. The live-connect path publishes this via the work result;
     /// recovery bypasses that path, so it is carried here instead.
     pub openvpn_dns: Option<crate::vortix_core::ports::dns::DnsRequest>,
+    /// Routes the `OpenVPN` server pushed, recovered on adoption for the same
+    /// reason as `openvpn_dns`: without them a restart forgets that this tunnel
+    /// holds `0/0`, and a second full tunnel is admitted with no takeover.
+    pub openvpn_routes: Option<crate::vortix_core::privileged::OpenVpnRouteEvidence>,
     pub probe_receipts: Vec<ProbeReceipt>,
     pub truth: SupervisedTruth,
 }
@@ -340,6 +344,7 @@ impl Supervisor {
             adoption: None,
             handshake: None,
             openvpn_dns: None,
+            openvpn_routes: None,
             probe_receipts: Vec::new(),
             truth: if work.mutation == TunnelMutation::Disconnect {
                 SupervisedTruth::DisconnectedTombstone
@@ -421,6 +426,7 @@ impl Supervisor {
             adoption: None,
             handshake: None,
             openvpn_dns: None,
+            openvpn_routes: None,
             probe_receipts: Vec::new(),
             truth: if work.mutation == TunnelMutation::Disconnect {
                 SupervisedTruth::DisconnectedTombstone
@@ -476,6 +482,7 @@ impl Supervisor {
                 adoption: Some(evidence),
                 handshake: None,
                 openvpn_dns: None,
+                openvpn_routes: None,
                 probe_receipts: Vec::new(),
                 truth: SupervisedTruth::ObservedPresent,
             },
@@ -553,11 +560,30 @@ impl Supervisor {
                 adoption: Some(evidence),
                 handshake,
                 openvpn_dns,
+                openvpn_routes: None,
                 probe_receipts,
                 truth: SupervisedTruth::ObservedPresent,
             },
         );
         Ok(())
+    }
+
+    /// Attach the pushed-route evidence recovered for an adopted `OpenVPN`
+    /// tunnel, so the next snapshot knows which routes it owns.
+    pub fn restore_openvpn_routes(
+        &self,
+        profile_id: &ProfileId,
+        routes: crate::vortix_core::privileged::OpenVpnRouteEvidence,
+    ) {
+        if let Some(entry) = self
+            .state
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .profiles
+            .get_mut(profile_id)
+        {
+            entry.openvpn_routes = Some(routes);
+        }
     }
 
     pub fn submit_policy(&self, policy: &TopologyPolicy) -> Result<(), WorkFailure> {
@@ -1065,6 +1091,7 @@ impl Supervisor {
                         adoption: None,
                         handshake: None,
                         openvpn_dns: None,
+                        openvpn_routes: None,
                         probe_receipts: Vec::new(),
                         truth: if tombstone.teardown_failed {
                             SupervisedTruth::OutcomeUnknown

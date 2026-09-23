@@ -107,36 +107,54 @@ impl ControlSnapshot {
     /// `profile_id`. The calculation uses only canonical snapshot data.
     #[must_use]
     pub fn topology_conflict(&self, profile_id: &ProfileId) -> Option<Conflict> {
-        if let Some(conflict) = self
+        self.topology_conflicts(profile_id).into_iter().next()
+    }
+
+    /// Every live tunnel that cannot coexist with `profile_id`: the ones an
+    /// exclusive switch must tear down, and no others.
+    #[must_use]
+    pub fn conflicting_profiles(&self, profile_id: &ProfileId) -> Vec<ProfileId> {
+        let mut peers = self
+            .topology_conflicts(profile_id)
+            .into_iter()
+            .map(|conflict| match conflict {
+                Conflict::DefaultRouteTakeover { current, .. } => current,
+                Conflict::RouteOverlap { with, .. } => with,
+            })
+            .filter(|peer| peer != profile_id)
+            .collect::<Vec<_>>();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+
+    fn topology_conflicts(&self, profile_id: &ProfileId) -> Vec<Conflict> {
+        let mut conflicts = self
             .pending_route_conflicts
             .get(profile_id)
             .filter(|conflict| self.conflict_peer_is_active(profile_id, conflict))
-        {
-            return Some(conflict.clone());
-        }
-        let requested = self.profile_routes.get(profile_id)?;
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let Some(requested) = self.profile_routes.get(profile_id) else {
+            return conflicts;
+        };
         for (existing_id, tunnel) in &self.tunnels {
             if existing_id == profile_id || matches!(tunnel.state, Connection::Disconnected { .. })
             {
                 continue;
             }
-            // `?` here returned `None` from the whole function — "no conflict
-            // with anyone" — the moment a single peer had no route entry,
-            // hiding every other peer's conflict behind it. One peer we cannot
-            // describe is a peer to skip, not an answer about the rest.
             let Some(existing) = self.profile_routes.get(existing_id) else {
                 continue;
             };
-            if let Some(conflict) = crate::vortix_core::engine::classify_route_conflict(
+            conflicts.extend(crate::vortix_core::engine::classify_route_conflict(
                 requested,
                 existing,
                 existing_id,
                 profile_id,
-            ) {
-                return Some(conflict);
-            }
+            ));
         }
-        None
+        conflicts
     }
 
     fn conflict_peer_is_active(&self, profile_id: &ProfileId, conflict: &Conflict) -> bool {
@@ -211,6 +229,28 @@ mod conflict_scan_tests {
             }),
             "the conflict with a fully described peer must still be reported"
         );
+    }
+
+    #[test]
+    fn an_exclusive_switch_names_only_the_tunnels_that_conflict() {
+        let full = ProfileId::new("01-full");
+        let split = ProfileId::new("02-split");
+        let candidate = ProfileId::new("03-full");
+
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.tunnels.insert(full.clone(), connected(&full));
+        snapshot.tunnels.insert(split.clone(), connected(&split));
+        snapshot
+            .profile_routes
+            .insert(full.clone(), vec![cidr("0.0.0.0/0")]);
+        snapshot
+            .profile_routes
+            .insert(split.clone(), vec![cidr("10.250.0.0/24")]);
+        snapshot
+            .profile_routes
+            .insert(candidate.clone(), vec![cidr("0.0.0.0/0")]);
+
+        assert_eq!(snapshot.conflicting_profiles(&candidate), vec![full]);
     }
 
     /// The reported case: `wg07` is a split tunnel

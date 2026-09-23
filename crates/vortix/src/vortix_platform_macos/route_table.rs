@@ -62,7 +62,21 @@ impl RouteTable for MacRouteTable {
                 .timeout(ROUTE_QUERY_TIMEOUT)
                 .output_limit(256 * 1024),
         ) {
-            ProbeOutcome::Success(stdout) => parse_default_slot_gateway(&stdout),
+            ProbeOutcome::Success(stdout) => {
+                let gateway = parse_default_slot_gateway(&stdout);
+                if gateway.is_none() {
+                    let default_rows = stdout
+                        .lines()
+                        .filter(|line| line.starts_with("default"))
+                        .collect::<Vec<_>>();
+                    tracing::warn!(
+                        target: "vortix::vortix_platform_macos::route_table",
+                        ?default_rows,
+                        "no IP gateway on the default (/0) row"
+                    );
+                }
+                gateway
+            }
             ProbeOutcome::BackedOff => None,
             ProbeOutcome::Failed {
                 consecutive_failures,
@@ -86,18 +100,7 @@ impl RouteTable for MacRouteTable {
     }
 
     fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
-        // Run both verbs: `change` transfers an existing prefix and `add`
-        // creates a route suppressed by OpenVPN's --route-noexec. macOS route
-        // can exit successfully while reporting either no entry or an
-        // existing entry, so read-back remains the authority.
-        let mut ran = false;
-        for verb in ["change", "add"] {
-            let spec = CommandSpec::oneshot("route", bind_route_args(verb, cidr, interface))
-                .timeout(ROUTE_QUERY_TIMEOUT)
-                .output_limit(64 * 1024);
-            ran |= crate::vortix_process::run_to_output(spec).is_ok();
-        }
-        if ran {
+        if add_or_change(|verb| bind_route_args(verb, cidr, interface)) {
             Ok(())
         } else {
             Err(format!("route {cidr} could not be bound to {interface}"))
@@ -105,14 +108,7 @@ impl RouteTable for MacRouteTable {
     }
 
     fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String> {
-        let mut ran = false;
-        for verb in ["change", "add"] {
-            let spec =
-                CommandSpec::oneshot("route", bind_host_route_args(verb, destination, gateway))
-                    .timeout(ROUTE_QUERY_TIMEOUT)
-                    .output_limit(64 * 1024);
-            ran |= crate::vortix_process::run_to_output(spec).is_ok();
-        }
+        let ran = add_or_change(|verb| bind_host_route_args(verb, destination, gateway));
         if ran && selected_gateway(destination).as_deref() == Some(gateway) {
             Ok(())
         } else {
@@ -148,6 +144,28 @@ impl RouteTable for MacRouteTable {
             DefaultRouteObservation::NoDefaultRoute,
             DefaultRouteObservation::Interface,
         )
+    }
+}
+
+/// `add` the route; `change` it only when `add` reports that exact route already
+/// exists. Never `change` first: on a missing route, `route change` rewrites
+/// whatever it longest-prefix-matches — for `0.0.0.0/1` that is the default
+/// route itself, which hijacked the physical default onto the tunnel and left
+/// no default at all once the tunnel went away.
+fn add_or_change(args: impl Fn(&str) -> Vec<String>) -> bool {
+    let run = |verb| {
+        crate::vortix_process::run_to_output(
+            CommandSpec::oneshot("route", args(verb))
+                .timeout(ROUTE_QUERY_TIMEOUT)
+                .output_limit(64 * 1024),
+        )
+    };
+    match run("add") {
+        Ok(output) if String::from_utf8_lossy(&output.stderr).contains("File exists") => {
+            run("change").is_ok()
+        }
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
 

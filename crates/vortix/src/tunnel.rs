@@ -525,6 +525,7 @@ impl CanonicalTunnelExecutor {
             return Ok(false);
         };
         let receipt = Self::receipt_for(&recovery_work, &handle)?;
+        let openvpn_routes = receipt.openvpn_routes.clone();
         supervisor
             .restore_owned_tunnel(
                 receipt
@@ -538,6 +539,9 @@ impl CanonicalTunnelExecutor {
                 operation_id,
             )
             .map_err(|error| format!("supervisor refused recovered ownership: {error:?}"))?;
+        if let Some(routes) = openvpn_routes {
+            supervisor.restore_openvpn_routes(profile_id, routes);
+        }
         self.active
             .lock()
             .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?

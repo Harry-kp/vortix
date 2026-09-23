@@ -48,7 +48,7 @@ fn request(key: &str, profile_id: ProfileId, deadline: u64) -> CommandRequest {
 }
 
 #[tokio::test]
-async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
+async fn exclusive_connect_tears_down_only_conflicting_tunnels() {
     let first = profile('a');
     let target = profile('b');
     let untouched = profile('c');
@@ -57,9 +57,9 @@ async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
             .into_iter()
             .collect(),
         profile_topologies: [
-            (first.clone(), ProfileTopology::default()),
-            (target.clone(), ProfileTopology::default()),
-            (untouched.clone(), ProfileTopology::default()),
+            (first.clone(), routed("0.0.0.0/0")),
+            (target.clone(), routed("0.0.0.0/0")),
+            (untouched.clone(), routed("10.250.0.0/24")),
         ]
         .into_iter()
         .collect(),
@@ -68,7 +68,7 @@ async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
     let client = service.client();
     for (key, profile_id) in [
         ("connect-first", first.clone()),
-        ("connect-target", target.clone()),
+        ("connect-untouched", untouched.clone()),
     ] {
         client
             .submit(request(key, profile_id, u64::MAX))
@@ -81,7 +81,7 @@ async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
         Some(&vortix::vortix_core::control::RequestedTunnelState::Connected)
     );
     assert_eq!(
-        before.desired.tunnels.get(&target),
+        before.desired.tunnels.get(&untouched),
         Some(&vortix::vortix_core::control::RequestedTunnelState::Connected)
     );
 
@@ -107,8 +107,8 @@ async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
     );
     assert_eq!(
         after.desired.tunnels.get(&untouched),
-        Some(&vortix::vortix_core::control::RequestedTunnelState::Disconnected),
-        "the atomic subset must explicitly include untouched catalog profiles"
+        Some(&vortix::vortix_core::control::RequestedTunnelState::Connected),
+        "a split tunnel that does not conflict survives the switch"
     );
     let operation = after.operations.get(&admitted.operation_id).unwrap();
     let vortix::vortix_core::control::OperationIntent::DesiredSubset { tunnels, .. } =
@@ -116,7 +116,18 @@ async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
     else {
         panic!("exclusive switch must retain its exact desired subset");
     };
-    assert_eq!(tunnels, &after.desired.tunnels);
+    assert_eq!(
+        tunnels.len(),
+        2,
+        "only the target and its conflict: {tunnels:?}"
+    );
+}
+
+fn routed(route: &str) -> ProfileTopology {
+    ProfileTopology {
+        routes: std::iter::once(route.to_owned()).collect(),
+        ..ProfileTopology::default()
+    }
 }
 
 fn config() -> ControlServiceConfig {

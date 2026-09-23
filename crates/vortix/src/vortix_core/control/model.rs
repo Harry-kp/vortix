@@ -290,29 +290,16 @@ pub struct ObservedState {
     #[serde(default)]
     pub wireguard_probe_receipts:
         BTreeMap<ProfileId, Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>>,
-    /// Authenticated `OpenVPN` route truth fenced to the successful tunnel generation.
+    /// Routes the live `OpenVPN` tunnel negotiated; removed with the tunnel.
     #[serde(default)]
-    pub openvpn_routes: BTreeMap<ProfileId, ObservedOpenVpnRoutes>,
-    /// DNS request authenticated by the completed `OpenVPN` negotiation and
-    /// fenced to the exact successful desired generation.
+    pub openvpn_routes: BTreeMap<ProfileId, OpenVpnRouteEvidence>,
+    /// DNS the live `OpenVPN` tunnel negotiated; removed with the tunnel.
     #[serde(default)]
-    pub openvpn_dns: BTreeMap<ProfileId, ObservedOpenVpnDns>,
+    pub openvpn_dns: BTreeMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
     /// Ongoing typed health fenced to the successful desired generation.
     /// Snapshot subscribers consume this same record as CLI/TUI projections.
     #[serde(default)]
     pub connection_health: BTreeMap<ProfileId, ObservedConnectionHealth>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservedOpenVpnRoutes {
-    pub desired_generation: u64,
-    pub evidence: OpenVpnRouteEvidence,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservedOpenVpnDns {
-    pub desired_generation: u64,
-    pub request: crate::vortix_core::ports::dns::DnsRequest,
 }
 
 /// Generation-consistent ongoing health published by the control owner.

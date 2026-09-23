@@ -13,13 +13,12 @@ use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::service::ProfileTopology;
 use crate::vortix_core::control::worker::{
     gate_verified, PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage,
-    TopologyPolicy, TopologyState, TopologyTransitionKind,
+    TopologyPolicy, TopologyState, TopologyTransitionKind, TunnelRevision,
 };
 use crate::vortix_core::control::BootEligibility;
 use crate::vortix_core::control::PolicyDigest;
-use crate::vortix_core::ports::dns::{
-    DnsEffectiveStatus, DnsPolicyCoordinator, DnsTunnelIntent, DnsTunnelRole,
-};
+use crate::vortix_core::network_plan::{plan, NetworkPlan, PlanTunnel};
+use crate::vortix_core::ports::dns::{DnsEffectiveStatus, DnsPolicyCoordinator, DnsTunnelIntent};
 use crate::vortix_core::ports::killswitch::ActiveTunnelInfo;
 use crate::vortix_core::ports::route_table::DefaultRouteObservation;
 use crate::vortix_core::ports::tunnel::ParsedProfile as _;
@@ -35,10 +34,6 @@ const MAX_PROFILE_BYTES: u64 = 4 * 1024 * 1024;
 const ENDPOINT_CACHE_SCHEMA: u8 = 1;
 const MAX_CACHED_PROFILES: usize = 512;
 const MAX_ENDPOINTS_PER_PROFILE: usize = 256;
-/// Each exact policy-routing query can consume the platform subprocess's
-/// one-second budget. Reject unbounded plans before the first query while the
-/// policy deadline remains the tighter runtime bound.
-const MAX_ROUTE_PROBES_PER_BARRIER: usize = 256;
 
 /// Read route declarations for the compatibility conflict prompt.
 /// Canonical admission still consumes the complete [`ProfileTopology`].
@@ -437,13 +432,6 @@ struct Readback {
     evidence: PolicyExecutionEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RouteProbeExpectation {
-    target: std::net::IpAddr,
-    interface: String,
-    claims: Vec<(ProfileId, crate::vortix_core::control::worker::RouteClaim)>,
-}
-
 /// Executes the global barriers against the real route, DNS, and firewall
 /// adapters. Protocol lifecycle remains owned by `CanonicalTunnelExecutor`.
 pub struct CanonicalPolicyExecutor {
@@ -454,54 +442,10 @@ pub struct CanonicalPolicyExecutor {
     readback: Mutex<Option<Readback>>,
 }
 
-/// CIDRs to interface-bind so the claim's probe target lands on the right utun.
-/// A default rides `def1`'s two `/1` halves (more specific than any `/0`), not
-/// `0.0.0.0/0`; a split claim installs its own CIDR.
-fn rebind_targets(claim: crate::vortix_core::control::worker::RouteClaim) -> Vec<String> {
-    if claim.is_default() {
-        if claim.network().is_ipv4() {
-            vec!["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()]
-        } else {
-            vec!["::/1".to_owned(), "8000::/1".to_owned()]
-        }
-    } else {
-        vec![claim.to_string()]
-    }
-}
-
-fn openvpn_default_endpoints(state: &TopologyState) -> BTreeSet<std::net::IpAddr> {
-    state
-        .profiles
-        .iter()
-        .filter(|profile| {
-            state.protocols.get(*profile)
-                == Some(&crate::vortix_core::profile::ProtocolKind::OpenVpn)
-                && state
-                    .routes
-                    .get(*profile)
-                    .is_some_and(|claims| claims.iter().any(|claim| claim.is_default()))
-        })
-        .flat_map(|profile| state.server_ips.get(profile).into_iter().flatten().copied())
-        .collect()
-}
-
-fn openvpn_route_bindings(state: &TopologyState) -> BTreeSet<(String, String)> {
-    state
-        .profiles
-        .iter()
-        .filter(|profile| {
-            state.protocols.get(*profile)
-                == Some(&crate::vortix_core::profile::ProtocolKind::OpenVpn)
-        })
-        .filter_map(|profile| Some((state.interfaces.get(profile)?, state.routes.get(profile)?)))
-        .flat_map(|(interface, claims)| {
-            claims.iter().flat_map(|claim| {
-                rebind_targets(*claim)
-                    .into_iter()
-                    .map(|cidr| (cidr, interface.clone()))
-            })
-        })
-        .collect()
+fn rank(revisions: &BTreeMap<ProfileId, TunnelRevision>, profile: &ProfileId) -> u64 {
+    revisions
+        .get(profile)
+        .map_or(0, |revision| revision.generation)
 }
 
 impl CanonicalPolicyExecutor {
@@ -602,212 +546,153 @@ impl CanonicalPolicyExecutor {
         Ok(())
     }
 
-    fn route_probe_plan(
+    /// The live tunnel set of `state`, as the planner sees it. `live` reads
+    /// each interface from the current scan and fails if one is missing;
+    /// otherwise the interface recorded in `state` is used, which is what a
+    /// tunnel that is already gone still needs for its route removal.
+    fn plan_tunnels(
         &self,
-        policy: &TopologyPolicy,
-    ) -> Result<Vec<RouteProbeExpectation>, String> {
-        // The current cross-platform port can prove policy routing only by
-        // asking the kernel about one concrete destination. Inferring many
-        // claims from a route-table dump would be wrong in the presence of
-        // Linux rules/tables or macOS scoped routes, so only byte-equivalent
-        // target/interface expectations are safe to collapse.
-        let mut unique = BTreeMap::<
-            (std::net::IpAddr, String),
-            Vec<(ProfileId, crate::vortix_core::control::worker::RouteClaim)>,
-        >::new();
-        for profile in &policy.target.profiles {
-            let interface = self.session_interface(&policy.target, profile)?;
-            for claim in policy.target.routes.get(profile).into_iter().flatten() {
-                let mut probe = claim.probe_address();
-                if policy
-                    .target
-                    .server_ips
-                    .get(profile)
-                    .is_some_and(|endpoints| endpoints.contains(&probe))
-                    && claim.is_default()
-                {
-                    probe = if probe.is_ipv4() {
-                        "8.8.8.8".parse().expect("fixed IPv4 route probe")
-                    } else {
-                        "2001:4860:4860::8888"
-                            .parse()
-                            .expect("fixed IPv6 route probe")
-                    };
-                }
-                unique
-                    .entry((probe, interface.clone()))
-                    .or_default()
-                    .push((profile.clone(), *claim));
-                if unique.len() > MAX_ROUTE_PROBES_PER_BARRIER {
-                    return Err(format!(
-                        "route verification requires more than {MAX_ROUTE_PROBES_PER_BARRIER} distinct probes"
-                    ));
-                }
-            }
-        }
-        Ok(unique
-            .into_iter()
-            .map(|((target, interface), claims)| RouteProbeExpectation {
-                target,
+        state: &TopologyState,
+        revisions: &BTreeMap<ProfileId, TunnelRevision>,
+        live: bool,
+    ) -> Result<Vec<PlanTunnel>, String> {
+        let mut tunnels = Vec::new();
+        for profile in &state.profiles {
+            let interface = if live {
+                self.session_interface(state, profile)?
+            } else if let Some(interface) = state.interfaces.get(profile) {
+                interface.clone()
+            } else {
+                continue;
+            };
+            tunnels.push(PlanTunnel {
+                profile_id: profile.clone(),
                 interface,
-                claims,
-            })
-            .collect())
+                routes: state
+                    .routes
+                    .get(profile)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|claim| Cidr::new(claim.network(), claim.prefix_len()))
+                    .collect(),
+                server_ips: state.server_ips.get(profile).cloned().unwrap_or_default(),
+                dns: state.dns_requests.get(profile).cloned().unwrap_or_default(),
+                rank: rank(revisions, profile),
+            });
+        }
+        Ok(tunnels)
     }
 
-    fn verify_routes(&self, policy: &TopologyPolicy) -> Result<(), String> {
-        // Route and Observation invoke this separately on purpose: the latter
-        // is the fresh final read-back required for protection publication.
-        let route_table = &crate::platform::current_platform().route_table;
-        let endpoints = openvpn_default_endpoints(&policy.target);
-        if !endpoints.is_empty() {
-            let gateway = route_table.default_gateway().ok_or_else(|| {
-                "cannot preserve the physical gateway for OpenVPN default-route ownership"
-                    .to_owned()
-            })?;
-            for endpoint in endpoints {
-                route_table.bind_host_route(endpoint, &gateway)?;
-            }
-        }
+    fn target_plan(&self, policy: &TopologyPolicy) -> Result<NetworkPlan, String> {
+        Ok(plan(&self.plan_tunnels(
+            &policy.target,
+            &policy.tunnel_revisions,
+            true,
+        )?))
+    }
 
-        let plan = self.route_probe_plan(policy)?;
-        let total = plan.len();
-        for (index, expectation) in plan.into_iter().enumerate() {
-            if std::time::Instant::now() >= policy.deadline {
-                return Err(format!(
-                    "route verification deadline expired after {index} of {total} probes"
-                ));
+    /// Read back every planned route without touching the table.
+    fn verify_routes(&self, policy: &TopologyPolicy) -> Result<(), String> {
+        let route_table = &crate::platform::current_platform().route_table;
+        let target = self.target_plan(policy)?;
+        for (cidr, interface) in &target.routes {
+            if Instant::now() >= policy.deadline {
+                return Err("route verification deadline expired".to_owned());
             }
-            let mut observation = route_table.route_interface_for(expectation.target);
-            if std::time::Instant::now() >= policy.deadline {
-                return Err(format!(
-                    "route verification deadline expired during probe {} of {total}",
-                    index + 1
-                ));
-            }
-            let matches_expected = |observation: &DefaultRouteObservation| {
-                matches!(
-                    observation,
-                    DefaultRouteObservation::Interface(observed)
-                        if observed == &expectation.interface
-                )
+            let Some(probe) = target.probe_address(*cidr) else {
+                continue;
             };
-            if !matches_expected(&observation) {
-                // macOS OpenVPN installs routes via their gateway, which — with
-                // another tunnel already occupying a utun — resolves through the
-                // wrong interface. Rebind interface-scoped and re-probe. No-op on
-                // Linux, which already installs device-scoped.
-                let (_, claim) = expectation
-                    .claims
-                    .first()
-                    .expect("route probe expectation has at least one claim");
-                let mut rebound = false;
-                for cidr in rebind_targets(*claim) {
-                    if route_table
-                        .bind_route(&cidr, &expectation.interface)
-                        .is_ok()
-                    {
-                        rebound = true;
-                    }
+            match route_table.route_interface_for(probe) {
+                DefaultRouteObservation::Interface(observed) if &observed == interface => {}
+                DefaultRouteObservation::Interface(observed) => {
+                    return Err(format!(
+                        "{cidr} should route through {interface}, but the system routes it through {observed}"
+                    ))
                 }
-                if rebound {
-                    observation = route_table.route_interface_for(expectation.target);
+                DefaultRouteObservation::NoDefaultRoute => {
+                    return Err(format!(
+                        "{cidr} should route through {interface}, but the system has no route for it"
+                    ))
                 }
-            }
-            if !matches_expected(&observation) {
-                let (_, claim) = expectation
-                    .claims
-                    .first()
-                    .expect("route probe expectation has at least one claim");
-                // Profile ids are 64-character digests. The interface names
-                // the tunnel in the same words the user sees everywhere else.
-                let expected = &expectation.interface;
-                return Err(match &observation {
-                    DefaultRouteObservation::Interface(observed) => format!(
-                        "{claim} should route through {expected}, but the system routes it through {observed}"
-                    ),
-                    DefaultRouteObservation::NoDefaultRoute => format!(
-                        "{claim} should route through {expected}, but the system has no route for it"
-                    ),
-                    DefaultRouteObservation::ProbeFailed => format!(
-                        "could not read which interface carries {claim}; {expected} is unverified"
-                    ),
-                });
+                DefaultRouteObservation::ProbeFailed => {
+                    return Err(format!(
+                        "could not read which interface carries {cidr}; {interface} is unverified"
+                    ))
+                }
             }
         }
         Ok(())
     }
 
+    /// Move the route table from the prior plan to the target plan. Removal is
+    /// best-effort — a lingering utun route dies with its interface, a blocked
+    /// teardown does not — while installs are strict. A prefix the target
+    /// still carries is retargeted in place, never deleted first.
     fn reconcile_routes(&self, policy: &TopologyPolicy) -> Result<(), String> {
         let route_table = &crate::platform::current_platform().route_table;
-        let prior_bindings = openvpn_route_bindings(&policy.prior);
-        let target_bindings = openvpn_route_bindings(&policy.target);
-        // Route removal is best-effort. A failed delete — a `route` call that
-        // timed out during table churn, a stale interface from a concurrent
-        // transaction, an already-purged route — must never abort the reconcile:
-        // that hard-fails the Route barrier and strands a disconnect with the
-        // tunnel half-up and no working default route. A lingering route is
-        // recoverable (the kernel scrubs utun-bound routes when the interface is
-        // destroyed); a blocked teardown is not. Installs stay strict below.
-        for (cidr, interface) in prior_bindings.difference(&target_bindings) {
-            if let Err(error) = route_table.unbind_route(cidr, interface) {
+        let prior =
+            plan(&self.plan_tunnels(&policy.prior, &policy.prior_tunnel_revisions, false)?);
+        let target = self.target_plan(policy)?;
+        for (cidr, interface) in &prior.routes {
+            if target.routes.contains_key(cidr) {
+                continue;
+            }
+            if let Err(error) = route_table.unbind_route(&cidr.to_string(), interface) {
                 tracing::warn!(
                     target: "vortix::control::policy",
                     %cidr, %interface, %error,
-                    "route removal failed during reconcile; continuing teardown"
+                    "route removal failed during reconcile; continuing"
                 );
             }
         }
-        let prior_endpoints = openvpn_default_endpoints(&policy.prior);
-        let target_endpoints = openvpn_default_endpoints(&policy.target);
-        for endpoint in prior_endpoints.difference(&target_endpoints) {
+        for endpoint in prior.host_routes.difference(&target.host_routes) {
             if let Err(error) = route_table.unbind_host_route(*endpoint) {
                 tracing::warn!(
                     target: "vortix::control::policy",
                     %endpoint, %error,
-                    "host route removal failed during reconcile; continuing teardown"
+                    "host route removal failed during reconcile; continuing"
                 );
+            }
+        }
+        if !target.host_routes.is_empty() {
+            let gateway = route_table.default_gateway().ok_or_else(|| {
+                "cannot preserve the physical gateway for the VPN server route".to_owned()
+            })?;
+            for endpoint in &target.host_routes {
+                route_table.bind_host_route(*endpoint, &gateway)?;
+            }
+        }
+        for (cidr, interface) in &target.routes {
+            let bound = target.probe_address(*cidr).is_some_and(|probe| {
+                matches!(
+                    route_table.route_interface_for(probe),
+                    DefaultRouteObservation::Interface(observed) if &observed == interface
+                )
+            });
+            if !bound {
+                route_table.bind_route(&cidr.to_string(), interface)?;
             }
         }
         self.verify_routes(policy)
     }
 
-    fn dns_intents(&self, state: &TopologyState) -> Result<Vec<DnsTunnelIntent>, String> {
-        let mut intents = Vec::new();
-        for profile in &state.profiles {
-            let Some(request) = state.dns_requests.get(profile) else {
-                continue;
-            };
-            if request.is_empty() {
-                continue;
-            }
-            let role = if state
-                .routes
-                .get(profile)
-                .is_some_and(|routes| routes.iter().any(|route| route.is_default()))
-            {
-                DnsTunnelRole::Primary
-            } else {
-                DnsTunnelRole::Secondary
-            };
-            intents.push(DnsTunnelIntent {
-                profile_id: profile.clone(),
-                interface: self.session_interface(state, profile)?,
-                role,
-                request: request.clone(),
-            });
-        }
-        Ok(intents)
+    fn dns_intents(
+        &self,
+        state: &TopologyState,
+        revisions: &BTreeMap<ProfileId, TunnelRevision>,
+    ) -> Result<Vec<DnsTunnelIntent>, String> {
+        Ok(plan(&self.plan_tunnels(state, revisions, true)?).dns)
     }
 
     fn reconcile_dns(
         &self,
         state: &TopologyState,
+        revisions: &BTreeMap<ProfileId, TunnelRevision>,
         force_verify: bool,
         force_reapply: bool,
     ) -> Result<(), String> {
         self.require_global_authority()?;
-        let intents = self.dns_intents(state)?;
+        let intents = self.dns_intents(state, revisions)?;
         let _lock = crate::core::dns_policy::acquire_policy_lock(&self.config_dir)
             .map_err(|error| format!("DNS policy lock failed: {error}"))?;
         let mut coordinator = self.dns.lock().map_err(|_| "DNS policy mutex poisoned")?;
@@ -842,7 +727,7 @@ impl CanonicalPolicyExecutor {
 
     fn verify_dns(&self, policy: &TopologyPolicy) -> Result<(), String> {
         self.require_global_authority()?;
-        let intents = self.dns_intents(&policy.target)?;
+        let intents = self.dns_intents(&policy.target, &policy.tunnel_revisions)?;
         let dns_policy = {
             let coordinator = self.dns.lock().map_err(|_| "DNS policy mutex poisoned")?;
             coordinator
@@ -872,41 +757,17 @@ impl CanonicalPolicyExecutor {
         state: &TopologyState,
         require_endpoints: bool,
     ) -> Result<Vec<ActiveTunnelInfo>, String> {
-        state
-            .profiles
+        let tunnels = self.plan_tunnels(state, &BTreeMap::new(), true)?;
+        if let Some(tunnel) = tunnels
             .iter()
-            .map(|profile| {
-                let server_ips = state
-                    .server_ips
-                    .get(profile)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                if require_endpoints && server_ips.is_empty() {
-                    return Err(format!(
-                        "profile {profile} has no resolved server endpoint for firewall policy"
-                    ));
-                }
-                let declared_cidrs = state
-                    .routes
-                    .get(profile)
-                    .into_iter()
-                    .flatten()
-                    .map(ToString::to_string)
-                    .map(|route| route.parse().map_err(|_| format!("invalid route {route}")))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(ActiveTunnelInfo {
-                    interface: self.session_interface(state, profile)?,
-                    server_ips,
-                    declared_cidrs,
-                    is_primary: state
-                        .routes
-                        .get(profile)
-                        .is_some_and(|routes| routes.iter().any(|route| route.is_default())),
-                })
-            })
-            .collect()
+            .find(|tunnel| require_endpoints && tunnel.server_ips.is_empty())
+        {
+            return Err(format!(
+                "profile {} has no resolved server endpoint for firewall policy",
+                tunnel.profile_id
+            ));
+        }
+        Ok(plan(&tunnels).firewall)
     }
 
     fn pre_block_tunnels(&self, policy: &TopologyPolicy) -> Result<Vec<ActiveTunnelInfo>, String> {
@@ -1184,7 +1045,12 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
                 Ok(())
             }
             PolicyBarrier::Dns => {
-                self.reconcile_dns(&policy.target, false, reapplies_dns(policy))?;
+                self.reconcile_dns(
+                    &policy.target,
+                    &policy.tunnel_revisions,
+                    false,
+                    reapplies_dns(policy),
+                )?;
                 self.verify_current_dns_routes(policy.deadline)?;
                 self.with_readback(policy, |evidence| evidence.dns_verified = true);
                 Ok(())
@@ -1192,7 +1058,12 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
             PolicyBarrier::Observation => {
                 self.verify_tunnels(policy)?;
                 self.verify_routes(policy)?;
-                self.reconcile_dns(&policy.target, true, reapplies_dns(policy))?;
+                self.reconcile_dns(
+                    &policy.target,
+                    &policy.tunnel_revisions,
+                    true,
+                    reapplies_dns(policy),
+                )?;
                 self.verify_current_dns_routes(policy.deadline)?;
                 self.with_readback(policy, |evidence| {
                     evidence.interface_verified = true;
@@ -1217,7 +1088,9 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
 
     fn compensate(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
         match barrier {
-            PolicyBarrier::Dns => self.reconcile_dns(&policy.prior, false, false),
+            PolicyBarrier::Dns => {
+                self.reconcile_dns(&policy.prior, &policy.prior_tunnel_revisions, false, false)
+            }
             PolicyBarrier::Blocking | PolicyBarrier::EffectivePublication => {
                 match firewall_compensation_target(policy, barrier) {
                     FirewallCompensationTarget::Prior => self.restore_firewall(&policy.prior),
@@ -1315,109 +1188,12 @@ mod tests {
     use super::*;
     use crate::vortix_core::control::worker::{RouteClaim, TopologyTransitionKind};
     use crate::vortix_core::control::{AuthorityEpoch, OperationId, PolicyDigest};
-    use crate::vortix_core::ports::dns::DnsRequest;
+    use crate::vortix_core::ports::dns::{DnsRequest, DnsTunnelRole};
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
     fn operation() -> OperationId {
         serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap()
-    }
-
-    #[test]
-    fn default_claim_rebinds_the_def1_halves_not_the_zero_route() {
-        // A full tunnel's default rides `redirect-gateway def1`'s two /1 halves;
-        // binding `0.0.0.0/0` would miss the routes the probe actually uses and
-        // leave a full-on-top-of-split connect failing its route read-back.
-        assert_eq!(
-            rebind_targets(RouteClaim::parse("0.0.0.0/0").unwrap()),
-            vec!["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()]
-        );
-        assert_eq!(
-            rebind_targets(RouteClaim::parse("::/0").unwrap()),
-            vec!["::/1".to_owned(), "8000::/1".to_owned()]
-        );
-        // A split claim already names the route that was installed.
-        assert_eq!(
-            rebind_targets(RouteClaim::parse("10.250.0.0/24").unwrap()),
-            vec!["10.250.0.0/24".to_owned()]
-        );
-    }
-
-    #[test]
-    fn only_full_openvpn_endpoints_need_physical_escape_routes() {
-        let full = ProfileId::new("full");
-        let split = ProfileId::new("split");
-        let wireguard = ProfileId::new("wireguard");
-        let mut state = TopologyState {
-            profiles: BTreeSet::from([full.clone(), split.clone(), wireguard.clone()]),
-            protocols: BTreeMap::from([
-                (
-                    full.clone(),
-                    crate::vortix_core::profile::ProtocolKind::OpenVpn,
-                ),
-                (
-                    split.clone(),
-                    crate::vortix_core::profile::ProtocolKind::OpenVpn,
-                ),
-                (
-                    wireguard.clone(),
-                    crate::vortix_core::profile::ProtocolKind::WireGuard,
-                ),
-            ]),
-            ..TopologyState::default()
-        };
-        state.routes.insert(
-            full.clone(),
-            BTreeSet::from([RouteClaim::parse("0.0.0.0/0").unwrap()]),
-        );
-        state.routes.insert(
-            split.clone(),
-            BTreeSet::from([RouteClaim::parse("10.0.0.0/8").unwrap()]),
-        );
-        state.routes.insert(
-            wireguard.clone(),
-            BTreeSet::from([RouteClaim::parse("0.0.0.0/0").unwrap()]),
-        );
-        state
-            .server_ips
-            .insert(full, BTreeSet::from(["198.51.100.1".parse().unwrap()]));
-        state
-            .server_ips
-            .insert(split, BTreeSet::from(["198.51.100.2".parse().unwrap()]));
-        state
-            .server_ips
-            .insert(wireguard, BTreeSet::from(["198.51.100.3".parse().unwrap()]));
-
-        assert_eq!(
-            openvpn_default_endpoints(&state),
-            BTreeSet::from(["198.51.100.1".parse().unwrap()])
-        );
-    }
-
-    #[test]
-    fn openvpn_route_bindings_expand_defaults_and_keep_the_owner_interface() {
-        let profile = ProfileId::new("full");
-        let state = TopologyState {
-            profiles: BTreeSet::from([profile.clone()]),
-            protocols: BTreeMap::from([(
-                profile.clone(),
-                crate::vortix_core::profile::ProtocolKind::OpenVpn,
-            )]),
-            interfaces: BTreeMap::from([(profile.clone(), "utun5".into())]),
-            routes: BTreeMap::from([(
-                profile,
-                BTreeSet::from([RouteClaim::parse("0.0.0.0/0").unwrap()]),
-            )]),
-            ..TopologyState::default()
-        };
-
-        assert_eq!(
-            openvpn_route_bindings(&state),
-            BTreeSet::from([
-                ("0.0.0.0/1".into(), "utun5".into()),
-                ("128.0.0.0/1".into(), "utun5".into()),
-            ])
-        );
     }
 
     fn policy(prior: TopologyState, target: TopologyState) -> TopologyPolicy {
@@ -1745,77 +1521,9 @@ mod tests {
         assert_eq!(active[0].interface, "wg0");
         assert!(active[0].is_primary);
         assert_eq!(active[0].declared_cidrs[0].to_string(), "0.0.0.0/0");
-        let dns = executor.dns_intents(&state).unwrap();
+        let dns = executor.dns_intents(&state, &BTreeMap::new()).unwrap();
         assert_eq!(dns[0].interface, "wg0");
         assert_eq!(dns[0].role, DnsTunnelRole::Primary);
-    }
-
-    #[test]
-    fn route_plan_deduplicates_equivalent_exact_kernel_probes() {
-        let temp = tempfile::tempdir().unwrap();
-        let profile = ProfileId::new("corp");
-        let observed_profile = profile.clone();
-        let executor = CanonicalPolicyExecutor::new(
-            temp.path().into(),
-            move |candidate| {
-                (candidate == &observed_profile).then(|| ActiveSession {
-                    interface: "wg0".into(),
-                    interface_authoritative: true,
-                    ..ActiveSession::default()
-                })
-            },
-            || 0,
-        );
-        let mut state = target(&profile);
-        state
-            .routes
-            .get_mut(&profile)
-            .unwrap()
-            .insert(RouteClaim::parse("1.1.1.0/24").unwrap());
-
-        let plan = executor
-            .route_probe_plan(&policy(TopologyState::default(), state))
-            .unwrap();
-
-        assert_eq!(plan.len(), 1);
-        assert_eq!(
-            plan[0].target,
-            "1.1.1.1".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert_eq!(plan[0].claims.len(), 2);
-    }
-
-    #[test]
-    fn route_plan_rejects_unbounded_distinct_probe_work_before_execution() {
-        let temp = tempfile::tempdir().unwrap();
-        let profile = ProfileId::new("corp");
-        let observed_profile = profile.clone();
-        let executor = CanonicalPolicyExecutor::new(
-            temp.path().into(),
-            move |candidate| {
-                (candidate == &observed_profile).then(|| ActiveSession {
-                    interface: "wg0".into(),
-                    interface_authoritative: true,
-                    ..ActiveSession::default()
-                })
-            },
-            || 0,
-        );
-        let routes = (0..=MAX_ROUTE_PROBES_PER_BARRIER)
-            .map(|offset| {
-                let offset = u32::try_from(offset).unwrap();
-                let address = std::net::Ipv4Addr::from(0x0a00_0000_u32 + offset);
-                RouteClaim::parse(&format!("{address}/32")).unwrap()
-            })
-            .collect();
-        let mut state = target(&profile);
-        state.routes.insert(profile.clone(), routes);
-
-        let error = executor
-            .route_probe_plan(&policy(TopologyState::default(), state))
-            .unwrap_err();
-
-        assert!(error.contains("more than 256 distinct probes"));
     }
 
     #[test]
@@ -1839,7 +1547,7 @@ mod tests {
 
         let error = executor.verify_routes(&expired).unwrap_err();
 
-        assert!(error.contains("deadline expired after 0 of 1 probes"));
+        assert!(error.contains("deadline expired"));
     }
 
     #[test]

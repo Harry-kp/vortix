@@ -1163,7 +1163,7 @@ impl ControlHandle {
             let target_profiles = target_profiles_for_command(
                 &request.command,
                 &config.known_profiles,
-                &self.shared.snapshots.borrow().desired.tunnels,
+                &self.shared.snapshots.borrow(),
                 self.shared.selection,
                 self.shared.supervisor.as_deref(),
             )?;
@@ -1910,7 +1910,7 @@ impl ControlRuntime<'_> {
         if projection_inputs_changed {
             derive_tunnel_projections(snapshot, Some(owner), self.config);
         } else {
-            derive_dns_security_projection(snapshot, self.config, Some(&owner.tunnel_revisions));
+            derive_dns_security_projection(snapshot, self.config);
         }
         persisted_before_effects
     }
@@ -2527,26 +2527,20 @@ fn drive_supervision(
             .as_ref()
             .filter(|_| result.result.is_ok())
         {
-            snapshot.observed.openvpn_routes.insert(
-                result.profile_id.clone(),
-                crate::vortix_core::control::model::ObservedOpenVpnRoutes {
-                    desired_generation: result.revision.generation,
-                    evidence: routes.clone(),
-                },
-            );
+            snapshot
+                .observed
+                .openvpn_routes
+                .insert(result.profile_id.clone(), routes.clone());
         }
         if let Some(dns) = result
             .openvpn_dns
             .as_ref()
             .filter(|_| result.result.is_ok())
         {
-            snapshot.observed.openvpn_dns.insert(
-                result.profile_id.clone(),
-                crate::vortix_core::control::model::ObservedOpenVpnDns {
-                    desired_generation: result.revision.generation,
-                    request: dns.clone(),
-                },
-            );
+            snapshot
+                .observed
+                .openvpn_dns
+                .insert(result.profile_id.clone(), dns.clone());
         }
         if let Some(handshake) = result.handshake.as_ref().filter(|handshake| {
             result.result.is_ok() && handshake.generation == result.revision.generation
@@ -3672,9 +3666,6 @@ fn drive_supervision(
         "tunnel barrier decision"
     );
     let final_submission = if tunnel_barrier_ready {
-        // Bound before the mutable borrow of `owner.topology_transaction` below;
-        // these are disjoint fields, so the seal can read per-profile revisions.
-        let tunnel_revisions = &owner.tunnel_revisions;
         owner
             .topology_transaction
             .as_mut()
@@ -3684,9 +3675,9 @@ fn drive_supervision(
             })
             .map(|transaction| {
                 let pre_policy = &transaction.pre_policy;
-                let policy = transaction.final_policy.get_or_insert_with(|| {
-                    seal_final_topology_policy(pre_policy, snapshot, tunnel_revisions)
-                });
+                let policy = transaction
+                    .final_policy
+                    .get_or_insert_with(|| seal_final_topology_policy(pre_policy, snapshot));
                 let result = supervisor.submit_policy(policy);
                 let failure_context = result
                     .as_ref()
@@ -4425,7 +4416,6 @@ fn route_conflict_from_verification_detail(
 fn seal_final_topology_policy(
     pre_policy: &TopologyPolicy,
     snapshot: &ControlSnapshot,
-    tunnel_revisions: &BTreeMap<ProfileId, TunnelRevision>,
 ) -> TopologyPolicy {
     let mut final_policy = pre_policy.clone();
     let mut dns_changed = false;
@@ -4447,20 +4437,7 @@ fn seal_final_topology_policy(
         if *protocol != crate::vortix_core::profile::ProtocolKind::OpenVpn {
             continue;
         }
-        // A second tunnel changes the policy generation, not the revision of
-        // an already-live tunnel. Preserve that tunnel's negotiated routes,
-        // endpoint and DNS using its own revision.
-        let profile_generation = tunnel_revisions
-            .get(profile_id)
-            .map_or(final_policy.generation, |revision| revision.generation);
-        let Some(observed) = snapshot
-            .observed
-            .openvpn_routes
-            .get(profile_id)
-            .filter(|observed| observed.desired_generation == profile_generation)
-        else {
-            // Standard mode has no helper-authenticated negotiated evidence
-            // yet, so its existing configured-route contract remains intact.
+        let Some(evidence) = snapshot.observed.openvpn_routes.get(profile_id) else {
             continue;
         };
         final_policy
@@ -4469,13 +4446,13 @@ fn seal_final_topology_policy(
             .entry(profile_id.clone())
             .or_default()
             .extend(crate::vortix_core::control::worker::openvpn_route_claims(
-                &observed.evidence,
+                evidence,
             ));
         final_policy
             .target
             .openvpn_routes
-            .insert(profile_id.clone(), observed.evidence.clone());
-        if let Some(remote) = observed.evidence.selected_remote() {
+            .insert(profile_id.clone(), evidence.clone());
+        if let Some(remote) = evidence.selected_remote() {
             final_policy
                 .target
                 .server_ips
@@ -4484,16 +4461,11 @@ fn seal_final_topology_policy(
                 .insert(remote);
         }
 
-        if let Some(observed_dns) = snapshot
-            .observed
-            .openvpn_dns
-            .get(profile_id)
-            .filter(|observed| observed.desired_generation == profile_generation)
-        {
+        if let Some(request) = snapshot.observed.openvpn_dns.get(profile_id) {
             final_policy
                 .target
                 .dns_requests
-                .insert(profile_id.clone(), observed_dns.request.clone());
+                .insert(profile_id.clone(), request.clone());
             dns_changed = true;
         }
     }
@@ -4626,7 +4598,10 @@ fn transition_requires_blocking(
     use crate::vortix_core::state::killswitch::KillSwitchMode;
 
     match kill_switch {
-        KillSwitchMode::Off => transition == TopologyTransitionKind::PrimaryTransfer,
+        // Off means Vortix never touches the firewall. A switch that forced it
+        // on made switching depend on pf being traversable, and an aborted
+        // switch could strand a firewall the user never enabled.
+        KillSwitchMode::Off => false,
         KillSwitchMode::AlwaysOn => true,
         KillSwitchMode::Auto => matches!(
             transition,
@@ -5376,9 +5351,16 @@ fn command_profile(command: &UserCommand) -> Option<&ProfileId> {
     }
 }
 
-fn command_profiles(command: &UserCommand, known_profiles: &BTreeSet<ProfileId>) -> Vec<ProfileId> {
-    if matches!(command, UserCommand::ConnectExclusive { .. }) {
-        return known_profiles.iter().cloned().collect();
+fn command_profiles(
+    command: &UserCommand,
+    known_profiles: &BTreeSet<ProfileId>,
+    snapshot: &ControlSnapshot,
+) -> Vec<ProfileId> {
+    if let UserCommand::ConnectExclusive { profile_id } = command {
+        let mut profiles = snapshot.conflicting_profiles(profile_id);
+        profiles.push(profile_id.clone());
+        profiles.sort();
+        return profiles;
     }
     if let Some(profile) = command_profile(command) {
         return vec![profile.clone()];
@@ -5395,12 +5377,12 @@ fn command_profiles(command: &UserCommand, known_profiles: &BTreeSet<ProfileId>)
 fn target_profiles_for_command(
     command: &UserCommand,
     known_profiles: &BTreeSet<ProfileId>,
-    desired_tunnels: &BTreeMap<ProfileId, RequestedTunnelState>,
+    snapshot: &ControlSnapshot,
     selection: ExecutionSelection,
     supervisor: Option<&Supervisor>,
 ) -> Result<Vec<ProfileId>, AdmissionError> {
     if !matches!(command, UserCommand::Reconnect { profile_id: None }) {
-        return Ok(command_profiles(command, known_profiles));
+        return Ok(command_profiles(command, known_profiles, snapshot));
     }
     if selection == ExecutionSelection::CanonicalAuthority {
         return Ok(supervisor
@@ -5414,7 +5396,9 @@ fn target_profiles_for_command(
             })
             .collect());
     }
-    Ok(desired_tunnels
+    Ok(snapshot
+        .desired
+        .tunnels
         .iter()
         .filter_map(|(profile_id, state)| {
             (*state == RequestedTunnelState::Connected).then_some(profile_id.clone())
@@ -6650,6 +6634,10 @@ fn report_unrecovered_loss(snapshot: &ControlSnapshot, supervisor: &Supervisor) 
             continue;
         }
         let observed = snapshot.observed.tunnels.get(profile_id);
+        // A healthy tunnel needs no recovery; only explain ones that look lost.
+        if observed.is_some_and(|fact| fact.active) {
+            continue;
+        }
         let truth = supervisor.profile_truth(profile_id);
         tracing::warn!(
             target: "vortix::control::convergence",
@@ -7159,14 +7147,9 @@ fn topology_routes(
         .flat_map(|topology| &topology.routes)
         .filter_map(|route| RouteClaim::parse(route).ok())
         .collect::<BTreeSet<_>>();
-    if let Some(observed) = snapshot
-        .observed
-        .openvpn_routes
-        .get(profile_id)
-        .filter(|observed| observed.desired_generation == snapshot.desired.generation)
-    {
+    if let Some(evidence) = snapshot.observed.openvpn_routes.get(profile_id) {
         routes.extend(crate::vortix_core::control::worker::openvpn_route_claims(
-            &observed.evidence,
+            evidence,
         ));
     }
     routes
@@ -7211,18 +7194,18 @@ fn restore_supervised_evidence(snapshot: &mut ControlSnapshot, supervisor: &Supe
         if state.truth != SupervisedTruth::ObservedPresent {
             continue;
         }
-        // OpenVPN DNS the server pushed, recovered on adoption. The live
-        // connect publishes it via the work result; adoption bypasses that
-        // path, so without this the projection shows "DNS: Not provided" for a
-        // tunnel whose resolver is actually applied.
+        // Adoption bypasses the connect result that normally publishes these.
+        if let Some(evidence) = state.openvpn_routes {
+            snapshot
+                .observed
+                .openvpn_routes
+                .insert(profile_id.clone(), evidence);
+        }
         if let Some(request) = state.openvpn_dns {
-            snapshot.observed.openvpn_dns.insert(
-                profile_id.clone(),
-                crate::vortix_core::control::model::ObservedOpenVpnDns {
-                    desired_generation: state.revision.generation,
-                    request,
-                },
-            );
+            snapshot
+                .observed
+                .openvpn_dns
+                .insert(profile_id.clone(), request);
         }
         let Some(handshake) = state
             .handshake
@@ -7498,39 +7481,22 @@ fn derive_tunnel_projections(
     snapshot.primary = primary;
     snapshot.tunnels = projections;
     snapshot.profile_routes = routes_by_profile;
-    derive_dns_security_projection(snapshot, config, owner.map(|owner| &owner.tunnel_revisions));
+    derive_dns_security_projection(snapshot, config);
 }
 
-fn derive_dns_security_projection(
-    snapshot: &mut ControlSnapshot,
-    config: &ControlServiceConfig,
-    tunnel_revisions: Option<&BTreeMap<ProfileId, TunnelRevision>>,
-) {
+fn derive_dns_security_projection(snapshot: &mut ControlSnapshot, config: &ControlServiceConfig) {
     use crate::vortix_core::control::{DnsSecurityProjection, DnsSecurityStatus};
 
     let Some(primary) = snapshot.primary.as_ref() else {
         snapshot.dns = DnsSecurityProjection::default();
         return;
     };
-    // The primary keeps its own tunnel revision when another tunnel connects,
-    // so compare against that — not the global desired generation, which a
-    // second connect bumps and would stale-drop the primary's pushed DNS,
-    // showing "Not provided" for a resolver that is actually applied.
-    let primary_generation = tunnel_revisions
-        .and_then(|revisions| revisions.get(primary))
-        .map_or(snapshot.desired.generation, |revision| revision.generation);
-    let request = snapshot
-        .observed
-        .openvpn_dns
-        .get(primary)
-        .filter(|observed| observed.desired_generation == primary_generation)
-        .map(|observed| &observed.request)
-        .or_else(|| {
-            config
-                .profile_topologies
-                .get(primary)
-                .map(|topology| &topology.dns_request)
-        });
+    let request = snapshot.observed.openvpn_dns.get(primary).or_else(|| {
+        config
+            .profile_topologies
+            .get(primary)
+            .map(|topology| &topology.dns_request)
+    });
     let mut intended_servers = request
         .into_iter()
         .flat_map(|request| request.servers.iter().copied())
@@ -8198,7 +8164,7 @@ mod target_profiles_tests {
             ..ControlServiceConfig::default()
         };
 
-        derive_dns_security_projection(&mut snapshot, &config, None);
+        derive_dns_security_projection(&mut snapshot, &config);
 
         assert_eq!(
             snapshot.dns.intended_servers,
@@ -8207,7 +8173,7 @@ mod target_profiles_tests {
         assert_eq!(snapshot.dns.status, DnsSecurityStatus::Protected);
 
         snapshot.effective.freshness.current = false;
-        derive_dns_security_projection(&mut snapshot, &config, None);
+        derive_dns_security_projection(&mut snapshot, &config);
 
         assert_eq!(snapshot.dns.status, DnsSecurityStatus::Unverified);
     }
@@ -8224,7 +8190,7 @@ mod target_profiles_tests {
             ..ControlServiceConfig::default()
         };
 
-        derive_dns_security_projection(&mut snapshot, &config, None);
+        derive_dns_security_projection(&mut snapshot, &config);
 
         assert_eq!(snapshot.dns.status, DnsSecurityStatus::NotRequested);
         assert!(snapshot.dns.intended_servers.is_empty());
@@ -8237,15 +8203,11 @@ mod target_profiles_tests {
             primary: Some(profile_id.clone()),
             ..ControlSnapshot::default()
         };
-        snapshot.desired.generation = 11;
         snapshot.observed.openvpn_dns.insert(
             profile_id.clone(),
-            crate::vortix_core::control::model::ObservedOpenVpnDns {
-                desired_generation: 11,
-                request: crate::vortix_core::ports::dns::DnsRequest {
-                    servers: vec!["10.80.0.1".parse().unwrap()],
-                    search_domains: Vec::new(),
-                },
+            crate::vortix_core::ports::dns::DnsRequest {
+                servers: vec!["10.80.0.1".parse().unwrap()],
+                search_domains: Vec::new(),
             },
         );
         let config = ControlServiceConfig {
@@ -8263,7 +8225,7 @@ mod target_profiles_tests {
             ..ControlServiceConfig::default()
         };
 
-        derive_dns_security_projection(&mut snapshot, &config, None);
+        derive_dns_security_projection(&mut snapshot, &config);
 
         assert_eq!(
             snapshot.dns.intended_servers,
@@ -8273,63 +8235,15 @@ mod target_profiles_tests {
     }
 
     #[test]
-    fn connecting_a_second_tunnel_keeps_the_primarys_pushed_dns() {
-        // The primary connected at generation 11 and pushed 10.80.0.1. A second
-        // tunnel then connects and bumps the global desired generation to 12,
-        // but the primary keeps its own tunnel revision (11). Comparing against
-        // the global generation stale-dropped the primary's DNS — reverting its
-        // resolver and showing "Not provided" for a resolver still applied.
-        let primary = ProfileId::new("corp");
-        let mut snapshot = ControlSnapshot {
-            primary: Some(primary.clone()),
-            ..ControlSnapshot::default()
-        };
-        snapshot.desired.generation = 12; // bumped by the second tunnel's connect
-        snapshot.observed.openvpn_dns.insert(
-            primary.clone(),
-            crate::vortix_core::control::model::ObservedOpenVpnDns {
-                desired_generation: 11, // the primary's own connect generation
-                request: crate::vortix_core::ports::dns::DnsRequest {
-                    servers: vec!["10.80.0.1".parse().unwrap()],
-                    search_domains: Vec::new(),
-                },
-            },
-        );
-        let config = ControlServiceConfig {
-            known_profiles: BTreeSet::from([primary.clone()]),
-            ..ControlServiceConfig::default()
-        };
-        let tunnel_revisions = BTreeMap::from([(
-            primary,
-            TunnelRevision {
-                authority_epoch: snapshot.desired.authority_epoch,
-                generation: 11,
-            },
-        )]);
-
-        derive_dns_security_projection(&mut snapshot, &config, Some(&tunnel_revisions));
-
-        assert_eq!(
-            snapshot.dns.intended_servers,
-            vec!["10.80.0.1".parse::<std::net::IpAddr>().unwrap()],
-            "a second tunnel's generation bump must not drop the primary's pushed DNS"
-        );
-        assert_ne!(snapshot.dns.status, DnsSecurityStatus::NotRequested);
-    }
-
-    #[test]
     fn final_policy_keeps_an_existing_tunnels_negotiated_routes() {
         let primary = ProfileId::new("primary");
         let evidence = redirect_evidence();
         let mut snapshot = ControlSnapshot::default();
         snapshot.desired.generation = 12;
-        snapshot.observed.openvpn_routes.insert(
-            primary.clone(),
-            crate::vortix_core::control::model::ObservedOpenVpnRoutes {
-                desired_generation: 11,
-                evidence: evidence.clone(),
-            },
-        );
+        snapshot
+            .observed
+            .openvpn_routes
+            .insert(primary.clone(), evidence.clone());
         let pre_policy = TopologyPolicy {
             generation: 12,
             authority_epoch: AuthorityEpoch(7),
@@ -8353,15 +8267,7 @@ mod target_profiles_tests {
             captured_at_millis: 0,
             stage: PolicyStage::PreTunnelBlocking,
         };
-        let revisions = BTreeMap::from([(
-            primary.clone(),
-            TunnelRevision {
-                authority_epoch: pre_policy.authority_epoch,
-                generation: 11,
-            },
-        )]);
-
-        let final_policy = seal_final_topology_policy(&pre_policy, &snapshot, &revisions);
+        let final_policy = seal_final_topology_policy(&pre_policy, &snapshot);
 
         assert_eq!(final_policy.target.openvpn_routes[&primary], evidence);
         assert!(
@@ -8381,13 +8287,22 @@ mod target_profiles_tests {
     struct NoopTunnel;
 
     #[test]
-    fn exclusive_switch_is_a_fail_closed_primary_transfer() {
+    fn exclusive_switch_blocks_only_when_the_kill_switch_asks_for_it() {
+        use crate::vortix_core::state::killswitch::KillSwitchMode;
         assert_eq!(
             transition_for_plan(&[], false, true, false),
             TopologyTransitionKind::PrimaryTransfer
         );
+        assert!(!transition_requires_blocking(
+            KillSwitchMode::Off,
+            TopologyTransitionKind::PrimaryTransfer
+        ));
         assert!(transition_requires_blocking(
-            crate::vortix_core::state::killswitch::KillSwitchMode::Off,
+            KillSwitchMode::Auto,
+            TopologyTransitionKind::PrimaryTransfer
+        ));
+        assert!(transition_requires_blocking(
+            KillSwitchMode::AlwaysOn,
             TopologyTransitionKind::PrimaryTransfer
         ));
     }
@@ -8759,9 +8674,63 @@ mod target_profiles_tests {
                 .observed
                 .openvpn_dns
                 .get(&profile_id)
-                .map(|observed| observed.request.servers.clone()),
+                .map(|request| request.servers.clone()),
             Some(vec!["1.1.1.1".parse().unwrap()]),
             "the pushed DNS must survive adoption so the projection can show it"
+        );
+    }
+
+    #[test]
+    fn adopted_full_openvpn_still_holds_the_default_route() {
+        // Adoption bypasses the work result that publishes pushed routes; losing
+        // them hid this tunnel's 0/0 and let a second full tunnel skip takeover.
+        use crate::vortix_core::ports::process::ManagedProcessId;
+        let profile_id = ProfileId::new("ovpn-adopted-full");
+        let revision = TunnelRevision {
+            authority_epoch: AuthorityEpoch(7),
+            generation: 9,
+        };
+        let ownership = ManagedProcessId {
+            profile_id: profile_id.clone(),
+            generation: revision.generation,
+            ownership_token: "0".repeat(64),
+        };
+        let receipt = TunnelExecutionReceipt::attested(
+            profile_id.clone(),
+            "utun4",
+            crate::vortix_core::ports::tunnel::TunnelKindTag::OpenVpn,
+            Some(4242),
+            format!("openvpn-generation:{}", revision.generation),
+        )
+        .expect("valid OpenVPN receipt");
+        let supervisor = Supervisor::new(
+            AuthorityEpoch(7),
+            Arc::new(NoopTunnel),
+            Arc::new(NoopPolicy),
+            1,
+            2,
+        );
+        supervisor
+            .restore_owned_tunnel(
+                receipt.adoption.expect("adoption evidence"),
+                None,
+                None,
+                Vec::new(),
+                Some(&ownership),
+                revision,
+                OperationId::from_parts(AuthorityEpoch(7), 1),
+            )
+            .expect("valid restored ownership");
+        supervisor.restore_openvpn_routes(&profile_id, redirect_evidence());
+
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.desired.generation = 12;
+        restore_supervised_evidence(&mut snapshot, &supervisor);
+
+        let routes = topology_routes(&snapshot, &ControlServiceConfig::default(), &profile_id);
+        assert!(
+            routes.iter().any(|cidr| cidr.prefix_len == 0),
+            "an adopted full tunnel must still claim the default route: {routes:?}"
         );
     }
 
@@ -9347,10 +9316,16 @@ mod target_profiles_tests {
         let targets = target_profiles_for_command(
             &UserCommand::Reconnect { profile_id: None },
             &BTreeSet::from([connected.clone(), disconnected.clone()]),
-            &BTreeMap::from([
-                (connected.clone(), RequestedTunnelState::Connected),
-                (disconnected, RequestedTunnelState::Disconnected),
-            ]),
+            &ControlSnapshot {
+                desired: crate::vortix_core::control::DesiredState {
+                    tunnels: BTreeMap::from([
+                        (connected.clone(), RequestedTunnelState::Connected),
+                        (disconnected, RequestedTunnelState::Disconnected),
+                    ]),
+                    ..crate::vortix_core::control::DesiredState::default()
+                },
+                ..ControlSnapshot::default()
+            },
             ExecutionSelection::LegacyAuthority,
             None,
         )
@@ -9393,7 +9368,7 @@ mod target_profiles_tests {
         let targets = target_profiles_for_command(
             &command,
             &catalog,
-            &BTreeMap::new(),
+            &ControlSnapshot::default(),
             ExecutionSelection::CanonicalAuthority,
             Some(&supervisor),
         )

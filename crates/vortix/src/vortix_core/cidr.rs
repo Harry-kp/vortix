@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// The address is stored verbatim — callers may pass non-canonical inputs
 /// such as `10.0.0.5/8`; aggregation masks the host bits away before
 /// computing the numeric range, so the result is unaffected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Cidr {
     pub addr: IpAddr,
     pub prefix_len: u8,

@@ -13,6 +13,7 @@ pub mod control;
 pub mod engine;
 pub mod ipc;
 pub mod journal;
+pub mod network_plan;
 pub(crate) mod openvpn_credentials;
 pub mod ports;
 pub mod privileged;
