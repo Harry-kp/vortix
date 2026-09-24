@@ -23,6 +23,7 @@ use system_configuration::sys::schema_definitions::{
     kSCPropNetDNSServerAddresses,
 };
 
+use crate::config::owned_file::{mkdirat, openat};
 use crate::control::dns::{
     DnsAssignment, DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource,
     DnsPlatformCapabilities, DnsPolicy, DnsPolicyAdapter, DnsScope,
@@ -1253,7 +1254,7 @@ impl ResolverDirectory {
         expected_owner_uid: u32,
         create: bool,
     ) -> Result<Option<Self>, String> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::fd::FromRawFd as _;
         use std::os::unix::fs::MetadataExt as _;
 
         if !path.is_absolute() {
@@ -1286,36 +1287,29 @@ impl ResolverDirectory {
             let name = std::ffi::CString::new(component.as_encoded_bytes())
                 .map_err(|_| "resolver directory component contains NUL".to_string())?;
             let is_leaf = components.peek().is_none();
-            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            // SAFETY: the parent descriptor and component C string remain
-            // live for the call; successful ownership moves into File.
-            let mut fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-            if fd < 0 && is_leaf && create {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    // SAFETY: descriptor and component are valid. EEXIST is
-                    // handled by the following no-follow open.
-                    let created =
-                        unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) };
-                    if created != 0
-                        && std::io::Error::last_os_error().kind()
-                            != std::io::ErrorKind::AlreadyExists
-                    {
-                        return Err(std::io::Error::last_os_error().to_string());
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+            let mut opened = openat(&directory, &name, flags, 0);
+            if is_leaf && create {
+                if let Err(error) = &opened {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        if let Err(error) = mkdirat(&directory, &name, 0o755) {
+                            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                                return Err(error.to_string());
+                            }
+                        }
+                        opened = openat(&directory, &name, flags, 0);
                     }
-                    // SAFETY: same validated arguments as the first openat.
-                    fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
                 }
             }
-            if fd < 0 {
-                let error = std::io::Error::last_os_error();
-                if is_leaf && !create && error.kind() == std::io::ErrorKind::NotFound {
+            directory = match opened {
+                Ok(file) => file,
+                Err(error)
+                    if is_leaf && !create && error.kind() == std::io::ErrorKind::NotFound =>
+                {
                     return Ok(None);
                 }
-                return Err(error.to_string());
-            }
-            // SAFETY: `openat` returned a new descriptor owned by this call.
-            directory = unsafe { std::fs::File::from_raw_fd(fd) };
+                Err(error) => return Err(error.to_string()),
+            };
 
             if is_leaf {
                 let metadata = directory.metadata().map_err(|error| error.to_string())?;
@@ -1346,30 +1340,18 @@ impl ResolverDirectory {
         require_owned: bool,
     ) -> Result<Option<Vec<u8>>, String> {
         use std::io::Read as _;
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::fs::MetadataExt as _;
 
-        // SAFETY: the pinned directory and validated C string are live; a
-        // successful descriptor is transferred into File exactly once.
-        let fd = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            return if error.kind() == std::io::ErrorKind::NotFound
-                || (!require_owned && error.raw_os_error() == Some(libc::ELOOP))
+        let mut file = match openat(&self.directory, name, libc::O_RDONLY, 0) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || (!require_owned && error.raw_os_error() == Some(libc::ELOOP)) =>
             {
-                Ok(None)
-            } else {
-                Err(error.to_string())
-            };
-        }
-        // SAFETY: `openat` returned a new descriptor owned by this call.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+                return Ok(None);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let metadata = file.metadata().map_err(|error| error.to_string())?;
         if !metadata.is_file() || metadata.len() > MAX_RESOLVER_BYTES {
             return if require_owned {
@@ -1398,7 +1380,7 @@ impl ResolverDirectory {
 
     fn write(&self, name: &std::ffi::CStr, body: &[u8]) -> Result<(), String> {
         use std::io::Write as _;
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1420,29 +1402,15 @@ impl ResolverDirectory {
                     TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 ))
                 .expect("fixed resolver temporary name contains no NUL");
-                // SAFETY: the pinned directory and C string are live. The
-                // returned descriptor, if any, is uniquely owned here.
-                let fd = unsafe {
-                    libc::openat(
-                        self.directory.as_raw_fd(),
-                        candidate.as_ptr(),
-                        libc::O_WRONLY
-                            | libc::O_CREAT
-                            | libc::O_EXCL
-                            | libc::O_NOFOLLOW
-                            | libc::O_CLOEXEC,
-                        0o644,
-                    )
-                };
-                if fd >= 0 {
-                    // SAFETY: `openat` returned a new owned descriptor.
-                    Some(Ok((candidate, unsafe { std::fs::File::from_raw_fd(fd) })))
-                } else if std::io::Error::last_os_error().kind()
-                    == std::io::ErrorKind::AlreadyExists
-                {
-                    None
-                } else {
-                    Some(Err(std::io::Error::last_os_error().to_string()))
+                match openat(
+                    &self.directory,
+                    &candidate,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o644,
+                ) {
+                    Ok(file) => Some(Ok((candidate, file))),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error.to_string())),
                 }
             })
             .transpose()?

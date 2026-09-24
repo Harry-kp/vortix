@@ -116,8 +116,8 @@ fn write_secret_file_tracked_with(
     persist: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> Result<SecretFileIdentity, SecretFileError> {
     use std::ffi::CString;
-    use std::fs::{File, OpenOptions};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt};
 
     let parent = path.parent().ok_or(SecretFileError::NoParent)?;
@@ -182,45 +182,18 @@ fn write_secret_file_tracked_with(
     let c_name =
         CString::new(basename.as_encoded_bytes()).map_err(|_| SecretFileError::InvalidFilename)?;
 
-    // 4. openat(parent_fd, basename, O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC, 0o600).
-    //    - O_CREAT|O_EXCL: refuses to overwrite (EEXIST) — no race vs an
-    //      attacker who might pre-create the target as a symlink.
-    //    - O_NOFOLLOW: refuses to follow if the basename is itself a symlink
-    //      (ELOOP).
-    //    - O_CLOEXEC: prevents fd leak across exec.
-    //    - 0o600 mode: file is created with restrictive perms in one step,
-    //      eliminating the chmod-after-write window.
-    // openat's mode argument is variadic, so it must be passed as `c_uint`
-    // (not `mode_t`, which may be narrower on some platforms — e.g. `u16`
-    // on macOS — and would be illegal as a variadic arg).
-    let mode: std::ffi::c_uint = 0o600;
-    #[allow(unsafe_code)]
-    let raw_fd = {
-        // SAFETY: libc::openat is FFI. We pass a valid fd, a non-null
-        // C-string pointer whose lifetime exceeds the call, and standard
-        // POSIX flags. The returned int is checked below before we wrap it.
-        unsafe {
-            libc::openat(
-                parent_fd.as_raw_fd(),
-                c_name.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                mode,
-            )
-        }
-    };
-
-    if raw_fd < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(match err.raw_os_error() {
-            Some(libc::EEXIST) => SecretFileError::FileExists,
-            _ => SecretFileError::Io(err),
-        });
-    }
-
-    // SAFETY: openat returned a non-negative fd that we own exclusively;
-    // wrapping it in `File` transfers ownership so the fd is closed on drop.
-    #[allow(unsafe_code)]
-    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    // 4. O_EXCL refuses an existing name (so a planted symlink cannot be
+    //    followed) and 0o600 applies at creation, with no chmod window.
+    let mut file = crate::config::owned_file::openat(
+        &parent_fd,
+        &c_name,
+        libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
+        0o600,
+    )
+    .map_err(|err| match err.raw_os_error() {
+        Some(libc::EEXIST) => SecretFileError::FileExists,
+        _ => SecretFileError::Io(err),
+    })?;
 
     let metadata = match file.metadata() {
         Ok(metadata) => metadata,

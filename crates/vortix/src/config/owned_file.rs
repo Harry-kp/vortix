@@ -43,6 +43,89 @@ impl From<std::io::Error> for AtomicWriteError {
     }
 }
 
+/// `openat` relative to `dir` with `O_NOFOLLOW | O_CLOEXEC` always added, as
+/// an owned file. Every descriptor-relative open goes through here.
+///
+/// # Errors
+///
+/// Returns the OS error; callers map `ENOENT` / `ELOOP` as they need.
+#[allow(unsafe_code)]
+pub(crate) fn openat(
+    dir: &impl std::os::fd::AsRawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: `dir` is a live descriptor and `name` a NUL-terminated string
+    // for the duration of the call; the mode is only read with O_CREAT.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::c_uint::from(mode),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new descriptor that nothing else owns.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// `mkdirat` relative to `dir`; `EEXIST` is the caller's to interpret.
+///
+/// # Errors
+///
+/// Returns the OS error.
+#[allow(unsafe_code)]
+pub(crate) fn mkdirat(
+    dir: &impl std::os::fd::AsRawFd,
+    name: &std::ffi::CStr,
+    mode: libc::mode_t,
+) -> std::io::Result<()> {
+    // SAFETY: descriptor and C string stay live for the call.
+    if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Open or create the directory `name` under `parent` without following a
+/// link. `Ok(None)` when it is missing and `create` is false; the bool says
+/// whether this call created it.
+fn open_or_create_dir_at(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    create: bool,
+    before_create: impl FnOnce() -> Result<(), FileError>,
+) -> Result<Option<(std::fs::File, bool)>, FileError> {
+    let unsafe_or = |error: std::io::Error| {
+        if is_unsafe_path_error(&error) {
+            FileError::UnsafeFile
+        } else {
+            error.into()
+        }
+    };
+    match openat(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+        Ok(directory) => return Ok(Some((directory, false))),
+        Err(error) if error.raw_os_error() != Some(libc::ENOENT) => return Err(unsafe_or(error)),
+        Err(_) if !create => return Ok(None),
+        Err(_) => {}
+    }
+    before_create()?;
+    let created = match mkdirat(parent, name, 0o700) {
+        Ok(()) => true,
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => false,
+        Err(error) => return Err(error.into()),
+    };
+    let directory =
+        openat(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0).map_err(unsafe_or)?;
+    Ok(Some((directory, created)))
+}
+
 #[allow(unsafe_code)]
 #[allow(clippy::similar_names)]
 pub(crate) fn open_owned_directory(
@@ -52,7 +135,6 @@ pub(crate) fn open_owned_directory(
     expected_gid: u32,
 ) -> Result<Option<OwnedDirectory>, FileError> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
 
     let absolute = if path.is_absolute() {
@@ -67,40 +149,12 @@ pub(crate) fn open_owned_directory(
         .canonicalize()?;
     let parent = open_absolute_directory(&parent_path)?;
     let leaf = CString::new(leaf.as_bytes()).map_err(|_| FileError::UnsafeFile)?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let mut fd = unsafe { libc::openat(parent.as_raw_fd(), leaf.as_ptr(), flags) };
-    let mut created = false;
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if is_unsafe_path_error(&error) {
-            return Err(FileError::UnsafeFile);
-        }
-        if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error.into());
-        }
-        if !create {
-            return Ok(None);
-        }
-        validate_directory_descriptor(&parent, expected_uid)?;
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EEXIST) {
-                return Err(error.into());
-            }
-        } else {
-            created = true;
-        }
-        fd = unsafe { libc::openat(parent.as_raw_fd(), leaf.as_ptr(), flags) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            return if is_unsafe_path_error(&error) {
-                Err(FileError::UnsafeFile)
-            } else {
-                Err(error.into())
-            };
-        }
-    }
-    let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    let Some((directory, created)) = open_or_create_dir_at(&parent, &leaf, create, || {
+        validate_directory_descriptor(&parent, expected_uid)
+    })?
+    else {
+        return Ok(None);
+    };
     if created {
         prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)?;
         parent.sync_all()?;
@@ -119,43 +173,14 @@ pub(crate) fn open_owned_directory_at(
     expected_gid: u32,
 ) -> Result<Option<OwnedDirectory>, FileError> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::fd::AsRawFd as _;
 
     validate_directory_descriptor(parent, expected_uid)?;
     let name = CString::new(name).map_err(|_| FileError::UnsafeFile)?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let mut fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    let mut created = false;
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if is_unsafe_path_error(&error) {
-            return Err(FileError::UnsafeFile);
-        }
-        if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error.into());
-        }
-        if !create {
-            return Ok(None);
-        }
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EEXIST) {
-                return Err(error.into());
-            }
-        } else {
-            created = true;
-        }
-        fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            return if is_unsafe_path_error(&error) {
-                Err(FileError::UnsafeFile)
-            } else {
-                Err(error.into())
-            };
-        }
-    }
-    let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    let Some((directory, created)) = open_or_create_dir_at(parent, &name, create, || Ok(()))?
+    else {
+        return Ok(None);
+    };
     if created {
         if let Err(error) =
             prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)
@@ -186,7 +211,7 @@ pub(crate) fn open_owned_directory_at(
 #[allow(unsafe_code)]
 fn open_absolute_directory(path: &Path) -> Result<std::fs::File, FileError> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::fd::FromRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::Component;
 
@@ -205,16 +230,13 @@ fn open_absolute_directory(path: &Path) -> Result<std::fs::File, FileError> {
             return Err(FileError::UnsafeFile);
         };
         let name = CString::new(component.as_bytes()).map_err(|_| FileError::UnsafeFile)?;
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            return if is_unsafe_path_error(&error) {
-                Err(FileError::UnsafeFile)
+        directory = openat(&directory, &name, flags, 0).map_err(|error| {
+            if is_unsafe_path_error(&error) {
+                FileError::UnsafeFile
             } else {
-                Err(error.into())
-            };
-        }
-        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+                error.into()
+            }
+        })?;
     }
     Ok(directory)
 }
@@ -289,28 +311,15 @@ fn read_owned_entry_with_policy(
 ) -> Result<Option<Vec<u8>>, FileError> {
     use std::ffi::CString;
     use std::io::Read as _;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let name = CString::new(name).map_err(|_| FileError::UnsafeFile)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let mut file = match openat(directory, &name, libc::O_RDONLY, 0) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(error) if is_unsafe_path_error(&error) => return Err(FileError::UnsafeFile),
+        Err(error) => return Err(error.into()),
     };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENOENT) {
-            Ok(None)
-        } else if is_unsafe_path_error(&error) {
-            Err(FileError::UnsafeFile)
-        } else {
-            Err(error.into())
-        };
-    }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != expected_uid
@@ -379,7 +388,7 @@ pub(crate) fn write_owned_atomic_with_hook(
 ) -> Result<(), AtomicWriteError> {
     use std::ffi::CString;
     use std::io::Write as _;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::fd::AsRawFd as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -395,21 +404,18 @@ pub(crate) fn write_owned_atomic_with_hook(
         );
         let candidate_c = CString::new(candidate.as_str())
             .map_err(|_| AtomicWriteError::NotPublished(FileError::UnsafeFile))?;
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                candidate_c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd >= 0 {
-            allocated = Some((candidate, unsafe { std::fs::File::from_raw_fd(fd) }));
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(AtomicWriteError::NotPublished(error.into()));
+        match openat(
+            directory,
+            &candidate_c,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => {
+                allocated = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(AtomicWriteError::NotPublished(error.into())),
         }
     }
     let (temporary_name, mut temporary) = allocated.ok_or_else(|| {
@@ -497,27 +503,22 @@ pub(crate) fn open_owned_lock(
     gid: u32,
 ) -> Result<std::fs::File, FileError> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
     let name = CString::new(name).map_err(|_| FileError::UnsafeFile)?;
     // O_NONBLOCK: a FIFO planted at the name must not hang the open.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(if is_unsafe_path_error(&error) {
+    let file = openat(
+        directory,
+        &name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+        0o600,
+    )
+    .map_err(|error| {
+        if is_unsafe_path_error(&error) {
             FileError::UnsafeFile
         } else {
             error.into()
-        });
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+    })?;
     if !file.metadata()?.is_file() {
         return Err(FileError::UnsafeFile);
     }

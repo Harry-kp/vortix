@@ -14,8 +14,8 @@ use crate::constants::OPENVPN_AUTH_DIR;
 use crate::profile::{unambiguous_legacy_artifact_key, ProfileId};
 
 use super::owned_file::{
-    open_owned_directory, open_owned_directory_at, write_owned_atomic_with_hook, AtomicWriteError,
-    AtomicWriteStage, FileError, OwnedDirectory,
+    open_owned_directory, open_owned_directory_at, openat, write_owned_atomic_with_hook,
+    AtomicWriteError, AtomicWriteStage, FileError, OwnedDirectory,
 };
 
 const MAX_AUTH_BYTES: u64 = 16 * 1024;
@@ -355,34 +355,27 @@ impl FsOpenVpnCredentialStore {
     ) -> Result<Option<OpenedCredential>, CredentialStoreError> {
         use std::ffi::CString;
         use std::io::Read as _;
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
         validate_artifact_key(key)?;
         let name = format!("{key}.auth");
         let c_name = CString::new(name.as_str()).map_err(|_| {
             CredentialStoreError::UnsafeArtifact(CredentialArtifactIssue::ChangedEntry)
         })?;
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                c_name.as_ptr(),
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+        let mut file = match openat(directory, &c_name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+            Ok(file) => file,
+            Err(source) => {
+                return match source.raw_os_error() {
+                    Some(libc::ENOENT) => Ok(None),
+                    Some(libc::ELOOP) => Err(CredentialStoreError::UnsafeArtifact(
+                        CredentialArtifactIssue::Symlink,
+                    )),
+                    _ => Err(CredentialStoreError::Io {
+                        operation: CredentialIoOperation::OpenEntry,
+                        source,
+                    }),
+                };
+            }
         };
-        if fd < 0 {
-            let source = std::io::Error::last_os_error();
-            return match source.raw_os_error() {
-                Some(libc::ENOENT) => Ok(None),
-                Some(libc::ELOOP) => Err(CredentialStoreError::UnsafeArtifact(
-                    CredentialArtifactIssue::Symlink,
-                )),
-                _ => Err(CredentialStoreError::Io {
-                    operation: CredentialIoOperation::OpenEntry,
-                    source,
-                }),
-            };
-        }
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let metadata = file.metadata().map_err(|source| CredentialStoreError::Io {
             operation: CredentialIoOperation::OpenEntry,
             source,
@@ -695,27 +688,18 @@ fn entry_matches(
     expected: Option<EntryIdentity>,
 ) -> Result<bool, FileError> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
     let name = CString::new(name).map_err(|_| FileError::UnsafeFile)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let file = match openat(directory, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+        Ok(file) => file,
+        Err(error) => {
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(expected.is_none()),
+                Some(libc::ELOOP) => Ok(false),
+                _ => Err(error.into()),
+            };
+        }
     };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENOENT) {
-            Ok(expected.is_none())
-        } else if error.raw_os_error() == Some(libc::ELOOP) {
-            Ok(false)
-        } else {
-            Err(error.into())
-        };
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let actual = EntryIdentity::from_metadata(&file.metadata()?);
     Ok(expected == Some(actual))
 }

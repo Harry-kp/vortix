@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::config::owned_file::{mkdirat, openat};
 use crate::config::profile_store::{
     acquire_profile_lock, is_profile_config_name, write_atomic, FsProfileStore, Sidecar,
 };
@@ -546,7 +547,6 @@ fn legacy_archive_entry(
 #[allow(unsafe_code)]
 fn open_legacy_sidecar(path: &Path) -> std::io::Result<std::fs::File> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let parent = path
@@ -560,17 +560,7 @@ fn open_legacy_sidecar(path: &Path) -> std::io::Result<std::fs::File> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(parent)?;
     let name = CString::new(name.as_encoded_bytes()).map_err(invalid_data)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    openat(&directory, &name, libc::O_RDONLY, 0)
 }
 
 fn legacy_archive_entry_from_file(
@@ -641,7 +631,7 @@ fn archive_legacy_sidecars_platform(
     entries: &[LegacySidecarArchiveEntry],
 ) -> std::io::Result<()> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let profiles = std::fs::OpenOptions::new()
@@ -649,27 +639,17 @@ fn archive_legacy_sidecars_platform(
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(profiles_dir)?;
     let archive_name = CString::new(LEGACY_SIDECAR_ARCHIVE_DIR).expect("static archive name");
-    let created =
-        if unsafe { libc::mkdirat(profiles.as_raw_fd(), archive_name.as_ptr(), 0o700) } == 0 {
-            true
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EEXIST) {
-                return Err(error);
-            }
-            false
-        };
-    let archive_fd = unsafe {
-        libc::openat(
-            profiles.as_raw_fd(),
-            archive_name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let created = match mkdirat(&profiles, &archive_name, 0o700) {
+        Ok(()) => true,
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => false,
+        Err(error) => return Err(error),
     };
-    if archive_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let archive = unsafe { std::fs::File::from_raw_fd(archive_fd) };
+    let archive = openat(
+        &profiles,
+        &archive_name,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )?;
     if unsafe { libc::fchmod(archive.as_raw_fd(), 0o700) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -812,23 +792,11 @@ fn openat_verified_regular(
     name: &std::ffi::CStr,
     expected: &LegacySidecarArchiveEntry,
 ) -> std::io::Result<Option<std::fs::File>> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let file = match openat(directory, name, libc::O_RDONLY, 0) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(error);
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
     verify_archive_file(&file, expected)?;
     Ok(Some(file))
 }
