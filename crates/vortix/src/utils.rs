@@ -525,21 +525,6 @@ pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &
     }
 }
 
-/// Read a .ovpn config and return the `static-challenge` prompt text if the
-/// directive is present.
-///
-/// Helper for the auth-overlay construction sites that need to know whether
-/// to render a third (OTP) field. Parse-on-demand symmetric with
-/// [`openvpn_config_needs_auth`]: we read the file at use-time rather than
-/// caching the parsed profile on `Profile`. Returns `None` on any read or
-/// parse failure so callers always degrade to the existing two-field flow.
-#[must_use]
-pub fn read_openvpn_static_challenge_prompt(config_path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(config_path).ok()?;
-    let parsed = crate::openvpn::parser::parse_ovpn_conf(&text).ok()?;
-    parsed.static_challenge.map(|sc| sc.prompt)
-}
-
 /// Scan the `OpenVPN` auth directory and delete any leftover transient
 /// `<safe>.scrv1.auth` credentials bundle.
 ///
@@ -576,43 +561,6 @@ pub fn scrub_stale_scrv1_auth_files() {
             let _ = std::fs::remove_file(&path);
         }
     }
-}
-
-/// Checks whether an `OpenVPN` config file contains `auth-user-pass` without a file argument.
-///
-/// Returns `true` if the config has a bare `auth-user-pass` directive (meaning
-/// `OpenVPN` will prompt for credentials on stdin). Returns `false` if:
-/// - The directive is absent
-/// - The directive has a file path argument (`auth-user-pass /path/to/file`)
-/// - The directive is commented out (`# auth-user-pass`)
-#[must_use]
-pub fn openvpn_config_needs_auth(config_path: &std::path::Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        // Skip comments and empty lines
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
-            continue;
-        }
-        // Check for the directive
-        if trimmed == crate::constants::OVPN_AUTH_USER_PASS {
-            // Bare directive with no file argument
-            return true;
-        }
-        if let Some(rest) = trimmed.strip_prefix(crate::constants::OVPN_AUTH_USER_PASS) {
-            // Only whitespace after directive = bare (OpenVPN will prompt)
-            if rest.trim().is_empty() {
-                return true;
-            }
-            // Has a file argument = no prompt needed
-            return false;
-        }
-    }
-
-    false
 }
 
 /// Returns the current local time formatted as HH:MM:SS.
@@ -829,31 +777,6 @@ pub(crate) fn is_systemd_resolved() -> bool {
     }
 }
 
-/// Check whether a `WireGuard` config file contains a `DNS =` directive.
-///
-/// When `DNS` is present, `wg-quick` on Linux will invoke `resolvconf` to
-/// manage DNS, which may not be installed on all distributions (e.g. Arch,
-/// Fedora, NixOS).  This helper lets callers detect that situation early.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn wireguard_config_has_dns(config_path: &std::path::Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    for line in content.lines() {
-        let trimmed = line.trim().to_lowercase();
-        if trimmed.starts_with("dns") {
-            // Match "dns = …" with optional whitespace around '='
-            if let Some(rest) = trimmed.strip_prefix("dns") {
-                let rest = rest.trim_start();
-                if rest.starts_with('=') {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Detect whether the kernel has IPv6 disabled.
 ///
 /// True when `/proc/sys/net/ipv6` is absent (booted with
@@ -994,34 +917,6 @@ fn acquire_nonblocking_lock(path: &std::path::Path) -> std::io::Result<std::fs::
         return Err(std::io::Error::last_os_error());
     }
     Ok(file)
-}
-
-/// Check whether a `WireGuard` config declares an IPv6 entry on an
-/// `Address =` line. `wg-quick` runs `ip -6 address add` for each such
-/// entry, which fails outright when the kernel has IPv6 disabled
-/// (issue #242).
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn wireguard_config_has_ipv6_address(config_path: &std::path::Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    for line in content.lines() {
-        let trimmed = line.trim().to_lowercase();
-        let Some(rest) = trimmed.strip_prefix("address") else {
-            continue;
-        };
-        let Some(rhs) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let rhs = rhs.split(['#', ';']).next().unwrap_or("");
-        for entry in rhs.split(',') {
-            let ip_part = entry.trim().split('/').next().unwrap_or("");
-            if ip_part.parse::<std::net::Ipv6Addr>().is_ok() {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -1285,87 +1180,6 @@ mod tests {
 
     // === OpenVPN auth-user-pass detection tests ===
 
-    #[test]
-    fn test_openvpn_config_needs_auth_bare_directive() {
-        let dir = tempfile::Builder::new()
-            .prefix("vortix_test_")
-            .tempdir()
-            .unwrap();
-        let path = dir.path().join("test.ovpn");
-        std::fs::write(
-            &path,
-            "client\nremote example.com 1194\nauth-user-pass\ndev tun\n",
-        )
-        .unwrap();
-        assert!(openvpn_config_needs_auth(&path));
-    }
-
-    #[test]
-    fn test_openvpn_config_needs_auth_bare_with_trailing_space() {
-        let dir = tempfile::Builder::new()
-            .prefix("vortix_test_")
-            .tempdir()
-            .unwrap();
-        let path = dir.path().join("test.ovpn");
-        std::fs::write(
-            &path,
-            "client\nremote example.com 1194\nauth-user-pass   \ndev tun\n",
-        )
-        .unwrap();
-        assert!(openvpn_config_needs_auth(&path));
-    }
-
-    #[test]
-    fn test_openvpn_config_needs_auth_with_file_arg() {
-        let dir = tempfile::Builder::new()
-            .prefix("vortix_test_")
-            .tempdir()
-            .unwrap();
-        let path = dir.path().join("test.ovpn");
-        std::fs::write(
-            &path,
-            "client\nremote example.com 1194\nauth-user-pass /etc/openvpn/creds.txt\ndev tun\n",
-        )
-        .unwrap();
-        assert!(!openvpn_config_needs_auth(&path));
-    }
-
-    #[test]
-    fn test_openvpn_config_needs_auth_absent() {
-        let dir = tempfile::Builder::new()
-            .prefix("vortix_test_")
-            .tempdir()
-            .unwrap();
-        let path = dir.path().join("test.ovpn");
-        std::fs::write(
-            &path,
-            "client\nremote example.com 1194\ndev tun\nproto udp\n",
-        )
-        .unwrap();
-        assert!(!openvpn_config_needs_auth(&path));
-    }
-
-    #[test]
-    fn test_openvpn_config_needs_auth_commented_out() {
-        let dir = tempfile::Builder::new()
-            .prefix("vortix_test_")
-            .tempdir()
-            .unwrap();
-        let path = dir.path().join("test.ovpn");
-        std::fs::write(
-            &path,
-            "client\nremote example.com 1194\n# auth-user-pass\n; auth-user-pass\ndev tun\n",
-        )
-        .unwrap();
-        assert!(!openvpn_config_needs_auth(&path));
-    }
-
-    #[test]
-    fn test_openvpn_config_needs_auth_nonexistent_file() {
-        let path = std::path::PathBuf::from("/tmp/nonexistent_vortix_config_12345.ovpn");
-        assert!(!openvpn_config_needs_auth(&path));
-    }
-
     // === OpenVPN auth file write/read tests ===
 
     /// Global mutex serialising any test that mutates the process-wide
@@ -1431,141 +1245,7 @@ mod tests {
 
     // --- wireguard_config_has_dns tests ---
 
-    #[test]
-    fn test_wg_config_has_dns_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wg0.conf");
-        std::fs::write(
-            &path,
-            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = xyz\nEndpoint = 1.2.3.4:51820\n",
-        )
-        .unwrap();
-        assert!(wireguard_config_has_dns(&path));
-    }
-
-    #[test]
-    fn test_wg_config_has_dns_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wg0.conf");
-        std::fs::write(
-            &path,
-            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n\n[Peer]\nPublicKey = xyz\nEndpoint = 1.2.3.4:51820\n",
-        )
-        .unwrap();
-        assert!(!wireguard_config_has_dns(&path));
-    }
-
-    #[test]
-    fn test_wg_config_has_dns_case_insensitive() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wg0.conf");
-        std::fs::write(
-            &path,
-            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\ndns = 8.8.8.8\n\n[Peer]\nPublicKey = xyz\nEndpoint = 1.2.3.4:51820\n",
-        )
-        .unwrap();
-        assert!(wireguard_config_has_dns(&path));
-    }
-
-    #[test]
-    fn test_wg_config_has_dns_with_spaces() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wg0.conf");
-        std::fs::write(
-            &path,
-            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n  DNS  =  1.1.1.1, 8.8.8.8\n\n[Peer]\nPublicKey = xyz\nEndpoint = 1.2.3.4:51820\n",
-        )
-        .unwrap();
-        assert!(wireguard_config_has_dns(&path));
-    }
-
-    #[test]
-    fn test_wg_config_has_dns_nonexistent_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.conf");
-        assert!(!wireguard_config_has_dns(&path));
-    }
-
-    #[test]
-    fn test_wg_config_dns_in_comment_not_matched() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wg0.conf");
-        // A comment like "# DNS = ..." should not be matched since it starts
-        // with '#', not 'dns' after trimming.
-        std::fs::write(
-            &path,
-            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n# DNS = 1.1.1.1\n\n[Peer]\nPublicKey = xyz\nEndpoint = 1.2.3.4:51820\n",
-        )
-        .unwrap();
-        assert!(!wireguard_config_has_dns(&path));
-    }
-
     // --- wireguard_config_has_ipv6_address tests (issue #242) ---
-
-    fn write_wg_conf(address_line: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wg0.conf");
-        std::fs::write(
-            &path,
-            format!(
-                "[Interface]\nPrivateKey = abc\n{address_line}\n\n[Peer]\nPublicKey = xyz\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 1.2.3.4:51820\n"
-            ),
-        )
-        .unwrap();
-        (dir, path)
-    }
-
-    #[test]
-    fn test_wg_config_ipv6_address_v4_only_is_false() {
-        let (_dir, path) = write_wg_conf("Address = 10.0.0.2/24");
-        assert!(!wireguard_config_has_ipv6_address(&path));
-    }
-
-    #[test]
-    fn test_wg_config_ipv6_address_mixed_v4_v6_is_true() {
-        let (_dir, path) = write_wg_conf("Address = 10.0.0.2/24, fd00::2/64");
-        assert!(wireguard_config_has_ipv6_address(&path));
-    }
-
-    #[test]
-    fn test_wg_config_ipv6_address_v6_only_is_true() {
-        let (_dir, path) = write_wg_conf("Address = fd00::2/128");
-        assert!(wireguard_config_has_ipv6_address(&path));
-    }
-
-    #[test]
-    fn test_wg_config_ipv6_address_no_address_line_is_false() {
-        let (_dir, path) = write_wg_conf("MTU = 1420");
-        assert!(!wireguard_config_has_ipv6_address(&path));
-    }
-
-    #[test]
-    fn test_wg_config_ipv6_address_case_insensitive() {
-        let (_dir, path) = write_wg_conf("address = FD00::2/64");
-        assert!(wireguard_config_has_ipv6_address(&path));
-    }
-
-    #[test]
-    fn test_wg_config_ipv6_address_trailing_comment_stripped() {
-        let (_dir, path) = write_wg_conf("Address = 10.0.0.2/24 # fd00::2 mentioned in comment");
-        assert!(!wireguard_config_has_ipv6_address(&path));
-    }
-
-    #[test]
-    fn test_wg_config_ipv6_address_v6_allowed_ips_alone_is_false() {
-        // Fixture's AllowedIPs carries ::/0; only the Address line
-        // triggers `ip -6 address add`, so this must not fire.
-        let (_dir, path) = write_wg_conf("Address = 10.0.0.2/24");
-        assert!(!wireguard_config_has_ipv6_address(&path));
-    }
-
-    #[test]
-    fn test_wg_config_ipv6_address_nonexistent_file_is_false() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!wireguard_config_has_ipv6_address(
-            &dir.path().join("missing.conf")
-        ));
-    }
 
     // --- get_tmp_config_dir ---
 

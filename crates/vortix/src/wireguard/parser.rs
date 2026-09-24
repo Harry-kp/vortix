@@ -38,7 +38,8 @@ pub struct WgPeer {
 pub struct WgParsedProfile {
     pub dns_servers: Vec<String>,
     pub dns_search_domains: Vec<String>,
-    pub address: Option<String>,
+    /// Every `Address =` entry, comments stripped.
+    pub addresses: Vec<String>,
     pub mtu: Option<u32>,
     pub peers: Vec<WgPeer>,
 }
@@ -51,6 +52,23 @@ enum Section {
 }
 
 impl WgParsedProfile {
+    /// Whether the profile asks for DNS (servers or search domains).
+    #[must_use]
+    pub fn has_dns(&self) -> bool {
+        !self.dns_servers.is_empty() || !self.dns_search_domains.is_empty()
+    }
+
+    /// Whether any interface address is IPv6 (`wg-quick` then needs IPv6).
+    #[must_use]
+    pub fn has_ipv6_address(&self) -> bool {
+        self.addresses.iter().any(|entry| {
+            entry
+                .split('/')
+                .next()
+                .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+        })
+    }
+
     #[must_use]
     pub fn dns_request(&self) -> crate::core::ports::dns::DnsRequest {
         crate::core::ports::dns::DnsRequest {
@@ -145,7 +163,16 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                         }
                     }
                 } else if key.eq_ignore_ascii_case("Address") {
-                    profile.address = Some(value.to_string());
+                    let value = value
+                        .find(['#', ';'])
+                        .map_or(value, |comment| &value[..comment]);
+                    profile.addresses.extend(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|entry| !entry.is_empty())
+                            .map(str::to_string),
+                    );
                 } else if key.eq_ignore_ascii_case("MTU") {
                     profile.mtu = value.parse::<u32>().ok();
                 } else if key.eq_ignore_ascii_case("PreUp")
@@ -254,6 +281,38 @@ pub(crate) fn parse_endpoint_host(value: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_interface_line(line: &str) -> WgParsedProfile {
+        parse_wg_conf(&format!(
+            "[Interface]\nPrivateKey = abc\n{line}\n\n[Peer]\nPublicKey = xyz\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 1.2.3.4:51820\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn dns_is_detected_in_any_spelling_but_not_in_comments() {
+        assert!(with_interface_line("DNS = 1.1.1.1").has_dns());
+        assert!(with_interface_line("dns = 8.8.8.8").has_dns());
+        assert!(with_interface_line("  DNS  =  1.1.1.1, 8.8.8.8").has_dns());
+        assert!(with_interface_line("DNS = corp.example").has_dns());
+        assert!(!with_interface_line("# DNS = 1.1.1.1").has_dns());
+        assert!(!with_interface_line("MTU = 1420").has_dns());
+    }
+
+    #[test]
+    fn ipv6_address_detection_reads_every_address_entry() {
+        assert!(!with_interface_line("Address = 10.0.0.2/24").has_ipv6_address());
+        assert!(with_interface_line("Address = 10.0.0.2/24, fd00::2/64").has_ipv6_address());
+        assert!(with_interface_line("Address = fd00::2/128").has_ipv6_address());
+        assert!(with_interface_line("address = FD00::2/64").has_ipv6_address());
+        assert!(!with_interface_line("MTU = 1420").has_ipv6_address());
+        assert!(
+            !with_interface_line("Address = 10.0.0.2/24 # fd00::2 in a comment").has_ipv6_address()
+        );
+        assert!(
+            with_interface_line("Address = 10.0.0.2/24\nAddress = fd00::2/64").has_ipv6_address()
+        );
+    }
     use std::net::IpAddr;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -272,7 +331,7 @@ Endpoint = 203.0.113.5:51820
 ";
         let p = parse_wg_conf(text).unwrap();
         assert_eq!(p.dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
-        assert_eq!(p.address.as_deref(), Some("10.0.0.2/32"));
+        assert_eq!(p.addresses, ["10.0.0.2/32"]);
         assert_eq!(p.mtu, Some(1420));
     }
 
@@ -565,7 +624,7 @@ PrivateKey = AAAA
 Address = 10.0.0.2/32
 ";
         let p = parse_wg_conf(text).unwrap();
-        assert_eq!(p.address.as_deref(), Some("10.0.0.2/32"));
+        assert_eq!(p.addresses, ["10.0.0.2/32"]);
     }
 
     #[test]

@@ -81,6 +81,27 @@ impl OvpnParsedProfile {
     }
 }
 
+/// Whether the profile at `path` prompts for a username and password: a
+/// bare `auth-user-pass` with no credentials file. Unreadable or invalid
+/// profiles report `false`.
+#[must_use]
+pub fn needs_credentials(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| parse_ovpn_conf(&text).ok())
+        .is_some_and(|parsed| parsed.interactive_auth)
+}
+
+/// The `static-challenge` prompt of the profile at `path`, if it has one.
+#[must_use]
+pub fn static_challenge_prompt(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_ovpn_conf(&text)
+        .ok()?
+        .static_challenge
+        .map(|sc| sc.prompt)
+}
+
 /// Parse a `.ovpn` body into [`OvpnParsedProfile`].
 ///
 /// # Errors
@@ -494,6 +515,26 @@ pub(super) fn merge_redirect_gateways(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn needs_credentials_reads_the_file_and_fails_closed_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare.ovpn");
+        std::fs::write(
+            &bare,
+            "client\nremote example.com 1194\nauth-user-pass   \n",
+        )
+        .unwrap();
+        let with_file = dir.path().join("file.ovpn");
+        std::fs::write(
+            &with_file,
+            "client\nauth-user-pass /etc/openvpn/creds.txt\n",
+        )
+        .unwrap();
+        assert!(needs_credentials(&bare));
+        assert!(!needs_credentials(&with_file));
+        assert!(!needs_credentials(&dir.path().join("missing.ovpn")));
+    }
     use std::net::Ipv4Addr;
 
     #[test]

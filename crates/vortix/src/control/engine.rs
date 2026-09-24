@@ -1006,11 +1006,11 @@ impl Engine {
         };
         let path = &entry.profile.config_path;
         if entry.profile.protocol != ProtocolKind::OpenVpn
-            || !crate::utils::openvpn_config_needs_auth(path)
+            || !crate::openvpn::parser::needs_credentials(path)
         {
             return ready;
         }
-        let otp_label = crate::utils::read_openvpn_static_challenge_prompt(path);
+        let otp_label = crate::openvpn::parser::static_challenge_prompt(path);
         let saved = self
             .credentials
             .lock()

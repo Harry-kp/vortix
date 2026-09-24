@@ -11,7 +11,6 @@ use crate::core::profile::ProtocolKind;
 use crate::core::telemetry::TelemetryUpdate;
 use crate::logger;
 use crate::message::{Message, ScrollMove, SelectionMove};
-use crate::utils;
 
 /// A `Message` handler taking longer than this is treated as a UI-thread
 /// stutter and surfaced via `tracing::warn`. Threshold is empirically the
@@ -418,7 +417,7 @@ impl App {
                         "Auth credentials only apply to OpenVPN profiles".to_string(),
                         ToastType::Info,
                     );
-                } else if !utils::openvpn_config_needs_auth(&profile.config_path) {
+                } else if !crate::openvpn::parser::needs_credentials(&profile.config_path) {
                     self.show_toast(
                         "This profile does not use auth-user-pass".to_string(),
                         ToastType::Info,
@@ -482,7 +481,7 @@ impl App {
         if let Some(idx) = self.profile_list_state.selected() {
             if let Some(profile) = self.runtime.profiles.get(idx) {
                 let is_openvpn = matches!(profile.protocol, ProtocolKind::OpenVpn);
-                let has_auth = utils::openvpn_config_needs_auth(&profile.config_path);
+                let has_auth = crate::openvpn::parser::needs_credentials(&profile.config_path);
                 let name = profile.name.clone();
                 let profile_id = profile.id.clone();
                 if !is_openvpn {

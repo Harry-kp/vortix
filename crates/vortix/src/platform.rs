@@ -643,9 +643,16 @@ pub fn check_dependencies(
             // Otherwise emit the missing-dep label with a hint at
             // which shim the user actually needs.
             #[cfg(target_os = "linux")]
+            // xtask:allow-platform-cfg: the gates below are Linux-only
+            let parsed = std::fs::read_to_string(config_path)
+                .ok()
+                .and_then(|text| crate::wireguard::parser::parse_wg_conf(&text).ok());
+            #[cfg(target_os = "linux")]
             // xtask:allow-platform-cfg: resolvconf check is Linux-only DNS plumbing
             if let Some(label) = wireguard_dns_missing_dep(WireguardDnsGateInputs {
-                has_dns_directive: crate::utils::wireguard_config_has_dns(config_path),
+                has_dns_directive: parsed
+                    .as_ref()
+                    .is_some_and(crate::wireguard::parser::WgParsedProfile::has_dns),
                 resolvectl_path_available: crate::utils::use_resolvectl_path(),
                 resolvconf_works: crate::utils::resolvconf_works(),
                 is_systemd_resolved: crate::utils::is_systemd_resolved(),
@@ -655,7 +662,9 @@ pub fn check_dependencies(
             #[cfg(target_os = "linux")]
             // xtask:allow-platform-cfg: /proc sysctl gate is Linux-only (issue #242)
             if let Some(label) = wireguard_ipv6_missing_dep(
-                crate::utils::wireguard_config_has_ipv6_address(config_path),
+                parsed
+                    .as_ref()
+                    .is_some_and(crate::wireguard::parser::WgParsedProfile::has_ipv6_address),
                 crate::utils::host_ipv6_disabled,
             ) {
                 missing.push(label);
