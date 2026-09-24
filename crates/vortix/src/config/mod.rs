@@ -16,7 +16,7 @@ pub mod settings;
 
 pub use hooks_config::{HookConfigError, HookSpec};
 pub use migration::{migrate_legacy_profiles, MigrationStats};
-pub use profile_store::{ProfileStore, ProfileStoreError, ProfileSummary};
+pub use profile_store::{ProfileStoreError, ProfileSummary};
 pub use settings::{EngineSettings, JournalSettings, Settings, SettingsError, UiSettings};
 
 use std::path::{Path, PathBuf};

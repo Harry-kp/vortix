@@ -153,7 +153,7 @@ fn add_stored_profile(
         crate::core::profile::ProtocolKind::WireGuard,
         config_path.clone(),
     );
-    crate::config::profile_store::ProfileStore::insert(store, &profile, b"dummy").unwrap();
+    store.insert(&profile, b"dummy").unwrap();
     app.runtime.profiles.push(VpnProfile {
         id: profile_id.clone(),
         name: name.to_string(),
@@ -2172,12 +2172,12 @@ fn test_auth_delete_profile_cleans_auth_file() {
         crate::core::profile::ProtocolKind::OpenVpn,
         config_path.clone(),
     );
-    crate::config::profile_store::ProfileStore::insert(
-        &crate::config::profile_store::FsProfileStore::new(profiles_dir),
-        &stored,
-        b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
-    )
-    .unwrap();
+    crate::config::profile_store::FsProfileStore::new(profiles_dir)
+        .insert(
+            &stored,
+            b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
+        )
+        .unwrap();
     app.runtime.profiles.push(VpnProfile {
         id: stable_id.clone(),
         name: "del-vpn".to_string(),

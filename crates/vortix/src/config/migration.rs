@@ -1429,7 +1429,6 @@ fn store_error(error: crate::config::profile_store::ProfileStoreError) -> std::i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::profile_store::ProfileStore as _;
 
     #[test]
     fn pre_sidecar_migration_is_inventory_first_and_idempotent() {

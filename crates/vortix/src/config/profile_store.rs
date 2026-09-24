@@ -98,7 +98,7 @@ pub(crate) fn acquire_profile_lock(
     Ok(ProfileMutationLock(file))
 }
 
-/// Errors returned by [`ProfileStore`] implementations.
+/// Errors returned by [`FsProfileStore`].
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProfileStoreError {
@@ -138,7 +138,7 @@ impl From<ProfileIdError> for ProfileStoreError {
     }
 }
 
-/// Cheap-list summary returned by [`ProfileStore::list`].
+/// Cheap-list summary returned by [`FsProfileStore::list`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileSummary {
     pub id: ProfileId,
@@ -185,17 +185,6 @@ impl Sidecar {
             last_used: None,
         }
     }
-}
-
-/// The profile-storage port.
-pub trait ProfileStore {
-    fn list(&self) -> Result<Vec<ProfileSummary>, ProfileStoreError>;
-    fn get(&self, id: &ProfileId) -> Result<Profile, ProfileStoreError>;
-    fn resolve_display_name(&self, name: &str) -> Result<ProfileId, ProfileStoreError>;
-    fn insert(&self, profile: &Profile, raw_body: &[u8]) -> Result<(), ProfileStoreError>;
-    fn touch(&self, id: &ProfileId) -> Result<(), ProfileStoreError>;
-    fn rename(&self, id: &ProfileId, new_name: &str) -> Result<Profile, ProfileStoreError>;
-    fn delete(&self, id: &ProfileId) -> Result<(), ProfileStoreError>;
 }
 
 /// Filesystem-backed implementation.
@@ -851,8 +840,8 @@ impl FsProfileStore {
     }
 }
 
-impl ProfileStore for FsProfileStore {
-    fn list(&self) -> Result<Vec<ProfileSummary>, ProfileStoreError> {
+impl FsProfileStore {
+    pub fn list(&self) -> Result<Vec<ProfileSummary>, ProfileStoreError> {
         let mut summaries = self
             .validated_sidecars()?
             .into_iter()
@@ -878,7 +867,7 @@ impl ProfileStore for FsProfileStore {
         Ok(summaries)
     }
 
-    fn get(&self, id: &ProfileId) -> Result<Profile, ProfileStoreError> {
+    pub fn get(&self, id: &ProfileId) -> Result<Profile, ProfileStoreError> {
         self.list()?
             .into_iter()
             .find(|summary| &summary.id == id)
@@ -893,7 +882,7 @@ impl ProfileStore for FsProfileStore {
             .ok_or_else(|| ProfileStoreError::NotFound(id.clone()))
     }
 
-    fn resolve_display_name(&self, name: &str) -> Result<ProfileId, ProfileStoreError> {
+    pub fn resolve_display_name(&self, name: &str) -> Result<ProfileId, ProfileStoreError> {
         self.list()?
             .into_iter()
             .find(|summary| summary.display_name == name)
@@ -901,7 +890,7 @@ impl ProfileStore for FsProfileStore {
             .ok_or_else(|| ProfileStoreError::DisplayNameNotFound(name.to_string()))
     }
 
-    fn insert(&self, profile: &Profile, raw_body: &[u8]) -> Result<(), ProfileStoreError> {
+    pub fn insert(&self, profile: &Profile, raw_body: &[u8]) -> Result<(), ProfileStoreError> {
         let lock = acquire_profile_lock(&self.profiles_dir)?;
         Self::validate_name(&profile.display_name)?;
         ProfileId::parse(profile.id.as_str().to_string())?;
@@ -936,7 +925,7 @@ impl ProfileStore for FsProfileStore {
         Ok(())
     }
 
-    fn touch(&self, id: &ProfileId) -> Result<(), ProfileStoreError> {
+    pub fn touch(&self, id: &ProfileId) -> Result<(), ProfileStoreError> {
         let lock = acquire_profile_lock(&self.profiles_dir)?;
         self.recover_pending_transactions_guarded(&lock)?;
         for (path, mut sidecar, candidate) in self.validated_sidecars_guarded(&lock)? {
@@ -948,7 +937,7 @@ impl ProfileStore for FsProfileStore {
         Err(ProfileStoreError::NotFound(id.clone()))
     }
 
-    fn rename(&self, id: &ProfileId, new_name: &str) -> Result<Profile, ProfileStoreError> {
+    pub fn rename(&self, id: &ProfileId, new_name: &str) -> Result<Profile, ProfileStoreError> {
         let lock = acquire_profile_lock(&self.profiles_dir)?;
         Self::validate_name(new_name)?;
         self.recover_pending_transactions_guarded(&lock)?;
@@ -1011,7 +1000,7 @@ impl ProfileStore for FsProfileStore {
         ))
     }
 
-    fn delete(&self, id: &ProfileId) -> Result<(), ProfileStoreError> {
+    pub fn delete(&self, id: &ProfileId) -> Result<(), ProfileStoreError> {
         let lock = acquire_profile_lock(&self.profiles_dir)?;
         self.recover_pending_transactions_guarded(&lock)?;
         let profiles = self.validated_sidecars_guarded(&lock)?;
@@ -1228,12 +1217,14 @@ mod tests {
     }
 
     #[test]
-    fn insert_list_get_and_resolve_use_stable_id() {
+    fn insert_then_list_keeps_the_stable_id() {
         let tmp = tempfile::tempdir().unwrap();
         let store = FsProfileStore::new(tmp.path().join("profiles"));
         store.insert(&corp(), b"[Interface]\n").unwrap();
-        assert_eq!(store.resolve_display_name("corp").unwrap(), id(1));
-        assert_eq!(store.get(&id(1)).unwrap().display_name, "corp");
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id(1));
+        assert_eq!(listed[0].display_name, "corp");
     }
 
     #[test]
@@ -1398,7 +1389,13 @@ mod tests {
             std::fs::create_dir_all(&store.profiles_dir).unwrap();
             std::fs::write(store.profiles_dir.join("corp.conf"), b"[Interface]\n").unwrap();
             crate::config::migration::migrate_legacy_profiles(&store.profiles_dir).unwrap();
-            let stable_id = store.resolve_display_name("corp").unwrap();
+            let stable_id = store
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.display_name == "corp")
+                .unwrap()
+                .id;
             let old_auth = store.legacy_auth_path("corp").unwrap();
             std::fs::create_dir_all(old_auth.parent().unwrap()).unwrap();
             std::fs::write(&old_auth, b"secret").unwrap();

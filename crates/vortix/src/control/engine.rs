@@ -403,7 +403,7 @@ impl Engine {
                         .config_dir
                         .join(crate::constants::PROFILES_DIR_NAME),
                 );
-                if let Err(error) = crate::config::ProfileStore::touch(&store, profile_id) {
+                if let Err(error) = store.touch(profile_id) {
                     tracing::warn!(%error, "could not record last-used time");
                 }
                 for peer in replaced {

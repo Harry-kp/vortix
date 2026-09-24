@@ -14,7 +14,7 @@ use crate::cli::output::{
     err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError,
     ConnectionEntry, ConnectionHealthEntry, ExitCode, OutputMode,
 };
-use crate::config::profile_store::{FsProfileStore, ProfileStore};
+use crate::config::profile_store::FsProfileStore;
 use crate::config::AppConfig;
 use crate::constants;
 use crate::vpn_runtime::VpnRuntime;

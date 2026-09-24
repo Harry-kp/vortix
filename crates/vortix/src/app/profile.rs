@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use super::{App, InputMode, ToastType};
-use crate::config::profile_store::{FsProfileStore, ProfileStore};
+use crate::config::profile_store::FsProfileStore;
 use crate::constants;
 use crate::core::profile::ProfileId;
 use crate::core::profile::ProtocolKind;

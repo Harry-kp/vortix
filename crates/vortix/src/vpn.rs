@@ -1,6 +1,6 @@
 //! VPN profile import functionality
 
-use crate::config::profile_store::{FsProfileStore, ProfileStore};
+use crate::config::profile_store::FsProfileStore;
 use crate::constants;
 use crate::core::profile::{Profile, ProfileId, ProtocolKind};
 use crate::logger::{self, LogLevel};

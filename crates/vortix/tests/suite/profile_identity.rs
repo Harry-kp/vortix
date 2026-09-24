@@ -1,5 +1,5 @@
 use vortix::config::migrate_legacy_profiles;
-use vortix::config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError, Sidecar};
+use vortix::config::profile_store::{FsProfileStore, ProfileStoreError, Sidecar};
 use vortix::core::profile::{Profile, ProfileId, ProtocolKind};
 
 fn id(byte: u8) -> ProfileId {

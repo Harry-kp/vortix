@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use vortix::config::profile_store::{FsProfileStore, ProfileStore};
+use vortix::config::profile_store::FsProfileStore;
 use vortix::core::profile::{Profile, ProfileId, ProtocolKind};
 
 fn run_vortix(config_dir: &std::path::Path, args: &[&str]) -> std::process::Output {
