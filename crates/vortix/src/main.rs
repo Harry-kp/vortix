@@ -7,10 +7,10 @@ use vortix::{cli, config, constants, event, ui};
 
 #[allow(clippy::too_many_lines)] // main() carries the whole bootstrap sequence
 fn main() -> Result<()> {
-    // Private Standard-mode lifecycle actor. Handle this before error hooks,
+    // Private lifecycle actor. Handle this before error hooks,
     // configuration migration, argument parsing, or any user-facing startup
     // work: the custodian has exactly one child and only status/stop IPC.
-    if let Some(exit_code) = vortix::vortix_process::custodian::maybe_run_hidden_entrypoint() {
+    if let Some(exit_code) = vortix::process::custodian::maybe_run_hidden_entrypoint() {
         std::process::exit(exit_code);
     }
 
@@ -18,12 +18,6 @@ fn main() -> Result<()> {
     // toggles so production startup is silent; `RUST_LOG=vortix::process=info`
     // surfaces every subprocess invocation as a structured event.
     init_tracing();
-    vortix::vortix_process::set_global_runner(vortix::vortix_process::CommandRunner::real());
-
-    // Platform aggregate. Detect the OS variants once at startup;
-    // consumers reach for `crate::platform::current_platform()` instead of
-    // branching on `cfg(target_os)`.
-    vortix::platform::set_global_platform(vortix::platform::Platform::detect_current());
 
     // Wrap Rust's default panic hook with terminal restoration and recovery
     // instructions. Drop glue on App will still run to release kill switch
@@ -102,10 +96,10 @@ fn main() -> Result<()> {
     // its writer lock at the first safe point after resolving the authoritative
     // config directory, before migration, journals, or other shared-state work.
     let _tui_lifecycle_lock = if args.command.is_none() {
-        Some(match vortix::utils::acquire_lifecycle_lock() {
+        Some(match vortix::config::acquire_lifecycle_lock() {
             Ok(lock) => lock,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                eprintln!("{}", vortix::utils::lifecycle_lock_user_message(&error));
+                eprintln!("{}", vortix::config::lifecycle_lock_user_message(&error));
                 std::process::exit(cli::output::ExitCode::StateConflict.code());
             }
             Err(error) => {
@@ -113,7 +107,7 @@ fn main() -> Result<()> {
                 // cleanly; this one returned an eyre error, so a lock the
                 // user simply could not open came with a source location and
                 // backtrace hints attached.
-                eprintln!("{}", vortix::utils::lifecycle_lock_user_message(&error));
+                eprintln!("{}", vortix::config::lifecycle_lock_user_message(&error));
                 let exit = if error.kind() == std::io::ErrorKind::PermissionDenied {
                     cli::output::ExitCode::PermissionDenied
                 } else {
@@ -132,7 +126,7 @@ fn main() -> Result<()> {
     // root-ownership error. The lifecycle-lock check deliberately wins when
     // another Vortix session is already active; read-only CLI commands remain
     // available without administrator access.
-    if args.command.is_none() && !vortix::utils::is_root() {
+    if args.command.is_none() && !vortix::platform::is_root() {
         eprintln!("Vortix needs administrator access to manage VPN connections.");
         eprintln!("Try again with: sudo vortix");
         std::process::exit(cli::output::ExitCode::PermissionDenied.code());
@@ -160,65 +154,64 @@ fn main() -> Result<()> {
     // config.toml. Resolve this only after clap/env/sudo-user selection so an
     // old default-path settings file can never silently override
     // `--config-dir` or `VORTIX_CONFIG_DIR`.
-    let settings = match vortix::vortix_config::Settings::load_from_config_dir(&config_dir) {
+    let settings = match vortix::config::Settings::load(
+        &config_dir,
+        vortix::config::EngineSettings::default(),
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: failed to load settings ({e}); using defaults");
-            vortix::vortix_config::Settings::default()
+            vortix::config::Settings::default()
         }
     };
 
     // Journal — open the per-session JSONL writer using the runner's own
     // tokio runtime after the authoritative settings path is known.
-    let runtime_handle = vortix::vortix_process::global_runner()
-        .as_real()
-        .map(|r| r.runtime().handle().clone());
-    if let Some(handle) = runtime_handle.clone() {
+    if let Some(handle) = vortix::process::runtime_handle() {
         let _guard = handle.enter();
-        match vortix::vortix_core::journal::Journal::open(
-            vortix::vortix_core::journal::JournalConfig {
-                disk: settings.journal.disk,
-                retention_days: settings.journal.retention_days,
-                retention_count: settings.journal.retention_count,
-                // The default resolves the XDG data dir from $HOME, which is
-                // /root under sudo, so session journals landed outside the
-                // user's home where they could neither find nor prune them.
-                // Keep them beside the logs, in the sudo-aware config dir.
-                journal_dir: Some(config_dir.join("sessions")),
-                ..Default::default()
-            },
-        ) {
+        match vortix::journal::Journal::open(vortix::journal::JournalConfig {
+            disk: settings.journal.disk,
+            retention_days: settings.journal.retention_days,
+            retention_count: settings.journal.retention_count,
+            // The default resolves the XDG data dir from $HOME, which is
+            // /root under sudo, so session journals landed outside the
+            // user's home where they could neither find nor prune them.
+            // Keep them beside the logs, in the sudo-aware config dir.
+            journal_dir: Some(config_dir.join("sessions")),
+            ..Default::default()
+        }) {
             Ok(journal) => {
-                vortix::vortix_core::journal::set_global_journal(journal);
+                vortix::journal::set_global_journal(journal);
             }
             Err(e) => {
                 eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
             }
         }
     }
-    let _ = runtime_handle;
 
     // Clear any SCRV1 envelopes left on
     // disk by a previous crash mid-connect. Runs once at startup before
     // the CLI/TUI fork so both paths see a clean auth dir. Cheap O(N)
     // scan; failures are swallowed.
-    vortix::utils::scrub_stale_scrv1_auth_files();
+    vortix::openvpn::scrub_stale_scrv1_auth_files();
 
     // Hold a process-lifetime scratch lease before sweeping. Concurrent CLI
     // and TUI processes intentionally have different journal session IDs;
     // only an acquirable lease proves that another session crashed.
-    let temp_session_id = vortix::utils::temp_session_id();
-    let _temp_session_lease =
-        match vortix::utils::acquire_temp_session_lease(&config_dir, &temp_session_id) {
-            Ok(lease) => {
-                vortix::utils::sweep_orphan_temp_configs(&config_dir, &temp_session_id);
-                Some(lease)
-            }
-            Err(error) => {
-                eprintln!("warning: failed to lease temporary tunnel state ({error})");
-                None
-            }
-        };
+    let temp_session_id = vortix::wireguard::tunnel::temp_session_id();
+    let _temp_session_lease = match vortix::wireguard::tunnel::acquire_temp_session_lease(
+        &config_dir,
+        &temp_session_id,
+    ) {
+        Ok(lease) => {
+            vortix::wireguard::tunnel::sweep_orphan_temp_configs(&config_dir, &temp_session_id);
+            Some(lease)
+        }
+        Err(error) => {
+            eprintln!("warning: failed to lease temporary tunnel state ({error})");
+            None
+        }
+    };
 
     // backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
@@ -249,7 +242,7 @@ fn main() -> Result<()> {
     if std::env::var_os("VORTIX_SKIP_MIGRATION").is_some() {
         eprintln!("VORTIX_SKIP_MIGRATION set — skipping startup sidecar backfill.");
     } else {
-        match vortix::vortix_config::migrate_legacy_profiles(&profiles_dir) {
+        match vortix::config::migrate_legacy_profiles(&profiles_dir) {
             Ok(stats) => {
                 if stats.created > 0 {
                     eprintln!(
@@ -300,7 +293,7 @@ fn main() -> Result<()> {
                         cli::output::ExitCode::PermissionDenied,
                     )
                 } else if let Some(sidecar) =
-                    vortix::vortix_config::migration::unexplained_sidecar_cause(&e)
+                    vortix::config::migration::unexplained_sidecar_cause(&e)
                 {
                     // The blanket "restore the inventory" text told the user
                     // neither which file was the problem nor how to clear it,
@@ -363,15 +356,12 @@ fn main() -> Result<()> {
     // reported every live managed tunnel as a possible orphan. Absence of
     // evidence is not evidence of an orphan, so only scan where the
     // evidence is readable.
-    let mut tracked_pids = vortix::utils::tracked_openvpn_pids();
-    tracked_pids.extend(vortix::core::managed_wireguard::tracked_wireguard_pids(
+    let mut tracked_pids = vortix::openvpn::tracked_openvpn_pids();
+    tracked_pids.extend(vortix::wireguard::receipt::tracked_wireguard_pids(
         &config_dir,
     ));
-    let orphans = vortix::vortix_process::filter_untracked(
-        vortix::vortix_process::scan_orphans(),
-        &tracked_pids,
-    );
-    if !orphans.is_empty() && vortix::utils::is_root() {
+    let orphans = vortix::process::filter_untracked(vortix::process::scan_orphans(), &tracked_pids);
+    if !orphans.is_empty() && vortix::platform::is_root() {
         eprintln!(
             "Warning: detected {} possible orphan VPN process(es) from a previous session:",
             orphans.len()
@@ -412,7 +402,6 @@ fn main() -> Result<()> {
             &config_dir,
             config_dir_source,
             &app_config,
-            &settings,
             output_mode,
         );
         std::process::exit(exit_code);
@@ -420,12 +409,7 @@ fn main() -> Result<()> {
 
     // Run the TUI application
     let terminal = init_terminal()?;
-    let result = run_tui(
-        terminal,
-        app_config,
-        config_dir,
-        settings.diagnostics.fallback_snapshot,
-    );
+    let result = run_tui(terminal, app_config, config_dir);
     restore_terminal();
 
     result
@@ -469,8 +453,8 @@ fn prompt_migration(old_dir: &std::path::Path, new_dir: &std::path::Path) -> std
         match config::migrate_data(old_dir, new_dir) {
             Ok(()) => {
                 // Verify profiles were actually migrated
-                let profiles_exist = new_dir.join("profiles").is_dir()
-                    && std::fs::read_dir(new_dir.join("profiles"))
+                let profiles_exist = new_dir.join(vortix::constants::PROFILES_DIR_NAME).is_dir()
+                    && std::fs::read_dir(new_dir.join(vortix::constants::PROFILES_DIR_NAME))
                         .map(|mut d| d.next().is_some())
                         .unwrap_or(false);
                 if profiles_exist {
@@ -478,7 +462,7 @@ fn prompt_migration(old_dir: &std::path::Path, new_dir: &std::path::Path) -> std
                 } else {
                     eprintln!(
                         "  Warning: Move completed but no profiles found at {}",
-                        new_dir.join("profiles").display()
+                        new_dir.join(vortix::constants::PROFILES_DIR_NAME).display()
                     );
                     eprintln!(
                         "  Check if your profiles are still at {}\n",
@@ -509,7 +493,6 @@ fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     config: config::AppConfig,
     config_dir: std::path::PathBuf,
-    diagnostics_fallback: bool,
 ) -> Result<()> {
     terminal.draw(|frame| {
         use ratatui::layout::Alignment;
@@ -540,7 +523,6 @@ fn run_tui(
     })?;
     let tick_rate = config.tick_rate;
     let mut app = App::new(config, config_dir);
-    app.set_background_diagnostics_fallback(diagnostics_fallback);
     let control_config = app.runtime.config.clone();
     let control_dir = app.runtime.config_dir.clone();
     let control_profiles = app.runtime.profiles.clone();
@@ -548,11 +530,8 @@ fn run_tui(
     std::thread::Builder::new()
         .name("vortix-control-startup".into())
         .spawn(move || {
-            let result = vortix::cli::control::LocalControlSession::start_tui(
-                &control_config,
-                &control_dir,
-                control_profiles,
-            );
+            let result =
+                vortix::control::Control::start(&control_config, &control_dir, control_profiles);
             let _ = control_tx.send(result);
         })
         .map_err(|error| eyre::eyre!("cannot start control bootstrap: {error}"))?;
@@ -590,10 +569,7 @@ fn run_tui(
         if let Some(receiver) = control_rx.as_ref() {
             match receiver.try_recv() {
                 Ok(Ok(control)) => {
-                    app.attach_client_control_session(
-                        vortix::cli::control::ClientControlSession::standard(control),
-                    )
-                    .map_err(|error| eyre::eyre!("cannot attach TUI control service: {error}"))?;
+                    app.attach_control(control);
                     control_rx = None;
                 }
                 Ok(Err(error)) => {
@@ -682,7 +658,7 @@ fn log_filter(directives: Option<&str>) -> tracing_subscriber::filter::Targets {
 }
 
 fn init_terminal() -> Result<ratatui::DefaultTerminal> {
-    vortix::theme::configure_for_terminal();
+    vortix::ui::theme::configure_for_terminal();
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     terminal.clear()?;
@@ -711,7 +687,7 @@ mod tests {
         ] {
             let filter = log_filter(value);
             assert!(
-                !filter.would_enable("vortix::vortix_process", &Level::ERROR),
+                !filter.would_enable("vortix::process", &Level::ERROR),
                 "RUST_LOG={value:?} must not enable anything, not even ERROR"
             );
             assert_eq!(filter.default_level(), None, "RUST_LOG={value:?}");
@@ -720,8 +696,8 @@ mod tests {
 
     #[test]
     fn a_trailing_comma_does_not_widen_the_filter() {
-        let filter = log_filter(Some("vortix::vortix_process=info,"));
-        assert!(filter.would_enable("vortix::vortix_process", &Level::INFO));
+        let filter = log_filter(Some("vortix::process=info,"));
+        assert!(filter.would_enable("vortix::process", &Level::INFO));
         assert!(!filter.would_enable("some::other::crate", &Level::ERROR));
     }
 

@@ -14,7 +14,7 @@
 //! - Help iterates [`CATALOG`] (or a category-filtered subset).
 //! - No code anywhere constructs a sigil glyph + style inline.
 
-use crate::theme;
+use crate::ui::theme;
 use ratatui::style::{Color, Modifier, Style};
 
 /// Identifies a sigil for lookup. Each variant maps to exactly one
@@ -35,7 +35,7 @@ pub enum SigilId {
     Reconnecting,
     /// `◑` yellow — Disconnecting (teardown in flight).
     Disconnecting,
-    /// `?` yellow — `AwaitingUserInput` (2FA / passphrase prompt).
+    /// `?` yellow — awaiting credentials.
     AwaitingInput,
     /// `✗` red — Disconnected with a failure record.
     Failed,
@@ -386,7 +386,7 @@ mod tests {
         // Sanity check on `Sigil::style()` — bold/dim flags compose
         // with the fg color.
         fn test_color() -> Color {
-            crate::theme::SYNTHWAVE.error
+            crate::ui::theme::SYNTHWAVE.error
         }
 
         let bold_alarm = Sigil {
@@ -400,7 +400,7 @@ mod tests {
             category: SigilCategory::SecurityGuard,
         };
         let style = bold_alarm.style();
-        assert_eq!(style.fg, Some(crate::theme::SYNTHWAVE.error));
+        assert_eq!(style.fg, Some(crate::ui::theme::SYNTHWAVE.error));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert!(!style.add_modifier.contains(Modifier::DIM));
     }

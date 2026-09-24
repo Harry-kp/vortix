@@ -11,13 +11,13 @@
 //!   '◐'  Connecting              → theme::current().warning
 //!   '↻'  Reconnecting            → theme::current().warning + Modifier::DIM
 //!   '◑'  Disconnecting           → theme::current().warning
-//!   '?'  AwaitingUserInput       → theme::current().warning
+//!   '?'  AwaitingCredentials     → theme::current().warning
 //!   '✗'  Disconnected w/ failure → theme::current().error
 //!   ' '  Disconnected, no fail   → Color::Reset
 //! ```
 //!
 //! The primary tunnel (kernel-truth holder of the default route, per
-//! `TunnelRegistry::primary`) is suffixed with ` *` after the profile name to
+//! `App::primary_id`) is suffixed with ` *` after the profile name to
 //! cross-correlate with the header's primary marker.
 //!
 //! ## Risk annotations
@@ -26,7 +26,7 @@
 //! risk states that the user should drill into Connection Details to resolve.
 //! Today the taxonomy surfaces **mode-mismatch risk**: a tunnel whose declared `AllowedIPs`
 //! claim `0/0` but which did not win the kernel default route — represented in
-//! the registry as `Role::AddressableSuppressed`. The fwmark-hijack risk
+//! the engine as `Role::AddressableSuppressed`. The fwmark-hijack risk
 //! annotation (also `!`, ) lands when a follow-up wires
 //! the WG-config-aware predicate; the rendering pipeline here already reserves
 //! the column so a follow-up only has to extend the predicate, not the layout.
@@ -50,10 +50,10 @@
 //! the `fixed_cols` arithmetic above.
 
 use crate::app::App;
-use crate::vortix_core::engine::state::Connection;
-use crate::vortix_core::engine::{Role, TunnelSnapshot};
-use crate::vortix_core::profile::ProfileId;
-use crate::{theme, utils};
+use crate::app::Role;
+use crate::control::{Phase, TunnelView};
+use crate::profile::ProfileId;
+use crate::ui::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     style::{Color, Modifier, Style},
@@ -65,7 +65,7 @@ use ratatui::{
     Frame,
 };
 
-/// Per-row status badge derived from a registry snapshot.
+/// Per-row status badge derived from the tunnel's phase.
 ///
 /// Returns the (glyph, style) pair for the status cell. `None` means the row
 /// is fully disconnected with no failure — caller renders a blank cell.
@@ -74,49 +74,43 @@ use ratatui::{
 /// [`crate::ui::sigils::CATALOG`] — the single source of truth shared
 /// between this renderer and the `?` help overlay's Sigils tab.
 fn status_badge_for(
-    snapshot: &TunnelSnapshot,
-    protocol: Option<crate::state::Protocol>,
-) -> Option<(&'static str, Style)> {
-    use crate::ui::sigils::sigil;
-    let id = status_sigil_id(snapshot, protocol)?;
-    let s = sigil(id);
-    Some((s.glyph, s.style()))
+    tunnel: &TunnelView,
+    protocol: Option<crate::profile::ProtocolKind>,
+) -> (&'static str, Style) {
+    let s = crate::ui::sigils::sigil(status_sigil_id(tunnel, protocol));
+    (s.glyph, s.style())
 }
 
 fn status_sigil_id(
-    snapshot: &TunnelSnapshot,
-    protocol: Option<crate::state::Protocol>,
-) -> Option<crate::ui::sigils::SigilId> {
+    tunnel: &TunnelView,
+    protocol: Option<crate::profile::ProtocolKind>,
+) -> crate::ui::sigils::SigilId {
     use crate::ui::sigils::SigilId;
-    Some(match &snapshot.state {
-        Connection::Connected { details, .. } => {
+    match tunnel.phase {
+        Phase::Up => {
             // the state-authority contract: Connected entries whose
             // interface name vortix couldn't reliably attribute to a PID
             // (current case: externally-started OpenVPN on macOS where
             // the scanner's ifconfig-scan fallback collides across
             // PIDs) render with a muted/dim treatment. They ARE up;
             // vortix just can't verify their routing posture.
-            if details.interface_authoritative {
+            if tunnel.details.interface_authoritative {
                 SigilId::Connected
             } else {
                 SigilId::ConnectedUnauthoritative
             }
         }
-        Connection::Connecting { .. } => {
-            if matches!(protocol, Some(crate::state::Protocol::WireGuard)) {
+        Phase::Starting => {
+            if matches!(protocol, Some(crate::profile::ProtocolKind::WireGuard)) {
                 SigilId::Handshaking
             } else {
                 SigilId::Connecting
             }
         }
-        Connection::Reconnecting { .. } => SigilId::Reconnecting,
-        Connection::Disconnecting { .. } => SigilId::Disconnecting,
-        Connection::AwaitingUserInput { .. } => SigilId::AwaitingInput,
-        Connection::Disconnected {
-            last_failure: Some(_),
-        } => SigilId::Failed,
-        Connection::Disconnected { last_failure: None } => return None,
-    })
+        Phase::Waiting { .. } => SigilId::Reconnecting,
+        Phase::Stopping => SigilId::Disconnecting,
+        Phase::AwaitingCredentials => SigilId::AwaitingInput,
+    }
 }
 
 /// Does this snapshot warrant a `!` risk annotation in the sidebar?
@@ -126,12 +120,9 @@ fn status_sigil_id(
 /// also include WG-secondary-missing-FwMark while primary holds 0/0; the
 /// signature returns a `bool` so the predicate can grow without churning the
 /// render path.
-fn has_risk_annotation(snapshot: &TunnelSnapshot) -> bool {
-    matches!(snapshot.role, Role::AddressableSuppressed { .. })
-        || matches!(
-            snapshot.health,
-            crate::vortix_core::engine::state::ConnectionHealth::Degraded { .. }
-        )
+fn has_risk_annotation(role: &Role, health: &crate::tunnel::ConnectionHealth) -> bool {
+    matches!(role, Role::AddressableSuppressed { .. })
+        || matches!(health, crate::tunnel::ConnectionHealth::Degraded { .. })
 }
 
 /// Should the primary `*` suffix render given the available name-cell width?
@@ -146,7 +137,7 @@ fn should_show_primary_marker(is_primary: bool, name_cell_width: usize) -> bool 
     is_primary && name_cell_width.saturating_sub(PRIMARY_RESERVE) >= MIN_NAME_BUDGET_FOR_PRIMARY
 }
 
-/// Per-row presentation derived from registry data, decoupled from layout.
+/// Per-row presentation derived from the engine snapshot, decoupled from layout.
 struct RowSignal {
     /// Status glyph + style; `None` → blank status cell.
     badge: Option<(&'static str, Style)>,
@@ -157,7 +148,7 @@ struct RowSignal {
     is_primary: bool,
     /// True if a `!` risk annotation should follow the status char.
     risk: bool,
-    /// True if the registry holds a snapshot for this profile at all.
+    /// True if the engine has a tunnel for this profile at all.
     is_active: bool,
 }
 
@@ -174,22 +165,20 @@ impl RowSignal {
 }
 
 fn signal_for(
-    snapshots: &[TunnelSnapshot],
-    primary: Option<&ProfileId>,
+    app: &App,
     profile_id: &ProfileId,
-    protocol: crate::state::Protocol,
+    protocol: crate::profile::ProtocolKind,
 ) -> RowSignal {
-    let Some(snap) = snapshots.iter().find(|s| &s.profile_id == profile_id) else {
+    let Some(tunnel) = app.tunnel(profile_id) else {
         return RowSignal::empty();
     };
-    let badge = status_badge_for(snap, Some(protocol));
+    let badge = Some(status_badge_for(tunnel, Some(protocol)));
     let accent = badge.map_or(Color::Reset, |(_, style)| style.fg.unwrap_or(Color::Reset));
-    let is_primary = primary == Some(profile_id);
     RowSignal {
         badge,
         accent,
-        is_primary,
-        risk: has_risk_annotation(snap),
+        is_primary: app.primary_id() == Some(profile_id),
+        risk: has_risk_annotation(&app.role(tunnel), &tunnel.health),
         is_active: true,
     }
 }
@@ -197,11 +186,10 @@ fn signal_for(
 /// One profile row: status badge, name (with the primary `*`), protocol
 /// tag and last-used time. Selection owns the foreground of every cell.
 fn profile_row(
-    profile: &crate::state::VpnProfile,
+    profile: &crate::config::profiles::VpnProfile,
     idx: usize,
     is_selected: bool,
     signal: &RowSignal,
-    profile_missing: bool,
     name_cell_width: usize,
 ) -> Row<'static> {
     // Status cell: badge taxonomy + optional `!` risk annotation.
@@ -215,18 +203,13 @@ fn profile_row(
             style
         };
         let mut spans = vec![Span::styled(glyph, badge_style)];
-        if signal.risk || profile_missing {
+        if signal.risk {
             spans.push(Span::styled(
                 "!",
                 Style::default().fg(row_fg(is_selected, theme::current().warning)),
             ));
         }
         Cell::from(Line::from(spans))
-    } else if profile_missing {
-        Cell::from(Span::styled(
-            "!",
-            Style::default().fg(row_fg(is_selected, theme::current().warning)),
-        ))
     } else if idx < 9 {
         Cell::from(Span::styled(
             format!("{}", idx + 1),
@@ -247,8 +230,6 @@ fn profile_row(
         Style::default()
             .fg(theme::current().row_selected_fg)
             .add_modifier(Modifier::BOLD)
-    } else if profile_missing {
-        Style::default().fg(theme::current().warning)
     } else if signal.is_primary {
         Style::default()
             .fg(signal.accent)
@@ -259,7 +240,7 @@ fn profile_row(
         Style::default().fg(theme::current().inactive)
     };
 
-    let display_name = utils::truncate(&profile.name, name_budget);
+    let display_name = crate::ui::helpers::truncate_to_width(&profile.name, name_budget);
     let mut name_spans = vec![Span::styled(display_name, name_style)];
     if show_primary_marker {
         name_spans.push(Span::styled(
@@ -272,8 +253,8 @@ fn profile_row(
     let name_cell = Cell::from(Line::from(name_spans));
 
     let proto_icon = match profile.protocol {
-        crate::app::Protocol::WireGuard => "WG",
-        crate::app::Protocol::OpenVPN => "OV",
+        crate::profile::ProtocolKind::WireGuard => "WG",
+        crate::profile::ProtocolKind::OpenVpn => "OV",
     };
     let proto_color = if is_selected {
         theme::current().row_selected_fg
@@ -284,7 +265,7 @@ fn profile_row(
     };
 
     let time_str = if let Some(last_used) = profile.last_used {
-        let relative = utils::format_relative_time(last_used);
+        let relative = crate::ui::helpers::format_relative_time(last_used);
         if !relative.ends_with("ago") && !relative.is_empty() {
             format!("{relative} ago")
         } else {
@@ -368,11 +349,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // snapshots come from the registry; profile catalog still on engine.
-    let snapshots = app.registry.snapshot_all();
-    let primary = app.registry.primary().cloned();
-
-    if app.runtime.profiles.is_empty() && snapshots.is_empty() {
+    if app.runtime.profiles.is_empty() && app.tunnel_count() == 0 {
         render_empty_state(frame, inner);
         return;
     }
@@ -387,20 +364,12 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(idx, p)| {
-            let signal = signal_for(&snapshots, primary.as_ref(), &p.id, p.protocol);
-            let profile_missing = app
-                .runtime
-                .profile_presence
-                .get(&p.id)
-                .is_some_and(|tracker| {
-                    matches!(tracker.state(), crate::state::ProfilePresence::Missing)
-                });
+            let signal = signal_for(app, &p.id, p.protocol);
             profile_row(
                 p,
                 idx,
                 app.profile_list_state.selected() == Some(idx),
                 &signal,
-                profile_missing,
                 name_cell_width,
             )
         })
@@ -451,79 +420,38 @@ mod tests {
     //! Earlier smoke tests (empty-state, row rendering) remain.
     use super::*;
     use crate::app::App;
-    use crate::state::{Protocol, VpnProfile};
-    use crate::vortix_core::cidr::Cidr;
-    use crate::vortix_core::engine::registry::Role;
-    use crate::vortix_core::engine::state::ConnectionHealth;
-    use crate::vortix_core::profile::ProfileId;
+    use crate::app::Role;
+    use crate::cidr::Cidr;
+    use crate::config::profiles::VpnProfile;
+    use crate::profile::ProfileId;
+    use crate::profile::ProtocolKind;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
-    use std::time::SystemTime;
     use unicode_width::UnicodeWidthStr;
 
     fn make_profile(name: &str) -> VpnProfile {
         VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(name),
+            id: crate::profile::ProfileId::new(name),
             name: name.to_string(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             location: String::new(),
             config_path: PathBuf::from(format!("/tmp/{name}.conf")),
             last_used: None,
+            group: None,
         }
     }
 
-    fn snap_connected(name: &str, role: Role) -> TunnelSnapshot {
-        TunnelSnapshot {
-            profile_id: ProfileId::new(name),
-            state: Connection::Connected {
-                profile_id: ProfileId::new(name),
-                since: SystemTime::now(),
-                health: ConnectionHealth::default(),
-                details: Box::default(),
-            },
-            role,
-            health: ConnectionHealth::default(),
-            interface_name: None,
-            started_at: None,
-        }
+    fn snap_connected(name: &str) -> TunnelView {
+        crate::app::connection::test_view(name, Phase::Up)
     }
 
-    fn snap_connecting(name: &str) -> TunnelSnapshot {
-        TunnelSnapshot {
-            profile_id: ProfileId::new(name),
-            state: Connection::Connecting {
-                profile_id: ProfileId::new(name),
-                started_at: SystemTime::now(),
-                attempt: 1,
-                retry_budget_remaining: std::time::Duration::from_secs(30),
-            },
-            role: Role::AwaitingInput,
-            health: ConnectionHealth::default(),
-            interface_name: None,
-            started_at: None,
-        }
+    fn snap_connecting(name: &str) -> TunnelView {
+        crate::app::connection::test_view(name, Phase::Starting)
     }
 
-    fn snap_reconnecting(name: &str) -> TunnelSnapshot {
-        TunnelSnapshot {
-            profile_id: ProfileId::new(name),
-            state: Connection::Reconnecting {
-                profile_id: ProfileId::new(name),
-                started_at: SystemTime::now(),
-                attempt: 1,
-                retry_budget_remaining: std::time::Duration::from_secs(30),
-                last_error: None,
-            },
-            role: Role::Reconnecting {
-                prior_role: Box::new(Role::Primary {
-                    allowed_ips: vec![],
-                }),
-            },
-            health: ConnectionHealth::default(),
-            interface_name: None,
-            started_at: None,
-        }
+    fn snap_reconnecting(name: &str) -> TunnelView {
+        crate::app::connection::test_view(name, Phase::Waiting { retry_at: None })
     }
 
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
@@ -547,9 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_and_empty_profiles_renders_no_profiles_empty_state() {
+    fn no_tunnels_and_empty_profiles_renders_no_profiles_empty_state() {
         let mut app = App::new_test();
-        assert_eq!(app.registry.tunnel_count(), 0);
+        assert_eq!(app.tunnel_count(), 0);
         assert!(app.runtime.profiles.is_empty());
 
         let out = render_to_string(&mut app, 40, 10);
@@ -578,18 +506,18 @@ mod tests {
     #[test]
     fn selected_row_uses_one_contrasting_foreground_in_every_fixed_theme() {
         for choice in [
-            crate::theme::ThemeChoice::Synthwave,
-            crate::theme::ThemeChoice::CatppuccinMocha,
-            crate::theme::ThemeChoice::Dracula,
-            crate::theme::ThemeChoice::Nord,
-            crate::theme::ThemeChoice::GruvboxDark,
-            crate::theme::ThemeChoice::TokyoNight,
+            crate::ui::theme::ThemeChoice::Synthwave,
+            crate::ui::theme::ThemeChoice::CatppuccinMocha,
+            crate::ui::theme::ThemeChoice::Dracula,
+            crate::ui::theme::ThemeChoice::Nord,
+            crate::ui::theme::ThemeChoice::GruvboxDark,
+            crate::ui::theme::ThemeChoice::TokyoNight,
         ] {
             let mut app = App::new_test();
             app.runtime.profiles = vec![make_profile("selected")];
             app.profile_list_state.select(Some(0));
             let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("terminal");
-            crate::theme::with_choice(choice, || {
+            crate::ui::theme::with_choice(choice, || {
                 terminal
                     .draw(|frame| render(frame, &mut app, Rect::new(0, 0, 60, 6)))
                     .expect("draw");
@@ -616,14 +544,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_yields_no_active_marker_for_any_profile() {
-        let snapshots: Vec<TunnelSnapshot> = Vec::new();
-        let sig = signal_for(
-            &snapshots,
-            None,
-            &ProfileId::new("anything"),
-            Protocol::WireGuard,
-        );
+    fn no_tunnels_yields_no_active_marker_for_any_profile() {
+        let app = App::new_test();
+        let sig = signal_for(&app, &ProfileId::new("anything"), ProtocolKind::WireGuard);
         assert!(!sig.is_active);
         assert!(sig.badge.is_none());
         assert!(!sig.is_primary);
@@ -634,22 +557,15 @@ mod tests {
 
     #[test]
     fn connected_snapshot_renders_filled_circle_glyph() {
-        let snap = snap_connected(
-            "vpn1",
-            Role::Primary {
-                allowed_ips: vec![],
-            },
-        );
-        let (glyph, _) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connected → badge");
+        let snap = snap_connected("vpn1");
+        let (glyph, _) = status_badge_for(&snap, Some(ProtocolKind::WireGuard));
         assert_eq!(glyph, "●");
     }
 
     #[test]
     fn connecting_snapshot_renders_half_circle_glyph() {
         let snap = snap_connecting("vpn1");
-        let (glyph, _) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connecting → badge");
+        let (glyph, _) = status_badge_for(&snap, Some(ProtocolKind::WireGuard));
         assert_eq!(glyph, "◐");
     }
 
@@ -657,12 +573,12 @@ mod tests {
     fn connecting_sigil_identity_is_protocol_specific() {
         let snap = snap_connecting("vpn1");
         assert_eq!(
-            status_sigil_id(&snap, Some(Protocol::WireGuard)),
-            Some(crate::ui::sigils::SigilId::Handshaking)
+            status_sigil_id(&snap, Some(ProtocolKind::WireGuard)),
+            crate::ui::sigils::SigilId::Handshaking
         );
         assert_eq!(
-            status_sigil_id(&snap, Some(Protocol::OpenVPN)),
-            Some(crate::ui::sigils::SigilId::Connecting)
+            status_sigil_id(&snap, Some(ProtocolKind::OpenVpn)),
+            crate::ui::sigils::SigilId::Connecting
         );
     }
 
@@ -674,20 +590,9 @@ mod tests {
         // ifconfig-scan fallback collides across PIDs), the row's
         // status badge must visually distinguish from a fully-tracked
         // Connected tunnel.
-        let mut snap = snap_connected(
-            "vpn1",
-            Role::Addressable {
-                allowed_ips: vec![],
-            },
-        );
-        if let Connection::Connected {
-            ref mut details, ..
-        } = snap.state
-        {
-            details.interface_authoritative = false;
-        }
-        let (glyph, style) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connected → badge");
+        let mut snap = snap_connected("vpn1");
+        snap.details.interface_authoritative = false;
+        let (glyph, style) = status_badge_for(&snap, Some(ProtocolKind::WireGuard));
         assert_eq!(glyph, "●", "still Connected — glyph stays a filled dot");
         assert!(
             style.add_modifier.contains(Modifier::DIM),
@@ -708,14 +613,8 @@ mod tests {
         // Inverse check: a normal Connected tunnel (interface_authoritative
         // defaults to true) keeps the bright SUCCESS color and no DIM
         // modifier.
-        let snap = snap_connected(
-            "vpn1",
-            Role::Primary {
-                allowed_ips: vec![],
-            },
-        );
-        let (glyph, style) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connected → badge");
+        let snap = snap_connected("vpn1");
+        let (glyph, style) = status_badge_for(&snap, Some(ProtocolKind::WireGuard));
         assert_eq!(glyph, "●");
         assert!(!style.add_modifier.contains(Modifier::DIM));
         assert_eq!(style.fg, Some(theme::current().success));
@@ -724,49 +623,12 @@ mod tests {
     #[test]
     fn reconnecting_snapshot_renders_reload_glyph_dim() {
         let snap = snap_reconnecting("vpn1");
-        let (glyph, style) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("reconnecting → badge");
+        let (glyph, style) = status_badge_for(&snap, Some(ProtocolKind::WireGuard));
         assert_eq!(glyph, "↻");
         assert!(
             style.add_modifier.contains(Modifier::DIM),
             "reconnecting must dim to distinguish from connecting under monochrome — got {style:?}"
         );
-    }
-
-    #[test]
-    fn disconnected_no_failure_renders_no_badge() {
-        let snap = TunnelSnapshot {
-            profile_id: ProfileId::new("vpn1"),
-            state: Connection::Disconnected { last_failure: None },
-            role: Role::Addressable {
-                allowed_ips: vec![],
-            },
-            health: ConnectionHealth::default(),
-            interface_name: None,
-            started_at: None,
-        };
-        assert!(status_badge_for(&snap, Some(Protocol::WireGuard)).is_none());
-    }
-
-    #[test]
-    fn disconnected_with_failure_renders_x_glyph_error() {
-        use crate::vortix_core::engine::state::FailureReason;
-        let snap = TunnelSnapshot {
-            profile_id: ProfileId::new("vpn1"),
-            state: Connection::Disconnected {
-                last_failure: Some(FailureReason::HandshakeFailed("test".to_string())),
-            },
-            role: Role::Addressable {
-                allowed_ips: vec![],
-            },
-            health: ConnectionHealth::default(),
-            interface_name: None,
-            started_at: None,
-        };
-        let (glyph, style) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("failure → badge");
-        assert_eq!(glyph, "✗");
-        assert_eq!(style.fg, Some(theme::current().error));
     }
 
     // ── width discipline ──────────────────────────────────────────────
@@ -820,22 +682,10 @@ mod tests {
 
     #[test]
     fn signal_for_marks_primary_when_id_matches() {
-        let snap = snap_connected(
-            "corp",
-            Role::Primary {
-                allowed_ips: vec![Cidr {
-                    addr: "0.0.0.0".parse().unwrap(),
-                    prefix_len: 0,
-                }],
-            },
-        );
-        let primary = ProfileId::new("corp");
-        let sig = signal_for(
-            std::slice::from_ref(&snap),
-            Some(&primary),
-            &ProfileId::new("corp"),
-            Protocol::WireGuard,
-        );
+        let snap = snap_connected("corp");
+        let mut app = App::new_test();
+        app.set_tunnels_for_test(vec![snap], Some(ProfileId::new("corp")));
+        let sig = signal_for(&app, &ProfileId::new("corp"), ProtocolKind::WireGuard);
         assert!(sig.is_primary);
         assert!(sig.is_active);
         assert_eq!(sig.badge.map(|(g, _)| g), Some("●"));
@@ -843,19 +693,10 @@ mod tests {
 
     #[test]
     fn signal_for_does_not_mark_primary_for_other_rows() {
-        let snap = snap_connected(
-            "corp",
-            Role::Primary {
-                allowed_ips: vec![],
-            },
-        );
-        let primary = ProfileId::new("corp");
-        let sig = signal_for(
-            std::slice::from_ref(&snap),
-            Some(&primary),
-            &ProfileId::new("other"),
-            Protocol::WireGuard,
-        );
+        let snap = snap_connected("corp");
+        let mut app = App::new_test();
+        app.set_tunnels_for_test(vec![snap], Some(ProfileId::new("corp")));
+        let sig = signal_for(&app, &ProfileId::new("other"), ProtocolKind::WireGuard);
         assert!(!sig.is_primary);
         assert!(!sig.is_active);
     }
@@ -864,40 +705,34 @@ mod tests {
 
     #[test]
     fn addressable_suppressed_role_triggers_risk_annotation() {
-        let snap = snap_connected(
-            "vpn1",
-            Role::AddressableSuppressed {
-                allowed_ips: vec![Cidr {
-                    addr: "0.0.0.0".parse().unwrap(),
-                    prefix_len: 0,
-                }],
-            },
-        );
+        let snap = snap_connected("vpn1");
+        let role = Role::AddressableSuppressed {
+            allowed_ips: vec![Cidr {
+                addr: "0.0.0.0".parse().unwrap(),
+                prefix_len: 0,
+            }],
+        };
         assert!(
-            has_risk_annotation(&snap),
+            has_risk_annotation(&role, &snap.health),
             "AddressableSuppressed role surfaces mode-mismatch `!` annotation"
         );
     }
 
     #[test]
     fn addressable_role_no_risk_annotation() {
-        let snap = snap_connected(
-            "vpn1",
-            Role::Addressable {
-                allowed_ips: vec![],
-            },
-        );
-        assert!(!has_risk_annotation(&snap));
+        let snap = snap_connected("vpn1");
+        let role = Role::Addressable {
+            allowed_ips: vec![],
+        };
+        assert!(!has_risk_annotation(&role, &snap.health));
     }
 
     #[test]
     fn primary_role_no_risk_annotation() {
-        let snap = snap_connected(
-            "vpn1",
-            Role::Primary {
-                allowed_ips: vec![],
-            },
-        );
-        assert!(!has_risk_annotation(&snap));
+        let snap = snap_connected("vpn1");
+        let role = Role::Primary {
+            allowed_ips: vec![],
+        };
+        assert!(!has_risk_annotation(&role, &snap.health));
     }
 }

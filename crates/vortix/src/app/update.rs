@@ -5,12 +5,12 @@
 
 use std::time::{Duration, Instant};
 
-use super::{App, ConnectionState, FocusedPanel, InputMode, Protocol, ToastType};
+use super::{App, FocusedPanel, InputMode, ToastType};
 use crate::constants;
-use crate::core::telemetry::TelemetryUpdate;
 use crate::logger;
 use crate::message::{Message, ScrollMove, SelectionMove};
-use crate::utils;
+use crate::profile::ProtocolKind;
+use crate::telemetry::TelemetryUpdate;
 
 /// A `Message` handler taking longer than this is treated as a UI-thread
 /// stutter and surfaced via `tracing::warn`. Threshold is empirically the
@@ -19,21 +19,11 @@ use crate::utils;
 /// threshold via `RUST_LOG=vortix::app=warn`; the value is silent otherwise.
 const UI_HANDLER_SLOW_THRESHOLD: Duration = Duration::from_millis(50);
 
-fn is_unknown_identity_value(value: &str) -> bool {
-    value.is_empty()
-        || value == "Unknown"
-        || value == constants::MSG_DETECTING
-        || value == constants::MSG_FETCHING
-}
-
 /// Extract the variant name (without the payload) from a `Message` for
 /// observability. `format!("{msg:?}")` produces `"NextPanel"` for unit
 /// variants, `"ConnectResult { ... }"` for struct variants, etc. — we
 /// want just the name so `tracing` events are aggregatable.
 fn message_variant_label(msg: &Message) -> String {
-    if matches!(msg, Message::BackgroundDiagnosticsLoaded(_)) {
-        return "BackgroundDiagnosticsLoaded".into();
-    }
     let s = format!("{msg:?}");
     s.split_once([' ', '(', '{'])
         .map_or(s.clone(), |(prefix, _)| prefix.to_string())
@@ -100,57 +90,21 @@ impl App {
                     self.confirm_delete_profile(&profile_id);
                 }
             }
-            Message::SwitchExclusiveAndConnect { idx } => {
-                // User chose the legacy "switch VPNs" path on the
-                // takeover overlay: disconnect the current tunnel,
-                // queue the new one to fire once teardown completes.
-                // This is the pre-multi-tunnel UX preserved as an
-                // opt-in `[S]` hotkey for users who don't want both
-                // VPNs active at once.
+            Message::SwitchExclusiveAndConnect { idx } | Message::ConfirmRouteOverlap { idx } => {
                 self.input_mode = InputMode::Normal;
-                if let Some(profile) = self.runtime.profiles.get(idx) {
+                if let Some(profile) = self.runtime.profiles.get(idx).cloned() {
                     self.log(&format!(
-                        "ACTION: Disconnecting current tunnel before connecting '{}'",
+                        "ACTION: Switching to '{}'; conflicting tunnels stop once it is up",
                         profile.name
                     ));
-                }
-                if let Some(profile_id) = self
-                    .runtime
-                    .profiles
-                    .get(idx)
-                    .map(|profile| profile.id.clone())
-                {
-                    self.issue_control_command(
-                        crate::vortix_core::control::UserCommand::ConnectExclusive { profile_id },
-                    );
+                    self.send(crate::control::Command::Switch(profile.id));
                 }
             }
-            Message::ConfirmRouteOverlap { idx } => {
-                self.input_mode = InputMode::Normal;
-                let Some(profile) = self.runtime.profiles.get(idx).cloned() else {
-                    return;
-                };
-                self.log(&format!(
-                    "ACTION: Disconnecting the conflicting tunnel before connecting '{}'",
-                    profile.name
-                ));
-                // The kernel routes a prefix through one interface, so two
-                // profiles claiming the same network cannot both carry it.
-                // Keeping both up meant the route read-back demanded one
-                // address resolve through two interfaces and the connect
-                // always failed. Stop the other tunnel, like a takeover.
-                self.issue_control_command(
-                    crate::vortix_core::control::UserCommand::ConnectExclusive {
-                        profile_id: profile.id,
-                    },
-                );
-            }
-            Message::DisconnectProfile { idx } => self.disconnect_profile_by_idx(idx),
-            Message::ForceDisconnectProfile { idx } => {
-                self.force_disconnect_profile_by_idx(idx);
+            Message::DisconnectProfile { idx } | Message::CancelConnect { idx } => {
+                self.disconnect_profile_by_idx(idx);
             }
             Message::RequestDisconnectAll => {
-                let count = self.active_tunnel_count();
+                let count = self.tunnel_count();
                 if count > 1 {
                     self.input_mode = InputMode::ConfirmDisconnectAll {
                         count,
@@ -166,7 +120,6 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 self.disconnect_all_active();
             }
-            Message::CancelConnect { idx } => self.cancel_connect(idx),
             Message::ProfileMove(mv) => match mv {
                 SelectionMove::Next => self.profile_next(),
                 SelectionMove::Prev => self.profile_previous(),
@@ -178,39 +131,19 @@ impl App {
             },
 
             // Connection
-            Message::Disconnect => {
-                if matches!(self.legacy_state(), ConnectionState::Disconnecting { .. }) {
-                    self.force_disconnect();
-                } else {
-                    self.disconnect();
-                }
-            }
+            Message::Disconnect => self.disconnect(),
             Message::Reconnect => self.reconnect(),
             Message::ConnectSelected => {
-                if let Some(idx) = self.profile_list_state.selected() {
-                    let target = self.runtime.profiles.get(idx).map(|p| p.name.clone());
-                    let legacy = self.legacy_state();
-                    match (&legacy, target) {
-                        (ConnectionState::Connected { profile, .. }, Some(name))
-                            if *profile == name =>
-                        {
-                            if let Some(profile_id) = self
-                                .runtime
-                                .profiles
-                                .get(idx)
-                                .map(|profile| profile.id.clone())
-                            {
-                                self.issue_control_command(
-                                    crate::vortix_core::control::UserCommand::Reconnect {
-                                        profile_id: Some(profile_id),
-                                    },
-                                );
-                            }
-                        }
-                        (_, Some(_)) => {
-                            self.toggle_connection(idx);
-                        }
-                        _ => {}
+                if let Some((idx, profile_id)) = self
+                    .profile_list_state
+                    .selected()
+                    .and_then(|idx| Some((idx, self.runtime.profiles.get(idx)?.id.clone())))
+                {
+                    // The selected row's own tunnel, primary or not.
+                    if self.tunnel(&profile_id).is_some() {
+                        self.send(crate::control::Command::Reconnect(profile_id));
+                    } else {
+                        self.toggle_connection(idx);
                     }
                 }
             }
@@ -238,69 +171,19 @@ impl App {
                     self.flip_state_mut(panel).flip();
                 }
             }
-            Message::OpenBackgroundSetup => {
-                self.input_mode = InputMode::BackgroundSetup {
-                    state: crate::background::BackgroundOverlayState::new(
-                        crate::background::BackgroundWorkflow::Setup,
-                    ),
-                };
-            }
-            Message::OpenBackgroundStatus => {
-                self.input_mode = InputMode::BackgroundSetup {
-                    state: crate::background::BackgroundOverlayState::new(
-                        crate::background::BackgroundWorkflow::Status,
-                    ),
-                };
-            }
-            Message::OpenBackgroundRecover => {
-                self.input_mode = InputMode::BackgroundSetup {
-                    state: crate::background::BackgroundOverlayState::new(
-                        crate::background::BackgroundWorkflow::Recover,
-                    ),
-                };
-            }
-            Message::OpenBackgroundDisable => {
-                self.input_mode = InputMode::BackgroundSetup {
-                    state: crate::background::BackgroundOverlayState::new(
-                        crate::background::BackgroundWorkflow::Disable,
-                    ),
-                };
-            }
-            Message::OpenBackgroundDiagnostics => self.open_background_diagnostics(),
-            Message::BackgroundDiagnosticsLoaded(result) => {
-                self.background_diagnostics_loading = false;
-                match result {
-                    Ok(view) => self.log_batch(&background_diagnostic_log_lines(&view)),
-                    Err(error) => {
-                        self.log(&format!(
-                            "BACKGROUND: diagnostics unavailable ({error}); status remains Standard and no authority claim was made"
-                        ));
-                        self.show_toast(
-                            "Background diagnostics are unavailable. Standard mode is unchanged."
-                                .to_string(),
-                            ToastType::Warning,
-                        );
-                    }
-                }
-            }
-            Message::ConfirmBackgroundAction => {
-                let workflow = match &self.input_mode {
-                    InputMode::BackgroundSetup { state } => Some(state.workflow),
-                    _ => None,
-                };
-                if workflow != Some(crate::background::BackgroundWorkflow::Status) {
-                    self.show_toast(
-                        "Background enrollment is not enabled in this release; Standard mode is unchanged".into(),
-                        ToastType::Info,
-                    );
-                }
-                self.input_mode = InputMode::Normal;
-            }
             Message::CloseOverlay => {
-                if let Some(challenge_id) = self.control_challenge.take() {
-                    if let Some(control) = &self.control_session {
-                        if let Err(error) = control.cancel_challenge(challenge_id) {
-                            self.log(&format!("WARN: Could not cancel challenge: {error}"));
+                // Only closing the prompt's own form cancels the connect.
+                let closing_prompt = matches!(
+                    self.input_mode,
+                    InputMode::AuthPrompt {
+                        connect_after: true,
+                        ..
+                    }
+                );
+                if closing_prompt {
+                    if let Some(prompt) = self.control_prompt.take() {
+                        if let Some(control) = &self.control {
+                            control.answer(prompt, None);
                         }
                     }
                 }
@@ -309,6 +192,7 @@ impl App {
                 self.show_action_menu = false;
                 self.show_bulk_menu = false;
                 self.input_mode = InputMode::Normal;
+                self.show_pending_prompt();
             }
             Message::OpenActionMenu => {
                 if self.profile_list_state.selected().is_some()
@@ -392,14 +276,13 @@ impl App {
             Message::OpenHelp => {
                 self.input_mode = InputMode::Help {
                     scroll: 0,
-                    tab: crate::state::HelpTab::default(),
+                    tab: crate::app::state::HelpTab::default(),
                 };
             }
             Message::CycleLogFilter => self.handle_cycle_log_filter(),
 
             // System
             Message::Quit => self.handle_quit(),
-            Message::Log(msg) => self.log(&msg),
             Message::Toast(msg, t_type) => self.show_toast(msg, t_type),
             Message::CopyIp => self.copy_ip_to_clipboard(),
             Message::ClearLogs => {
@@ -408,8 +291,10 @@ impl App {
                 self.log("APP: Logs cleared");
             }
             Message::Telemetry(update) => self.handle_telemetry(update),
-            Message::ControlSnapshot(snapshot) => self.apply_control_snapshot(*snapshot),
-            Message::Tick => self.handle_tick(),
+            Message::Tick => {
+                self.handle_tick();
+                self.show_pending_prompt();
+            }
             Message::Resize(width, height) => {
                 self.terminal_size = (width, height);
             }
@@ -423,40 +308,6 @@ impl App {
                 "ui-handler slow: a Message handler blocked the UI thread for longer than the perceptible-stutter threshold"
             );
         }
-    }
-
-    fn open_background_diagnostics(&mut self) {
-        self.focused_panel = FocusedPanel::Logs;
-        self.logs_auto_scroll = true;
-        if self.background_diagnostics_loading {
-            self.show_toast(
-                "Background diagnostics are already loading".into(),
-                ToastType::Info,
-            );
-            return;
-        }
-        self.background_diagnostics_loading = true;
-        self.log("BACKGROUND: loading redacted diagnostics");
-        let socket = crate::daemon::daemon_socket_path_override()
-            .unwrap_or_else(crate::daemon::default_socket_path);
-        let fallback = self
-            .runtime
-            .config_dir
-            .join("control")
-            .join("diagnostics.json");
-        let allow_fallback = self.background_diagnostics_fallback;
-        let tx = self.runtime.cmd_tx.clone();
-        std::thread::spawn(move || {
-            let result = crate::background::load_diagnostics(
-                &socket,
-                &fallback,
-                allow_fallback,
-                crate::daemon::diagnostics::unix_millis(),
-            )
-            .map(Box::new)
-            .map_err(|error| error.to_string());
-            let _ = tx.send(Message::BackgroundDiagnosticsLoaded(result));
-        });
     }
 
     fn handle_toggle_theme(&mut self) {
@@ -512,8 +363,8 @@ impl App {
 
     fn handle_theme_persisted(
         &mut self,
-        previous: crate::theme::ThemeChoice,
-        selected: crate::theme::ThemeChoice,
+        previous: crate::ui::theme::ThemeChoice,
+        selected: crate::ui::theme::ThemeChoice,
         result: Result<crate::config::ThemePersistOutcome, String>,
     ) {
         let Some(pending) = self.pending_theme_change else {
@@ -562,12 +413,12 @@ impl App {
     fn handle_manage_auth(&mut self) {
         if let Some(idx) = self.profile_list_state.selected() {
             if let Some(profile) = self.runtime.profiles.get(idx) {
-                if !matches!(profile.protocol, Protocol::OpenVPN) {
+                if !matches!(profile.protocol, ProtocolKind::OpenVpn) {
                     self.show_toast(
                         "Auth credentials only apply to OpenVPN profiles".to_string(),
                         ToastType::Info,
                     );
-                } else if !utils::openvpn_config_needs_auth(&profile.config_path) {
+                } else if !crate::openvpn::parser::needs_credentials(&profile.config_path) {
                     self.show_toast(
                         "This profile does not use auth-user-pass".to_string(),
                         ToastType::Info,
@@ -578,7 +429,7 @@ impl App {
                     // this save-only overlay intentionally omits that field.
                     let profile_id = profile.id.clone();
                     let profile_name = profile.name.clone();
-                    let Some(control) = self.control_session.as_ref() else {
+                    let Some(control) = self.control.as_ref() else {
                         self.show_toast(
                             "Credential service is unavailable".to_string(),
                             ToastType::Error,
@@ -586,11 +437,11 @@ impl App {
                         return;
                     };
                     let (username, password) = match control
-                        .load_openvpn_credentials(&profile_id, &profile_name)
+                        .load_credentials(&profile_id, &profile_name)
                     {
                         Ok(Some(credentials)) => (
-                            crate::state::SecretText::from(credentials.username()),
-                            crate::state::SecretText::from(credentials.password()),
+                            crate::app::state::SecretText::from(credentials.username()),
+                            crate::app::state::SecretText::from(credentials.password()),
                         ),
                         Ok(None) => Default::default(),
                         Err(error) => {
@@ -614,9 +465,9 @@ impl App {
                         username_cursor,
                         password,
                         password_cursor,
-                        otp: crate::state::SecretText::default(),
+                        otp: crate::app::state::SecretText::default(),
                         otp_cursor: 0,
-                        focused_field: crate::state::AuthField::Username,
+                        focused_field: crate::app::state::AuthField::Username,
                         save_credentials: true,
                         connect_after: false,
                         static_challenge_prompt: None,
@@ -630,8 +481,8 @@ impl App {
     fn handle_clear_auth(&mut self) {
         if let Some(idx) = self.profile_list_state.selected() {
             if let Some(profile) = self.runtime.profiles.get(idx) {
-                let is_openvpn = matches!(profile.protocol, Protocol::OpenVPN);
-                let has_auth = utils::openvpn_config_needs_auth(&profile.config_path);
+                let is_openvpn = matches!(profile.protocol, ProtocolKind::OpenVpn);
+                let has_auth = crate::openvpn::parser::needs_credentials(&profile.config_path);
                 let name = profile.name.clone();
                 let profile_id = profile.id.clone();
                 if !is_openvpn {
@@ -645,36 +496,25 @@ impl App {
                         ToastType::Info,
                     );
                 } else {
-                    let Some(control) = self.control_session.as_ref() else {
+                    let Some(control) = self.control.as_ref() else {
                         self.show_toast(
                             "Credential service is unavailable".to_string(),
                             ToastType::Error,
                         );
                         return;
                     };
-                    match control.clear_openvpn_credentials(&profile_id, &name) {
-                        Ok(crate::cli::control::CredentialClearOutcome::NotFound) => self
-                            .show_toast(
-                                format!("No saved credentials for '{name}'"),
-                                ToastType::Info,
-                            ),
-                        Ok(crate::cli::control::CredentialClearOutcome::Cleared) => {
+                    match control.clear_credentials(&profile_id, &name) {
+                        Ok(
+                            crate::config::openvpn_credentials::CredentialClearOutcome::NotFound,
+                        ) => self.show_toast(
+                            format!("No saved credentials for '{name}'"),
+                            ToastType::Info,
+                        ),
+                        Ok(crate::config::openvpn_credentials::CredentialClearOutcome::Cleared) => {
                             self.log(&format!("AUTH: Cleared saved credentials for '{name}'"));
                             self.show_toast(
                                 format!("Credentials cleared for '{name}'"),
                                 ToastType::Success,
-                            );
-                        }
-                        Err(
-                            crate::cli::control::LocalControlError::CredentialDurabilityUncertain,
-                        ) => {
-                            self.log(&format!(
-                                "WARN: Credentials for '{name}' were removed but disk durability is uncertain"
-                            ));
-                            self.show_toast(
-                                "Credentials were cleared, but disk confirmation failed. Verify after restarting."
-                                    .to_string(),
-                                ToastType::Warning,
                             );
                         }
                         Err(error) => {
@@ -694,22 +534,35 @@ impl App {
     }
     fn handle_auth_submit(
         &mut self,
-        profile_id: crate::vortix_core::profile::ProfileId,
-        username: crate::state::SecretText,
-        password: crate::state::SecretText,
-        otp: Option<crate::state::SecretText>,
+        profile_id: crate::profile::ProfileId,
+        username: crate::app::state::SecretText,
+        password: crate::app::state::SecretText,
+        otp: Option<crate::app::state::SecretText>,
         save: bool,
         connect_after: bool,
     ) {
-        if let Some(challenge_id) = self.control_challenge {
-            self.handle_control_auth_submit(
-                challenge_id,
-                profile_id,
-                username,
-                password,
-                otp,
-                save,
-            );
+        // Only the form opened for the pending prompt may answer it.
+        let answers_prompt = self.control_prompt.is_some_and(|id| {
+            self.control_snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == id && prompt.profile_id == profile_id)
+        });
+        if let Some(prompt) = self.control_prompt.filter(|_| answers_prompt) {
+            self.control_prompt = None;
+            let answer = crate::control::Credentials {
+                username: username.expose().to_owned(),
+                password: password.expose().to_owned(),
+                otp: otp
+                    .filter(|answer| !answer.trim().is_empty())
+                    .map(|answer| answer.expose().to_owned()),
+                remember: save,
+            };
+            if let Some(control) = &self.control {
+                control.answer(prompt, Some(answer));
+            }
+            self.input_mode = InputMode::Normal;
+            self.log("AUTH: Credentials submitted");
             return;
         }
 
@@ -724,42 +577,27 @@ impl App {
         };
         if connect_after {
             self.show_toast(
-                "The connection challenge expired; start the connection again".to_string(),
+                "The connection prompt expired; start the connection again".to_string(),
                 ToastType::Warning,
             );
             self.input_mode = InputMode::Normal;
             return;
         }
         let profile_name = profile.name.clone();
-        let Some(control) = self.control_session.as_ref() else {
+        let Some(control) = self.control.as_ref() else {
             self.show_toast(
                 "Credential service is unavailable".to_string(),
                 ToastType::Error,
             );
             return;
         };
-        match control.remember_openvpn_credentials(
-            &profile_id,
-            username.expose(),
-            password.expose(),
-        ) {
+        match control.remember_credentials(&profile_id, username.expose(), password.expose()) {
             Ok(()) => {
                 self.input_mode = InputMode::Normal;
                 self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
                 self.show_toast(
                     format!("Credentials updated for '{profile_name}'"),
                     ToastType::Success,
-                );
-            }
-            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
-                self.input_mode = InputMode::Normal;
-                self.log(&format!(
-                    "WARN: Credential update for '{profile_name}' is visible but disk durability is uncertain"
-                ));
-                self.show_toast(
-                    "Credentials were updated, but disk confirmation failed. You may be asked again after a restart."
-                        .to_string(),
-                    ToastType::Warning,
                 );
             }
             Err(error) => {
@@ -774,128 +612,15 @@ impl App {
         }
     }
 
-    fn handle_control_auth_submit(
-        &mut self,
-        challenge_id: crate::vortix_core::control::ChallengeId,
-        profile_id: crate::vortix_core::profile::ProfileId,
-        username: crate::state::SecretText,
-        password: crate::state::SecretText,
-        otp: Option<crate::state::SecretText>,
-        save: bool,
-    ) {
-        let challenge_matches_profile = self
-            .control_snapshot
-            .challenges
-            .get(&challenge_id)
-            .is_some_and(|challenge| challenge.profile_id == profile_id);
-        if !challenge_matches_profile {
-            self.show_toast(
-                "The connection prompt expired; start the connection again".to_string(),
-                ToastType::Warning,
-            );
-            return;
-        }
-        let answer = otp.filter(|answer| !answer.trim().is_empty());
-        let payload = crate::vortix_core::control::Secret::openvpn_credentials(
-            username.expose(),
-            password.expose(),
-            answer.as_deref(),
-        )
-        .into_vec();
-        let control = self
-            .control_session
-            .as_ref()
-            .expect("service challenge requires attached control session");
-        if let Err(error) = control.respond_challenge(challenge_id, payload) {
-            self.show_toast(
-                format!("Challenge response failed: {error}"),
-                ToastType::Error,
-            );
-            return;
-        }
-
-        self.control_challenge = None;
-        self.input_mode = InputMode::Normal;
-        self.log("AUTH: Submitted service-owned challenge response");
-        if !save {
-            return;
-        }
-        let profile_name = self
-            .runtime
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone());
-        // Held, not written. The server has not judged this pair yet, and a
-        // profile with stored credentials raises no challenge — persisting a
-        // rejected password here is what silently suppressed the next prompt.
-        self.pending_credential_save = Some(super::PendingCredentialSave {
-            profile_id,
-            profile_name,
-            username,
-            password,
-        });
-    }
-
     fn handle_toggle_killswitch(&mut self) {
-        if self.control_session.is_none() {
-            self.show_toast(
-                super::connection::CONTROL_STARTING_MESSAGE.to_string(),
-                ToastType::Info,
-            );
-            return;
-        }
         let next = self
-            .queued_killswitch_target
-            .or(self.pending_control_killswitch_mode)
-            .unwrap_or(self.control_snapshot.desired.kill_switch)
+            .pending_control_killswitch_mode
+            .unwrap_or(self.control_snapshot.kill_switch)
             .next();
-
-        // One change at a time. Each press used to submit its own operation
-        // while the control worker applies them serially, so a few quick taps
-        // left the later ones to expire on their own deadline. That surfaced
-        // as "kill switch change timed out" and, because a timed-out change
-        // never publishes an effective state, as "Degraded" in Security Guard
-        // — while the firewall itself was applied and correct the whole time.
-        //
-        // Cycling stays responsive: the target moves immediately and is
-        // submitted once the running change settles.
-        if self.killswitch_change_in_flight() {
-            self.queued_killswitch_target = Some(next);
-            return;
-        }
-
-        if self
-            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
-                mode: next,
-            })
-            .is_some()
-        {
-            self.pending_control_killswitch_mode = Some(next);
-        }
+        self.pending_control_killswitch_mode = Some(next);
+        self.send(crate::control::Command::SetKillSwitch(next));
     }
 
-    /// Submit the coalesced kill-switch target once the running change ends.
-    pub(crate) fn submit_queued_killswitch_target(&mut self) {
-        let Some(target) = self.queued_killswitch_target else {
-            return;
-        };
-        if self.killswitch_change_in_flight() {
-            return;
-        }
-        self.queued_killswitch_target = None;
-        if target == self.control_snapshot.desired.kill_switch {
-            return;
-        }
-        if self
-            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
-                mode: target,
-            })
-            .is_some()
-        {
-            self.pending_control_killswitch_mode = Some(target);
-        }
-    }
     fn handle_quit(&mut self) {
         if let Some(pending) = &mut self.pending_theme_change {
             if pending.quit_after {
@@ -916,7 +641,6 @@ impl App {
     #[allow(clippy::too_many_lines)] // TEA-style dispatch — every arm is one telemetry variant; splitting would obscure the handler shape without simplifying it
     fn handle_telemetry(&mut self, update: TelemetryUpdate) {
         match update {
-            TelemetryUpdate::PublicIp(ip) => self.apply_public_ipv4(ip),
             TelemetryUpdate::EgressIdentity(identity) => {
                 self.apply_egress_identity(identity);
             }
@@ -950,17 +674,9 @@ impl App {
                     && !is_connected
                     && !self.default_route_is_tunnel();
                 let no_tunnel_routes_v6 = is_connected
-                    && !self.registry.snapshot_all().into_iter().any(|snap| {
-                        use crate::vortix_core::engine::{Connection, Role};
-                        match (snap.state, snap.role) {
-                            (
-                                Connection::Connected { .. },
-                                Role::Primary { allowed_ips }
-                                | Role::Addressable { allowed_ips }
-                                | Role::AddressableSuppressed { allowed_ips },
-                            ) => crate::vortix_core::cidr::claims_default_route_v6(&allowed_ips),
-                            _ => false,
-                        }
+                    && !self.control_snapshot.tunnels.iter().any(|tunnel| {
+                        tunnel.phase == crate::control::Phase::Up
+                            && crate::cidr::claims_default_route_v6(&tunnel.routes)
                     });
                 let safe_to_cache = disconnect_safe || no_tunnel_routes_v6;
                 if safe_to_cache {
@@ -972,7 +688,7 @@ impl App {
                                 self.log(&format!("NET: Real IPv6 detected: {ip}"));
                             }
                             self.runtime.real_ipv6 = Some(ip.clone());
-                            crate::core::real_ip_cache::save_ipv6(&self.runtime.config_dir, ip);
+                            crate::telemetry::ip_cache::save_ipv6(&self.runtime.config_dir, ip);
                         }
                         self.runtime.real_ipv6_from_cache = false;
                     }
@@ -997,12 +713,12 @@ impl App {
         }
     }
 
-    fn apply_egress_identity(&mut self, identity: crate::core::telemetry::EgressIdentity) {
+    fn apply_egress_identity(&mut self, identity: crate::telemetry::EgressIdentity) {
         let same_exit = self.runtime.public_ip == identity.public_ip;
         self.apply_public_ipv4(identity.public_ip);
 
         let next_isp = identity.isp.unwrap_or_else(|| {
-            if same_exit && !is_unknown_identity_value(&self.runtime.isp) {
+            if same_exit && !constants::is_unknown(&self.runtime.isp) {
                 self.runtime.isp.clone()
             } else {
                 "Unknown".to_string()
@@ -1014,7 +730,7 @@ impl App {
         self.runtime.isp = next_isp;
 
         let next_location = identity.location.unwrap_or_else(|| {
-            if same_exit && !is_unknown_identity_value(&self.runtime.location) {
+            if same_exit && !constants::is_unknown(&self.runtime.location) {
                 self.runtime.location.clone()
             } else {
                 "Unknown".to_string()
@@ -1029,15 +745,15 @@ impl App {
     }
 
     fn apply_egress_unavailable(&mut self) {
-        if !is_unknown_identity_value(&self.runtime.isp) {
+        if !constants::is_unknown(&self.runtime.isp) {
             self.log("NET: Exit node: Unknown");
         }
-        if !is_unknown_identity_value(&self.runtime.location) {
+        if !constants::is_unknown(&self.runtime.location) {
             self.log("NET: Location: Unknown");
         }
         self.runtime.public_ip = constants::MSG_UNAVAILABLE.to_string();
-        self.runtime.isp = "Unknown".to_string();
-        self.runtime.location = "Unknown".to_string();
+        self.runtime.isp = constants::MSG_UNKNOWN.to_string();
+        self.runtime.location = constants::MSG_UNKNOWN.to_string();
         let checked_at = Instant::now();
         self.runtime.last_egress_check = Some(checked_at);
         self.runtime.last_security_check = Some(checked_at);
@@ -1048,15 +764,15 @@ impl App {
         let old_ip = self.runtime.public_ip.clone();
 
         if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
-            if let Some(journal) = crate::vortix_core::journal::global_journal() {
-                let _ = journal.append(crate::vortix_core::engine::EngineEvent::IpChanged {
+            if let Some(journal) = crate::journal::global_journal() {
+                let _ = journal.append(crate::journal::JournalEvent::IpChanged {
                     old: Some(old_ip.clone()),
                     new: ip.clone(),
                 });
             }
         }
 
-        // Cache the real address only after the scanner, the registry and the
+        // Cache the real address only after the scanner, the engine snapshot and the
         // kernel's own default route all agree no tunnel owns the egress path.
         let safe_to_cache = self.runtime.scanner_first_tick_done
             && self.runtime.last_kernel_session_count == 0
@@ -1071,7 +787,7 @@ impl App {
             self.runtime.real_ip = Some(ip.clone());
             self.runtime.real_ip_from_cache = false;
             if first_detection || changed {
-                crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
+                crate::telemetry::ip_cache::save(&self.runtime.config_dir, &ip);
             }
         } else if self.runtime.public_ip != ip && self.runtime.public_ip != constants::MSG_FETCHING
         {
@@ -1094,7 +810,7 @@ impl App {
     }
 
     fn log_network_quality_transition(&mut self) {
-        use crate::state::QualityLevel;
+        use crate::app::state::QualityLevel;
 
         let quality = QualityLevel::from_metrics(
             self.runtime.latency_ms,
@@ -1115,8 +831,8 @@ impl App {
 
     // Removed by the state-authority rework: `scanner_promote_to_connected`. The scanner can no
     // longer drive the Connecting → Connected transition. Only the
-    // protocol layer's `Tunnel::up()` success result (via
-    // `Message::ConnectResult` → `mirror_connect_into_registry`) can.
+    // protocol layer's the protocol `up()` success result (via
+    // `Message::ConnectResult` → `the connect result`) can.
     // The (Connecting, Some(session)) arm in `handle_sync_system_state`
     // now just logs the kernel-visible-but-not-yet-tracked state at
     // SCANNER_LOG_INTERVAL_SECS cadence; the connect-timeout safety
@@ -1126,11 +842,10 @@ impl App {
     }
 
     fn tick_presentation(&mut self) {
-        self.flush_catalog_feedback(false);
         if self
             .toast
             .as_ref()
-            .is_some_and(crate::state::Toast::is_expired)
+            .is_some_and(crate::app::state::Toast::is_expired)
         {
             self.toast = None;
         }
@@ -1189,23 +904,6 @@ impl App {
     }
 }
 
-fn background_diagnostic_log_lines(
-    view: &crate::vortix_core::control::DiagnosticView,
-) -> Vec<String> {
-    let mut lines = Vec::with_capacity(view.snapshot.records.len() + 1);
-    lines.push(format!(
-        "BACKGROUND: diagnostics source={:?} stale={} age_ms={} generation={}",
-        view.source, view.stale, view.age_millis, view.snapshot.generation
-    ));
-    lines.extend(view.snapshot.records.iter().map(|record| {
-        format!(
-            "BACKGROUND: diagnostic #{} {:?}/{:?} {:?} {:?}",
-            record.sequence, record.component, record.severity, record.code, record.fields
-        )
-    }));
-    lines
-}
-
 /// Whether an interface name is a tunnel device.
 ///
 /// The real-IP gate proves Vortix owns no tunnel, which is not the same as
@@ -1225,8 +923,8 @@ impl App {
     /// Whether the kernel's last observed default route leaves through a
     /// tunnel device, managed by Vortix or not.
     pub(crate) fn default_route_is_tunnel(&self) -> bool {
-        self.runtime
-            .default_route_interface
+        self.control_snapshot
+            .default_route
             .as_deref()
             .is_some_and(interface_is_tunnel)
     }

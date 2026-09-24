@@ -26,21 +26,20 @@ Vortix keeps user files owned by the invoking user even when tunnel operations r
 ~/.config/vortix/
 ├── profiles/          imported profiles and identity sidecars
 ├── auth/              saved OpenVPN credentials
-├── run/               transient tunnel runtime files
+├── run/               transient OpenVPN runtime files
+├── tmp/<session>/     transient WireGuard configs
+├── downloads/         profiles fetched by URL import
+├── sessions/          session event journals (JSONL)
 ├── logs/              application logs
 ├── config.toml        optional UI and legacy runtime settings
 ├── settings.toml      optional layered engine settings
-├── metadata.json      profile metadata such as last-used time
 ├── killswitch.state   persisted kill-switch preference
 └── real-ip.cache      last observed un-tunneled identity
 ```
 
 Treat `profiles/` as Vortix-managed storage. Import new files from outside it with `vortix import`; do not copy files into the directory while Vortix is running. Identity sidecars and runtime files are internal and may change between releases.
 
-Session journals are observability data, so they use the platform data directory rather than the config directory:
-
-- Linux: `~/.local/share/vortix/sessions/`
-- macOS: `~/Library/Application Support/vortix/sessions/`
+Session journals live in `sessions/` beside the logs, so they stay in the invoking user's home under `sudo`.
 
 ## `config.toml`
 
@@ -115,9 +114,8 @@ Use `terminal` when you want Vortix to follow a terminal application's light or 
 `settings.toml` is the newer layered configuration surface for engine policy. Its precedence is:
 
 1. built-in defaults
-2. system settings
-3. user `settings.toml`
-4. `VORTIX_*` environment variables
+2. `<config_dir>/settings.toml`
+3. `VORTIX_*` environment variables
 
 `config.toml` remains supported for compatibility and appearance. Prefer the documented engine settings when a field exists in both places. Run `vortix info` to inspect the active files, and consult command help before automating an engine setting that may evolve.
 

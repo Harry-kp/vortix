@@ -1,0 +1,467 @@
+//! Owner-readable receipts for successful `WireGuard` connects.
+//!
+//! A receipt is display/adoption evidence only. It is deliberately never
+//! accepted as authority to remove an interface, change routes, or mutate
+//! policy. Lifecycle cleanup still requires protocol ownership plus a fresh
+//! kernel absence observation.
+
+use std::fs::{File, OpenOptions};
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
+
+use crate::control::scanner::ActiveSession;
+use crate::profile::ProfileId;
+use crate::tunnel::ConnectionHealth;
+use crate::tunnel::{HandshakeEvidence, ProbeReceipt};
+
+const DIRECTORY: &str = "managed-wireguard";
+const LOCK_FILE: &str = "managed-wireguard.lock";
+const SCHEMA_VERSION: u8 = 1;
+const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+const MAX_TRACKED_RECEIPTS: usize = 512;
+
+/// A successful, generation-bound `WireGuard` connect issued by Vortix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedWireGuardReceipt {
+    schema_version: u8,
+    profile_id: String,
+    pub generation: u64,
+    pub interface_name: String,
+    pub handshake: HandshakeEvidence,
+    pub probe_receipts: Vec<ProbeReceipt>,
+    pub connected_at: SystemTime,
+    #[serde(default)]
+    pub last_health: ConnectionHealth,
+}
+
+impl ManagedWireGuardReceipt {
+    /// Whether this receipt still matches a fresh protocol observation.
+    /// Scanner presence alone is insufficient: stable profile identity,
+    /// interface identity, peer identity, and non-regressing handshake proof
+    /// must all agree.
+    #[must_use]
+    pub fn validates(&self, profile_id: &ProfileId, session: &ActiveSession) -> bool {
+        self.schema_version == SCHEMA_VERSION
+            && self.profile_id == profile_id.as_str()
+            && self.generation > 0
+            && self.handshake.generation == self.generation
+            && !self.interface_name.is_empty()
+            && self.interface_name == session.details.interface
+            && session.wireguard_peers.iter().any(|peer| {
+                peer.public_key == self.handshake.peer_public_key
+                    && peer.allowed_routes == self.handshake.allowed_routes
+                    && peer
+                        .latest_handshake
+                        .is_some_and(|at| at >= self.handshake.handshake_at)
+            })
+    }
+}
+
+/// Persist a successful current-generation connect before publishing it as
+/// Connected. This file carries no teardown or privileged-policy capability.
+pub fn issue(
+    config_dir: &Path,
+    profile_id: &ProfileId,
+    interface_name: String,
+    generation: u64,
+    handshake: HandshakeEvidence,
+    probe_receipts: Vec<ProbeReceipt>,
+) -> std::io::Result<ManagedWireGuardReceipt> {
+    if generation == 0 || handshake.generation != generation {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "WireGuard receipt requires exact non-zero generation evidence",
+        ));
+    }
+    let receipt = ManagedWireGuardReceipt {
+        schema_version: SCHEMA_VERSION,
+        profile_id: profile_id.as_str().to_owned(),
+        generation,
+        interface_name,
+        handshake,
+        probe_receipts,
+        connected_at: SystemTime::now(),
+        // Ongoing expectation is evaluated from the next typed peer snapshot;
+        // initial handshake success alone must not claim aggregate health.
+        last_health: ConnectionHealth::Unknown,
+    };
+    let _lock = acquire_lock(config_dir)?;
+    save(config_dir, &receipt)?;
+    Ok(receipt)
+}
+
+/// Load an owner-readable receipt. Corrupt, oversized, mismatched, or unknown
+/// schema content is treated as absent and can never grant lifecycle authority.
+#[must_use]
+pub fn load(config_dir: &Path, profile_id: &ProfileId) -> Option<ManagedWireGuardReceipt> {
+    let path = receipt_path(config_dir, profile_id);
+    let receipt = load_receipt_path(&path)?;
+    (receipt.profile_id == profile_id.as_str()).then_some(receipt)
+}
+
+/// PIDs backed by a bounded managed receipt and a currently live interface.
+///
+/// This is advisory startup classification only. It does not grant teardown
+/// authority; lifecycle recovery still validates the root-owned ownership
+/// record and fresh protocol evidence before adopting or mutating a tunnel.
+#[must_use]
+pub fn tracked_wireguard_pids(config_dir: &Path) -> Vec<u32> {
+    tracked_wireguard_pids_with(config_dir, |interface| {
+        crate::platform::Interface::get_wireguard_pid(interface)
+    })
+}
+
+fn tracked_wireguard_pids_with(
+    config_dir: &Path,
+    resolve_pid: impl Fn(&str) -> Option<u32>,
+) -> Vec<u32> {
+    let directory = config_dir.join(DIRECTORY);
+    let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+        return Vec::new();
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let entries = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "json")
+        })
+        .take(MAX_TRACKED_RECEIPTS + 1)
+        .collect::<Vec<_>>();
+    if entries.len() > MAX_TRACKED_RECEIPTS {
+        return Vec::new();
+    }
+
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let receipt = load_receipt_path(&path)?;
+            let profile_id = ProfileId::new(&receipt.profile_id);
+            (receipt_path(config_dir, &profile_id).file_name() == path.file_name())
+                .then_some(receipt)
+        })
+        .filter_map(|receipt| resolve_pid(&receipt.interface_name))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn load_receipt_path(path: &Path) -> Option<ManagedWireGuardReceipt> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_RECEIPT_BYTES
+    {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_RECEIPT_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        return None;
+    }
+    let receipt: ManagedWireGuardReceipt = serde_json::from_slice(&bytes).ok()?;
+    (receipt.schema_version == SCHEMA_VERSION
+        && !receipt.profile_id.is_empty()
+        && receipt.generation > 0
+        && receipt.handshake.generation == receipt.generation)
+        .then_some(receipt)
+}
+
+/// Persist a typed ongoing-health transition for cross-process status and
+/// journal parity. Returns the prior value when it changed.
+pub fn update_health(
+    config_dir: &Path,
+    receipt: &mut ManagedWireGuardReceipt,
+    health: ConnectionHealth,
+) -> std::io::Result<Option<ConnectionHealth>> {
+    let _lock = acquire_lock(config_dir)?;
+    let Some(mut current) = load(config_dir, &ProfileId::new(&receipt.profile_id)) else {
+        return Ok(None);
+    };
+    if current.generation != receipt.generation || current.handshake != receipt.handshake {
+        return Ok(None);
+    }
+    if current.last_health == health {
+        return Ok(None);
+    }
+    let prior = std::mem::replace(&mut current.last_health, health);
+    save(config_dir, &current)?;
+    *receipt = current;
+    Ok(Some(prior))
+}
+
+/// Remove after the caller has already established exact profile absence.
+pub fn remove_after_confirmed_absence(
+    config_dir: &Path,
+    profile_id: &ProfileId,
+) -> std::io::Result<bool> {
+    let _lock = acquire_lock(config_dir)?;
+    let path = receipt_path(config_dir, profile_id);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn save(config_dir: &Path, receipt: &ManagedWireGuardReceipt) -> std::io::Result<()> {
+    let directory = config_dir.join(DIRECTORY);
+    crate::config::owned_file::create_user_dir(&directory)?;
+    let key = ProfileId::new(&receipt.profile_id).digest_key(16);
+    let bytes = serde_json::to_vec(receipt).map_err(std::io::Error::other)?;
+    crate::config::owned_file::write_user_file_atomic(&directory, &format!("{key}.json"), &bytes)
+}
+
+fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
+    crate::config::owned_file::create_user_dir(config_dir)?;
+    let path = config_dir.join(LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    crate::config::chown_to_invoking_user(&file)?;
+    {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: `file` owns a valid descriptor for the duration of the lock.
+        #[allow(unsafe_code)]
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(file)
+}
+
+fn receipt_path(config_dir: &Path, profile_id: &ProfileId) -> PathBuf {
+    let key = profile_id.digest_key(16);
+    config_dir.join(DIRECTORY).join(format!("{key}.json"))
+}
+
+/// Last accepted counter sample for one `WireGuard` peer. Cumulative byte
+/// totals are not activity by themselves: only a positive delta between two
+/// ordered observations advances `last_transfer_at`.
+#[derive(Debug, Clone)]
+pub struct WireGuardPeerActivity {
+    pub bytes_rx: u64,
+    pub bytes_tx: u64,
+    pub observed_at: std::time::SystemTime,
+    pub last_transfer_at: Option<std::time::SystemTime>,
+}
+
+/// Per-peer counter history, keyed by public key.
+pub type PeerActivity = std::collections::HashMap<String, WireGuardPeerActivity>;
+
+/// Classify a `WireGuard` tunnel from its peers. `activity` carries byte
+/// counters between observations so a transfer counts as traffic.
+pub fn health_from_peers(
+    peers: &[crate::tunnel::TunnelPeerStatus],
+    activity: &mut PeerActivity,
+    probe_receipts: &[crate::tunnel::ProbeReceipt],
+    stale_after: std::time::Duration,
+) -> crate::tunnel::ConnectionHealth {
+    use crate::tunnel::{
+        classify_peer_handshake_health, PeerHandshakeHealth, PeerTrafficExpectation,
+    };
+    use crate::tunnel::{ConnectionHealth, DegradedReason};
+
+    let now = std::time::SystemTime::now();
+    let expectation_window = stale_after.saturating_mul(2);
+    let mut expected_peers = 0_usize;
+    for peer in peers {
+        let peer_activity =
+            activity
+                .entry(peer.public_key.clone())
+                .or_insert(WireGuardPeerActivity {
+                    bytes_rx: peer.bytes_rx,
+                    bytes_tx: peer.bytes_tx,
+                    observed_at: peer.evidence_observed_at,
+                    last_transfer_at: None,
+                });
+        if peer.evidence_observed_at > peer_activity.observed_at {
+            if peer.bytes_rx > peer_activity.bytes_rx || peer.bytes_tx > peer_activity.bytes_tx {
+                peer_activity.last_transfer_at = Some(peer.evidence_observed_at);
+            }
+            peer_activity.bytes_rx = peer.bytes_rx;
+            peer_activity.bytes_tx = peer.bytes_tx;
+            peer_activity.observed_at = peer.evidence_observed_at;
+        }
+
+        let recent_transfer = peer_activity.last_transfer_at.is_some_and(|at| {
+            now.duration_since(at)
+                .is_ok_and(|age| age <= expectation_window)
+        });
+        // An actually-issued probe is durable connection metadata. Aging the
+        // issue timestamp out would silently turn a stale expected peer into
+        // Unknown even though the connection policy still expects that peer
+        // to remain fresh. Absence/explicit replacement removes the receipt;
+        // a fresh handshake clears the degraded result naturally.
+        let configured_probe = probe_receipts.iter().find(|record| {
+            record.peer_public_key == peer.public_key
+                && record.allowed_routes == peer.allowed_routes
+        });
+        let expectation = if peer.keepalive_expected() {
+            PeerTrafficExpectation::PersistentKeepalive
+        } else if recent_transfer {
+            PeerTrafficExpectation::RoutedTraffic
+        } else if let Some(record) = configured_probe {
+            PeerTrafficExpectation::ConfiguredProbe {
+                target: record.target,
+            }
+        } else {
+            PeerTrafficExpectation::Idle
+        };
+        if !matches!(expectation, PeerTrafficExpectation::Idle) {
+            expected_peers += 1;
+        }
+        match classify_peer_handshake_health(peer, now, &expectation, stale_after) {
+            PeerHandshakeHealth::Stale { age } => {
+                return ConnectionHealth::Degraded {
+                    reason: DegradedReason::WireGuardPeerStale {
+                        peer_public_key: peer.public_key.clone(),
+                        allowed_routes: peer.allowed_routes.clone(),
+                        seconds_since_last_handshake: age.as_secs(),
+                    },
+                };
+            }
+            PeerHandshakeHealth::NeverObserved => {
+                return ConnectionHealth::Degraded {
+                    reason: DegradedReason::WireGuardPeerNeverObserved {
+                        peer_public_key: peer.public_key.clone(),
+                        allowed_routes: peer.allowed_routes.clone(),
+                    },
+                };
+            }
+            PeerHandshakeHealth::Healthy { .. } | PeerHandshakeHealth::InformationalIdle { .. } => {
+            }
+        }
+    }
+    if expected_peers > 0 {
+        ConnectionHealth::Healthy
+    } else {
+        ConnectionHealth::Unknown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tunnel::TunnelPeerStatus;
+    use std::time::Duration;
+
+    fn evidence(generation: u64, at: SystemTime) -> HandshakeEvidence {
+        HandshakeEvidence {
+            generation,
+            peer_public_key: "peer-a".into(),
+            handshake_at: at,
+            observed_at: at,
+            allowed_routes: vec!["0.0.0.0/0".into()],
+        }
+    }
+
+    #[test]
+    fn receipt_requires_matching_profile_interface_peer_and_non_regressing_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = ProfileId::new("stable-profile");
+        let at = SystemTime::now() - Duration::from_secs(10);
+        issue(
+            dir.path(),
+            &profile,
+            "wg0".into(),
+            7,
+            evidence(7, at),
+            vec![ProbeReceipt {
+                peer_public_key: "peer-a".into(),
+                target: "1.1.1.1".parse().unwrap(),
+                allowed_routes: vec!["0.0.0.0/0".into()],
+                issued_at: at,
+            }],
+        )
+        .unwrap();
+        let receipt = load(dir.path(), &profile).unwrap();
+        let session = ActiveSession {
+            name: "corp".into(),
+            details: crate::tunnel::DetailedConnectionInfo {
+                interface: "wg0".into(),
+                ..Default::default()
+            },
+            wireguard_peers: vec![TunnelPeerStatus {
+                public_key: "peer-a".into(),
+                endpoint: None,
+                allowed_routes: vec!["0.0.0.0/0".into()],
+                latest_handshake: Some(at + Duration::from_secs(1)),
+                evidence_observed_at: SystemTime::now(),
+                evidence_generation: 0,
+                persistent_keepalive: None,
+                bytes_rx: 0,
+                bytes_tx: 0,
+            }],
+            ..ActiveSession::default()
+        };
+        assert!(receipt.validates(&profile, &session));
+        assert!(!receipt.validates(&ProfileId::new("other"), &session));
+        let mut wrong_interface = session.clone();
+        wrong_interface.details.interface = "wg1".into();
+        assert!(!receipt.validates(&profile, &wrong_interface));
+    }
+
+    #[test]
+    fn tracked_pids_include_only_live_interfaces_from_valid_managed_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = ProfileId::new("stable-profile");
+        let at = SystemTime::now();
+        issue(
+            dir.path(),
+            &profile,
+            "utun4".into(),
+            1,
+            evidence(1, at),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let resolved = std::cell::RefCell::new(Vec::new());
+        let tracked = tracked_wireguard_pids_with(dir.path(), |interface| {
+            resolved.borrow_mut().push(interface.to_owned());
+            (interface == "utun4").then_some(4242)
+        });
+        assert_eq!(tracked, vec![4242]);
+        assert_eq!(*resolved.borrow(), vec!["utun4"]);
+
+        std::fs::write(
+            dir.path()
+                .join(DIRECTORY)
+                .join("not-a-managed-receipt.json"),
+            br#"{"interface_name":"utun9"}"#,
+        )
+        .unwrap();
+        resolved.borrow_mut().clear();
+        let tracked = tracked_wireguard_pids_with(dir.path(), |interface| {
+            resolved.borrow_mut().push(interface.to_owned());
+            Some(9999)
+        });
+        assert_eq!(tracked, vec![9999]);
+        assert_eq!(*resolved.borrow(), vec!["utun4"]);
+    }
+}

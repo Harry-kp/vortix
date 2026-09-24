@@ -6,8 +6,8 @@
 //! - Predictable state changes
 //! - Testable update logic
 
-use crate::core::telemetry::TelemetryUpdate;
-use crate::state::{FocusedPanel, ToastType};
+use crate::app::state::{FocusedPanel, ToastType};
+use crate::telemetry::TelemetryUpdate;
 
 /// All messages that can modify application state.
 ///
@@ -36,7 +36,6 @@ pub enum ScrollMove {
 /// Messages are the single source of truth for state mutations.
 /// They can originate from user input or programmatically.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Some variants are handled in match but not constructed externally
 pub enum Message {
     // === Navigation ===
     /// Focus next panel
@@ -50,15 +49,6 @@ pub enum Message {
     /// Toggle flip (front/back view) on current panel
     ToggleFlip,
 
-    // === Optional Background mode ===
-    OpenBackgroundSetup,
-    OpenBackgroundStatus,
-    OpenBackgroundRecover,
-    OpenBackgroundDisable,
-    OpenBackgroundDiagnostics,
-    BackgroundDiagnosticsLoaded(Result<Box<crate::vortix_core::control::DiagnosticView>, String>),
-    ConfirmBackgroundAction,
-
     // === Profile Management ===
     /// Move selection in profile list
     ProfileMove(SelectionMove),
@@ -66,7 +56,7 @@ pub enum Message {
     // === Connection ===
     /// Toggle connection for profile at index (None = selected)
     ToggleConnect(Option<usize>),
-    /// Disconnect from current VPN (press again while disconnecting to force-kill)
+    /// Disconnect the current tunnel
     Disconnect,
     /// Reconnect to last profile
     Reconnect,
@@ -90,28 +80,16 @@ pub enum Message {
     /// disconnect the current tunnel first, then connect the new one. Two
     /// tunnels cannot both hold the default route, so switch is the only
     /// way to proceed. Fired by the `[Y] Switch` choice on the overlay.
-    SwitchExclusiveAndConnect {
-        idx: usize,
-    },
+    SwitchExclusiveAndConnect { idx: usize },
     /// Confirm route-overlap . User
     /// accepted the AllowedIPs-overlap overlay; retry the connect with
     /// `force=true`.
-    ConfirmRouteOverlap {
-        idx: usize,
-    },
+    ConfirmRouteOverlap { idx: usize },
     /// disconnect one specific profile by
     /// index (the `d` keybinding on a Connected sidebar row). Distinct from
     /// the global `Disconnect` message which targets the legacy single-
     /// tunnel active profile.
-    DisconnectProfile {
-        idx: usize,
-    },
-    /// Force-disconnect one exact profile when its teardown is already in
-    /// progress. This is the profile-scoped counterpart to the legacy global
-    /// `Disconnect` fallback.
-    ForceDisconnectProfile {
-        idx: usize,
-    },
+    DisconnectProfile { idx: usize },
     /// open the "Disconnect all N tunnels?"
     /// confirmation dialog (the Shift+`D` keybinding when N>1). Fired from
     /// the sidebar; with N≤1 the input layer dispatches `DisconnectProfile`
@@ -119,15 +97,13 @@ pub enum Message {
     RequestDisconnectAll,
     /// user accepted the
     /// `InputMode::ConfirmDisconnectAll` overlay; tear down every active
-    /// tunnel (registry-aware) plus the legacy single-tunnel state.
+    /// tunnel (multi-tunnel) plus the legacy single-tunnel state.
     ConfirmDisconnectAll,
     /// cancel an in-flight connect (the
     /// `c` keybinding on a Connecting row's Connection Details). FSM
     /// transitions Connecting → Disconnected and the sidebar row clears
     /// the badge.
-    CancelConnect {
-        idx: usize,
-    },
+    CancelConnect { idx: usize },
 
     // === Action Menu ===
     /// Open the action menu (Single actions)
@@ -144,8 +120,6 @@ pub enum Message {
     OpenImport,
 
     // === System ===
-    /// Log a message
-    Log(String),
     /// Copy IP to clipboard
     CopyIp,
     /// Clear activity logs
@@ -154,8 +128,6 @@ pub enum Message {
     Quit,
     /// Background telemetry update
     Telemetry(TelemetryUpdate),
-    /// New immutable publication from the canonical control owner.
-    ControlSnapshot(Box<crate::vortix_core::control::ControlSnapshot>),
     /// Periodic heartbeat tick
     Tick,
     /// Terminal resize event
@@ -167,16 +139,16 @@ pub enum Message {
     /// Submit credentials from the auth prompt overlay
     AuthSubmit {
         /// Stable profile identity captured when the prompt opened.
-        profile_id: crate::vortix_core::profile::ProfileId,
+        profile_id: crate::profile::ProfileId,
         /// Username entered by the user
-        username: crate::state::SecretText,
+        username: crate::app::state::SecretText,
         /// Password entered by the user
-        password: crate::state::SecretText,
+        password: crate::app::state::SecretText,
         /// 2FA code from the static-challenge OTP field, when the profile
         /// declares a `static-challenge` directive.
         /// `None` for non-MFA profiles; the connect path embeds `Some(otp)`
         /// in the SCRV1 envelope and the save path always writes plain.
-        otp: Option<crate::state::SecretText>,
+        otp: Option<crate::app::state::SecretText>,
         /// Whether to persist credentials for future sessions
         save: bool,
         /// Whether to auto-connect after saving (false = save-only from manage flow)
@@ -200,9 +172,9 @@ pub enum Message {
     /// Completion of the background theme-persistence transaction.
     ThemePersisted {
         /// Theme active before the user requested the switch.
-        previous: crate::theme::ThemeChoice,
+        previous: crate::ui::theme::ThemeChoice,
         /// Theme painted optimistically while the config write runs.
-        selected: crate::theme::ThemeChoice,
+        selected: crate::ui::theme::ThemeChoice,
         /// Durable config-write result.
         result: Result<crate::config::ThemePersistOutcome, String>,
     },
@@ -413,14 +385,6 @@ mod tests {
         assert!(!actions
             .iter()
             .any(|a| { matches!(a.message, Message::ToggleTheme) }));
-        assert!(!actions.iter().any(|action| matches!(
-            action.message,
-            Message::OpenBackgroundSetup
-                | Message::OpenBackgroundStatus
-                | Message::OpenBackgroundRecover
-                | Message::OpenBackgroundDisable
-                | Message::OpenBackgroundDiagnostics
-        )));
     }
 
     #[test]
@@ -451,7 +415,7 @@ mod tests {
     #[test]
     fn auth_submit_debug_redacts_all_credential_fields() {
         let message = Message::AuthSubmit {
-            profile_id: crate::vortix_core::profile::ProfileId::new("debug-redaction"),
+            profile_id: crate::profile::ProfileId::new("debug-redaction"),
             username: "private-user".into(),
             password: "private-password".into(),
             otp: Some("private-otp".into()),

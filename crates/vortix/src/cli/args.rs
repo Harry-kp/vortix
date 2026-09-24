@@ -74,28 +74,6 @@ EXIT CODES:
 /// Available CLI commands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Explain and prepare optional Background mode
-    ///
-    /// Background mode adds live CLI/TUI synchronization, automatic drop
-    /// recovery, boot connections, and continuous policy verification by
-    /// running persistent Vortix processes. Standard mode remains available
-    /// when setup is declined.
-    Setup {
-        /// Profiles requested for boot connection (repeatable)
-        #[arg(long, value_name = "PROFILE")]
-        boot: Vec<String>,
-
-        /// Confirm setup after reviewing its persistent-process cost
-        #[arg(short, long)]
-        yes: bool,
-    },
-
-    /// Inspect or manage optional Background mode
-    Background {
-        #[command(subcommand)]
-        command: BackgroundCommands,
-    },
-
     /// Connect to a VPN profile
     ///
     /// Connects to the specified profile, or reconnects to the last used
@@ -125,8 +103,8 @@ pub enum Commands {
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
 
-        /// Bypass the multi-tunnel conflict gate — default-route takeover
-        /// or route overlap (). Without this flag,
+        /// Bypass the multi-tunnel conflict gate (default-route takeover or
+        /// route overlap) and switch to this tunnel. Without this flag,
         /// conflicting connects exit with code 4 (`StateConflict`) so
         /// scripted callers can branch.
         #[arg(short, long)]
@@ -140,13 +118,13 @@ pub enum Commands {
     /// means "stop the one tunnel"). With a profile name, disconnects
     /// that profile only. `--all` is the explicit script-friendly form
     /// of the no-args behaviour. If already disconnected, exits
-    /// successfully (idempotent). Use --force to SIGKILL a stuck process.
+    /// successfully (idempotent). A process still running 5 s after the
+    /// graceful stop is killed on every disconnect.
     ///
     /// EXAMPLES:
     ///     sudo vortix down              Disconnect every active tunnel
     ///     sudo vortix down corp         Disconnect only the 'corp' profile
     ///     sudo vortix down --all        Explicit "all" (script clarity)
-    ///     sudo vortix down --force      Force-kill if stuck
     ///     sudo vortix down --json       Disconnect with JSON result
     #[command(visible_alias = "disconnect")]
     Down {
@@ -160,8 +138,9 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Force-kill the VPN process (SIGKILL)
-        #[arg(short, long)]
+        /// Accepted for older scripts; every disconnect already kills a
+        /// process that ignores the graceful stop.
+        #[arg(short, long, hide = true)]
         force: bool,
     },
 
@@ -205,7 +184,6 @@ pub enum Commands {
     ///     vortix status --brief                  One-line summary
     ///     vortix status --watch                  Live updates every 2s
     ///     vortix status --watch --json           NDJSON stream for monitoring
-    ///     vortix status --operation op-...       Query a durable operation
     Status {
         /// Continuously update (streams NDJSON in --json mode)
         #[arg(short, long)]
@@ -218,16 +196,6 @@ pub enum Commands {
         /// One-line status summary
         #[arg(short, long)]
         brief: bool,
-
-        /// Always read state directly from disk + scanner, even if a
-        /// daemon socket is connectable. Useful for testing the
-        /// bypass path or working around a misbehaving daemon.
-        #[arg(long)]
-        no_daemon: bool,
-
-        /// Query one durable lifecycle operation returned by a prior timeout.
-        #[arg(long, value_name = "ID", conflicts_with_all = ["watch", "brief"])]
-        operation: Option<String>,
     },
 
     /// List imported VPN profiles
@@ -380,26 +348,6 @@ pub enum Commands {
     ///     vortix report
     Report,
 
-    /// Run the vortix daemon
-    ///
-    /// Hosts the engine FSM as a long-running process and accepts
-    /// client connections on a Unix domain socket. Set
-    /// `VORTIX_DAEMON_SOCKET=<path>` in your TUI/CLI shell to route
-    /// commands through the daemon instead of spawning a local engine.
-    ///
-    /// EXAMPLES:
-    ///     vortix daemon                          Default socket path
-    ///     vortix daemon --socket /tmp/vortix.sock Custom socket path
-    ///
-    /// Typically driven by systemd / launchd; see `examples/` for
-    /// reference unit files.
-    Daemon {
-        /// Override the default socket path. Default: `${XDG_RUNTIME_DIR}/vortix.sock`
-        /// (Linux), `${TMPDIR}/vortix.sock` (macOS), `/tmp/vortix.sock` (fallback).
-        #[arg(long)]
-        socket: Option<std::path::PathBuf>,
-    },
-
     /// Audit open sockets and which interface routes them
     ///
     /// Per-process snapshot of open TCP/UDP sockets visible to the
@@ -431,31 +379,6 @@ pub enum Commands {
     Completions {
         /// Target shell: bash, zsh, fish, powershell
         shell: clap_complete::Shell,
-    },
-}
-
-/// Background-mode status, recovery, diagnostics, and disable actions.
-#[derive(Subcommand, Debug)]
-pub enum BackgroundCommands {
-    /// Show the shared Background/Standard mode and health record
-    Status,
-    /// Safely recover an incomplete setup or disable operation
-    Recover {
-        /// Confirm the previewed cleanup boundary
-        #[arg(short, long)]
-        yes: bool,
-    },
-    /// Show bounded redacted diagnostics without service-manager logs
-    Diagnostics {
-        /// Follow authenticated live diagnostics when available
-        #[arg(short, long)]
-        follow: bool,
-    },
-    /// Return to Standard mode after an explicit preview
-    Disable {
-        /// Confirm the previewed disable boundary
-        #[arg(short, long)]
-        yes: bool,
     },
 }
 
@@ -612,41 +535,5 @@ mod tests {
             panic!("expected Up");
         };
         assert_eq!(timeout, Some(60));
-    }
-
-    #[test]
-    fn background_setup_and_recovery_grammar_is_explicit() {
-        let args = parse(&["vortix", "setup", "--boot", "corp", "--yes"]);
-        assert!(matches!(
-            args.command,
-            Some(Commands::Setup { boot, yes }) if boot == vec!["corp"] && yes
-        ));
-
-        let args = parse(&["vortix", "background", "recover", "--yes"]);
-        assert!(matches!(
-            args.command,
-            Some(Commands::Background {
-                command: super::BackgroundCommands::Recover { yes: true }
-            })
-        ));
-    }
-
-    #[test]
-    fn background_diagnostics_follow_and_disable_parse() {
-        let args = parse(&["vortix", "background", "diagnostics", "--follow"]);
-        assert!(matches!(
-            args.command,
-            Some(Commands::Background {
-                command: super::BackgroundCommands::Diagnostics { follow: true }
-            })
-        ));
-
-        let args = parse(&["vortix", "background", "disable"]);
-        assert!(matches!(
-            args.command,
-            Some(Commands::Background {
-                command: super::BackgroundCommands::Disable { yes: false }
-            })
-        ));
     }
 }

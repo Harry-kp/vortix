@@ -1,7 +1,6 @@
 use crate::app::App;
 use crate::ui::helpers;
-use crate::vortix_core::engine::state::Connection;
-use crate::{constants, theme, utils};
+use crate::{constants, ui::theme};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::Style,
@@ -25,7 +24,10 @@ fn stats_line<'a>(app: &App, session_rx: &'a str, session_tx: &'a str) -> Line<'
     Line::from(vec![
         Span::styled(" ▲ UP: ", Style::default().fg(theme::current().success)),
         Span::styled(
-            format!("{:<10}", utils::format_bytes_speed(app.runtime.current_up)),
+            format!(
+                "{:<10}",
+                crate::ui::helpers::format_bytes_speed(app.runtime.current_up)
+            ),
             Style::default().fg(theme::current().text_primary),
         ),
         Span::styled(
@@ -39,7 +41,7 @@ fn stats_line<'a>(app: &App, session_rx: &'a str, session_tx: &'a str) -> Line<'
         Span::styled(
             format!(
                 "{:<10}",
-                utils::format_bytes_speed(app.runtime.current_down)
+                crate::ui::helpers::format_bytes_speed(app.runtime.current_down)
             ),
             Style::default().fg(theme::current().text_primary),
         ),
@@ -79,15 +81,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let max_down = app.runtime.down_history.iter().copied().fold(0.0, f64::max);
     let max_up = app.runtime.up_history.iter().copied().fold(0.0, f64::max);
-    let peak = (max_down.max(max_up) * 1.2).max(1024.0 * 1024.0 * 0.5);
-    let (scale_val, scale_unit) = if peak >= 1024.0 * 1024.0 * 1024.0 {
-        (peak / 1024.0 / 1024.0 / 1024.0, "GB/s")
-    } else if peak >= 1024.0 * 1024.0 {
-        (peak / 1024.0 / 1024.0, "MB/s")
-    } else {
-        (peak / 1024.0, "KB/s")
-    };
-    let peak_label = format!(" Peak: {scale_val:.1} {scale_unit} ");
+    let peak = (max_down.max(max_up) * 1.2).max(500_000.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scale = crate::ui::helpers::format_bytes_speed(peak as u64);
+    let peak_label = format!(" Peak: {scale} ");
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -102,7 +99,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         )
         .title_bottom(
             Line::from(Span::styled(
-                format!(" Scale: 0 – {scale_val:.1} {scale_unit} "),
+                format!(" Scale: 0 – {scale} "),
                 Style::default().fg(theme::current().key_hint_desc),
             ))
             .right_aligned(),
@@ -114,14 +111,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
 
     // Session totals derived from the primary tunnel's snapshot.
-    let primary_snap = app
-        .registry
-        .primary()
-        .and_then(|id| app.registry.snapshot(id));
-    let (session_rx, session_tx) = match primary_snap.as_ref().map(|s| &s.state) {
-        Some(Connection::Connected { details, .. }) => (
-            helpers::nonempty_or(&details.transfer_rx, "0B").to_string(),
-            helpers::nonempty_or(&details.transfer_tx, "0B").to_string(),
+    let primary_snap = app.primary_id().and_then(|id| app.tunnel(id));
+    let (session_rx, session_tx) = match primary_snap {
+        Some(tunnel) if tunnel.phase == crate::control::Phase::Up => (
+            helpers::nonempty_or(&tunnel.details.transfer_rx, "0B").to_string(),
+            helpers::nonempty_or(&tunnel.details.transfer_tx, "0B").to_string(),
         ),
         _ => ("0B".to_string(), "0B".to_string()),
     };
@@ -179,8 +173,8 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let current_down_str = utils::format_bytes_speed(app.runtime.current_down);
-    let current_up_str = utils::format_bytes_speed(app.runtime.current_up);
+    let current_down_str = crate::ui::helpers::format_bytes_speed(app.runtime.current_down);
+    let current_up_str = crate::ui::helpers::format_bytes_speed(app.runtime.current_up);
 
     let text = vec![
         Line::from(""),

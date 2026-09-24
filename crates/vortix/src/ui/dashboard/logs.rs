@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::{constants, logger, theme, utils};
+use crate::{constants, logger, ui::theme};
 use ratatui::{
     layout::{Alignment, Rect},
     style::Style,
@@ -57,7 +57,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let lines: Vec<Line> = all_logs
         .iter()
         .map(|entry| {
-            let time_str = utils::format_system_time_local(entry.timestamp);
+            let time_str = crate::ui::helpers::format_system_time_local(entry.timestamp);
             let level_tag = entry.level.prefix();
 
             let cat = format!(

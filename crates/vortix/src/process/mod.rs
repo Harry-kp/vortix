@@ -1,0 +1,397 @@
+//! Every subprocess goes through here: `CommandRunner` is the real runner,
+//! or a scripted mock in tests.
+//!
+
+#![allow(clippy::missing_errors_doc)]
+
+pub mod custodian;
+#[cfg(test)]
+pub mod mock;
+pub mod orphan_scan;
+pub mod real;
+
+pub use custodian::{Custodian, CustodianError, CustodianHandshake};
+#[cfg(test)]
+pub use mock::MockRunner;
+pub use orphan_scan::{filter_untracked, scan_orphans, OrphanProcess};
+pub use real::{RealProcessLifecycle, RealRunner};
+
+/// The enum carrier — held by value, dispatched statically.
+#[derive(Debug, Clone)]
+pub enum CommandRunner {
+    Real(RealRunner),
+    #[cfg(test)]
+    Mock(MockRunner),
+}
+
+impl CommandRunner {
+    pub async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
+        match self {
+            CommandRunner::Real(r) => r.run(spec).await,
+            #[cfg(test)]
+            CommandRunner::Mock(m) => m.run_sync(spec),
+        }
+    }
+
+    /// Synchronous wrapper around `run`. Drives the async future via the
+    /// runtime bundled in `RealRunner` (or directly for `MockRunner`, which
+    /// never awaits). Used by the synchronous TUI loop and CLI commands.
+    pub fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
+        match self {
+            CommandRunner::Real(r) => r.run_blocking(spec),
+            #[cfg(test)]
+            CommandRunner::Mock(m) => m.run_sync(spec),
+        }
+    }
+
+    /// Construct the production runner.
+    #[must_use]
+    pub fn real() -> Self {
+        Self::Real(RealRunner::new())
+    }
+
+    /// Construct a mock runner that succeeds at every call.
+    #[cfg(test)]
+    #[must_use]
+    pub fn mock_default_success() -> Self {
+        Self::Mock(MockRunner::with_default_success())
+    }
+}
+
+use std::sync::OnceLock;
+
+static GLOBAL_RUNNER: OnceLock<CommandRunner> = OnceLock::new();
+
+/// Get the process-wide runner. Unit tests that never install one get a
+/// mock that succeeds at every call; everything else gets the real runner,
+/// so a missing setup can never turn commands into silent successes.
+pub fn global_runner() -> &'static CommandRunner {
+    #[cfg(test)]
+    {
+        GLOBAL_RUNNER.get_or_init(CommandRunner::mock_default_success)
+    }
+    #[cfg(not(test))]
+    {
+        GLOBAL_RUNNER.get_or_init(CommandRunner::real)
+    }
+}
+
+/// The process-wide runner's tokio runtime, for auxiliary tasks.
+#[must_use]
+pub fn runtime_handle() -> Option<tokio::runtime::Handle> {
+    match global_runner() {
+        CommandRunner::Real(runner) => Some(runner.runtime().handle().clone()),
+        #[cfg(test)]
+        CommandRunner::Mock(_) => None,
+    }
+}
+
+/// Run a one-shot subprocess through the process-wide runner. A non-zero
+/// exit is `Ok`: check `CommandOutcome::success`.
+pub fn run(spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
+    global_runner().run_blocking(spec)
+}
+
+/// Run a simple unprivileged command and discard invocation errors.
+///
+/// This helper is used by scanner probes, which must never retain a blocking
+/// worker indefinitely during control-runtime shutdown.
+#[must_use]
+pub fn simple_output(program: &str, args: &[&str]) -> Option<CommandOutcome> {
+    let args = args.iter().map(|arg| (*arg).to_string()).collect();
+    run(CommandSpec::oneshot(program, args)
+        .timeout(std::time::Duration::from_secs(2))
+        .output_limit(1024 * 1024))
+    .ok()
+}
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read as _;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::profile::ProfileId;
+
+/// What privilege level a `CommandSpec` requires.
+///
+/// `RealRunner` checks the running uid against this requirement and fails fast with
+/// `ProcessError::PrivilegeDenied` when the requirement is unmet — vortix does NOT
+/// auto-escalate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PrivilegeReq {
+    /// Runs as the current user. Used for read-only ops (`wg show`, `ps`, `which`, etc.).
+    #[default]
+    None,
+    /// Requires effective uid 0. Used for VPN tool invocation (`wg-quick`, `openvpn`,
+    /// `iptables`, `pfctl`, etc.).
+    Root,
+}
+
+/// Explicit non-root identity for an owner-run subprocess.
+///
+/// Supplying this never grants privilege: a non-root caller may name only
+/// its current identity, while a root caller must drop all three credential
+/// sets before `exec`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessCredentials {
+    pub uid: u32,
+    pub gid: u32,
+    pub supplementary_groups: Vec<u32>,
+}
+
+/// The full specification of a subprocess invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Optional environment variables. By default merged into the current process env;
+    /// callers who need a clean env should set `env_clear = true`.
+    pub env: HashMap<String, String>,
+    pub env_clear: bool,
+    pub cwd: Option<PathBuf>,
+    pub stdin_bytes: Option<Vec<u8>>,
+    pub timeout: Option<Duration>,
+    /// Maximum bytes retained from each captured output stream. The runner
+    /// continues draining the child after the limit so a noisy process cannot
+    /// deadlock on a full pipe, then returns a typed overflow error.
+    pub output_limit: Option<usize>,
+    pub requires_privilege: PrivilegeReq,
+    /// Arg indices to redact in `tracing` audit logs. Used by callers that pass
+    /// secret material (e.g., file paths in `/tmp/vortix-*.conf`) as args.
+    /// No current callsite uses this; the field is reserved for future use.
+    pub redact_in_audit: Vec<usize>,
+    /// Verified non-root credentials applied before `exec`.
+    #[serde(default)]
+    pub run_as: Option<ProcessCredentials>,
+    /// Put the child in a new process group and contain descendants on
+    /// timeout/cancellation. Required for lifecycle hooks.
+    #[serde(default)]
+    pub terminate_process_group: bool,
+}
+
+impl CommandSpec {
+    /// Construct a default `OneShot` spec running as the current user.
+    pub fn oneshot(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            env: HashMap::new(),
+            env_clear: false,
+            cwd: None,
+            stdin_bytes: None,
+            timeout: None,
+            output_limit: None,
+            requires_privilege: PrivilegeReq::None,
+            redact_in_audit: Vec::new(),
+            run_as: None,
+            terminate_process_group: false,
+        }
+    }
+
+    /// Builder: require root.
+    #[must_use]
+    pub fn privilege(mut self, req: PrivilegeReq) -> Self {
+        self.requires_privilege = req;
+        self
+    }
+
+    /// Builder: set a timeout for `OneShot` invocations.
+    #[must_use]
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout = Some(duration);
+        self
+    }
+
+    /// Builder: bound each captured stdout/stderr stream.
+    #[must_use]
+    pub fn output_limit(mut self, bytes: usize) -> Self {
+        self.output_limit = Some(bytes);
+        self
+    }
+
+    /// Builder: feed stdin bytes.
+    #[must_use]
+    pub fn stdin(mut self, bytes: Vec<u8>) -> Self {
+        self.stdin_bytes = Some(bytes);
+        self
+    }
+
+    /// Builder: mark arg indices as secret (redacted in audit logs).
+    #[must_use]
+    pub fn redact_args(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
+        self.redact_in_audit = indices.into_iter().collect();
+        self
+    }
+
+    /// Builder: execute under an already-verified non-root identity.
+    #[must_use]
+    pub fn run_as(mut self, credentials: ProcessCredentials) -> Self {
+        self.run_as = Some(credentials);
+        self
+    }
+
+    /// Builder: contain the child and descendants in a dedicated process group.
+    #[must_use]
+    pub fn contain_process_group(mut self) -> Self {
+        self.terminate_process_group = true;
+        self
+    }
+}
+
+/// Subprocess exit status in a serde-friendly form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitStatusInfo {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub success: bool,
+}
+
+/// Outcome of a `OneShot` subprocess invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandOutcome {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_status: ExitStatusInfo,
+    pub duration: Duration,
+    pub started_at: SystemTime,
+}
+
+impl CommandOutcome {
+    /// Convenience: was the exit successful?
+    #[must_use]
+    pub fn success(&self) -> bool {
+        self.exit_status.success
+    }
+
+    /// Convenience: stdout as a UTF-8 string (lossy).
+    #[must_use]
+    pub fn stdout_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.stdout)
+    }
+}
+
+/// Stable ownership key for a foreground protocol child.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ManagedProcessId {
+    pub profile_id: ProfileId,
+    /// Non-zero per-attempt generation. It is useful for diagnostics, but is
+    /// never accepted as authentication on its own.
+    pub generation: u64,
+    /// Cryptographically opaque ownership capability. A stale handle cannot
+    /// address a later child for the same stable profile identity.
+    pub ownership_token: String,
+}
+
+impl ManagedProcessId {
+    /// Allocate an identity before spawning the child so every cleanup path,
+    /// including partial startup, is bound to the exact attempt.
+    ///
+    /// # Panics
+    /// Never: the 8-byte prefix of a 32-byte buffer always converts.
+    pub fn generate(profile_id: ProfileId) -> std::io::Result<Self> {
+        let mut bytes = [0_u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let ownership_token = crate::profile::hex(&bytes);
+        let generation =
+            u64::from_be_bytes(bytes[..8].try_into().expect("fixed-size prefix")).max(1);
+        Ok(Self {
+            profile_id,
+            generation,
+            ownership_token,
+        })
+    }
+
+    #[must_use]
+    pub fn has_valid_token(&self) -> bool {
+        self.generation != 0
+            && self.ownership_token.len() == 64
+            && self
+                .ownership_token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+/// Managed process-group ownership receipt. It contains no command arguments
+/// or credentials. Concrete backends may return a containment guardian PID
+/// rather than the protocol process PID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOwnership {
+    pub identity: ManagedProcessId,
+    pub pid: u32,
+}
+
+/// Process-lifecycle port used by the custodian. Protocol
+/// adapters build the command specification; only the process layer spawns,
+/// signals, waits for, and reaps the child.
+pub trait ProcessLifecycle: Send + 'static {
+    fn spawn_foreground(
+        &mut self,
+        identity: ManagedProcessId,
+        spec: CommandSpec,
+    ) -> Result<ProcessOwnership, ProcessError>;
+    fn is_alive(&mut self, identity: &ManagedProcessId) -> Result<bool, ProcessError>;
+    fn graceful_stop(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
+    fn wait_for_exit(
+        &mut self,
+        identity: &ManagedProcessId,
+        timeout: Duration,
+    ) -> Result<bool, ProcessError>;
+    fn force_kill(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
+    fn reap(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
+}
+
+/// What failed when invoking a subprocess.
+///
+/// Each variant carries enough context to populate the JSON envelope's `next_actions`
+/// field at the CLI edge.
+#[derive(Debug, Error)]
+pub enum ProcessError {
+    /// The spec required root but the running uid is not zero.
+    #[error("subprocess `{program}` requires root but current uid is not 0")]
+    PrivilegeDenied { program: String },
+    /// Requested credential transition is unsafe or unavailable.
+    #[error("subprocess `{program}` has invalid owner credentials: {reason}")]
+    InvalidCredentials { program: String, reason: String },
+    /// The program could not be found on PATH (`exec` returned ENOENT).
+    #[error("subprocess `{program}` not found on PATH")]
+    ProgramNotFound { program: String },
+    /// The subprocess did not complete within the configured timeout.
+    #[error("subprocess `{program}` timed out after {duration:?}")]
+    Timeout { program: String, duration: Duration },
+    /// A captured stream exceeded the caller's explicit memory bound.
+    #[error("subprocess `{program}` output exceeded {limit} bytes")]
+    OutputLimitExceeded { program: String, limit: usize },
+    /// The subprocess was killed by a signal.
+    #[error("subprocess `{program}` killed by signal {signal}")]
+    Killed { program: String, signal: i32 },
+    /// I/O error during spawn / stdin write / output read.
+    #[error("subprocess `{program}` I/O error: {source}")]
+    IoError {
+        program: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+impl From<ProcessError> for std::io::Error {
+    fn from(error: ProcessError) -> Self {
+        use std::io::ErrorKind;
+        if let ProcessError::IoError { source, .. } = error {
+            return source;
+        }
+        let kind = match &error {
+            ProcessError::Timeout { .. } => ErrorKind::TimedOut,
+            ProcessError::OutputLimitExceeded { .. } => ErrorKind::InvalidData,
+            ProcessError::ProgramNotFound { .. } => ErrorKind::NotFound,
+            ProcessError::PrivilegeDenied { .. } | ProcessError::InvalidCredentials { .. } => {
+                ErrorKind::PermissionDenied
+            }
+            _ => ErrorKind::Other,
+        };
+        std::io::Error::new(kind, error)
+    }
+}

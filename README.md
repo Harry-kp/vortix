@@ -144,7 +144,7 @@ Vortix runs privileged only because tunnel, route, DNS, and firewall mutation re
 
 Kill-switch rules survive a Vortix restart within the same boot, but the OS may flush them during reboot. Re-arm `vpn-only` after each boot.
 
-For the trust boundaries and threat analysis, read the [privileged-helper threat model](https://github.com/Harry-kp/vortix/blob/main/docs/security/privileged-helper-threat-model.md).
+For trust assumptions and known risks, read [SECURITY.md](https://github.com/Harry-kp/vortix/blob/main/SECURITY.md).
 
 ## Command overview
 
@@ -192,8 +192,6 @@ Common TUI keys:
 |---|---|
 | [Contributing](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md) | Development workflow and contribution entry points |
 | [CI parity](https://github.com/Harry-kp/vortix/blob/main/docs/ci-parity.md) | The exact checks to run before pushing |
-| [Architecture migration](https://github.com/Harry-kp/vortix/blob/main/docs/architecture-migration-v1.md) | Control-plane boundaries and migration direction |
-| [Privileged-helper threat model](https://github.com/Harry-kp/vortix/blob/main/docs/security/privileged-helper-threat-model.md) | Authority, ownership, replay, and recovery invariants |
 | [Project board](https://github.com/users/Harry-kp/projects/6) | Active and planned work |
 
 ## Contributing

@@ -104,18 +104,6 @@ pub const CONTROL_SCENARIOS: &[ControlScenario] = &[
         OutputSurface::JsonWatch,
     ),
     scenario(
-        "status-durable-operation",
-        ContractArea::Status,
-        &[
-            "vortix",
-            "status",
-            "--operation",
-            "op-0000000000000001-0000000000000002",
-        ],
-        "status",
-        OutputSurface::Human,
-    ),
-    scenario(
         "killswitch-show-json",
         ContractArea::KillSwitch,
         &["vortix", "--json", "killswitch"],
@@ -199,58 +187,4 @@ pub const CONTROL_SCENARIOS: &[ControlScenario] = &[
         "tui",
         OutputSurface::Tui,
     ),
-];
-
-pub const MODE_STATUS_LABELS: &[&str] = &[
-    "Standard mode: Active",
-    "Background mode: Enabling",
-    "Background mode: Active",
-    "Background mode: Degraded",
-    "Background mode: Disabling",
-    "Background mode: Recovery required",
-];
-
-pub const BACKGROUND_CAPABILITY_COPY: &[&str] = &[
-    "routine CLI/TUI control without sudo after one-time setup",
-    "live CLI/TUI synchronization",
-    "automatic drop recovery",
-    "boot connections",
-    "continuous policy verification",
-    "shared multi-client coordination",
-];
-
-pub const TRUST_BOUNDARY_COPY: &[&str] = &[
-    "Standard mode: root-assisted full-client trust boundary",
-    "Background mode: narrow privileged helper",
-];
-
-pub const DIAGNOSTIC_FALLBACK_LABELS: &[&str] = &["stale", "unauthenticated", "advisory-only"];
-
-pub const LIFECYCLE_EVENT_HOOKS: &[&str] = &[
-    "connect_started",
-    "connected",
-    "disconnect_started",
-    "disconnected",
-    "connect_failed",
-    "reconnecting",
-];
-
-pub const BOOT_INELIGIBLE_CREDENTIALS: &[&str] =
-    &["password", "OTP", "challenge", "private-key prompt"];
-
-pub const RECOVERY_ACTIONS: &[&str] = &[
-    "vortix setup",
-    "vortix background status",
-    "vortix background recover",
-    "vortix background disable",
-];
-
-pub const ERROR_CONTRACTS: &[(&str, i32)] = &[
-    ("success", 0),
-    ("general_error", 1),
-    ("permission_denied", 2),
-    ("not_found", 3),
-    ("state_conflict", 4),
-    ("dependency_missing", 5),
-    ("timeout", 6),
 ];

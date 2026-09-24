@@ -14,8 +14,7 @@ use vortix::cli::output::OutputMode;
 fn cli_import_single_file() {
     use vortix::cli::args::Commands;
     use vortix::cli::commands::handle_command;
-    use vortix::vortix_config::profile_store::FsProfileStore;
-    use vortix::vortix_config::ProfileStore as _;
+    use vortix::config::profile_store::FsProfileStore;
 
     let dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
@@ -38,7 +37,6 @@ fn cli_import_single_file() {
         config_dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
 
@@ -47,22 +45,8 @@ fn cli_import_single_file() {
     // Verify the profile landed in the temp dir, not the real config
     let profiles_dir = config_dir.path().join("profiles");
     assert!(profiles_dir.join("test.conf").exists());
-    let persisted = std::fs::read_to_string(config_dir.path().join("control/control-state.json"))
-        .expect("typed import persists its terminal operation");
-    assert!(
-        persisted.contains("\"status\": \"succeeded\""),
-        "terminal import must be durable before CLI success: {persisted}"
-    );
-
     let store = FsProfileStore::new(profiles_dir.clone());
     let stable_id = store.resolve_display_name("test").unwrap();
-    let persisted_json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
-    assert!(
-        persisted_json["requested_resources"]
-            .get(stable_id.as_str())
-            .is_some(),
-        "terminal import must persist canonical requested resources"
-    );
     let rename = handle_command(
         &Commands::Rename {
             old: "test".to_owned(),
@@ -71,7 +55,6 @@ fn cli_import_single_file() {
         config_dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(rename, 0, "typed rename should preserve the CLI result");
@@ -86,7 +69,6 @@ fn cli_import_single_file() {
         config_dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(delete, 0, "typed delete should preserve the CLI result");

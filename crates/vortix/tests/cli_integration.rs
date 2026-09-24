@@ -6,9 +6,10 @@
 #[path = "support/control_scenarios.rs"]
 mod control_scenarios;
 
+use vortix::app::runtime::VpnRuntime;
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
-use vortix::state::{KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
-use vortix::vpn_runtime::VpnRuntime;
+use vortix::config::profiles::VpnProfile;
+use vortix::profile::ProtocolKind;
 
 // ============================================================================
 // VpnRuntime headless mode
@@ -16,44 +17,38 @@ use vortix::vpn_runtime::VpnRuntime;
 
 #[test]
 fn engine_new_headless_starts_disconnected() {
-    // P5d: the legacy `connection_state` field was retired; a fresh
-    // headless engine carries no active tunnels — verified via the
-    // scanner-driven `scan_status` snapshot below.
     let config = vortix::config::AppConfig::default();
     let dir = tempfile::tempdir().unwrap();
-    let engine = VpnRuntime::new_headless(config, dir.path().to_path_buf());
-    assert!(!engine.is_root); // tests run unprivileged
-    let snap = engine.scan_status();
-    assert_eq!(snap.connection_state, "disconnected");
+    let snap = vortix::cli::status::scan_status(&[], &config, dir.path());
+    assert!(snap.sessions.is_empty());
 }
 
 #[test]
 fn engine_new_test_has_empty_profiles() {
     let engine = VpnRuntime::new_test();
     assert!(engine.profiles.is_empty());
-    assert!(engine.session_start.is_none());
-    assert_eq!(engine.killswitch_mode, KillSwitchMode::Off);
-    assert_eq!(engine.killswitch_state, KillSwitchState::Disabled);
 }
 
 #[test]
 fn engine_find_profile_by_name() {
     let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
-        id: vortix::vortix_core::profile::ProfileId::new("work-vpn"),
+        id: vortix::profile::ProfileId::new("work-vpn"),
         name: "work-vpn".into(),
-        protocol: Protocol::WireGuard,
+        protocol: ProtocolKind::WireGuard,
         config_path: "/tmp/work.conf".into(),
         location: "US".into(),
         last_used: None,
+        group: None,
     });
     engine.profiles.push(VpnProfile {
-        id: vortix::vortix_core::profile::ProfileId::new("personal"),
+        id: vortix::profile::ProfileId::new("personal"),
         name: "personal".into(),
-        protocol: Protocol::OpenVPN,
+        protocol: ProtocolKind::OpenVpn,
         config_path: "/tmp/personal.ovpn".into(),
         location: "EU".into(),
         last_used: None,
+        group: None,
     });
 
     assert_eq!(engine.find_profile("work-vpn"), Some(0));
@@ -66,22 +61,23 @@ fn engine_sort_profiles_by_name() {
     let mut engine = VpnRuntime::new_test();
     for name in &["charlie", "alpha", "bravo"] {
         engine.profiles.push(VpnProfile {
-            id: vortix::vortix_core::profile::ProfileId::new(*name),
+            id: vortix::profile::ProfileId::new(*name),
             name: (*name).into(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             config_path: format!("/tmp/{name}.conf").into(),
             location: "Test".into(),
             last_used: None,
+            group: None,
         });
     }
 
-    engine.sort_order = vortix::state::ProfileSortOrder::NameAsc;
+    engine.sort_order = vortix::app::state::ProfileSortOrder::NameAsc;
     engine.sort_profiles();
     assert_eq!(engine.profiles[0].name, "alpha");
     assert_eq!(engine.profiles[1].name, "bravo");
     assert_eq!(engine.profiles[2].name, "charlie");
 
-    engine.sort_order = vortix::state::ProfileSortOrder::NameDesc;
+    engine.sort_order = vortix::app::state::ProfileSortOrder::NameDesc;
     engine.sort_profiles();
     assert_eq!(engine.profiles[0].name, "charlie");
 }
@@ -90,44 +86,48 @@ fn engine_sort_profiles_by_name() {
 fn engine_sort_profiles_by_protocol() {
     let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
-        id: vortix::vortix_core::profile::ProfileId::new("ovpn-profile"),
+        id: vortix::profile::ProfileId::new("ovpn-profile"),
         name: "ovpn-profile".into(),
-        protocol: Protocol::OpenVPN,
+        protocol: ProtocolKind::OpenVpn,
         config_path: "/tmp/a.ovpn".into(),
         location: "EU".into(),
         last_used: None,
+        group: None,
     });
     engine.profiles.push(VpnProfile {
-        id: vortix::vortix_core::profile::ProfileId::new("wg-profile"),
+        id: vortix::profile::ProfileId::new("wg-profile"),
         name: "wg-profile".into(),
-        protocol: Protocol::WireGuard,
+        protocol: ProtocolKind::WireGuard,
         config_path: "/tmp/b.conf".into(),
         location: "US".into(),
         last_used: None,
+        group: None,
     });
 
-    engine.sort_order = vortix::state::ProfileSortOrder::Protocol;
+    engine.sort_order = vortix::app::state::ProfileSortOrder::Protocol;
     engine.sort_profiles();
-    assert_eq!(engine.profiles[0].protocol, Protocol::WireGuard);
-    assert_eq!(engine.profiles[1].protocol, Protocol::OpenVPN);
+    assert_eq!(engine.profiles[0].protocol, ProtocolKind::WireGuard);
+    assert_eq!(engine.profiles[1].protocol, ProtocolKind::OpenVpn);
 }
 
 #[test]
 fn engine_check_dependencies_wireguard() {
     // Use a dummy config path — the resolvconf check only matters on Linux
     let dummy = std::path::Path::new("/dev/null");
-    let missing = VpnRuntime::check_dependencies(Protocol::WireGuard, dummy);
+    let missing = vortix::platform::check_dependencies(ProtocolKind::WireGuard, dummy);
     // In test env, wg-quick/wg may or may not be available; just ensure no panic
     assert!(missing.len() <= 3); // wg-quick, wg, and possibly resolvconf on Linux
 }
 
 #[test]
 fn engine_scan_status_when_disconnected() {
-    let engine = VpnRuntime::new_test();
-    let snap = engine.scan_status();
-    assert_eq!(snap.connection_state, "disconnected");
-    assert!(snap.profile.is_none());
-    assert!(snap.uptime_secs.is_none());
+    let snap = vortix::cli::status::scan_status(
+        &[],
+        &vortix::config::AppConfig::default(),
+        std::path::Path::new("/nonexistent"),
+    );
+    assert!(snap.sessions.is_empty());
+    assert!(snap.primary.is_none());
 }
 
 // ============================================================================
@@ -224,7 +224,6 @@ fn cli_list_empty_profiles() {
         dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(exit, 0);
@@ -243,7 +242,6 @@ fn cli_info_runs_without_error() {
         dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(exit, 0);
@@ -262,13 +260,10 @@ fn cli_status_disconnected() {
             watch: false,
             interval: 2,
             brief: true,
-            no_daemon: true,
-            operation: None,
         },
         dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(exit, 0);
@@ -287,7 +282,6 @@ fn cli_killswitch_show_mode() {
         dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(exit, 0);
@@ -316,7 +310,7 @@ fn cli_release_killswitch_accepts_canonical_command_and_compatibility_alias() {
 #[cfg(unix)]
 #[test]
 fn emergency_release_reaches_root_gate_before_normal_startup() {
-    if vortix::utils::is_root() {
+    if vortix::platform::is_root() {
         // Non-root CI exercises the proof that emergency dispatch precedes
         // normal startup. Root environments would proceed to real firewall
         // mutation, which this test must never attempt.
@@ -643,35 +637,6 @@ fn clap_parses_up_yes_defaults_false() {
 }
 
 #[test]
-fn clap_parses_durable_operation_query() {
-    use clap::Parser;
-    use vortix::cli::args::{Args, Commands};
-
-    let args = Args::try_parse_from([
-        "vortix",
-        "status",
-        "--operation",
-        "op-0000000000000001-0000000000000002",
-    ])
-    .unwrap();
-    assert!(matches!(
-        args.command,
-        Some(Commands::Status {
-            operation: Some(operation),
-            ..
-        }) if operation == "op-0000000000000001-0000000000000002"
-    ));
-    assert!(Args::try_parse_from([
-        "vortix",
-        "status",
-        "--operation",
-        "op-0000000000000001-0000000000000002",
-        "--watch",
-    ])
-    .is_err());
-}
-
-#[test]
 fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
     use clap::Parser;
     use control_scenarios::{OutputSurface, CONTROL_SCENARIOS};
@@ -682,8 +647,6 @@ fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
             .unwrap_or_else(|error| panic!("{} failed to parse: {error}", scenario.id));
         let command = match parsed.command.as_ref() {
             None => "tui",
-            Some(Commands::Setup { .. }) => "setup",
-            Some(Commands::Background { .. }) => "background",
             Some(Commands::Up { .. }) => "up",
             Some(Commands::Down { .. }) => "down",
             Some(Commands::Reconnect { .. }) => "reconnect",
@@ -698,7 +661,6 @@ fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
             Some(Commands::Info) => "info",
             Some(Commands::Update) => "update",
             Some(Commands::Report) => "report",
-            Some(Commands::Daemon { .. }) => "daemon",
             Some(Commands::Audit { .. }) => "audit",
             Some(Commands::Completions { .. }) => "completions",
         };
@@ -720,87 +682,6 @@ fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
         assert_eq!(output, scenario.output, "{} output drift", scenario.id);
     }
 }
-
-#[test]
-fn prepared_background_json_uses_the_shared_mode_record() {
-    let view = vortix::background::BackgroundCommandView::prepared(vec![
-        "No privileged process was invoked".into(),
-    ]);
-    let value = serde_json::to_value(&view).unwrap();
-    assert_eq!(value["mode"]["state"], "standard_active");
-    assert_eq!(view.mode.state.display_name(), "Standard mode: Active");
-    assert_eq!(value["activation_available"], false);
-    assert!(!view.mode.may_claim_background_authority());
-}
-
-#[test]
-fn confirmed_prepared_background_mutations_have_nonzero_refusal_contract() {
-    for command in [
-        ["setup", "--yes"].as_slice(),
-        ["background", "recover", "--yes"].as_slice(),
-        ["background", "disable", "--yes"].as_slice(),
-    ] {
-        let config = tempfile::tempdir().unwrap();
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box CLI refusal contract
-            .arg("--config-dir")
-            .arg(config.path())
-            .arg("--json")
-            .args(command)
-            .env("VORTIX_SKIP_MIGRATION", "1")
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(4), "{command:?}");
-        let response: serde_json::Value =
-            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-                panic!(
-                    "{command:?} emitted invalid JSON ({error}): {}",
-                    String::from_utf8_lossy(&output.stdout)
-                )
-            });
-        assert_eq!(response["ok"], false, "{command:?}");
-        assert_eq!(
-            response["error"]["code"], "background_activation_unavailable",
-            "{command:?}"
-        );
-        let persisted_names = walk_file_names(config.path());
-        assert!(
-            persisted_names
-                .iter()
-                .all(|name| !name.contains("background") && !name.contains("bootstrap")),
-            "refusal persisted authority artifacts: {persisted_names:?}"
-        );
-
-        for (flag, expected_stderr) in [
-            (
-                None,
-                "error: Background mode is not available in this release",
-            ),
-            (
-                Some("--quiet"),
-                "error: Background mode is not available in this release",
-            ),
-        ] {
-            let config = tempfile::tempdir().unwrap();
-            let mut process = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")); // xtask:allow-subprocess: black-box CLI refusal contract
-            process.arg("--config-dir").arg(config.path());
-            if let Some(flag) = flag {
-                process.arg(flag);
-            }
-            let output = process
-                .args(command)
-                .env("VORTIX_SKIP_MIGRATION", "1")
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(4), "{command:?} {flag:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains(expected_stderr),
-                "unexpected stderr for {command:?} {flag:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
-}
-
 #[cfg(unix)]
 #[test]
 #[allow(
@@ -883,7 +764,7 @@ fn second_tui_reports_an_actionable_already_running_message() {
 #[cfg(unix)]
 #[test]
 fn tui_without_administrator_access_fails_before_terminal_startup() {
-    if vortix::utils::is_root() {
+    if vortix::platform::is_root() {
         // The production contract is exercised by non-root macOS and Linux CI
         // runners. A root-only test environment cannot reproduce this entry
         // condition without changing process credentials.
@@ -912,23 +793,4 @@ fn tui_without_administrator_access_fails_before_terminal_startup() {
     assert!(!stderr.contains("invalid invoking owner"));
     assert!(!stderr.contains("Backtrace"));
     assert!(!stderr.contains("Location:"));
-}
-
-fn walk_file_names(root: &std::path::Path) -> Vec<String> {
-    let mut pending = vec![root.to_path_buf()];
-    let mut names = Vec::new();
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                names.push(name.to_owned());
-            }
-        }
-    }
-    names
 }

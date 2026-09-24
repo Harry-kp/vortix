@@ -31,9 +31,9 @@ either script is safe.
 ## What's wired in CI today
 
 - `wg_happy_path.sh` — WireGuard connect → status → ping → disconnect
-- `killswitch.sh` — verify owned dual-stack iptables chains, host-rule
-  preservation, blocked egress, and clean release; it also invokes
-  `nft_killswitch.sh` to exercise the native nft backend and failed atomic
+- `killswitch.sh` — verify the nftables kill switch (`inet vortix_killswitch`)
+  blocks egress, preserves host rules, and releases cleanly; it also invokes
+  `nft_killswitch.sh` for multi-tunnel dual-stack rules and failed atomic
   replacement
 - `release_smoke.sh` — runs on macOS, off any kernel: proves the shipped
   release profile links and the binaries run, and holds a size budget. It
@@ -71,9 +71,9 @@ docker run --privileged --rm -v "$PWD:/workspace" -w /workspace vortix-integrati
 ## CI gate
 
 `.github/workflows/integration-tests.yml` runs the netns scripts on both
-`ubuntu-22.04` (iptables-nft compat) and `fedora-41` (native nft), plus
-`release_smoke.sh` on `macos-latest`, for every PR and nightly. Failures
-block merge.
+`ubuntu-22.04` (iptables-nft compat image) and `fedora-41` (native nft), plus
+`release_smoke.sh` on `macos-latest`, for every PR and nightly. A failure fails the PR check; merges refuse red
+checks.
 
 ## Notes on macOS
 

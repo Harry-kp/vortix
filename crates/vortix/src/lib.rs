@@ -4,45 +4,31 @@
 //! It provides profile management and an intuitive dashboard interface.
 #![allow(clippy::missing_errors_doc, clippy::implicit_hasher)]
 
-// Internal library modules (formerly separate crates).
-// Hidden from public API docs — these are implementation details.
-#[doc(hidden)]
-pub mod vortix_config;
-#[doc(hidden)]
-pub mod vortix_core;
-#[doc(hidden)]
-pub mod vortix_process;
-#[doc(hidden)]
-pub mod vortix_protocol_openvpn;
-#[doc(hidden)]
-pub mod vortix_protocol_wireguard;
-
-#[cfg(target_os = "linux")]
-#[doc(hidden)]
-pub mod vortix_platform_linux;
-#[cfg(target_os = "macos")]
-#[doc(hidden)]
-pub mod vortix_platform_macos;
-
-// Application modules
 pub mod app;
-pub(crate) mod authority_lock;
-pub mod background;
+pub mod cidr;
 pub mod cli;
 pub mod config;
 pub mod constants;
-pub mod core;
-pub mod daemon;
+pub mod control;
 pub mod event;
 pub mod hooks;
+pub mod journal;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod linux;
 pub mod logger;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub mod macos;
 pub mod message;
+#[doc(hidden)]
+pub mod openvpn;
 pub mod platform;
-pub mod state;
-pub mod theme;
-pub mod topology_policy;
+#[doc(hidden)]
+pub mod process;
+pub mod profile;
+pub mod telemetry;
 pub mod tunnel;
 pub mod ui;
-pub mod utils;
-pub mod vpn;
-pub mod vpn_runtime;
+#[doc(hidden)]
+pub mod wireguard;

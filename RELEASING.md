@@ -19,9 +19,10 @@ Everything is automated. Just write code and merge PRs.
 │     - Creates git tag (e.g., v0.2.0)                            │
 │                           ↓                                     │
 │  5. Git tag triggers cargo-dist which:                          │
-│     - Builds macOS binaries (Intel + Apple Silicon)             │
+│     - Builds macOS (x86_64, arm64) and Linux gnu/musl           │
+│       (x86_64, aarch64) binaries                                │
 │     - Creates GitHub Release with binaries attached             │
-│     - Generates shell installer script                          │
+│     - Generates shell installer; publishes Homebrew and npm     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,7 +56,7 @@ Ensure these are set in GitHub repo settings → Secrets → Actions:
 | Tool | Purpose |
 |------|---------|
 | **release-plz** | Version bumps, changelog, crates.io publishing, git tags |
-| **cargo-dist** | macOS binaries, GitHub releases, shell installer |
+| **cargo-dist** | macOS + Linux (gnu/musl) binaries, GitHub releases, shell installer, Homebrew tap, npm |
 
 ## Manual Release (if needed)
 

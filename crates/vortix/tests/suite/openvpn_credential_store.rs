@@ -2,10 +2,8 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 
-use vortix::vortix_config::openvpn_credentials::{
-    FsOpenVpnCredentialStore, RememberedOpenVpnCredentials,
-};
-use vortix::vortix_core::profile::ProfileId;
+use vortix::config::openvpn_credentials::{FsOpenVpnCredentialStore, RememberedOpenVpnCredentials};
+use vortix::profile::ProfileId;
 
 fn id(byte: u8) -> ProfileId {
     ProfileId::parse(format!("{byte:02x}").repeat(32)).unwrap()

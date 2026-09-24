@@ -1,94 +1,196 @@
-# Context for Claude Code sessions
-## VERY IMPORTANT: Read the STOPOVERENGINEERING.md
+# Vortix — context for Claude Code
 
-Hard-won knowledge from prior sessions. Read these before you ship anything.
+Vortix is a terminal VPN manager (TUI + CLI) for WireGuard and OpenVPN on macOS
+and Linux. One Rust crate, `crates/vortix`, plus `crates/xtask` for boundary
+lints. It runs as root (`sudo vortix`); there is no helper or daemon.
 
-## Before every push: run the full CI parity set
+**Read [`STOPOVERENGINEERING.md`](STOPOVERENGINEERING.md) before writing code.**
 
-CI failed four times on a single PR because each push verified a different subset of what CI actually runs. The full command set lives in [`docs/ci-parity.md`](docs/ci-parity.md) — run it before every push, not a subset.
+To fix a reported bug end to end (reproduce → fix → CI → PR → review → merge),
+run `/fix-bug <issue number, URL or description>`.
 
-Common traps documented there (each cost one CI cycle):
-- `-p vortix --lib` skips test code; `clippy::pedantic` is workspace-wide so test code gets pedantic lints too
-- macOS host cannot validate Linux-cfg code paths (`vortix_platform_linux/*`, `daemon/server.rs` SO_PEERCRED block) and vice versa
-- `cargo clippy` does NOT run rustdoc lints — only `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps` exercises them
-- `cargo fmt` (without `--all`) skips workspace members on rustfmt diffs
+## How we work here
 
-"Passes locally" is a claim that requires the full command output, not a verbal assertion.
+- **Less code, fewer files, fewer bugs.** Deleting is the best change. Before
+  adding a helper, search: it probably exists (`rg "fn name"`). One owner per
+  concept; a second copy of a rule is a future bug.
+- **Fix the root, not the symptom.** Grep every caller of what you touch and fix
+  it once where all paths meet. No per-caller guards, no layered patches.
+- **User-visible behaviour does not change unless asked.** Refactors keep every
+  CLI flag, JSON field, TUI label and exit code.
+- **Remove stale code** instead of working around it. Before calling something
+  dead, read the *full* grep output — truncated output has fooled us twice.
+- **Comments:** default none; one short line when the *why* is not obvious.
+  No plan IDs, ticket codes or phase names in code, help text or logs.
+- **No new dependencies, traits with one impl, builders, or Cargo features**
+  without asking.
 
-## Architectural boundaries are enforced by xtask, not just convention
+## Commands
 
-- `vortix_core/` must not import from `vortix_platform_*`, `vortix_protocol_*`, or the process layer
-- `vortix_platform_*` must not import from `vortix_protocol_*` and vice versa
-- Subprocess invocations of protocol binaries (`wg`, `wg-quick`, `openvpn`) belong in `vortix_protocol_*` only — anywhere else needs a `// xtask:allow-protocol-leak: <reason>` annotation
+```bash
+cargo build -p vortix                 # debug build → target/debug/vortix (use this for testing)
+cargo test -p vortix <filter>         # focused tests while iterating
+scripts/ci-local.sh --quick           # what CI runs (fmt, clippy, test, doc, xtask, Linux cross-clippy)
+scripts/ci-local.sh                   # same + release build; run before every push
+```
 
-The three `cargo xtask check-*-leak` commands enforce this in CI. If you're tempted to add an import that crosses a boundary, stop and ask whether the abstraction should move instead.
+`ci-local.sh` is the only pre-push check that counts; see
+[`docs/ci-parity.md`](docs/ci-parity.md) for why each step exists. Linux-only
+code (`linux/`, `cfg(target_os = "linux")`) is only compiled by its Linux
+cross-clippy step and only *run* by CI's Docker integration tests. Release
+builds only when asked.
 
-## TUI density principle
+## Where things live
 
-User's explicit guidance from session memory: density via signaling, not duplication. Never auto-add UI panels per entity. When you add a TUI feature:
-- Single-line summary signals beat multi-line panels
-- Multi-tunnel views fit in the existing 6-row dashboard layout via overflow ladders, not new panels
-- See `docs/manual-testing/multi-connection.md` for what "fits cleanly at 80×24" means in practice
+| Symptom / area | Look in |
+|---|---|
+| Connect, disconnect, switch, reconnect, retries | `control/engine.rs` (one thread), `control/state.rs` (tunnel state, route-conflict rule) |
+| Which routes / DNS / firewall the host should have | `control/plan.rs` (pure), applied by `control/net.rs` |
+| Kill switch modes and persisted state | `control/killswitch.rs`; firewalls in `macos/firewall.rs` (pf), `linux/firewall.rs` (nftables) |
+| DNS | `control/dns.rs` (policy and its persisted receipt), `macos/dns.rs`, `linux/dns.rs` |
+| Detecting running tunnels | `control/scanner.rs` |
+| Starting protocol processes | `control/tunnels.rs` → `wireguard/tunnel.rs`, `openvpn/tunnel.rs`; supervision in `process/custodian.rs` |
+| Config parsing | `wireguard/parser.rs`, `openvpn/parser.rs` (the only readers of profile files) |
+| Profiles on disk, import, rename, delete | `config/profiles.rs`, `config/profile_store.rs`, `config/import.rs` |
+| Settings, config dir, file ownership under sudo | `config/settings.rs`, `config/mod.rs`, `config/owned_file.rs`, `config/secret.rs` |
+| TUI state and keys | `app/` (`input.rs` keys, `update.rs` messages, `connection.rs` engine snapshot → render view) |
+| TUI rendering | `ui/dashboard/*`, `ui/overlays.rs`, `ui/theme.rs`, `ui/helpers.rs` (formatting) |
+| CLI | `cli/args.rs` (clap), `cli/commands.rs` (dispatch), `cli/tunnel.rs`, `cli/status.rs`, `cli/profiles.rs`, `cli/output.rs` (JSON envelope) |
+| Public IP, ISP, latency | `telemetry/` |
+| Every subprocess | `process/` (`process::run`, `CommandSpec`) |
+| OS differences | `platform.rs` re-exports the per-OS type (`platform::Firewall`, `platform::Dns`, …) |
+| Shared tunnel types | `tunnel.rs`; profile ids in `profile.rs`; CIDR math in `cidr.rs` |
 
-## Build budget and test-target layout
+## How a connection works
 
-Binary size, build time and the profile knobs behind them live in
-[`docs/performance.md`](docs/performance.md); `scripts/bench-build.sh` re-measures the table.
-Two rules from it that bite silently:
+`control/` owns every VPN connection. One engine thread (`engine.rs`) holds the
+tunnel list (`state.rs`), starts and stops protocol processes (`tunnels.rs`),
+and after every change asks the pure planner (`plan.rs`) what routes, DNS and
+firewall the host should carry, then applies the difference (`net.rs`). The plan
+depends only on which tunnels are up and the kill switch mode — never on command
+order — so every path to the same tunnel set lands on the same host state. The
+newest full tunnel owns the default route and DNS; a switch brings the new
+tunnel up before stopping the ones it conflicts with.
 
-- `[profile.release]` sets `opt-level = "z"`. `panic = "abort"` is **not** set and must not be —
-  `catch_unwind` carries panic isolation for tunnels, hooks, the control worker and background
-  tasks.
-- Integration tests live in `crates/vortix/tests/suite/` behind one `main.rs`. A file dropped in
-  that directory with no `mod` line compiles into nothing and its tests stop running with no
-  diagnostic. A suite that mutates process-global state or asserts wall-clock duration stays a
-  top-level `tests/*.rs` instead.
+TUI and CLI send `control::Command`s and read `control::Snapshot`s; nothing else
+touches routes, DNS or the firewall. The dashboard renders straight from the
+snapshot (`App::tunnels`, `App::tunnel`, `App::primary_id`). New behaviour goes
+into the planner or a state transition, with a test in `plan.rs`/`state.rs` —
+not into a caller.
 
-## Manual testing convention
+## Kill switch vocabulary
 
-Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. The release gate lives in [`docs/manual-testing/P0.md`](docs/manual-testing/P0.md) — numbered workflows an agent can execute against a live TUI on macOS and Linux. When you ship a feature with observable runtime behavior, add a workflow only if no automated test can answer it, and write its pass signal as something visible in a captured frame.
+One vocabulary on every surface (CLI verbs, CLI output, TUI, JSON, logs). Enum
+variants never leak into output; route every string through the helpers on
+`control::killswitch` — `KillSwitchMode::display_name`, `cli_verb`,
+`from_cli_verb`, `one_liner`, `behavior_lines`, `KillSwitchState::display_status`.
 
-## Multi-tunnel: registry is the truth
+| Enum | Slug | Behaviour |
+|---|---|---|
+| `Off` | `off` | No firewall rules. Real IP exposed if the VPN drops. |
+| `Auto` | `block-on-drop` | Armed while a VPN is up; blocks egress only on an unexpected drop. |
+| `AlwaysOn` | `vpn-only` | Firewall always engaged: default-drop plus per-tunnel allow rules. State is always `Blocking`, never `Armed`. |
 
-The App layer's single source of truth for active VPN state is `App.registry: TunnelRegistry<TunnelKind>`. Every panel renderer (header, sidebar, Connection Details, Security Guard, footer) reads from `app.registry.snapshot_all` / `app.registry.snapshot(profile_id)` exclusively.
+No aliases: `auto`/`always` are rejected with "Use: off, block-on-drop, vpn-only".
+The header uses short forms (`KS:Off` / `KS:Watch` / `KS:VPN-only` / `KS:DROPPED`)
+for the 80-column budget.
 
-The legacy `ConnectionState` enum still exists in `crates/vortix/src/vpn_runtime/connection_state.rs` and is re-exported from `vpn_runtime`, but only as: (a) the CLI's blocking helpers' local single-tunnel view (one process, one tunnel), and (b) the return type of `App::legacy_state()` — a derived view from the registry primary for the few residual single-tunnel-shaped reads (kill-switch sync, delete-safety, scanner dispatch).
+## Boundaries (enforced by `cargo xtask`, run in CI)
 
-There is **no** `connection_state` field on `VpnRuntime`. Don't add one. Multi-tunnel-aware code reads registry snapshots; single-tunnel-shaped code calls `App::legacy_state()` and matches on the variant.
+- `cfg(target_os)` only in `macos/`, `linux/`, `platform.rs` (`check-platform-leak`).
+- `Command::new` only in `process/` (`check-subprocess`).
+- `wg`/`wg-quick` only in `wireguard/`, `openvpn` only in `openvpn/` (`check-protocol-leak`).
 
-## Kill switch semantics
+Exceptions take `// xtask:allow-*: <reason>`. If you reach for one, move the
+code instead.
 
-One vocabulary, used identically on every surface — CLI input verb, CLI output, TUI panels, JSON envelope, log lines. Rust enum variants (`Off` / `Auto` / `AlwaysOn`) stay idiomatic for the language but never leak into output. The bridge between the enum and every user-visible string is the helper set on `vortix_core::state::killswitch` — `KillSwitchMode::display_name` (display), `cli_verb` / `from_cli_verb` (input parsing), `one_liner`, `behavior_lines`, and `KillSwitchState::display_status`.
+## TUI density
 
-| Rust enum    | Slug (CLI verb + display) | What it does                                                                                                                                                                                                  |
-|--------------|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `Off`        | **`off`**                 | No firewall rules. All traffic flows; real IP exposed if VPN drops.                                                                                                                                           |
-| `Auto`       | **`block-on-drop`**       | Armed while a VPN is up; engages default-DROP egress only on an unexpected drop.                                                                                                                              |
-| `AlwaysOn`   | **`vpn-only`**            | Firewall stays engaged whether VPN is up or down. Default-DROP OUTPUT policy + per-tunnel ACCEPT rules (`core::killswitch::enable_blocking_multi`) close the gap-between-drop-and-reconnect leak window. State always resolves to `Blocking`, never `Armed`. |
+Density via signalling, not duplication. Never add a panel per tunnel; one-line
+summaries and overflow ladders fit the existing layout at 80×24 (see
+[`docs/manual-testing/multi-connection.md`](docs/manual-testing/multi-connection.md)).
 
-There are **no aliases**. `vortix killswitch auto` and `vortix killswitch always` are not accepted — the parser returns the "Use: off, block-on-drop, vpn-only" error. If you're touching killswitch I/O, route through the helpers; never hardcode a string.
+## Tests
 
-The header bar uses short abbreviations of the same labels (`KS:Off` / `KS:Watch` / `KS:VPN-only` / `KS:DROPPED`) because of the 80-col budget. The display-name labels (`Off` / `Block on drop` / `VPN-only`) are the long-form rendering of the same three slugs — just title-cased for prose. Slug everywhere, prose only in the long-form Security Guard / `vortix killswitch` output.
+- Engine behaviour: unit tests in `control/plan.rs` and `control/state.rs`.
+- Rendering: `App::new_test()`, seed tunnels with `App::set_tunnels_for_test`
+  and `app::connection::test_view`, render into a `TestBackend`.
+- Integration tests live in `crates/vortix/tests/suite/` behind one `main.rs`.
+  **A new file there needs a `mod` line or it silently never runs.** Suites that
+  mutate process-global state or time wall-clock stay top-level `tests/*.rs`.
+- Things only a real kernel, terminal or VPN server can show go in
+  [`docs/manual-testing/P0.md`](docs/manual-testing/P0.md), with a pass signal
+  visible in a captured frame — only if no automated test can answer it.
 
-## Background mode was removed — the daemon is passive-only
+## Live testing (macOS)
 
-Vortix runs as root directly. There is no helper, no enrolled daemon, no
-remote mutation. That path — a privilege-separated execution model behind an
-enrolled root helper — was built but never reachable from any shipped
-`main()`, and was removed. The full tree is preserved on the
-`archive/background-mode` branch if it is ever revived.
+Claude never runs `sudo` on the Mac. The user keeps a tmux session `vxrun` with two root
+panes: window 0 for the TUI, window 1 for a root shell (both started with
+`sudo -s` and `export SUDO_UID=502 SUDO_GID=20 SUDO_USER=harshitchaudhary`).
+Drive them with `tmux send-keys -t vxrun:0 …` and read frames with
+`tmux capture-pane -p -t vxrun:0`. If the session is missing, ask the user to
+create it. In the TUI: digits quick-connect a profile; with the sidebar
+focused, `D` disconnects all (and asks `y`/`n` only when 2+ tunnels are up —
+with one tunnel a following `y` copies the IP); `K` cycles the kill switch;
+`q` quits. Window 1 is a root shell and `tmux send-keys` into it is allowed
+without a prompt: treat it as root access. Verify host state from
+window 1 (`netstat -rn -f inet`, `scutil --dns`, `pfctl -a com.apple/vortix.killswitch -sr`).
 
-What remains of `daemon/` is genuinely live and passive: `DaemonServer`
-binds an owner-only socket and serves scanner-derived snapshots and
-diagnostics subscriptions; the CLI's `status`/`list` route through
-`daemon/client.rs` when a socket is present. Mutation requests answer
-`CapabilityUnavailable`. Do not re-introduce a control-mutation path here
-without a product decision to ship Background mode.
+## Live testing (Linux)
 
-## Planning artifacts
+An Ubuntu lab laptop is on the LAN: `ssh -i ~/.ssh/vortix_lab_ed25519
+harrykp@192.168.1.97`, checkout at `~/vortix`, profiles already imported. It
+has passwordless sudo and the user allows using it **there** (never on the
+Mac). Sync with `git fetch origin <branch> && git checkout -B lab FETCH_HEAD`
+(or `scp` a changed file), build with `cargo build -p vortix`, and run as
+`sudo -n env SUDO_UID=1000 SUDO_GID=1000 SUDO_USER=harrykp ./target/debug/vortix …`.
+tmux session `vxlinux` has root windows 1 and 2 for the TUI. Check host state
+with `ip -4 route`, `resolvectl dns`, `nft list table inet vortix_killswitch`.
+Anything verified live on macOS should be verified here too.
 
-- `docs/brainstorms/<date>-<slug>-requirements.md` — what to build (origin doc)
-- `docs/plans/<date>-<seq>-<type>-<slug>-plan.md` — how to build (implementation units)
-- `docs/manual-testing/<slug>.md` — what to verify by hand after shipping
+## Secrets
 
-The `compound-engineering` skill set (`ce-brainstorm`, `ce-plan`, `ce-work`, `ce-doc-review`) drives this workflow. If you're starting from a fuzzy ask, run `ce-brainstorm` first.
+Profiles contain private keys and passwords, on both machines: never print,
+copy or commit them. Credentials are typed by the user.
+
+## Git and PRs
+
+- Branch from `main`; one branch per fix; conventional commit subjects
+  (`fix:`, `refactor:`, `perf:`, `test:`, `docs:`). Commit with the configured
+  identity — never pass `-c user.*`.
+- End commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- The pre-commit hook (`scripts/install-hooks.sh`) runs fmt, clippy, gitleaks
+  (secret scan of staged changes) and tests. `.DS_Store` is ignored.
+- PRs squash-merge into `main`. `main` has no branch protection, so the green
+  check is ours to enforce: merge only when every `gh pr checks` row is `pass`
+  or `skipping` (release jobs always skip) and none is failing or pending.
+- Push only when asked, or as part of `/fix-bug`.
+
+## Build budget
+
+`[profile.release]` uses `opt-level = "z"`. **Never set `panic = "abort"`**:
+`catch_unwind` isolates panics in tunnels, hooks and background tasks. Size and
+build-time numbers live in [`docs/performance.md`](docs/performance.md).
+
+## Removed on purpose — do not reintroduce
+
+- Background mode, the privileged helper and the daemon (archived on branch
+  `archive/background-mode`; needs a product decision to revive).
+- The `vortix secrets` command, `metadata.json`, the iptables backend (nftables
+  only; legacy chains are just cleaned up), `core/`, `utils.rs`, the TUI's
+  separate tunnel registry and its `Connection`/`TunnelSnapshot` render model.
+
+## Lessons that cost a CI cycle or a bug
+
+- Blanket regex renames hit enum variants and foreign imports. Let the
+  compiler find call sites and review the diff.
+- Linux-only code broke only in Linux cross-clippy; macOS builds never see it.
+- `cargo clippy` skips rustdoc lints; broken intra-doc links fail only in
+  `cargo doc` with `-D warnings`.
+- pf rules for `vpn-only` need `flags any`, or existing flows lose connectivity.
+- Async results that arrive after the state they describe must be dropped: the
+  telemetry worker tags results with an epoch so a pre-disconnect lookup cannot
+  overwrite the real IP.
+- `process::run` returns `Ok` for a command that exits non-zero; check
+  `CommandOutcome::success()`. Treating `Ok` as success shipped a DNS flush
+  that silently ignored failures.

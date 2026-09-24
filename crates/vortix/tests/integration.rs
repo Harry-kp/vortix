@@ -17,11 +17,11 @@
 use std::sync::Once;
 use std::time::Instant;
 
-use vortix::app::{
-    App, ConnectionState, FocusedPanel, InputMode, Protocol, Toast, ToastType, VpnProfile,
-};
+use vortix::profile::ProtocolKind;
+
+use vortix::app::{App, FocusedPanel, InputMode, Toast, ToastType};
+use vortix::config::profiles::VpnProfile;
 use vortix::message::{Message, ScrollMove, SelectionMove};
-use vortix::state::{KillSwitchMode, KillSwitchState};
 
 static INIT: Once = Once::new();
 
@@ -51,168 +51,47 @@ fn test_app() -> App {
 fn add_wg_profiles(app: &mut App, names: &[&str]) {
     for name in names {
         app.runtime.profiles.push(VpnProfile {
-            id: vortix::vortix_core::profile::ProfileId::new(*name),
+            id: vortix::profile::ProfileId::new(*name),
             name: (*name).to_string(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
             location: "Test".to_string(),
             last_used: None,
+            group: None,
         });
     }
 }
 
 fn set_connected(app: &mut App, name: &str) {
+    use vortix::control::{Phase, TunnelView};
+    use vortix::profile::ProfileId;
+
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_wg_profiles(app, &[name]);
     }
-    app.runtime.session_start = Some(Instant::now());
-    let details = vortix::vortix_core::engine::DetailedConnectionInfo {
-        interface: "wg0".to_string(),
-        interface_authoritative: true,
-        pid: Some(12345),
-        ..Default::default()
-    };
-    set_projection(
-        app,
-        name,
-        vortix::vortix_core::engine::state::Connection::Connected {
-            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
-            since: std::time::SystemTime::now(),
-            health: vortix::vortix_core::engine::state::ConnectionHealth::Healthy,
-            details: Box::new(details),
-        },
-    );
-}
-
-fn set_connecting(app: &mut App, name: &str) {
-    if !app.runtime.profiles.iter().any(|p| p.name == name) {
-        add_wg_profiles(app, &[name]);
-    }
-    set_projection(
-        app,
-        name,
-        vortix::vortix_core::engine::state::Connection::Connecting {
-            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
-            started_at: std::time::SystemTime::now(),
-            attempt: 1,
-            retry_budget_remaining: std::time::Duration::ZERO,
-        },
-    );
-}
-
-fn set_disconnecting(app: &mut App, name: &str) {
-    use vortix::vortix_core::profile::ProfileId;
-    if app.registry.snapshot(&ProfileId::new(name)).is_none() {
-        set_connected(app, name);
-    }
-    set_projection(
-        app,
-        name,
-        vortix::vortix_core::engine::state::Connection::Disconnecting {
-            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
-            started_at: std::time::SystemTime::now(),
-        },
-    );
-}
-
-fn set_projection(
-    app: &mut App,
-    name: &str,
-    state: vortix::vortix_core::engine::state::Connection,
-) {
-    use vortix::vortix_core::engine::{ConnectionHealth, Role, TunnelSnapshot};
-    use vortix::vortix_core::profile::ProfileId;
-
     let profile_id = ProfileId::new(name);
-    let mut snapshot = app.control_snapshot.clone();
-    snapshot.generation = snapshot.generation.saturating_add(1);
+    let mut snapshot = (*app.control_snapshot).clone();
+    snapshot.version += 1;
     snapshot.primary = Some(profile_id.clone());
-    snapshot.tunnels.insert(
-        profile_id.clone(),
-        TunnelSnapshot {
-            profile_id,
-            state,
-            role: Role::Primary {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::Healthy,
-            interface_name: Some("wg0".into()),
-            started_at: Some(std::time::SystemTime::now()),
+    snapshot
+        .tunnels
+        .retain(|tunnel| tunnel.profile_id != profile_id);
+    snapshot.tunnels.push(TunnelView {
+        profile_id,
+        name: name.to_owned(),
+        protocol: vortix::profile::ProtocolKind::WireGuard,
+        phase: Phase::Up,
+        interface: Some("wg0".into()),
+        since: std::time::SystemTime::now(),
+        routes: Vec::new(),
+        dns: Vec::new(),
+        details: vortix::tunnel::DetailedConnectionInfo {
+            interface: "wg0".into(),
+            ..Default::default()
         },
-    );
-    app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-}
-
-mod canonical_control_projection {
-    use super::*;
-    #[test]
-    fn lifecycle_is_rendered_only_from_successive_snapshots() {
-        let mut app = test_app();
-        set_connecting(&mut app, "vpn-a");
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Connecting { .. }
-        ));
-
-        set_connected(&mut app, "vpn-a");
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Connected { .. }
-        ));
-
-        set_disconnecting(&mut app, "vpn-a");
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Disconnecting { .. }
-        ));
-
-        let mut snapshot = app.control_snapshot.clone();
-        snapshot.generation = snapshot.generation.saturating_add(1);
-        snapshot.tunnels.clear();
-        snapshot.primary = None;
-        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
-    }
-
-    #[test]
-    fn unknown_effective_policy_is_degraded_unless_the_desired_mode_is_off() {
-        let mut app = test_app();
-        let mut snapshot = app.control_snapshot.clone();
-        snapshot.generation = 1;
-        snapshot.desired.kill_switch = KillSwitchMode::AlwaysOn;
-        snapshot.effective.kill_switch = None;
-        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-        assert_eq!(app.registry.killswitch_mode(), KillSwitchMode::AlwaysOn);
-        assert_eq!(app.registry.killswitch_state(), KillSwitchState::Degraded);
-
-        let mut off = app.control_snapshot.clone();
-        off.generation = off.generation.saturating_add(1);
-        off.desired.kill_switch = KillSwitchMode::Off;
-        off.effective.kill_switch = None;
-        app.handle_message(Message::ControlSnapshot(Box::new(off)));
-        assert_eq!(app.registry.killswitch_mode(), KillSwitchMode::Off);
-        assert_eq!(app.registry.killswitch_state(), KillSwitchState::Disabled);
-    }
-
-    #[test]
-    fn protected_auto_is_armed_only_while_a_tunnel_is_connected() {
-        let mut app = test_app();
-        set_connected(&mut app, "vpn-a");
-        let mut snapshot = app.control_snapshot.clone();
-        snapshot.generation = snapshot.generation.saturating_add(1);
-        snapshot.desired.kill_switch = KillSwitchMode::Auto;
-        snapshot.effective.kill_switch = Some(KillSwitchState::Armed);
-        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Armed);
-
-        let mut blocked = app.control_snapshot.clone();
-        blocked.generation = blocked.generation.saturating_add(1);
-        blocked.effective.kill_switch = Some(KillSwitchState::Blocking);
-        blocked.tunnels.clear();
-        blocked.primary = None;
-        app.handle_message(Message::ControlSnapshot(Box::new(blocked)));
-        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Blocking);
-    }
+        health: vortix::tunnel::ConnectionHealth::default(),
+    });
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
 }
 
 // ============================================================================
@@ -229,11 +108,13 @@ mod profile_import {
     /// "profile storage is busy". Serialising them removes the contention.
     static IMPORT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn import_serialised(path: &std::path::Path) -> Result<vortix::state::VpnProfile, String> {
+    fn import_serialised(
+        path: &std::path::Path,
+    ) -> Result<vortix::config::profiles::VpnProfile, String> {
         let _guard = IMPORT_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        vortix::vpn::import_profile(path)
+        vortix::config::profiles::import_profile(path)
     }
 
     fn create_temp_profile(
@@ -266,7 +147,7 @@ mod profile_import {
             "Valid WireGuard config should import: {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap().protocol, Protocol::WireGuard);
+        assert_eq!(result.unwrap().protocol, ProtocolKind::WireGuard);
     }
 
     #[test]
@@ -288,7 +169,7 @@ mod profile_import {
             "Valid OpenVPN config should import: {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap().protocol, Protocol::OpenVPN);
+        assert_eq!(result.unwrap().protocol, ProtocolKind::OpenVpn);
     }
 
     #[test]
@@ -526,12 +407,6 @@ mod message_routing {
     }
 
     #[test]
-    fn log_message_does_not_crash() {
-        let mut app = test_app();
-        app.handle_message(Message::Log("TEST: integration log".to_string()));
-    }
-
-    #[test]
     fn toast_message() {
         let mut app = test_app();
         app.handle_message(Message::Toast("Test toast".to_string(), ToastType::Info));
@@ -604,23 +479,27 @@ mod message_routing {
         add_wg_profiles(&mut app, &["vpn-a"]);
 
         app.handle_message(Message::QuickConnect(99));
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+        assert!(app.current_tunnel().is_none());
     }
 
     #[test]
     fn telemetry_public_ip_update() {
-        use vortix::core::telemetry::TelemetryUpdate;
+        use vortix::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
-        app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-            "1.2.3.4".to_string(),
+        app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+            vortix::telemetry::EgressIdentity {
+                public_ip: "1.2.3.4".to_string(),
+                isp: None,
+                location: None,
+            },
         )));
         assert_eq!(app.runtime.public_ip, "1.2.3.4");
     }
 
     #[test]
     fn telemetry_network_quality_update_is_atomic() {
-        use vortix::core::telemetry::TelemetryUpdate;
+        use vortix::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
         app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
@@ -635,7 +514,7 @@ mod message_routing {
 
     #[test]
     fn telemetry_publicipv6_leak_detection() {
-        use vortix::core::telemetry::TelemetryUpdate;
+        use vortix::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
         app.runtime.scanner_first_tick_done = true;

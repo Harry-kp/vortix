@@ -26,7 +26,8 @@ sync by hand;** changing one without the other silently splits the install paths
 ## Where the binary goes
 
 Attribution from an unstripped `--release` build of `crates/vortix` on `aarch64-apple-darwin`,
-symbols mapped to crates by mangled prefix. Measured before the changes below:
+symbols mapped to crates by mangled prefix. Measured before the changes below, while color-eyre
+and the daemon-era helper binaries still shipped (historical):
 
 | Section | Bytes | Share |
 |---|---:|---:|
@@ -48,7 +49,7 @@ Top `__text` contributors:
 | `rustls` + `ring` + `webpki` | 214,376 | required — every telemetry endpoint is `https://` |
 | `tokio` | 207,424 | |
 | `regex-automata` + `regex-syntax` | 174,692 | **removed**, see below |
-| backtrace stack (`gimli`/`addr2line`/`backtrace`/`rustc-demangle`) | 131,404 | color-eyre's error reports |
+| backtrace stack (`gimli`/`addr2line`/`backtrace`/`rustc-demangle`) | 131,404 | color-eyre's error reports (color-eyre since removed) |
 
 The serde share is inherent to a JSON control protocol with ~280 typed messages, and the TLS
 share is required by the endpoints in `constants.rs`. Neither is a lever.
@@ -57,7 +58,7 @@ share is required by the endpoints in `constants.rs`. Neither is a lever.
 
 ### `opt-level = "z"` (was `3`)
 
-| opt-level | `vortix` | all three binaries |
+| opt-level | `vortix` | all three binaries (historical, before the daemon was removed) |
 |---|---:|---:|
 | `3` | 9,947,104 | 11,415,392 |
 | `2` | 9,633,344 | 11,085,120 |
@@ -91,9 +92,8 @@ a first attempt at load average 57 produced a spurious 3x "improvement" in both 
 ### `panic = "abort"` — deliberately NOT set
 
 It would drop most of the 1.2 MB of unwind tables, and it is off the table: `catch_unwind` is
-load-bearing. A panic inside a tunnel operation (`tunnel.rs`,
-`vortix_protocol_wireguard/tunnel.rs`), a control-worker job (`vortix_core/control/worker.rs`),
-a lifecycle hook (`hooks/runner.rs`) or a background task (`background.rs`) is caught and turned
+load-bearing. A panic inside a tunnel operation (`control/tunnels.rs`,
+`wireguard/tunnel.rs`) or a lifecycle hook (`hooks.rs`) is caught and turned
 into an error rather than killing a process that holds kill-switch state. Aborting there trades
 a firewall-safety guarantee for binary size.
 
@@ -110,7 +110,7 @@ re-initialised it will try to put `lto = "thin"` back, and that must be rejected
 | Change | Left the graph |
 |---|---|
 | `tracing-subscriber` without `env-filter` | `matchers`, `regex-automata`, `regex-syntax` |
-| `color-eyre` without `capture-spantrace` | `color-spantrace`, `tracing-error` |
+| `color-eyre` without `capture-spantrace` (color-eyre later removed) | `color-spantrace`, `tracing-error` |
 | `ratatui` with `default-features = false` | `ratatui-macros`, the unused Calendar widget |
 | `time` without `macros` | `time-macros` |
 | `clap` without `color` | `anstream`, `anstyle-parse`, `anstyle-query`, `anstyle-wincon`, `colorchoice`, `is_terminal_polyfill`, `once_cell_polyfill` |
@@ -139,7 +139,7 @@ trailing comma paints error output over the alternate screen.
 ## Test-target layout
 
 `crates/vortix/tests/` held 22 top-level `*.rs` files, so cargo built and linked 22 test binaries
-against the whole `vortix` rlib. Seventeen are now modules of one `tests/suite/main.rs`.
+against the whole `vortix` rlib. Seven are now modules of one `tests/suite/main.rs`.
 
 Five stay as their own targets:
 
@@ -148,16 +148,14 @@ Five stay as their own targets:
 | `cli_integration.rs` | mutates `VORTIX_CONFIG_DIR` process-wide |
 | `tunnel_custodian.rs` | mutates `VORTIX_CUSTODIAN_*` process-wide |
 | `integration.rs` | installs a process-global config dir; its profile store has a 500 ms lock budget |
-| `control_diagnostics.rs` | flaked when merged |
+| `cli_import_config_dir.rs` | sets `VORTIX_CONFIG_DIR` with `set_var` |
 | `cold_start.rs` | asserts a wall-clock startup ceiling |
 
-That list is empirical, not theoretical. The first version of the merge put `integration.rs` and
-`control_diagnostics.rs` in the shared binary and both flaked within three runs — the profile
+That list is empirical, not theoretical. The first version of the merge put `integration.rs` and a
+since-removed control-diagnostics suite in the shared binary and both flaked within three runs — the profile
 store's 500 ms lock times out when the holding thread is descheduled under ~245-way concurrency.
 
-Modules that remain **do** use second-scale `tokio::time::timeout` hang-guards, and
-`control_reconcile.rs` has two `elapsed() < 250ms` assertions. Those held over 10 consecutive
-runs under 8x CPU oversubscription. If one starts flaking on CI, move that module back to a
+Modules that remain **do** use second-scale `tokio::time::timeout` hang-guards. If one starts flaking on CI, move that module back to a
 top-level `tests/*.rs` rather than raising its budget.
 
 **Adding a test file:** if it touches `std::env::set_var`, `config::set_config_dir`, a fixed port
@@ -205,7 +203,7 @@ different target has a different figure, which is why the check is opt-in via
 `VORTIX_SIZE_BUDGET_BYTES` rather than hardcoded.
 
 The script also pins the contracts that a size-driven profile change could plausibly break
-without failing a unit test: all three binaries reporting the same version, `--json` keeping
+without failing a unit test: the one binary reporting the workspace version, `--json` keeping
 stdout free of diagnostics, kill-switch verb parsing rejecting aliases, and an unprivileged
 launch exiting 2 with an actionable message instead of hanging.
 

@@ -16,7 +16,7 @@ vortix report
 | `sudo: vortix: command not found` | `sudo` does not include the install directory in `PATH` | Link the binary into `/usr/local/bin` |
 | A second Vortix instance exits | Another process owns the lifecycle lock | Use or close the running instance |
 | Profile import rejects a name | Invalid or overlong WireGuard interface name | Rename the source file and import it again |
-| Connect stays transitional | The durable operation has not reached a terminal observation | Use `vortix status` and query the reported operation ID |
+| Connect stays transitional | The tunnel has not finished coming up | Check `vortix status` |
 | Connected split tunnel does not change public IP | The profile does not own the default route | Test a destination included in its declared routes |
 | Connected tunnel cannot resolve names | DNS application, read-back, or resolver routing failed | Inspect the DNS section below |
 | Kill switch blocks all traffic | `vpn-only` is active without an effective tunnel | Connect a VPN or use `release-killswitch` in an emergency |
@@ -68,14 +68,9 @@ sudo chown -R "$(id -un):$(id -gn)" ~/.config/vortix
 
 ### A CLI command timed out
 
-A timeout does not erase the operation. Vortix keeps the command in durable history because the OS effect may still be reconciling.
+A timeout does not cancel the connect; it carries on. Check `vortix status`.
 
-```bash
-vortix status
-vortix status --operation <OPERATION_ID>
-```
-
-Do not repeatedly submit the same connect or disconnect while the earlier operation still owns the profile. If the TUI and CLI appear different, ensure both were built from and are running the same binary and config directory.
+Do not repeatedly submit the same connect or disconnect while the earlier one is still in progress. If the TUI and CLI appear different, ensure both were built from and are running the same binary and config directory.
 
 ### Split-route tunnel shows the normal public IP
 

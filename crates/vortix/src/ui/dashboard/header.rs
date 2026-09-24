@@ -1,10 +1,9 @@
+use crate::app::state::QualityLevel;
 use crate::app::App;
-use crate::state::QualityLevel;
+use crate::control::{Phase, TunnelView};
+use crate::profile::ProfileId;
 use crate::ui::helpers;
-use crate::vortix_core::engine::state::Connection;
-use crate::vortix_core::engine::TunnelSnapshot;
-use crate::vortix_core::profile::ProfileId;
-use crate::{constants, theme, utils};
+use crate::{constants, ui::theme};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -22,14 +21,14 @@ fn profile_display_name(app: &App, id: &ProfileId) -> String {
         .map_or_else(|| format!("missing:{id}"), |profile| profile.name.clone())
 }
 
-/// Render the header bar from the registry's three states.
+/// Render the header bar from the engine snapshot's three states.
 ///
 /// Branches:
 /// * `tunnel_count == 0` → `⚠ Real: <public_ip>` warning form (no VPN; real
 ///   IP exposed). Replaces the legacy `○ DISCONNECTED ... Your IP:` row.
 /// * `tunnel_count >= 1` and a primary is elected → today's single-tunnel
 ///   rendering (CONNECTING / CONNECTED / etc.) sourced from
-///   `registry.snapshot(primary)` and `app.runtime` telemetry. When
+///   `App::tunnel(primary)` and `app.runtime` telemetry. When
 ///   `tunnel_count >= 2`, a `Tunnels [ ... ]` strip is appended after the
 ///   primary segment with an overflow ladder for narrow widths.
 /// * `tunnel_count >= 1` and no primary (e.g., only addressable secondaries
@@ -42,9 +41,9 @@ fn profile_display_name(app: &App, id: &ProfileId) -> String {
 /// dropped with a `+N` overflow suffix, then the whole strip collapses to a
 /// dot-row of badge chars (`[●●●● +1]`).
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let tunnel_count = app.registry.tunnel_count();
-    let primary = app.registry.primary().cloned();
-    let primary_snap = primary.as_ref().and_then(|id| app.registry.snapshot(id));
+    let tunnel_count = app.tunnel_count();
+    let primary = app.primary_id().cloned();
+    let primary_snap = primary.as_ref().and_then(|id| app.tunnel(id));
     let startup_label = app.control_starting.then_some({
         if area.width >= 70 {
             "Starting…"
@@ -55,7 +54,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let ks_indicator = get_killswitch_indicator(app);
 
-    // ── 0-active branch: no tunnels in the registry → real IPv4 exposed.
+    // ── 0-active branch: no tunnels in the engine snapshot → real IPv4 exposed.
     // Show the explicit `○ DISCONNECTED` title here — the user's
     // mental model is "no VPN at all" and the title makes that
     // unambiguous. The no-primary-but-tunnels-up branch below still
@@ -77,18 +76,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // (tunnels ARE up) and from CONNECTED (no exit owner). Tunnels
     // strip still appends so the user sees what's connected.
     let Some(primary_snap) = primary_snap else {
-        let snapshots = app.registry.snapshot_all();
+        let snapshots = app.tunnels();
         let content_width = status_content_width(startup_label, area.width)
             .saturating_sub(u16::from(snapshots.len() >= 2) * 8);
-        if let Some(transitional) = snapshots.iter().find(|snapshot| {
-            matches!(
-                snapshot.state,
-                Connection::Connecting { .. }
-                    | Connection::Reconnecting { .. }
-                    | Connection::Disconnecting { .. }
-                    | Connection::AwaitingUserInput { .. }
-            )
-        }) {
+        if let Some(transitional) = snapshots.iter().find(|tunnel| tunnel.phase != Phase::Up) {
             let mut line = with_startup_signal(
                 startup_label,
                 render_primary_line(app, transitional, ks_indicator.clone(), content_width),
@@ -115,11 +106,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(u16::from(tunnel_count >= 2) * 8);
     let mut line = with_startup_signal(
         startup_label,
-        render_primary_line(app, &primary_snap, ks_indicator, content_width),
+        render_primary_line(app, primary_snap, ks_indicator, content_width),
     );
 
     if tunnel_count >= 2 {
-        let snapshots = app.registry.snapshot_all();
+        let snapshots = app.tunnels();
         line = append_tunnels_strip(Some(app), line, &snapshots, primary.as_ref(), area.width);
     }
 
@@ -150,7 +141,7 @@ fn with_startup_signal(label: Option<&'static str>, mut line: Line<'static>) -> 
 }
 
 /// Build the `○ NO EXIT │ Real: <public_ip>` header used when ≥1
-/// tunnel is in the registry but the kernel default route isn't
+/// tunnel is in the engine snapshot but the kernel default route isn't
 /// theirs (split-only topology, or an externally-adopted
 /// unauthoritative tunnel). Distinguishes from
 /// [`render_disconnected_line`] (genuine no-VPN) and from the
@@ -179,7 +170,7 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
 }
 
 /// Build the `○ DISCONNECTED │ Real: <public_ip>` header used when the
-/// registry holds zero tunnels — a genuine no-VPN state. The explicit
+/// engine snapshot holds zero tunnels — a genuine no-VPN state. The explicit
 /// title was removed by the header redesign in favour of the `⚠ Real:`
 /// form alone; that conflated "no exit selected" with "no VPN at all"
 /// from the user's perspective, so the title is back. The killswitch
@@ -198,7 +189,12 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
             Style::default().fg(theme::current().text_secondary),
         ),
         Span::styled(
-            app.runtime.public_ip.clone(),
+            // The last egress sample may still be the tunnel's exit right
+            // after a disconnect; the gated real address is the truth.
+            app.runtime
+                .real_ip
+                .clone()
+                .unwrap_or_else(|| app.runtime.public_ip.clone()),
             Style::default().fg(theme::current().text_primary),
         ),
         helpers::divider(),
@@ -206,10 +202,6 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
     ])
 }
 
-/// Render the primary-tunnel section (CONNECTING / CONNECTED / etc.). This
-/// is the existing single-tunnel rendering preserved verbatim from U6B; the
-/// only behavioural delta is that the `(+N more)` suffix has been retired
-/// in favour of the explicit Tunnels strip appended by the caller.
 /// Session uptime as `▲Nd HH:MM:SS`, dropping the units it doesn't need.
 fn format_uptime(elapsed: u64) -> String {
     let (h, m, s) = (elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
@@ -226,9 +218,7 @@ fn format_uptime(elapsed: u64) -> String {
 /// signal bars and the kill-switch indicator, thinned out below 84 columns.
 fn connected_line(
     app: &App,
-    primary_snap: &TunnelSnapshot,
-    details: &crate::vortix_core::engine::state::DetailedConnectionInfo,
-    since: std::time::SystemTime,
+    primary_snap: &TunnelView,
     ks_indicator: Span<'static>,
     area_width: u16,
 ) -> Line<'static> {
@@ -238,12 +228,12 @@ fn connected_line(
     // removing that prefix cannot clip the kill-switch signal.
     let compact = area_width < 84;
     let profile_name = if compact {
-        utils::truncate(&profile_name, 10)
+        crate::ui::helpers::truncate_to_width(&profile_name, 10)
     } else {
         profile_name
     };
 
-    let uptime = format_uptime(since.elapsed().map_or(0, |d| d.as_secs()));
+    let uptime = format_uptime(primary_snap.since.elapsed().map_or(0, |d| d.as_secs()));
 
     let quality_indicator = match QualityLevel::from_metrics(
         app.runtime.latency_ms,
@@ -262,8 +252,8 @@ fn connected_line(
         .iter()
         .find(|p| p.name == profile_name)
         .map_or("", |p| match p.protocol {
-            crate::state::Protocol::WireGuard => "WG",
-            crate::state::Protocol::OpenVPN => "OVPN",
+            crate::profile::ProtocolKind::WireGuard => "WG",
+            crate::profile::ProtocolKind::OpenVpn => "OVPN",
         });
 
     let proto_suffix = if proto_tag.is_empty() {
@@ -298,22 +288,19 @@ fn connected_line(
         ),
     ];
 
-    if !compact
-        && !app.runtime.location.is_empty()
-        && app.runtime.location != "Unknown"
-        && app.runtime.location != constants::MSG_DETECTING
-    {
+    if !compact && !constants::is_unknown(&app.runtime.location) {
         let loc_budget = (area_width as usize / 4).max(10);
         header_spans.push(Span::styled(
             " @ ",
             Style::default().fg(theme::current().text_secondary),
         ));
         header_spans.push(Span::styled(
-            utils::truncate(&app.runtime.location, loc_budget),
+            crate::ui::helpers::truncate_to_width(&app.runtime.location, loc_budget),
             Style::default().fg(theme::current().accent_primary),
         ));
     }
 
+    let details = &primary_snap.details;
     if !compact && !details.interface.is_empty() {
         header_spans.push(Span::styled(
             format!(" [{}]", details.interface),
@@ -344,38 +331,28 @@ fn connected_line(
 
 fn render_primary_line(
     app: &App,
-    primary_snap: &TunnelSnapshot,
+    primary_snap: &TunnelView,
     ks_indicator: Span<'static>,
     area_width: u16,
 ) -> Line<'static> {
-    match &primary_snap.state {
-        Connection::Disconnected { .. } => {
-            // count >= 1 with a primary snapshot but state==Disconnected
-            // is a transient window (registry entry survives a brief
-            // disconnect for journal purposes). Use the NO EXIT title —
-            // the registry has tunnels but the primary slot isn't
-            // serving as exit right now.
-            render_no_exit_line(app, ks_indicator)
-        }
-        Connection::Connecting { started_at, .. }
-        | Connection::Disconnecting { started_at, .. }
-        | Connection::Reconnecting { started_at, .. } => {
+    match primary_snap.phase {
+        Phase::Starting | Phase::Stopping | Phase::Waiting { .. } => {
             let profile_name = profile_display_name(app, &primary_snap.profile_id);
-            let elapsed = started_at.elapsed().map_or(0, |d| d.as_secs());
+            let elapsed = primary_snap.since.elapsed().map_or(0, |d| d.as_secs());
             let spinner_frames = ['◐', '◓', '◑', '◒'];
             #[allow(clippy::cast_possible_truncation)]
             let spinner = spinner_frames[(elapsed as usize) % spinner_frames.len()];
-            let action = match primary_snap.state {
-                Connection::Disconnecting { .. } => "DISCONNECTING",
-                Connection::Reconnecting { .. } => "RECONNECTING",
-                Connection::Connecting { .. }
+            let action = match primary_snap.phase {
+                Phase::Stopping => "DISCONNECTING",
+                Phase::Waiting { .. } => "RECONNECTING",
+                Phase::Starting
                     if app
                         .runtime
                         .profiles
                         .iter()
                         .find(|profile| profile.id == primary_snap.profile_id)
                         .is_some_and(|profile| {
-                            profile.protocol == crate::state::Protocol::WireGuard
+                            profile.protocol == crate::profile::ProtocolKind::WireGuard
                         }) =>
                 {
                     "HANDSHAKING"
@@ -401,7 +378,7 @@ fn render_primary_line(
                 ks_indicator,
             ])
         }
-        Connection::AwaitingUserInput { .. } => Line::from(vec![
+        Phase::AwaitingCredentials => Line::from(vec![
             Span::styled(
                 "? AWAITING INPUT",
                 Style::default()
@@ -411,24 +388,19 @@ fn render_primary_line(
             helpers::divider(),
             ks_indicator,
         ]),
-        Connection::Connected { details, since, .. } => {
-            connected_line(app, primary_snap, details, *since, ks_indicator, area_width)
-        }
+        Phase::Up => connected_line(app, primary_snap, ks_indicator, area_width),
     }
 }
 
-/// Per-state badge char + colour used in the tunnels strip. Mirrors the
+/// Per-phase badge char + colour used in the tunnels strip. Mirrors the
 /// sidebar's badge mapping so cross-surface signal stays consistent.
-/// `Disconnected` snapshots are filtered out by the caller — when a tunnel
-/// is registered but truly disconnected, it doesn't belong on the strip.
-fn strip_badge(state: &Connection) -> Option<(&'static str, Color)> {
-    match state {
-        Connection::Connected { .. } => Some(("●", theme::current().success)),
-        Connection::Connecting { .. } => Some(("…", theme::current().warning)),
-        Connection::Reconnecting { .. } => Some(("↻", theme::current().warning)),
-        Connection::Disconnecting { .. } => Some(("⏻", theme::current().warning)),
-        Connection::AwaitingUserInput { .. } => Some(("?", theme::current().warning)),
-        Connection::Disconnected { .. } => None,
+fn strip_badge(phase: Phase) -> (&'static str, Color) {
+    match phase {
+        Phase::Up => ("●", theme::current().success),
+        Phase::Starting => ("…", theme::current().warning),
+        Phase::Waiting { .. } => ("↻", theme::current().warning),
+        Phase::Stopping => ("⏻", theme::current().warning),
+        Phase::AwaitingCredentials => ("?", theme::current().warning),
     }
 }
 
@@ -454,12 +426,12 @@ fn line_display_width(line: &Line<'_>) -> usize {
 fn append_tunnels_strip(
     app: Option<&App>,
     mut line: Line<'static>,
-    snapshots: &[TunnelSnapshot],
-    primary: Option<&crate::vortix_core::profile::ProfileId>,
+    snapshots: &[&TunnelView],
+    primary: Option<&crate::profile::ProfileId>,
     area_width: u16,
 ) -> Line<'static> {
     // Order: primary first (if any), then remaining stable-sorted.
-    let mut ordered: Vec<&TunnelSnapshot> = Vec::with_capacity(snapshots.len());
+    let mut ordered: Vec<&TunnelView> = Vec::with_capacity(snapshots.len());
     if let Some(p) = primary {
         if let Some(s) = snapshots.iter().find(|s| &s.profile_id == p) {
             ordered.push(s);
@@ -471,10 +443,12 @@ fn append_tunnels_strip(
         }
     }
 
-    // Filter out Disconnected entries — they're registered but inactive.
-    let visible: Vec<(&TunnelSnapshot, &'static str, Color)> = ordered
+    let visible: Vec<(&TunnelView, &'static str, Color)> = ordered
         .iter()
-        .filter_map(|s| strip_badge(&s.state).map(|(g, c)| (*s, g, c)))
+        .map(|s| {
+            let (glyph, color) = strip_badge(s.phase);
+            (*s, glyph, color)
+        })
         .collect();
 
     if visible.is_empty() {
@@ -525,7 +499,7 @@ fn append_tunnels_strip(
 /// plus the rendered spans. Caller checks whether the result fits before
 /// committing to this density.
 fn build_strip_inner(
-    visible: &[(&TunnelSnapshot, &'static str, Color)],
+    visible: &[(&TunnelView, &'static str, Color)],
     app: Option<&App>,
 ) -> (usize, Vec<Span<'static>>) {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(visible.len() * 3);
@@ -561,7 +535,7 @@ fn build_strip_inner(
 /// Tier-2 builder: 1-char names, dropping tunnels off the end to fit and
 /// summarising the drop as ` +N`.
 fn build_narrow_strip(
-    visible: &[(&TunnelSnapshot, &'static str, Color)],
+    visible: &[(&TunnelView, &'static str, Color)],
     app: Option<&App>,
     inner_budget: usize,
 ) -> Option<Vec<Span<'static>>> {
@@ -632,7 +606,7 @@ fn build_narrow_strip(
 /// fit. Primary stays at position 0 because `visible` is already primary-
 /// first ordered.
 fn build_dotrow(
-    visible: &[(&TunnelSnapshot, &'static str, Color)],
+    visible: &[(&TunnelView, &'static str, Color)],
     inner_budget: usize,
 ) -> Option<Vec<Span<'static>>> {
     let total = visible.len();
@@ -705,10 +679,10 @@ fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>
 ///
 /// The variant names `Off` / `Auto` / `AlwaysOn` are the stable
 /// CLI/JSON contract — never renamed. The labels here are the UI
-/// vocabulary; see `vortix_core::state::killswitch` module docs for
+/// vocabulary; see `control::killswitch` docs for
 /// the mapping convention.
 fn get_killswitch_indicator(app: &App) -> Span<'static> {
-    use crate::state::{KillSwitchMode, KillSwitchState};
+    use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 
     if let Some(mode) = app.pending_control_killswitch_mode {
         let label = match mode {
@@ -720,8 +694,8 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
     }
 
     match (
-        app.registry.killswitch_mode(),
-        app.registry.killswitch_state(),
+        app.control_snapshot.kill_switch,
+        app.control_snapshot.kill_switch_state,
     ) {
         (_, KillSwitchState::Degraded) => Span::styled(
             " KS:DEGRADED ",
@@ -755,50 +729,21 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
 
 #[cfg(test)]
 mod tests {
-    //! Header rendering tests. These exercise the empty-registry and
+    //! Header rendering tests. These exercise the no-tunnel and
     //! `≥2` overflow ladder paths via `App::new_test` + direct construction
-    //! of `TunnelSnapshot` values fed to the strip builders. The strip
-    //! builders are deliberately the unit-of-test rather than the full
-    //! `render()` path because populating a real `TunnelRegistry<TunnelKind>`
-    //! requires driving the FSM through async tunnel ops — out of scope for
-    //! the rendering smoke covered here.
+    //! of `TunnelView` values fed to the strip builders, plus full
+    //! `render()` smokes seeded through `App::set_tunnels_for_test`.
     use super::*;
     use crate::app::App;
-    use crate::vortix_core::engine::state::{Connection, ConnectionHealth, DetailedConnectionInfo};
-    use crate::vortix_core::engine::{Role, TunnelSnapshot};
-    use crate::vortix_core::profile::ProfileId;
+    use crate::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
-    use std::time::SystemTime;
 
-    fn snap(name: &str, state: Connection) -> TunnelSnapshot {
-        TunnelSnapshot {
-            profile_id: ProfileId::new(name),
-            state,
-            role: Role::Addressable {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::Healthy,
-            interface_name: None,
-            started_at: None,
-        }
-    }
-
-    fn connected(name: &str) -> TunnelSnapshot {
-        let details = DetailedConnectionInfo {
-            interface: format!("utun-{name}"),
-            ..Default::default()
-        };
-        snap(
-            name,
-            Connection::Connected {
-                profile_id: ProfileId::new(name),
-                since: SystemTime::now(),
-                health: ConnectionHealth::Healthy,
-                details: Box::new(details),
-            },
-        )
+    fn up_view(name: &str) -> crate::control::TunnelView {
+        let mut view = crate::app::connection::test_view(name, crate::control::Phase::Up);
+        view.details.interface = format!("utun-{name}");
+        view
     }
 
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
@@ -821,34 +766,24 @@ mod tests {
         out
     }
 
-    fn app_handshaking(protocol: crate::state::Protocol) -> App {
+    fn app_handshaking(protocol: crate::profile::ProtocolKind) -> App {
         let mut app = App::new_test();
-        app.runtime.profiles.push(crate::state::VpnProfile {
-            id: ProfileId::new("corp"),
-            name: "corp".into(),
-            protocol,
-            config_path: "/tmp/corp.conf".into(),
-            location: String::new(),
-            last_used: None,
-        });
-        let profile_id = ProfileId::new("corp");
-        let tunnel = crate::vortix_core::engine::TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: crate::vortix_core::engine::Connection::Connecting {
-                profile_id: profile_id.clone(),
-                started_at: std::time::SystemTime::UNIX_EPOCH,
-                attempt: 1,
-                retry_budget_remaining: std::time::Duration::ZERO,
-            },
-            role: crate::vortix_core::engine::Role::Addressable {
-                allowed_ips: Vec::new(),
-            },
-            health: crate::vortix_core::engine::ConnectionHealth::Unknown,
-            interface_name: None,
-            started_at: Some(std::time::SystemTime::UNIX_EPOCH),
-        };
-        app.registry.replace_control_projection(
-            &std::collections::BTreeMap::from([(profile_id, tunnel)]),
+        app.runtime
+            .profiles
+            .push(crate::config::profiles::VpnProfile {
+                id: ProfileId::new("corp"),
+                name: "corp".into(),
+                protocol,
+                config_path: "/tmp/corp.conf".into(),
+                location: String::new(),
+                last_used: None,
+                group: None,
+            });
+        app.set_tunnels_for_test(
+            vec![crate::app::connection::test_view(
+                "corp",
+                crate::control::Phase::Starting,
+            )],
             None,
         );
         app
@@ -856,11 +791,19 @@ mod tests {
 
     #[test]
     fn compact_header_uses_protocol_specific_connect_label() {
-        let wg = render_to_string(&app_handshaking(crate::state::Protocol::WireGuard), 80, 1);
+        let wg = render_to_string(
+            &app_handshaking(crate::profile::ProtocolKind::WireGuard),
+            80,
+            1,
+        );
         assert!(wg.contains("HANDSHAKING"), "{wg}");
         assert!(!wg.contains("NO EXIT"), "{wg}");
 
-        let ovpn = render_to_string(&app_handshaking(crate::state::Protocol::OpenVPN), 80, 1);
+        let ovpn = render_to_string(
+            &app_handshaking(crate::profile::ProtocolKind::OpenVpn),
+            80,
+            1,
+        );
         assert!(ovpn.contains("CONNECTING"), "{ovpn}");
         assert!(!ovpn.contains("HANDSHAKING"), "{ovpn}");
     }
@@ -888,11 +831,9 @@ mod tests {
     #[test]
     fn connected_header_keeps_kill_switch_visible_at_80_columns() {
         let mut app = App::new_test();
-        let snapshot = connected("a-very-long-profile-name");
-        let profile_id = snapshot.profile_id.clone();
-        app.registry.replace_control_projection(
-            &std::collections::BTreeMap::from([(profile_id.clone(), snapshot)]),
-            Some(profile_id),
+        app.set_tunnels_for_test(
+            vec![up_view("a-very-long-profile-name")],
+            Some(ProfileId::new("a-very-long-profile-name")),
         );
 
         let out = render_to_string(&app, 80, 1);
@@ -903,7 +844,8 @@ mod tests {
     #[test]
     fn pending_kill_switch_target_is_visible_in_the_header() {
         let mut app = App::new_test();
-        app.pending_control_killswitch_mode = Some(crate::state::KillSwitchMode::AlwaysOn);
+        app.pending_control_killswitch_mode =
+            Some(crate::control::killswitch::KillSwitchMode::AlwaysOn);
         assert_eq!(
             get_killswitch_indicator(&app).content.as_ref(),
             " KS:VPN-only… "
@@ -914,14 +856,9 @@ mod tests {
     fn hidden_mode_label_leaves_multi_tunnel_strip_visible() {
         let mut app = App::new_test();
         let tunnels = (0..6)
-            .map(|index| {
-                let snapshot = connected(&format!("tunnel-{index}"));
-                (snapshot.profile_id.clone(), snapshot)
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let primary = ProfileId::new("tunnel-0");
-        app.registry
-            .replace_control_projection(&tunnels, Some(primary));
+            .map(|index| up_view(&format!("tunnel-{index}")))
+            .collect();
+        app.set_tunnels_for_test(tunnels, Some(ProfileId::new("tunnel-0")));
 
         let out = render_to_string(&app, 80, 1);
         assert!(!out.contains("Standard"), "{out}");
@@ -932,14 +869,11 @@ mod tests {
     }
 
     #[test]
-    fn kill_switch_indicator_reads_registry_when_runtime_mirror_diverges() {
+    fn kill_switch_indicator_reads_the_snapshot() {
         let mut app = App::new_test();
-        app.runtime.killswitch_mode = crate::state::KillSwitchMode::Off;
-        app.runtime.killswitch_state = crate::state::KillSwitchState::Disabled;
-        app.registry
-            .set_killswitch_mode(crate::state::KillSwitchMode::AlwaysOn);
-        app.registry
-            .set_killswitch_state(crate::state::KillSwitchState::Degraded);
+        let snapshot = std::sync::Arc::make_mut(&mut app.control_snapshot);
+        snapshot.kill_switch = crate::control::killswitch::KillSwitchMode::AlwaysOn;
+        snapshot.kill_switch_state = crate::control::killswitch::KillSwitchState::Degraded;
         assert_eq!(
             get_killswitch_indicator(&app).content.as_ref(),
             " KS:DEGRADED "
@@ -949,7 +883,17 @@ mod tests {
     // ─────────── State 0: no tunnels → ⚠ Real ───────────
 
     #[test]
-    fn empty_registry_renders_disconnected_title_and_real_ip() {
+    fn disconnected_header_prefers_the_real_address_over_a_stale_exit() {
+        let mut app = App::new_test();
+        app.runtime.public_ip = "139.59.71.126".to_string();
+        app.runtime.real_ip = Some("203.0.113.7".to_string());
+        let out = render_to_string(&app, 100, 1);
+        assert!(out.contains("203.0.113.7"), "{out}");
+        assert!(!out.contains("139.59.71.126"), "{out}");
+    }
+
+    #[test]
+    fn no_tunnels_renders_disconnected_title_and_real_ip() {
         // 0-tunnel state surfaces the explicit `○ DISCONNECTED` title
         // alongside the Real: IP. The title was removed by the header
         // header redesign and restored after user feedback — the
@@ -1033,9 +977,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_does_not_emit_tunnels_label() {
+    fn no_tunnels_does_not_emit_tunnels_label() {
         let app = App::new_test();
-        assert_eq!(app.registry.tunnel_count(), 0);
+        assert_eq!(app.tunnel_count(), 0);
         let out = render_to_string(&app, 80, 1);
         assert!(!out.contains("Tunnels"), "got:\n{out}");
     }
@@ -1044,10 +988,13 @@ mod tests {
 
     #[test]
     fn strip_full_names_when_budget_is_ample() {
-        let snaps = [connected("corp"), connected("lab"), connected("home")];
+        let snaps = [up_view("corp"), up_view("lab"), up_view("home")];
         let visible: Vec<_> = snaps
             .iter()
-            .filter_map(|s| strip_badge(&s.state).map(|(g, c)| (s, g, c)))
+            .map(|s| {
+                let (g, c) = strip_badge(s.phase);
+                (s, g, c)
+            })
             .collect();
         let (width, spans) = build_strip_inner(&visible, None);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1059,10 +1006,13 @@ mod tests {
 
     #[test]
     fn narrow_strip_drops_overflow_with_plus_n() {
-        let snaps: Vec<TunnelSnapshot> = (0..5).map(|i| connected(&format!("tunnel{i}"))).collect();
+        let snaps: Vec<TunnelView> = (0..5).map(|i| up_view(&format!("tunnel{i}"))).collect();
         let visible: Vec<_> = snaps
             .iter()
-            .filter_map(|s| strip_badge(&s.state).map(|(g, c)| (s, g, c)))
+            .map(|s| {
+                let (g, c) = strip_badge(s.phase);
+                (s, g, c)
+            })
             .collect();
         // Budget tight enough that only ~2 fit.
         let spans = build_narrow_strip(&visible, None, 10).expect("some fit");
@@ -1075,13 +1025,16 @@ mod tests {
         // Primary appears first in `visible` because the caller orders it
         // that way; verify the dot-row builder doesn't reorder.
         let snaps = [
-            connected("primary"),
-            connected("secondary1"),
-            connected("secondary2"),
+            up_view("primary"),
+            up_view("secondary1"),
+            up_view("secondary2"),
         ];
         let visible: Vec<_> = snaps
             .iter()
-            .filter_map(|s| strip_badge(&s.state).map(|(g, c)| (s, g, c)))
+            .map(|s| {
+                let (g, c) = strip_badge(s.phase);
+                (s, g, c)
+            })
             .collect();
         let spans = build_dotrow(&visible, 10).expect("fits");
         // First non-separator span should be the primary's badge char.
@@ -1096,9 +1049,10 @@ mod tests {
     fn append_strip_skips_when_budget_too_small() {
         // Width 5 leaves no room for `│ [●] ` after even a tiny prefix.
         let base = Line::from(vec![Span::raw("XXX")]);
-        let snaps = vec![connected("a"), connected("b")];
+        let snaps = [up_view("a"), up_view("b")];
         let pid = ProfileId::new("a");
-        let out = append_tunnels_strip(None, base.clone(), &snaps, Some(&pid), 5);
+        let refs: Vec<&TunnelView> = snaps.iter().collect();
+        let out = append_tunnels_strip(None, base.clone(), &refs, Some(&pid), 5);
         // No new spans appended.
         assert_eq!(
             out.spans.len(),
@@ -1110,30 +1064,13 @@ mod tests {
     #[test]
     fn append_strip_emits_label_at_wide_widths() {
         let base = Line::from(vec![Span::raw("PRIMARY-LINE")]);
-        let snaps = vec![connected("alpha"), connected("bravo")];
+        let snaps = [up_view("alpha"), up_view("bravo")];
         let pid = ProfileId::new("alpha");
-        let out = append_tunnels_strip(None, base, &snaps, Some(&pid), 200);
+        let refs: Vec<&TunnelView> = snaps.iter().collect();
+        let out = append_tunnels_strip(None, base, &refs, Some(&pid), 200);
         let text: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Tunnels:"), "expected label, got:\n{text}");
         assert!(text.contains("alpha"), "expected alpha name, got:\n{text}");
         assert!(text.contains("bravo"), "expected bravo name, got:\n{text}");
-    }
-
-    #[test]
-    fn append_strip_drops_disconnected_entries() {
-        let mut disc = connected("ghost");
-        disc.state = Connection::Disconnected { last_failure: None };
-        let snaps = vec![connected("alpha"), disc];
-        let pid = ProfileId::new("alpha");
-        let out = append_tunnels_strip(
-            None,
-            Line::from(vec![Span::raw("X")]),
-            &snaps,
-            Some(&pid),
-            200,
-        );
-        let text: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("alpha"), "alpha kept: {text}");
-        assert!(!text.contains("ghost"), "ghost dropped: {text}");
     }
 }

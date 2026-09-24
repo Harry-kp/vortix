@@ -1,0 +1,783 @@
+//! DNS inspection and policy ports.
+//!
+//! Protocol adapters report requested resolvers; this module computes one
+//! protocol-neutral policy from the current tunnel roles. Platform adapters
+//! are the only writers of resolver state.
+
+use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::config::owned_file;
+use crate::profile::ProfileId;
+
+/// Resolver settings requested by one protocol profile or live session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsRequest {
+    pub servers: Vec<IpAddr>,
+    #[serde(default)]
+    pub search_domains: Vec<String>,
+}
+
+impl DnsRequest {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+}
+
+/// The kernel-derived routing role of a connected tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DnsTunnelRole {
+    Primary,
+    Secondary,
+}
+
+/// All policy inputs for one connected tunnel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsTunnelIntent {
+    pub profile_id: ProfileId,
+    pub interface: String,
+    pub role: DnsTunnelRole,
+    pub request: DnsRequest,
+}
+
+/// Capabilities of the selected platform DNS backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsPlatformCapabilities {
+    /// The backend can route named DNS suffixes to a secondary tunnel.
+    pub scoped_domains: bool,
+}
+
+/// Effective resolver scope assigned to one tunnel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DnsScope {
+    /// Resolve all names through the primary tunnel.
+    CatchAll,
+    /// Resolve only the listed suffixes through this secondary tunnel.
+    Scoped { domains: Vec<String> },
+    /// Do not register this tunnel's requested resolver globally.
+    Suppressed,
+}
+
+/// One entry in a complete desired DNS policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsAssignment {
+    pub profile_id: ProfileId,
+    pub interface: String,
+    pub servers: Vec<IpAddr>,
+    /// Normalized suffixes the resolver should use for unqualified names.
+    /// This is independent of routing scope: a catch-all primary may still
+    /// provide search domains, while a secondary uses them as scoped routes.
+    #[serde(default)]
+    pub search_domains: Vec<String>,
+    pub scope: DnsScope,
+}
+
+/// A complete resolver policy for one monotonic desired generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsPolicy {
+    pub generation: u64,
+    pub assignments: Vec<DnsAssignment>,
+}
+
+impl DnsPolicy {
+    /// Compute a complete policy. At most one tunnel may own catch-all DNS.
+    pub fn compute(
+        generation: u64,
+        intents: &[DnsTunnelIntent],
+        capabilities: DnsPlatformCapabilities,
+    ) -> Result<Self, DnsPolicyError> {
+        let primary_count = intents
+            .iter()
+            .filter(|intent| intent.role == DnsTunnelRole::Primary)
+            .count();
+        if primary_count > 1 {
+            return Err(DnsPolicyError::MultiplePrimaries);
+        }
+
+        let mut assignments = intents
+            .iter()
+            .filter(|intent| !intent.request.is_empty())
+            .map(|intent| {
+                let scope = match intent.role {
+                    DnsTunnelRole::Primary => DnsScope::CatchAll,
+                    DnsTunnelRole::Secondary if capabilities.scoped_domains => {
+                        let domains = normalized_domains(&intent.request.search_domains);
+                        if domains.is_empty() {
+                            DnsScope::Suppressed
+                        } else {
+                            DnsScope::Scoped { domains }
+                        }
+                    }
+                    DnsTunnelRole::Secondary => DnsScope::Suppressed,
+                };
+                DnsAssignment {
+                    profile_id: intent.profile_id.clone(),
+                    interface: intent.interface.clone(),
+                    servers: intent.request.servers.clone(),
+                    search_domains: normalized_domains(&intent.request.search_domains),
+                    scope,
+                }
+            })
+            .collect::<Vec<_>>();
+        assignments.sort_by(|a, b| a.profile_id.as_str().cmp(b.profile_id.as_str()));
+        Ok(Self {
+            generation,
+            assignments,
+        })
+    }
+
+    /// Compare desired content while ignoring its generation number.
+    #[must_use]
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.assignments == other.assignments
+    }
+}
+
+fn normalized_domains(domains: &[String]) -> Vec<String> {
+    let mut domains = domains
+        .iter()
+        .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
+        .collect::<Vec<_>>();
+    domains.sort();
+    domains.dedup();
+    domains
+}
+
+/// A platform resource created by Vortix for one desired generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsOwnedResource {
+    pub generation: u64,
+    pub id: String,
+    pub profile_id: ProfileId,
+    pub interface: String,
+}
+
+/// Truthful result of applying or releasing one desired generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DnsEffectiveStatus {
+    Released,
+    Applied,
+    Degraded,
+}
+
+/// Requested, effective, and ownership truth retained for reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsEffectiveState {
+    pub requested_generation: u64,
+    pub applied_generation: Option<u64>,
+    pub status: DnsEffectiveStatus,
+    pub owned: Vec<DnsOwnedResource>,
+    pub errors: Vec<String>,
+}
+
+impl Default for DnsEffectiveState {
+    fn default() -> Self {
+        Self {
+            requested_generation: 0,
+            applied_generation: None,
+            status: DnsEffectiveStatus::Released,
+            owned: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+}
+
+/// Platform mutation seam consumed by the global policy coordinator.
+pub trait DnsPolicyAdapter {
+    fn capabilities(&self) -> DnsPlatformCapabilities;
+
+    fn apply(
+        &self,
+        desired: &DnsPolicy,
+        previous_desired: Option<&DnsPolicy>,
+        previous_effective: &DnsEffectiveState,
+    ) -> DnsEffectiveState;
+
+    /// Prove that the platform still matches an already-applied policy
+    /// without mutating resolver state.
+    fn verify(&self, desired: &DnsPolicy, effective: &DnsEffectiveState)
+        -> Result<(), Vec<String>>;
+}
+
+const DNS_PROOF_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// Monotonic DNS coordinator state shared by the CLI and TUI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsPolicyCoordinator {
+    desired: Option<DnsPolicy>,
+    effective: DnsEffectiveState,
+    #[serde(default)]
+    verified_generation: Option<u64>,
+    #[serde(default)]
+    verified_digest: Option<u64>,
+    #[serde(default)]
+    verified_at_unix_ms: Option<u64>,
+    #[serde(skip)]
+    verified_at_monotonic: Option<Instant>,
+    /// Persisted user-owned state is useful as advisory intent, but must not
+    /// authorize cleanup or rollback of privileged platform resources.
+    #[serde(skip)]
+    runtime_authority: bool,
+}
+
+impl Default for DnsPolicyCoordinator {
+    fn default() -> Self {
+        Self {
+            desired: None,
+            effective: DnsEffectiveState::default(),
+            verified_generation: None,
+            verified_digest: None,
+            verified_at_unix_ms: None,
+            verified_at_monotonic: None,
+            runtime_authority: true,
+        }
+    }
+}
+
+impl DnsPolicyCoordinator {
+    #[must_use]
+    pub fn desired(&self) -> Option<&DnsPolicy> {
+        self.desired.as_ref()
+    }
+
+    #[must_use]
+    pub fn effective(&self) -> &DnsEffectiveState {
+        &self.effective
+    }
+
+    /// Persisted effective state is recovery evidence, never fresh platform
+    /// verification. Force the next reconcile to reapply/read back.
+    pub fn invalidate_effective(&mut self, reason: impl Into<String>) {
+        self.effective.status = DnsEffectiveStatus::Degraded;
+        self.effective.errors = vec![reason.into()];
+        self.clear_verification();
+    }
+
+    /// Strip all privileged ownership claims after loading user-controlled
+    /// persisted state. Desired intent remains advisory for recovery.
+    pub fn discard_persisted_authority(&mut self) {
+        self.runtime_authority = false;
+        self.effective.applied_generation = None;
+        self.effective.owned.clear();
+        self.invalidate_effective("persisted DNS state requires platform read-back");
+    }
+
+    /// Force a read-only platform proof on the next unchanged reconcile.
+    pub fn invalidate_verification(&mut self) {
+        self.clear_verification();
+    }
+
+    /// Recompute and apply the entire policy. Identical effective content is
+    /// a no-op; degraded content is retried without inventing a generation.
+    pub fn reconcile<A: DnsPolicyAdapter>(
+        &mut self,
+        intents: &[DnsTunnelIntent],
+        adapter: &A,
+    ) -> Result<&DnsEffectiveState, DnsPolicyError> {
+        self.reconcile_durable(intents, adapter, |_| Ok::<(), std::convert::Infallible>(()))
+    }
+
+    /// Reconcile with a write-ahead desired record and a durable effective
+    /// receipt. No platform mutation occurs unless the pending generation is
+    /// safely persisted first.
+    ///
+    /// # Panics
+    /// Never in practice: the desired record is installed before it is read.
+    pub fn reconcile_durable<A, F, E>(
+        &mut self,
+        intents: &[DnsTunnelIntent],
+        adapter: &A,
+        mut persist: F,
+    ) -> Result<&DnsEffectiveState, DnsPolicyError>
+    where
+        A: DnsPolicyAdapter,
+        F: FnMut(&Self) -> Result<(), E>,
+        E: std::fmt::Display,
+    {
+        let next_generation = self
+            .desired
+            .as_ref()
+            .map_or(1, |policy| policy.generation.saturating_add(1));
+        let candidate = DnsPolicy::compute(next_generation, intents, adapter.capabilities())?;
+
+        let unchanged = self
+            .desired
+            .as_ref()
+            .is_some_and(|current| current.same_content(&candidate));
+        if unchanged && self.effective.status != DnsEffectiveStatus::Degraded {
+            let desired = self.desired.as_ref().expect("unchanged policy exists");
+            if self.has_fresh_proof(desired) {
+                return Ok(&self.effective);
+            }
+            match adapter.verify(desired, &self.effective) {
+                Ok(()) => self.record_verification(),
+                Err(errors) => {
+                    self.effective.status = DnsEffectiveStatus::Degraded;
+                    self.effective.errors = errors;
+                    self.clear_verification();
+                }
+            }
+            persist(self).map_err(|error| {
+                self.mark_persistence_failure(format!("persist DNS verification: {error}"));
+                DnsPolicyError::Persistence(error.to_string())
+            })?;
+            return Ok(&self.effective);
+        }
+
+        let desired = if unchanged {
+            self.desired.clone().expect("unchanged policy exists")
+        } else {
+            candidate
+        };
+        let previous_desired = self.desired.clone();
+        let previous_effective = self.effective.clone();
+        let previous_authority = self.runtime_authority;
+
+        // Write-ahead state is deliberately degraded: it records intent but
+        // never claims that a privileged platform mutation completed.
+        self.desired = Some(desired);
+        self.effective.requested_generation = self
+            .desired
+            .as_ref()
+            .expect("desired policy was installed")
+            .generation;
+        self.effective.status = DnsEffectiveStatus::Degraded;
+        self.effective.errors = vec!["DNS policy generation pending platform apply".into()];
+        self.clear_verification();
+        if let Err(error) = persist(self) {
+            self.mark_persistence_failure(format!("persist DNS write-ahead: {error}"));
+            return Err(DnsPolicyError::Persistence(error.to_string()));
+        }
+
+        let desired = self.desired.clone().expect("desired policy was installed");
+        let trusted_previous = previous_authority
+            .then_some(previous_desired.as_ref())
+            .flatten();
+        let effective = adapter.apply(&desired, trusted_previous, &previous_effective);
+        self.effective = effective;
+        self.runtime_authority = true;
+        if matches!(
+            self.effective.status,
+            DnsEffectiveStatus::Applied | DnsEffectiveStatus::Released
+        ) {
+            self.record_verification();
+        }
+
+        if let Err(error) = persist(self) {
+            let rollback_policy = previous_desired.clone().unwrap_or_else(|| DnsPolicy {
+                generation: desired.generation.saturating_add(1),
+                assignments: Vec::new(),
+            });
+            let rollback = adapter.apply(&rollback_policy, Some(&desired), &self.effective);
+            self.desired = previous_desired;
+            self.effective = rollback;
+            self.runtime_authority = previous_authority;
+            self.mark_persistence_failure(format!(
+                "persist DNS effective receipt: {error}; platform rollback attempted"
+            ));
+            let _ = persist(self);
+            return Err(DnsPolicyError::Persistence(error.to_string()));
+        }
+        Ok(&self.effective)
+    }
+
+    fn has_fresh_proof(&self, desired: &DnsPolicy) -> bool {
+        self.verified_generation == Some(desired.generation)
+            && self.verified_digest == Some(policy_digest(desired))
+            && self.verified_at_unix_ms.is_some()
+            && self
+                .verified_at_monotonic
+                .is_some_and(|verified| verified.elapsed() <= DNS_PROOF_MAX_AGE)
+    }
+
+    fn record_verification(&mut self) {
+        let Some(desired) = self.desired.as_ref() else {
+            return;
+        };
+        self.verified_generation = Some(desired.generation);
+        self.verified_digest = Some(policy_digest(desired));
+        self.verified_at_unix_ms = Some(now_unix_ms());
+        self.verified_at_monotonic = Some(Instant::now());
+    }
+
+    fn clear_verification(&mut self) {
+        self.verified_generation = None;
+        self.verified_digest = None;
+        self.verified_at_unix_ms = None;
+        self.verified_at_monotonic = None;
+    }
+
+    fn mark_persistence_failure(&mut self, error: String) {
+        self.effective.status = DnsEffectiveStatus::Degraded;
+        self.effective.errors = vec![error];
+        self.clear_verification();
+    }
+}
+
+pub(crate) fn now_unix_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn policy_digest(policy: &DnsPolicy) -> u64 {
+    let bytes = serde_json::to_vec(policy).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Pure policy validation error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DnsPolicyError {
+    #[error("DNS policy has more than one primary tunnel")]
+    MultiplePrimaries,
+    #[error("DNS policy persistence failed: {0}")]
+    Persistence(String),
+}
+
+/// One resolver address as a system tool prints it: `192.168.1.100`,
+/// `fe80::1`, or `fe80::1%wlp3s0`.
+///
+/// Returns the token unchanged when it parses as an address, so a scoped
+/// IPv6 keeps its zone — the zone is the part that makes a link-local
+/// resolver identifiable at all.
+fn parse_resolver_address(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let (address, zone) = token.split_once('%').unwrap_or((token, ""));
+    let parsed: std::net::IpAddr = address.parse().ok()?;
+    if parsed.is_unspecified() {
+        return None;
+    }
+    if token.contains('%') && zone.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+/// A link-local resolver is real but says nothing a reader can act on, so a
+/// routable address configured on the same link wins. Falling back to the
+/// link-local keeps the honest answer when it is the only one there.
+fn is_link_local_resolver(address: &str) -> bool {
+    let base = address.split('%').next().unwrap_or(address);
+    match base.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_link_local(),
+        // `fe80::/10`. `Ipv6Addr::is_unicast_link_local` is still unstable.
+        Ok(std::net::IpAddr::V6(v6)) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        Err(_) => false,
+    }
+}
+
+/// Pick the resolver worth reporting from candidates in configured order.
+pub(crate) fn preferred_resolver<I>(candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut link_local = None;
+    for candidate in candidates {
+        let Some(address) = parse_resolver_address(&candidate) else {
+            continue;
+        };
+        if is_link_local_resolver(&address) {
+            link_local = link_local.or(Some(address));
+        } else {
+            return Some(address);
+        }
+    }
+    link_local
+}
+
+/// Read the first usable `nameserver` out of `resolv.conf` content.
+pub(crate) fn parse_resolv_conf_server(content: &str) -> Option<String> {
+    let candidates = content.lines().filter_map(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed.strip_prefix("nameserver")?;
+        // `nameserver` must be its own field, not a prefix of a longer key.
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest.split_whitespace().next().map(ToOwned::to_owned)
+    });
+    preferred_resolver(candidates)
+}
+
+// === Persisted policy receipt ===
+
+const DNS_POLICY_STATE_FILE: &str = "dns-policy.state";
+const DNS_POLICY_LOCK_FILE: &str = "dns-policy.lock";
+const DNS_POLICY_SCHEMA: u8 = 2;
+
+/// Serialize all DNS policy writers across CLI and TUI processes. This lock
+/// is intentionally distinct from the lifecycle lock so a CLI command that
+/// already owns lifecycle authority cannot self-deadlock.
+pub fn acquire_policy_lock(config_dir: &Path) -> std::io::Result<std::fs::File> {
+    acquire_policy_lock_with_hook(config_dir, || {})
+}
+
+fn acquire_policy_lock_with_hook(
+    config_dir: &Path,
+    after_pin: impl FnOnce(),
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+
+    let (directory, uid, gid) = owned_file::pin_user_dir(config_dir)?;
+    after_pin();
+    let file = owned_file::open_owned_lock(&directory, DNS_POLICY_LOCK_FILE, uid, gid)
+        .map_err(std::io::Error::other)?;
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc == 0 {
+        Ok(file)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedDnsPolicy {
+    schema: u8,
+    coordinator: DnsPolicyCoordinator,
+}
+
+#[must_use]
+pub fn load_policy(config_dir: &Path) -> Option<DnsPolicyCoordinator> {
+    let content = std::fs::read_to_string(config_dir.join(DNS_POLICY_STATE_FILE)).ok()?;
+    let persisted: PersistedDnsPolicy = serde_json::from_str(&content).ok()?;
+    if persisted.schema != DNS_POLICY_SCHEMA {
+        return None;
+    }
+    let mut coordinator = persisted.coordinator;
+    coordinator.discard_persisted_authority();
+    Some(coordinator)
+}
+
+pub fn save_policy(config_dir: &Path, coordinator: &DnsPolicyCoordinator) -> std::io::Result<()> {
+    let state = PersistedDnsPolicy {
+        schema: DNS_POLICY_SCHEMA,
+        coordinator: coordinator.clone(),
+    };
+    let content = serde_json::to_vec_pretty(&state).map_err(std::io::Error::other)?;
+    atomic_write_user_file_with_hook(config_dir, &content, || {})
+}
+
+fn atomic_write_user_file_with_hook(
+    config_dir: &Path,
+    content: &[u8],
+    after_pin: impl FnOnce(),
+) -> std::io::Result<()> {
+    let (directory, uid, gid) = owned_file::pin_user_dir(config_dir)?;
+    after_pin();
+    owned_file::write_owned_atomic(&directory, DNS_POLICY_STATE_FILE, content, uid, gid)
+        .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn resolv_conf_reports_the_first_nameserver() {
+        let content = "# Generated by NetworkManager\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n";
+        assert_eq!(
+            parse_resolv_conf_server(content),
+            Some("1.1.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_ignores_unparseable_and_unspecified_entries() {
+        let content =
+            "nameserver\nnameserver 0.0.0.0\nnameserver not-an-address\nnameserver 9.9.9.9\n";
+        assert_eq!(
+            parse_resolv_conf_server(content),
+            Some("9.9.9.9".to_string())
+        );
+        assert_eq!(parse_resolv_conf_server("search example.com\n"), None);
+    }
+
+    #[test]
+    fn a_scoped_address_missing_its_zone_is_not_a_resolver() {
+        assert_eq!(parse_resolver_address("fe80::1%"), None);
+        assert_eq!(parse_resolver_address("fe80"), None);
+        assert_eq!(parse_resolver_address("::"), None);
+        assert_eq!(
+            parse_resolver_address(" 2606:4700:4700::1111 "),
+            Some("2606:4700:4700::1111".to_string())
+        );
+    }
+
+    #[test]
+    fn policy_lock_serializes_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = acquire_policy_lock(temp.path()).unwrap();
+        let path = temp.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let second = acquire_policy_lock(&path).unwrap();
+            tx.send(()).unwrap();
+            drop(second);
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            rx.try_recv().is_err(),
+            "second writer bypassed DNS policy lock"
+        );
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn policy_lock_never_follows_a_precreated_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        symlink(&victim, temp.path().join("dns-policy.lock")).unwrap();
+
+        assert!(acquire_policy_lock(temp.path()).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn symlinked_config_directory_is_rejected_for_save_and_lock() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("sentinel"), b"unchanged").unwrap();
+        let config = temp.path().join("config");
+        symlink(&victim, &config).unwrap();
+
+        assert!(save_policy(&config, &DnsPolicyCoordinator::default()).is_err());
+        assert!(acquire_policy_lock(&config).is_err());
+        assert_eq!(
+            std::fs::read(victim.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+        assert!(!victim.join(DNS_POLICY_STATE_FILE).exists());
+        assert!(!victim.join("dns-policy.lock").exists());
+    }
+
+    #[test]
+    fn pinned_directory_survives_path_swap_without_touching_victim() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let pinned = temp.path().join("pinned");
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+
+        atomic_write_user_file_with_hook(&config, b"pinned state", || {
+            std::fs::rename(&config, &pinned).unwrap();
+            symlink(&victim, &config).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(pinned.join(DNS_POLICY_STATE_FILE)).unwrap(),
+            b"pinned state"
+        );
+        assert!(!victim.join(DNS_POLICY_STATE_FILE).exists());
+    }
+
+    #[test]
+    fn policy_lock_uses_pinned_directory_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let pinned = temp.path().join("pinned");
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+
+        let lock = acquire_policy_lock_with_hook(&config, || {
+            std::fs::rename(&config, &pinned).unwrap();
+            symlink(&victim, &config).unwrap();
+        })
+        .unwrap();
+
+        assert!(pinned.join("dns-policy.lock").exists());
+        assert!(!victim.join("dns-policy.lock").exists());
+        drop(lock);
+    }
+    #[test]
+    fn round_trip_is_atomic_and_owner_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let coordinator = DnsPolicyCoordinator::default();
+        save_policy(temp.path(), &coordinator).unwrap();
+        let loaded = load_policy(temp.path()).unwrap();
+        assert_eq!(
+            loaded.effective().status,
+            crate::control::dns::DnsEffectiveStatus::Degraded
+        );
+        assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+    }
+
+    #[test]
+    fn attacker_symlink_at_legacy_temp_name_is_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"do not overwrite").unwrap();
+        let trap = temp.path().join("dns-policy.state.tmp");
+        symlink(&victim, &trap).unwrap();
+
+        save_policy(temp.path(), &DnsPolicyCoordinator::default()).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not overwrite");
+        assert_eq!(std::fs::read_link(&trap).unwrap(), victim);
+    }
+
+    #[test]
+    fn user_owned_state_cannot_restore_privileged_ownership_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        save_policy(temp.path(), &DnsPolicyCoordinator::default()).unwrap();
+        let path = temp.path().join(DNS_POLICY_STATE_FILE);
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let attacker_profile = crate::profile::ProfileId::parse("a".repeat(64)).unwrap();
+        state["coordinator"]["effective"]["applied_generation"] = serde_json::json!(7);
+        state["coordinator"]["effective"]["status"] = serde_json::json!("Applied");
+        state["coordinator"]["effective"]["owned"] = serde_json::json!([{
+            "generation": 7,
+            "id": "resolved:eth0",
+            "profile_id": attacker_profile,
+            "interface": "eth0"
+        }]);
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let loaded = load_policy(temp.path()).unwrap();
+        assert_eq!(loaded.effective().applied_generation, None);
+        assert!(loaded.effective().owned.is_empty());
+        assert_eq!(
+            loaded.effective().status,
+            crate::control::dns::DnsEffectiveStatus::Degraded
+        );
+    }
+}

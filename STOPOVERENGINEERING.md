@@ -18,12 +18,12 @@ Before adding any function, trait, type, or dependency, search for what already 
 rg -i "parse_config|load_config|from_toml" --type rust
 
 # 2. Existing impls and traits
-rg "^impl " -n src/ | rg -i "config"
-rg "^pub (fn|struct|enum|trait)" -n src/
+rg "^impl " -n crates/vortix/src/ | rg -i "config"
+rg "^pub (fn|struct|enum|trait)" -n crates/vortix/src/
 
 # 3. What the crate already re-exports
-cat src/lib.rs          # pub use / pub mod — the real public surface
-rg "pub use" -n src/
+cat crates/vortix/src/lib.rs    # pub use / pub mod — the real public surface
+rg "pub use" -n crates/vortix/src/
 
 # 4. Dependencies you already have (use these before writing anything)
 cat Cargo.toml
@@ -45,8 +45,8 @@ State the result explicitly:
    `checked_*`, `matches!`, `Option`/`Result` combinators.
 2. **Crates already in `Cargo.toml`** — if `itertools`, `serde`, `regex`, `chrono`,
    `rayon`, or `anyhow` is already there, use it.
-3. **This crate's own helpers** — `utils/`, `common/`, `internal/`, plus whatever
-   `lib.rs` re-exports.
+3. **This crate's own helpers** — there is no `utils`; CLAUDE.md "Where things
+   live" names the owner of each concept.
 4. **Then, and only then**, write something new.
 
 **Never add a dependency without asking.** New crates mean compile time, audit surface,
@@ -139,17 +139,13 @@ alternative (std or an existing dep), and wait.
 
 ## Correctness gates
 
-Before presenting work, run and report:
-
-```bash
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo fmt --check   # only files you touched should appear
-```
+Before presenting work, run `scripts/ci-local.sh` (what CI runs; see
+`docs/ci-parity.md` for why each step exists) and report its tail. Bare
+`cargo clippy` / `cargo fmt --check` skip test code and workspace members.
 
 - Fix clippy findings in code you wrote. **Never** silence one with `#[allow(...)]` —
   if a lint seems genuinely wrong here, say so and leave it failing for me to decide.
+  Under `/fix-bug`, that means stop and report.
 - Do not `#[allow(dead_code)]` something instead of deleting it.
 - If it does not compile, say so plainly. Do not present untested code as working.
 
@@ -196,12 +192,13 @@ Say so explicitly and justify it in one or two sentences. Valid reasons:
 
 ## Response format
 
-End every implementation with:
+Under `/fix-bug`, the skill's report format wins. Otherwise, end every
+implementation with:
 
 - **Reused:** existing items used, with `path:line`
 - **Added:** new files / functions / types, with line counts and any new `pub` surface
 - **Skipped:** complexity deliberately left out
-- **Checks:** results of `cargo check` / `clippy` / `test`
+- **Checks:** the tail of `scripts/ci-local.sh`
 - **Noticed:** unrelated issues, one line each, not fixed
 
 Be direct. If I ask for something over-engineered, say so and propose the simpler version

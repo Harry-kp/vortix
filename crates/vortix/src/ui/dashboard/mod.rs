@@ -7,7 +7,7 @@ mod sidebar;
 
 use super::helpers::centered_rect;
 use crate::app::{App, FocusedPanel, InputMode};
-use crate::{constants, message, theme, utils};
+use crate::{constants, message, ui::theme};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -49,7 +49,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     .split(area);
 
     header::render(frame, app, chunks[0]);
-    super::widgets::footer::render_dashboard(frame, app, chunks[2]);
+    super::footer::render_dashboard(frame, app, chunks[2]);
 
     // Main Content: Left Sidebar (Profiles + Details) | Right Workspace
     // Expanded sidebar from 25% to 32% for better Connection Details display
@@ -188,17 +188,8 @@ fn render_animated_panel(
 
 fn render_overlays(frame: &mut Frame, app: &mut App) {
     match &app.input_mode {
-        InputMode::DependencyError { protocol, missing } => {
-            super::overlays::dependency_alert::render(frame, *protocol, missing);
-        }
-        InputMode::PermissionDenied { action } => {
-            super::overlays::permission_denied::render(frame, action);
-        }
         InputMode::Import { path, cursor } => {
             super::overlays::import::render(frame, path, *cursor);
-        }
-        InputMode::BackgroundSetup { state } => {
-            super::overlays::background_setup::render(frame, &app.background_mode, state);
         }
         InputMode::ConfirmDelete {
             name,
@@ -292,7 +283,7 @@ fn render_delete_confirm(frame: &mut Frame, name: &str, confirm_selected: bool) 
     let name_budget = usize::from(dialog_w)
         .saturating_sub(4 + prefix.len() + 1)
         .max(3);
-    let truncated = utils::truncate(name, name_budget);
+    let truncated = crate::ui::helpers::truncate_to_width(name, name_budget);
 
     confirm_dialog::render(
         frame,
@@ -437,8 +428,8 @@ fn render_default_route_takeover_confirm(
 fn render_route_overlap_confirm(
     frame: &mut Frame,
     app: &App,
-    with_profile_id: &crate::vortix_core::profile::ProfileId,
-    overlapping_cidrs: &[crate::vortix_core::cidr::Cidr],
+    with_profile_id: &crate::profile::ProfileId,
+    overlapping_cidrs: &[crate::cidr::Cidr],
     to_name: &str,
     confirm_selected: bool,
 ) {
@@ -477,7 +468,7 @@ fn render_route_overlap_confirm(
         let head = overlapping_cidrs
             .iter()
             .take(2)
-            .map(|cidr| format!("{}/{}", cidr.addr, cidr.prefix_len))
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         let tail = format!(", +{} more", overlapping_cidrs.len() - 2);
@@ -489,7 +480,7 @@ fn render_route_overlap_confirm(
     } else {
         let summary = overlapping_cidrs
             .iter()
-            .map(|cidr| format!("{}/{}", cidr.addr, cidr.prefix_len))
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         crate::ui::helpers::truncate_to_width(&summary, cidr_budget)
@@ -556,7 +547,7 @@ mod overlay_tests {
         let mut app = App::new_test();
         app.input_mode = InputMode::ConfirmDefaultRouteTakeover {
             from: "existing-primary-profile-with-a-deliberately-long-name".to_string(),
-            to_profile_id: crate::vortix_core::profile::ProfileId::new(
+            to_profile_id: crate::profile::ProfileId::new(
                 "incoming-primary-profile-with-a-deliberately-long-name",
             ),
             to_name: "incoming-primary-profile-with-a-deliberately-long-name".to_string(),
@@ -589,9 +580,9 @@ mod overlay_tests {
     fn the_overlap_dialog_says_what_confirming_does() {
         let mut app = App::new_test();
         app.input_mode = InputMode::ConfirmRouteOverlap {
-            with_profile_id: crate::vortix_core::profile::ProfileId::new("held"),
+            with_profile_id: crate::profile::ProfileId::new("held"),
             overlapping_cidrs: vec!["10.250.0.0/24".parse().unwrap()],
-            to_profile_id: crate::vortix_core::profile::ProfileId::new("incoming"),
+            to_profile_id: crate::profile::ProfileId::new("incoming"),
             to_name: "wg07".to_string(),
             confirm_selected: true,
         };
@@ -632,7 +623,7 @@ mod overlay_tests {
     #[test]
     fn overlap_dialog_keeps_long_ipv6_details_and_choices_within_bounds() {
         let mut app = App::new_test();
-        let existing = crate::vortix_core::profile::ProfileId::new(
+        let existing = crate::profile::ProfileId::new(
             "existing-profile-with-a-name-that-is-far-too-long-for-the-dialog",
         );
         app.input_mode = InputMode::ConfirmRouteOverlap {
@@ -648,7 +639,7 @@ mod overlay_tests {
                 "2001:db8:2::/64".parse().unwrap(),
                 "2001:db8:3::/64".parse().unwrap(),
             ],
-            to_profile_id: crate::vortix_core::profile::ProfileId::new("incoming"),
+            to_profile_id: crate::profile::ProfileId::new("incoming"),
             to_name: "incoming-profile-with-an-equally-long-human-readable-name".to_string(),
             confirm_selected: true,
         };

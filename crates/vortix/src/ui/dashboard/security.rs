@@ -1,8 +1,7 @@
 use crate::app::App;
-use crate::state::{KillSwitchMode, KillSwitchState};
-use crate::vortix_core::engine::registry::TunnelSnapshot;
-use crate::vortix_core::engine::state::Connection;
-use crate::{constants, theme, utils};
+use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
+use crate::control::{Phase, TunnelView};
+use crate::{constants, ui::theme};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -282,7 +281,7 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
     let value_budget = inner_width
         .saturating_sub(LABEL_COLUMN_WIDTH)
         .saturating_sub(SIGIL_COLUMN_WIDTH);
-    let value_truncated = utils::truncate(value, value_budget);
+    let value_truncated = crate::ui::helpers::truncate_to_width(value, value_budget);
     let value_chars = value_truncated.chars().count();
     let padding = " ".repeat(value_budget.saturating_sub(value_chars));
 
@@ -300,7 +299,7 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
 }
 
 fn push_dns_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
-    use crate::vortix_core::control::DnsSecurityStatus;
+    use crate::control::DnsSecurityStatus;
     // Only an observed resolver can go stale; the VPN's own is policy.
     if s.dns_is_stale() {
         lines.push(audit_row(
@@ -432,7 +431,7 @@ fn location_row(s: &PanelState, w: usize) -> Line<'static> {
 fn alarm_subline(text: &str, inner_width: usize) -> Line<'static> {
     let indent = " ".repeat(LABEL_COLUMN_WIDTH);
     let budget = inner_width.saturating_sub(LABEL_COLUMN_WIDTH);
-    let truncated = utils::truncate(text, budget);
+    let truncated = crate::ui::helpers::truncate_to_width(text, budget);
     Line::from(vec![
         Span::raw(indent),
         Span::styled(
@@ -463,8 +462,8 @@ fn footer_line(secs: Option<u64>) -> Line<'static> {
 
 /// Compact data the layout builders read from. Lifting this off `App`
 /// makes the builders pure functions, which lets us unit-test the
-/// `PROTECTED` branch without driving the registry into
-/// `Connection::Connected` (currently requires private test helpers).
+/// `PROTECTED` branch without driving the engine into
+/// an up tunnel (currently requires private test helpers).
 #[derive(Clone)]
 struct PanelState {
     inner_width: u16,
@@ -486,7 +485,7 @@ struct PanelState {
     ipv6_status: Ipv6RowStatus,
     dns_server: String,
     dns_provider: Option<&'static str>,
-    dns_status: crate::vortix_core::control::DnsSecurityStatus,
+    dns_status: crate::control::DnsSecurityStatus,
 
     // Per-observation ages. Each probe runs on its own schedule, so one
     // panel-wide stamp would let a fresh field vouch for a stalled one.
@@ -617,18 +616,12 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let primary_snap = app
-        .registry
-        .primary()
-        .and_then(|id| app.registry.snapshot(id));
-    let primary_connected = matches!(
-        primary_snap.as_ref().map(|s| &s.state),
-        Some(Connection::Connected { .. })
-    );
-    let any_tunnels = app.registry.tunnel_count() > 0;
+    let primary_snap = app.primary_id().and_then(|id| app.tunnel(id));
+    let primary_connected = primary_snap.is_some_and(|tunnel| tunnel.phase == Phase::Up);
+    let any_tunnels = app.tunnel_count() > 0;
 
     let verdict = if primary_connected {
-        verdict_for_protected(app, primary_snap.as_ref())
+        verdict_for_protected(app, primary_snap)
     } else if any_tunnels {
         Verdict::Partial
     } else {
@@ -646,11 +639,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let body = match verdict {
         Verdict::Protected => {
-            let state = collect_protected_state(app, primary_snap.as_ref(), inner.width);
+            let state = collect_state(app, primary_snap, inner.width);
             build_protected_audit(&state)
         }
         Verdict::Partial => {
-            let state = collect_partial_state(app, primary_snap.as_ref(), inner.width);
+            let state = collect_state(app, primary_snap, inner.width);
             build_partial_audit(&state)
         }
         Verdict::Exposed => build_exposed_audit(app, inner.width),
@@ -669,20 +662,20 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// Refines the headline verdict for the connected-primary case. Even with
 /// a primary up, the panel demotes to `Partial` when IP/DNS posture is
 /// degraded so the title doesn't claim full protection while a row is red.
-fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Verdict {
+fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelView>) -> Verdict {
     let ip_leaking = matches!(&app.runtime.real_ip, Some(real) if &app.runtime.public_ip == real);
-    let dns_unverified = app.control_snapshot.dns.status
-        != crate::vortix_core::control::DnsSecurityStatus::Protected;
+    let dns_unverified =
+        app.control_snapshot.dns.status != crate::control::DnsSecurityStatus::Protected;
     let ks_alarm = matches!(
         (
-            app.registry.killswitch_mode(),
-            app.registry.killswitch_state()
+            app.control_snapshot.kill_switch,
+            app.control_snapshot.kill_switch_state
         ),
         (
-            crate::state::KillSwitchMode::Auto,
-            crate::state::KillSwitchState::Blocking
-        ) | (_, crate::state::KillSwitchState::Degraded)
-            | (crate::state::KillSwitchMode::Off, _)
+            crate::control::killswitch::KillSwitchMode::Auto,
+            crate::control::killswitch::KillSwitchState::Blocking
+        ) | (_, crate::control::killswitch::KillSwitchState::Degraded)
+            | (crate::control::killswitch::KillSwitchMode::Off, _)
     );
     // Insecure cipher = effective wire plaintext. Demote to Partial so
     // the title doesn't claim full protection while crypto is broken.
@@ -814,7 +807,7 @@ fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
     if public.is_none() && real.is_none() {
         return Ipv6RowStatus::Absent;
     }
-    if app.registry.primary().is_none() {
+    if app.primary_id().is_none() {
         return Ipv6RowStatus::Masked;
     }
     match (public, real) {
@@ -825,74 +818,23 @@ fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
     }
 }
 
-fn collect_protected_state(
-    app: &App,
-    primary_snap: Option<&TunnelSnapshot>,
-    inner_width: u16,
-) -> PanelState {
-    let ip_status = derive_ip_status(app);
-
-    let dns_server = dns_display_value(app);
-    let dns_observed = app.control_snapshot.dns.intended_servers.is_empty();
-    let dns_provider = dns_provider_label(&dns_server);
-    let encryption = derive_encryption(primary_snap);
-
-    let location = if app.runtime.location.is_empty()
-        || app.runtime.location == constants::MSG_DETECTING
-        || app.runtime.location == constants::MSG_FETCHING
-    {
-        None
-    } else {
-        Some(app.runtime.location.clone())
-    };
-
-    PanelState {
-        inner_width,
-        show_section_headers: true,
-        real_ip: RealAddress::new(app.runtime.real_ip.clone(), app.runtime.real_ip_from_cache),
-        // Protected is only reached with a primary on the default route.
-        has_primary: true,
-        public_ip: app.runtime.public_ip.clone(),
-        real_ipv6: RealAddress::new(
-            app.runtime.real_ipv6.clone(),
-            app.runtime.real_ipv6_from_cache,
-        ),
-        public_ipv6: app.runtime.public_ipv6.clone(),
-        location,
-        ip_status,
-        ipv6_status: derive_ipv6_row_status(app),
-        dns_server,
-        dns_provider,
-        dns_status: app.control_snapshot.dns.status,
-        egress_age: app.runtime.last_egress_check.map(|at| at.elapsed()),
-        dns_age: app.runtime.last_dns_check.map(|at| at.elapsed()),
-        ipv6_age: app.runtime.last_ipv6_check.map(|at| at.elapsed()),
-        dns_observed,
-        stale_after: app.telemetry_stale_after(),
-        killswitch_mode: app.registry.killswitch_mode(),
-        killswitch_state: app.registry.killswitch_state(),
-        encryption,
-    }
-}
-
-fn collect_partial_state(
-    app: &App,
-    primary_snap: Option<&TunnelSnapshot>,
-    inner_width: u16,
-) -> PanelState {
+/// Protected and Partial share one state; only the primary decides the exit rows.
+fn collect_state(app: &App, primary_snap: Option<&TunnelView>, inner_width: u16) -> PanelState {
     // Cipher source: prefer the primary (when verdict is Partial because
     // of degraded defense), otherwise pick the first Connected tunnel
-    // from the registry (split-only topology). Ciphers are usually
+    // from the snapshot (split-only topology). Ciphers are usually
     // homogeneous in practice (all WG or all OpenVPN); if they diverge,
     // surfacing the first one is still strictly more useful than `N/A`.
-    let snapshots = app.registry.snapshot_all();
     let encryption = if let Some(snap) = primary_snap {
         derive_encryption(Some(snap))
     } else {
-        snapshots
-            .iter()
-            .find(|s| matches!(s.state, Connection::Connected { .. }))
-            .map_or_else(|| "N/A".to_string(), |s| derive_encryption(Some(s)))
+        app.tunnels()
+            .into_iter()
+            .find(|tunnel| tunnel.phase == Phase::Up)
+            .map_or_else(
+                || "N/A".to_string(),
+                |tunnel| derive_encryption(Some(tunnel)),
+            )
     };
 
     // When a primary IS present (Partial fired from a degraded-defense
@@ -903,10 +845,7 @@ fn collect_partial_state(
     let has_primary = primary_snap.is_some();
     let (public_ip, location, ip_status) = if has_primary {
         let ip_status = derive_ip_status(app);
-        let location = if app.runtime.location.is_empty()
-            || app.runtime.location == constants::MSG_DETECTING
-            || app.runtime.location == constants::MSG_FETCHING
-        {
+        let location = if constants::is_pending(&app.runtime.location) {
             None
         } else {
             Some(app.runtime.location.clone())
@@ -940,8 +879,8 @@ fn collect_partial_state(
         ipv6_age: app.runtime.last_ipv6_check.map(|at| at.elapsed()),
         dns_observed,
         stale_after: app.telemetry_stale_after(),
-        killswitch_mode: app.registry.killswitch_mode(),
-        killswitch_state: app.registry.killswitch_state(),
+        killswitch_mode: app.control_snapshot.kill_switch,
+        killswitch_state: app.control_snapshot.kill_switch_state,
         encryption,
     }
 }
@@ -953,10 +892,15 @@ fn collect_partial_state(
 /// no primary is connected — callers should treat unrecognised strings
 /// the same as `classify_cipher` would (downgrades unknown to
 /// `Deprecated`).
-fn derive_encryption(primary_snap: Option<&TunnelSnapshot>) -> String {
-    match primary_snap.map(|s| &s.state) {
-        Some(Connection::Connected { details, .. }) => {
-            if details.public_key == "OpenVPN" || details.public_key.is_empty() {
+fn derive_encryption(primary_snap: Option<&TunnelView>) -> String {
+    match primary_snap {
+        Some(TunnelView {
+            phase: Phase::Up,
+            protocol,
+            details,
+            ..
+        }) => {
+            if *protocol == crate::profile::ProtocolKind::OpenVpn {
                 if details.latest_handshake.starts_with("Cipher:") {
                     details.latest_handshake.replace("Cipher: ", "")
                 } else {
@@ -1119,10 +1063,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     // (no tunnel masking anything). Showing both rows side-by-side
     // with the same IP IS the alarm visualization: "your exit IP IS
     // your real IP".
-    let exposed_ip = if app.runtime.public_ip.is_empty()
-        || app.runtime.public_ip == constants::MSG_DETECTING
-        || app.runtime.public_ip == constants::MSG_FETCHING
-    {
+    let exposed_ip = if constants::is_pending(&app.runtime.public_ip) {
         "checking…".to_string()
     } else {
         app.runtime.public_ip.clone()
@@ -1169,10 +1110,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     };
     lines.push(alarm_subline(alarm, w));
 
-    let location = if app.runtime.location.is_empty()
-        || app.runtime.location == constants::MSG_DETECTING
-        || app.runtime.location == constants::MSG_FETCHING
-    {
+    let location = if constants::is_pending(&app.runtime.location) {
         "detecting…".to_string()
     } else {
         app.runtime.location.clone()
@@ -1194,8 +1132,8 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
 
     lines.push(audit_row(
         "Killswitch",
-        killswitch_mode_label(app.registry.killswitch_mode()),
-        match app.registry.killswitch_mode() {
+        killswitch_mode_label(app.control_snapshot.kill_switch),
+        match app.control_snapshot.kill_switch {
             KillSwitchMode::Off => Sigil::AlarmError,
             _ => Sigil::OkMuted,
         },
@@ -1290,7 +1228,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let is_connected = app.registry.primary().is_some();
+    let is_connected = app.primary_id().is_some();
 
     let text = if is_connected {
         vec![
@@ -1360,23 +1298,23 @@ mod tests {
     //! for `PARTIAL` and `EXPOSED` (the branches reachable from
     //! `App::new_test()`) and adds pure-function tests against
     //! `build_protected_audit` for the `PROTECTED` branch (which still
-    //! can't be driven into `Connection::Connected` without private
-    //! registry test helpers).
+    //! can't be driven into an up tunnel without private
+    //! snapshot test helpers).
     use super::*;
     use crate::app::App;
-    use crate::state::KillSwitchMode;
-    use crate::vortix_core::engine::Engine;
-    use crate::vortix_core::profile::ProfileId;
+    use crate::control::killswitch::KillSwitchMode;
+    use crate::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::Instant;
 
     fn insert_idle_tunnel(app: &mut App, name: &str) {
-        let tunnel = crate::tunnel::TunnelKind::Mock(
-            crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
-        );
-        let engine = Engine::new(tunnel, |_| None);
-        app.registry.insert(ProfileId::new(name), engine, vec![]);
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .tunnels
+            .push(crate::app::connection::test_view(
+                name,
+                crate::control::Phase::Starting,
+            ));
     }
 
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
@@ -1417,7 +1355,7 @@ mod tests {
             ipv6_status: Ipv6RowStatus::Absent,
             dns_server: "1.1.1.1".to_string(),
             dns_provider: Some("Cloudflare"),
-            dns_status: crate::vortix_core::control::DnsSecurityStatus::Protected,
+            dns_status: crate::control::DnsSecurityStatus::Protected,
             killswitch_mode: KillSwitchMode::AlwaysOn,
             killswitch_state: KillSwitchState::Blocking,
             encryption: "ChaCha20-Poly1305".to_string(),
@@ -1874,7 +1812,7 @@ mod tests {
 
     #[test]
     fn unverified_dns_policy_warns_without_claiming_a_leak() {
-        use crate::vortix_core::control::DnsSecurityStatus;
+        use crate::control::DnsSecurityStatus;
         let mut s = baseline_protected_state(40);
         s.dns_status = DnsSecurityStatus::Unverified;
         let lines = build_protected_audit(&s);
@@ -2053,19 +1991,8 @@ mod tests {
     }
 
     #[test]
-    fn dns_row_prefers_canonical_vpn_intent_over_stale_telemetry() {
-        let mut app = App::new_test();
-        app.runtime.dns_server = "192.168.1.100".into();
-        app.control_snapshot.dns.intended_servers =
-            vec!["10.80.0.1".parse().unwrap(), "1.1.1.1".parse().unwrap()];
-        app.control_snapshot.dns.status = crate::vortix_core::control::DnsSecurityStatus::Protected;
-
-        assert_eq!(dns_display_value(&app), "10.80.0.1, 1.1.1.1");
-    }
-
-    #[test]
     fn primary_without_vpn_dns_warns_instead_of_claiming_protection() {
-        use crate::vortix_core::control::DnsSecurityStatus;
+        use crate::control::DnsSecurityStatus;
         let mut s = baseline_protected_state(52);
         s.dns_status = DnsSecurityStatus::NotRequested;
 
@@ -2214,7 +2141,7 @@ mod tests {
     #[test]
     fn no_tunnels_renders_exposed_with_banner_and_polish() {
         let app = App::new_test();
-        assert_eq!(app.registry.tunnel_count(), 0);
+        assert_eq!(app.tunnel_count(), 0);
 
         let out = render_to_string(&app, 60, 20);
         // Loud EXPOSED banner is the eye-catcher when no VPN is up.
@@ -2238,96 +2165,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_renders_banner_section_words_and_killswitch_row() {
-        // The PARTIAL banner sits at the top; below it the `Identity` /
-        // `Defense` section words and a single Killswitch row in the
-        // right-column layout.
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        // Deliberately diverge the obsolete runtime mirror: renderers must
-        // follow the registry's canonical policy projection exclusively.
-        app.runtime.killswitch_mode = KillSwitchMode::Off;
-        app.runtime.killswitch_state = KillSwitchState::Disabled;
-        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
-        app.registry.set_killswitch_state(KillSwitchState::Blocking);
-
-        let out = render_to_string(&app, 60, 20);
-        assert!(out.contains("PARTIAL"), "PARTIAL banner missing:\n{out}");
-        assert!(out.contains("Identity"), "PARTIAL panel:\n{out}");
-        assert!(out.contains("Defense"), "PARTIAL panel:\n{out}");
-        assert!(out.contains("Killswitch"), "PARTIAL panel:\n{out}");
-        assert!(out.contains("VPN-only"), "active mode label:\n{out}");
-        assert!(!out.contains("Legend:"), "no in-panel legend:\n{out}");
-    }
-
-    #[test]
-    fn a_leaking_ipv6_cannot_be_headlined_as_protected() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
-        app.registry.set_killswitch_state(KillSwitchState::Blocking);
-        app.control_snapshot.dns.status = crate::vortix_core::control::DnsSecurityStatus::Protected;
-        // A profile owns the default route, so IPv4 is carried by the tunnel.
-        app.registry.replace_control_projection(
-            &std::collections::BTreeMap::new(),
-            Some(ProfileId::new("alpha")),
-        );
-        // An IPv4-only tunnel leaves IPv6 on the ISP link, so every
-        // IPv6-reachable site still sees the real address.
-        app.runtime.real_ipv6 = Some("2401:4900::abcd".to_string());
-        app.runtime.public_ipv6 = Some("2401:4900::abcd".to_string());
-
-        assert!(
-            derive_ipv6_row_status(&app) == Ipv6RowStatus::Leaking,
-            "the panel itself reports this state as exposed"
-        );
-        assert!(
-            verdict_for_protected(&app, None) == Verdict::Partial,
-            "the headline must not claim protection over its own `v6 exposed` row"
-        );
-
-        // Without the leak the same state is genuinely protected, so the
-        // assertion above is about IPv6 and nothing else.
-        app.runtime.public_ipv6 = Some("2a00:1450::1".to_string());
-        assert!(
-            verdict_for_protected(&app, None) == Verdict::Protected,
-            "a masked IPv6 must still read as protected"
-        );
-    }
-
-    #[test]
-    fn partial_killswitch_off_renders_off_with_alarm() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::Off);
-        app.registry.set_killswitch_state(KillSwitchState::Disabled);
-
-        let out = render_to_string(&app, 70, 20);
-        assert!(
-            out.contains("Off"),
-            "Off mode value missing in PARTIAL:\n{out}"
-        );
-        assert!(
-            out.contains("not protecting"),
-            "Off alarm sub-line missing:\n{out}"
-        );
-    }
-
-    #[test]
-    fn partial_killswitch_auto_renders_block_on_drop() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::Auto);
-        app.registry.set_killswitch_state(KillSwitchState::Armed);
-
-        let out = render_to_string(&app, 70, 20);
-        assert!(
-            out.contains("Block on drop"),
-            "Auto mode label missing:\n{out}"
-        );
-    }
-
-    #[test]
     fn partial_with_primary_renders_real_ip_not_split_route_noexit() {
         // Regression for the "Role=Primary everywhere else but Security
         // Guard says split-route — no exit" bug. When PARTIAL fires from
@@ -2339,7 +2176,7 @@ mod tests {
         state.location = Some("Frankfurt am Main, DE".to_string());
         state.ip_status = IpStatus::Masked;
         state.killswitch_mode = KillSwitchMode::Off;
-        state.killswitch_state = crate::state::KillSwitchState::Disabled;
+        state.killswitch_state = crate::control::killswitch::KillSwitchState::Disabled;
 
         let lines = build_partial_audit(&state);
         let body: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
@@ -2444,22 +2281,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partial_no_v6_connectivity_keeps_legacy_labels() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-
-        let out = render_to_string(&app, 70, 20);
-        assert!(
-            !out.contains("Real IPv6") && !out.contains("Exit IPv6"),
-            "no v6 connectivity must not render IPv6 rows:\n{out}"
-        );
-        assert!(
-            !out.contains("Not enforced"),
-            "old IPv6 explainer must be gone:\n{out}"
-        );
-    }
-
     /// Each row's freshness must come from its own probe. The fields share
     /// one panel but not one clock: collapsing them onto a single tick was
     /// what let a resolver reading that had not landed for minutes render
@@ -2474,7 +2295,7 @@ mod tests {
         app.runtime.last_egress_check = Some(now);
         app.runtime.last_dns_check = Some(long_ago);
 
-        let state = collect_partial_state(&app, None, 60);
+        let state = collect_state(&app, None, 60);
 
         assert!(
             !state.is_stale(state.egress_age),
@@ -2483,6 +2304,127 @@ mod tests {
         assert!(
             state.is_stale(state.dns_age),
             "the resolver reading is older than the staleness window and must say so"
+        );
+    }
+
+    #[test]
+    fn dns_row_prefers_canonical_vpn_intent_over_stale_telemetry() {
+        let mut app = App::new_test();
+        app.runtime.dns_server = "192.168.1.100".into();
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .intended_servers = vec!["10.80.0.1".parse().unwrap(), "1.1.1.1".parse().unwrap()];
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .status = crate::control::DnsSecurityStatus::Protected;
+
+        assert_eq!(dns_display_value(&app), "10.80.0.1, 1.1.1.1");
+    }
+
+    #[test]
+    fn partial_renders_banner_section_words_and_killswitch_row() {
+        // The PARTIAL banner sits at the top; below it the `Identity` /
+        // `Defense` section words and a single Killswitch row in the
+        // right-column layout.
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        // Deliberately diverge the obsolete runtime mirror: renderers must
+        // follow the engine snapshot's policy exclusively.
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::AlwaysOn;
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
+            KillSwitchState::Blocking;
+
+        let out = render_to_string(&app, 60, 20);
+        assert!(out.contains("PARTIAL"), "PARTIAL banner missing:\n{out}");
+        assert!(out.contains("Identity"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("Defense"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("Killswitch"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("VPN-only"), "active mode label:\n{out}");
+        assert!(!out.contains("Legend:"), "no in-panel legend:\n{out}");
+    }
+
+    #[test]
+    fn a_leaking_ipv6_cannot_be_headlined_as_protected() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::AlwaysOn;
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
+            KillSwitchState::Blocking;
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .status = crate::control::DnsSecurityStatus::Protected;
+        // A profile owns the default route, so IPv4 is carried by the tunnel.
+        app.set_tunnels_for_test(Vec::new(), Some(ProfileId::new("alpha")));
+        // An IPv4-only tunnel leaves IPv6 on the ISP link, so every
+        // IPv6-reachable site still sees the real address.
+        app.runtime.real_ipv6 = Some("2401:4900::abcd".to_string());
+        app.runtime.public_ipv6 = Some("2401:4900::abcd".to_string());
+
+        assert!(
+            derive_ipv6_row_status(&app) == Ipv6RowStatus::Leaking,
+            "the panel itself reports this state as exposed"
+        );
+        assert!(
+            verdict_for_protected(&app, None) == Verdict::Partial,
+            "the headline must not claim protection over its own `v6 exposed` row"
+        );
+
+        // Without the leak the same state is genuinely protected, so the
+        // assertion above is about IPv6 and nothing else.
+        app.runtime.public_ipv6 = Some("2a00:1450::1".to_string());
+        assert!(
+            verdict_for_protected(&app, None) == Verdict::Protected,
+            "a masked IPv6 must still read as protected"
+        );
+    }
+
+    #[test]
+    fn partial_killswitch_off_renders_off_with_alarm() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::Off;
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
+            KillSwitchState::Disabled;
+
+        let out = render_to_string(&app, 70, 20);
+        assert!(
+            out.contains("Off"),
+            "Off mode value missing in PARTIAL:\n{out}"
+        );
+        assert!(
+            out.contains("not protecting"),
+            "Off alarm sub-line missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_killswitch_auto_renders_block_on_drop() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::Auto;
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
+            KillSwitchState::Armed;
+
+        let out = render_to_string(&app, 70, 20);
+        assert!(
+            out.contains("Block on drop"),
+            "Auto mode label missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_no_v6_connectivity_keeps_legacy_labels() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+
+        let out = render_to_string(&app, 70, 20);
+        assert!(
+            !out.contains("Real IPv6") && !out.contains("Exit IPv6"),
+            "no v6 connectivity must not render IPv6 rows:\n{out}"
+        );
+        assert!(
+            !out.contains("Not enforced"),
+            "old IPv6 explainer must be gone:\n{out}"
         );
     }
 }

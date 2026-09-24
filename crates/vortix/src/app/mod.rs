@@ -5,8 +5,8 @@
 //!
 //! ## Architecture
 //!
-//! `App` is a control client: it caches one immutable canonical snapshot and
-//! copies its tunnel projection into the renderer-facing registry. Telemetry
+//! `App` is a control client: it caches one immutable engine snapshot and
+//! renders tunnels straight from it (`App::tunnels`). Telemetry
 //! and profile presentation remain in [`VpnRuntime`]; lifecycle, retry,
 //! scanner, policy, and protocol ownership do not.
 //!
@@ -20,14 +20,15 @@
 //! - `update` — Message dispatching (TEA-style update function)
 //! - `connection` — VPN connection lifecycle management
 //! - `profile` — Profile CRUD and import operations
-//! - `telemetry_poll` — Background telemetry and scanner polling
 //! - `helpers` — Logging, scrolling, toast notifications, and utilities
 
 pub(crate) mod connection;
+pub use connection::Role;
 mod helpers;
 mod input;
 mod profile;
-mod telemetry_poll;
+pub mod runtime;
+pub mod state;
 mod update;
 
 pub(crate) use input::{focused_tunnel_action, FocusedTunnelAction};
@@ -68,8 +69,8 @@ impl CachedConfigView {
     /// pre-highlights them so the open-config keypress pays the cost
     /// once and every subsequent scroll/render frame is constant-time.
     #[must_use]
-    pub fn from_content(content: String, choice: crate::theme::ThemeChoice) -> Self {
-        let highlighted_lines = crate::theme::with_choice(choice, || {
+    pub fn from_content(content: String, choice: crate::ui::theme::ThemeChoice) -> Self {
+        let highlighted_lines = crate::ui::theme::with_choice(choice, || {
             content
                 .lines()
                 .map(crate::ui::overlays::config_viewer::highlight_config_line)
@@ -84,31 +85,10 @@ impl CachedConfigView {
     }
 }
 
-pub(crate) struct PendingProfileImports {
-    source: std::path::PathBuf,
-    remaining: std::collections::VecDeque<std::path::PathBuf>,
-    queued: usize,
-    failed: usize,
-    active: Option<PendingProfileImport>,
-}
-
-pub(crate) enum PendingProfileImport {
-    AwaitingAdmission(String),
-    Admitted(crate::vortix_core::control::OperationId),
-}
-
-/// Credentials awaiting the server's verdict, held in memory only.
-pub(crate) struct PendingCredentialSave {
-    pub(crate) profile_id: crate::vortix_core::profile::ProfileId,
-    pub(crate) profile_name: String,
-    pub(crate) username: crate::state::SecretText,
-    pub(crate) password: crate::state::SecretText,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingThemeChange {
-    previous: crate::theme::ThemeChoice,
-    selected: crate::theme::ThemeChoice,
+    previous: crate::ui::theme::ThemeChoice,
+    selected: crate::ui::theme::ThemeChoice,
     quit_after: bool,
 }
 use std::collections::HashMap;
@@ -116,113 +96,37 @@ use std::collections::HashMap;
 use crate::constants;
 use crate::logger;
 use crate::message::Message;
-use crate::tunnel::TunnelKind;
-use crate::vortix_core::engine::TunnelRegistry;
-use crate::vpn_runtime::VpnRuntime;
+use runtime::VpnRuntime;
 
 // Re-export state types for convenient access
-pub use crate::state::{
-    AuthField, FlipState, FocusedPanel, InputMode, ProfileSortOrder, Protocol, Toast, ToastType,
-    VpnProfile, DISMISS_DURATION,
+pub use state::{
+    AuthField, FlipState, FocusedPanel, InputMode, ProfileSortOrder, Toast, ToastType,
+    DISMISS_DURATION,
 };
-// The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
-// lives on `crate::vpn_runtime` after the registry migration; re-export through `app::`
-// so the existing `app/connection.rs` / `app/update.rs` code paths that
-// drive the legacy mirror still resolve `app::ConnectionState`.
-pub use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
 
 /// Main application state container.
 ///
-/// Holds the VPN runtime (telemetry, profiles, config, background workers)
-/// alongside the `TunnelRegistry` (active tunnel FSMs) and TUI-specific
-/// state (panels, overlays, animations). Reads explicitly route through
-/// `self.runtime.X` for telemetry/profiles and `self.registry` for
-/// active-tunnel snapshots.
+/// Holds the VPN runtime (telemetry, profiles, config, background workers),
+/// the engine snapshot, and TUI state (panels, overlays, animations).
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     /// The headless VPN runtime — telemetry, profile catalog, config,
-    /// background workers, kill-switch mode. Active tunnel FSMs live on
-    /// `self.registry`.
+    /// background workers, kill-switch mode.
     pub runtime: VpnRuntime,
 
-    /// Optional plan-005 `EngineHandle`. Non-load-bearing today — kept for
-    /// IPC / remote-control surfaces that drive a single tunnel through the
-    /// FSM actor. Multi-tunnel callers bypass this and use `self.registry`.
-    pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
-
-    /// The `TunnelRegistry` owns active tunnel
-    /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
-    /// `connection_details`, security, chart).
-    pub registry: TunnelRegistry<TunnelKind>,
-
-    /// Long-lived Standard-mode canonical authority used by the TUI. Tests
-    /// that characterize presentation-only helpers may leave it detached.
-    pub(crate) control_session: Option<crate::cli::control::ClientControlSession>,
-
-    /// True while production is preparing the canonical control owner. This
-    /// is presentation-only: the control session remains the authority once
-    /// attached.
+    /// The connection engine. `None` while it is starting.
+    pub(crate) control: Option<crate::control::Control>,
     pub(crate) control_starting: bool,
-
-    /// Last complete immutable publication received from the control owner.
-    pub control_snapshot: crate::vortix_core::control::ControlSnapshot,
-
-    /// Service-owned challenge currently displayed by the existing auth
-    /// overlay. The answer is returned directly to the service and never
-    /// journaled or persisted in this client.
-    pub(crate) control_challenge: Option<crate::vortix_core::control::ChallengeId>,
-
-    /// Credentials the user asked to remember, held until the server accepts
-    /// them. Writing at submit time persisted rejected passwords, and a
-    /// profile with stored credentials raises no challenge — so the next
-    /// connect reused the bad pair and never reopened the prompt.
-    pub(crate) pending_credential_save: Option<PendingCredentialSave>,
-
-    /// Last control-service failure already surfaced, so a persistent one is
-    /// reported on transition instead of on every poll. A missing
-    /// `wireguard-tools` produced roughly two identical error toasts per
-    /// second, which buried the startup warning that named the fix.
-    pub(crate) last_control_error: Option<String>,
-
-    /// Kill-switch mode the user has cycled to while an earlier change is
-    /// still running. Presses used to submit an operation each, and the
-    /// worker is serial, so a few quick taps left later ones to expire — the
-    /// "kill switch change timed out" the user actually saw. The target is
-    /// coalesced here and submitted once the in-flight change settles.
-    pub(crate) queued_killswitch_target: Option<crate::state::KillSwitchMode>,
-
-    /// Stable identity retained when the canonical projection becomes empty,
-    /// so reconnect means "the last tunnel I used" rather than "all".
-    pub(crate) last_control_connected_profile: Option<crate::vortix_core::profile::ProfileId>,
-
-    /// Latest admitted-but-not-yet-published kill-switch intent. Rapid key
-    /// presses compose from this value until the snapshot acknowledges it.
-    pub(crate) pending_control_killswitch_mode: Option<crate::state::KillSwitchMode>,
-
-    /// TUI-originated durable operations awaiting terminal truth. This is
-    /// client presentation state only; the control snapshot remains the
-    /// authority for completion and failure.
-    pub(crate) pending_control_operations: std::collections::BTreeMap<
-        crate::vortix_core::control::OperationId,
-        connection::PendingControlOperation,
-    >,
-
-    control_request_sequence: u64,
-
-    /// Directory imports advance after each serial profile mutation settles.
-    /// This gives every durable write its own execution deadline without
-    /// blocking unrelated TUI commands.
-    pub(crate) pending_profile_imports: Option<PendingProfileImports>,
-
-    /// Short quiet-window aggregation for profile mutations. Directory
-    /// imports can complete over several control publications; presenting
-    /// one truthful summary is calmer than replacing the toast per file.
-    pub(crate) catalog_feedback: Option<connection::CatalogFeedback>,
-
-    /// Last catalog revision presented in the Event Log. Terminal mutation
-    /// outcomes may arrive in separate snapshots without changing the
-    /// catalog, so logging only revision changes preserves a no-change signal.
-    pub(crate) presented_catalog_revision: Option<u64>,
+    /// Last snapshot received from the engine.
+    pub control_snapshot: std::sync::Arc<crate::control::Snapshot>,
+    /// Engine prompt the credential overlay is answering.
+    pub(crate) control_prompt: Option<u64>,
+    /// Highest engine notice already shown.
+    pub(crate) notices_seen: u64,
+    /// Kept when every tunnel is gone, so reconnect means "the last one".
+    pub(crate) last_control_connected_profile: Option<crate::profile::ProfileId>,
+    /// Kill switch mode sent but not yet in a snapshot.
+    pub(crate) pending_control_killswitch_mode: Option<crate::control::killswitch::KillSwitchMode>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -234,7 +138,7 @@ pub struct App {
     pub log_level_filter: Option<crate::logger::LogLevel>,
     /// Last network-quality category emitted to the Event Log. Raw telemetry
     /// remains dashboard state and only semantic transitions are logged.
-    pub(crate) last_logged_network_quality: crate::state::QualityLevel,
+    pub(crate) last_logged_network_quality: crate::app::state::QualityLevel,
 
     // === UI State (Panel-based) ===
     pub focused_panel: FocusedPanel,
@@ -261,17 +165,7 @@ pub struct App {
     pub panel_areas: HashMap<FocusedPanel, Rect>,
     pub toast: Option<Toast>,
     pub terminal_size: (u16, u16),
-    /// Shared user-visible operating-mode projection.
-    pub background_mode: crate::background::BackgroundModeRecord,
-    pub(crate) background_diagnostics_loading: bool,
-    pub(crate) background_diagnostics_fallback: bool,
 }
-
-// An earlier refactor removed the previous `impl Deref<Target = VpnRuntime>` — the
-// porous boundary let every TUI/app/CLI callsite reach into VpnRuntime
-// without the indirection being visible at the call site. Use
-// `app.runtime.X` for runtime fields and `app.registry` for active
-// tunnels explicitly.
 
 impl App {
     /// Create a new App instance with the given configuration.
@@ -280,37 +174,28 @@ impl App {
         let mut runtime = VpnRuntime::new(config, config_dir);
 
         // Load metadata and sort
-        runtime.load_metadata();
         runtime.sort_profiles();
 
         // Apply user's logging preferences
         logger::configure(&runtime.config.log_level, runtime.config.max_log_entries);
 
-        // Registry is the TUI's protection truth from the first frame. Seed
-        // it from recovered runtime state so startup cannot briefly render
-        // Off while a persisted firewall is still present.
-        let mut registry = TunnelRegistry::new();
-        registry.set_killswitch_mode(runtime.killswitch_mode);
-        registry.set_killswitch_state(runtime.killswitch_state);
+        // Seed from disk so the first frame cannot show Off while a
+        // persisted firewall is still present.
+        let (kill_switch, kill_switch_state) = crate::control::killswitch::persisted();
 
         let mut app = Self {
             runtime,
-            engine_handle: None,
-            registry,
-            control_session: None,
+            control: None,
             control_starting: true,
-            control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
-            control_challenge: None,
-            pending_credential_save: None,
-            last_control_error: None,
-            queued_killswitch_target: None,
+            control_snapshot: std::sync::Arc::new(crate::control::Snapshot {
+                kill_switch,
+                kill_switch_state,
+                ..crate::control::Snapshot::default()
+            }),
+            control_prompt: None,
+            notices_seen: 0,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
-            pending_control_operations: std::collections::BTreeMap::new(),
-            control_request_sequence: 0,
-            pending_profile_imports: None,
-            catalog_feedback: None,
-            presented_catalog_revision: None,
 
             should_quit: false,
 
@@ -318,7 +203,7 @@ impl App {
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
-            last_logged_network_quality: crate::state::QualityLevel::Unknown,
+            last_logged_network_quality: crate::app::state::QualityLevel::Unknown,
 
             focused_panel: FocusedPanel::Sidebar,
             zoomed_panel: None,
@@ -336,9 +221,6 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (0, 0),
-            background_mode: crate::background::BackgroundModeRecord::default(),
-            background_diagnostics_loading: false,
-            background_diagnostics_fallback: true,
         };
 
         // Select first profile if available
@@ -359,11 +241,6 @@ impl App {
             app.log(&format!("IO: Auto-logging to {}", log_path.display()));
         }
 
-        // Log kill switch recovery if it happened
-        if app.runtime.killswitch_state == crate::state::KillSwitchState::Disabled {
-            // Check if we recovered from crash — the engine already handled this
-        }
-
         app.log("INIT: Interface ready; VPN service starting in the background");
 
         app.check_system_dependencies();
@@ -378,48 +255,14 @@ impl App {
         self.handle_message(Message::Tick);
     }
 
-    /// Surface a control-service failure once per transition.
-    ///
-    /// The service is polled continuously, so a persistent fault used to
-    /// raise an identical toast on every poll — a missing `wireguard-tools`
-    /// produced roughly two per second, which buried the single startup
-    /// warning that actually named the fix. Reporting only on change keeps
-    /// that warning readable and still shows every distinct failure.
-    pub(crate) fn report_control_failure(&mut self, error: &str) {
-        let message = format!("Control service unavailable: {error}");
-        if self.last_control_error.as_deref() == Some(message.as_str()) {
-            return;
-        }
-        self.last_control_error = Some(message.clone());
-        self.handle_message(Message::Toast(message, ToastType::Error));
-    }
-
     /// Process all pending external events (telemetry and background commands).
     pub fn process_external(&mut self) {
-        let control_update = self.control_session.as_ref().map(|control| {
-            control.progress().and_then(|()| {
-                let admissions = control.take_tui_admission_results();
-                let snapshot = control.take_changed_snapshot()?;
-                let catalog = snapshot
-                    .as_ref()
-                    .and_then(|snapshot| control.take_catalog_update(snapshot));
-                Ok((admissions, snapshot, catalog))
-            })
-        });
-        match control_update {
-            Some(Ok((admissions, snapshot, catalog))) => {
-                self.handle_control_admission_results(admissions);
-                if let Some(catalog) = catalog {
-                    self.apply_local_catalog_update(catalog);
-                }
-                self.last_control_error = None;
-                self.pump_pending_profile_imports();
-                if let Some(snapshot) = snapshot {
-                    self.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-                }
-            }
-            Some(Err(error)) => self.report_control_failure(&error.to_string()),
-            None => {}
+        if let Some(snapshot) = self
+            .control
+            .as_ref()
+            .and_then(crate::control::Control::changed)
+        {
+            self.apply_control_snapshot(snapshot);
         }
         self.process_telemetry();
 
@@ -484,37 +327,19 @@ impl App {
 }
 
 impl App {
-    /// Attach an `EngineHandle` to the app. The handle is not yet load-bearing — the TUI still
-    /// mutates `self.engine` through `Deref` — but future units swap UI
-    /// reads / commands over to it.
-    #[must_use]
-    pub fn with_engine_handle(mut self, handle: crate::vortix_core::engine::EngineHandle) -> Self {
-        self.engine_handle = Some(handle);
-        self
-    }
-
     /// Lightweight constructor for testing.
     #[must_use]
     pub fn new_test() -> Self {
         let runtime = VpnRuntime::new_test();
         Self {
             runtime,
-            engine_handle: None,
-            registry: TunnelRegistry::new(),
-            control_session: None,
+            control: None,
             control_starting: false,
-            control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
-            control_challenge: None,
-            pending_credential_save: None,
-            last_control_error: None,
-            queued_killswitch_target: None,
+            control_snapshot: std::sync::Arc::default(),
+            control_prompt: None,
+            notices_seen: 0,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
-            pending_control_operations: std::collections::BTreeMap::new(),
-            control_request_sequence: 0,
-            pending_profile_imports: None,
-            catalog_feedback: None,
-            presented_catalog_revision: None,
 
             should_quit: false,
 
@@ -522,7 +347,7 @@ impl App {
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
-            last_logged_network_quality: crate::state::QualityLevel::Unknown,
+            last_logged_network_quality: crate::app::state::QualityLevel::Unknown,
 
             focused_panel: FocusedPanel::Sidebar,
             zoomed_panel: None,
@@ -540,21 +365,7 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (80, 24),
-            background_mode: crate::background::BackgroundModeRecord::default(),
-            background_diagnostics_loading: false,
-            background_diagnostics_fallback: true,
         }
-    }
-
-    pub fn set_background_diagnostics_fallback(&mut self, enabled: bool) {
-        self.background_diagnostics_fallback = enabled;
-    }
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        // VpnRuntime's Drop handles kill switch cleanup and VPN process termination.
-        // Nothing additional needed here.
     }
 }
 

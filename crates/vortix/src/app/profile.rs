@@ -2,25 +2,17 @@
 
 use std::path::Path;
 
-use super::{App, InputMode, Protocol, ToastType};
+use super::{App, InputMode, ToastType};
+use crate::config::profile_store::FsProfileStore;
 use crate::constants;
-use crate::utils;
-use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
-use crate::vortix_core::profile::ProfileId;
-
-/// Bounds synchronous parsing/logging when a directory contains invalid files.
-const PROFILE_IMPORT_ATTEMPTS_PER_TURN: usize = 8;
+use crate::profile::ProfileId;
+use crate::profile::ProtocolKind;
 
 fn importable_profile_paths(dir_path: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut paths = std::fs::read_dir(dir_path)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|ext| ext == "conf" || ext == "ovpn")
-        })
+        .filter(|path| path.is_file() && crate::profile::has_profile_extension(path))
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
@@ -104,19 +96,6 @@ impl App {
         let profile_name = self.runtime.profiles[idx].name.clone();
         let protocol = self.runtime.profiles[idx].protocol;
 
-        if self.control_session.is_some() {
-            if self
-                .issue_control_command(crate::vortix_core::control::UserCommand::DeleteProfile {
-                    profile_id,
-                })
-                .is_some()
-            {
-                self.input_mode = InputMode::Normal;
-                self.show_toast(format!("Deleting '{profile_name}'…"), ToastType::Info);
-            }
-            return;
-        }
-
         let Some(profiles_dir) = config_path.parent().map(Path::to_path_buf) else {
             self.show_toast(
                 "Profile delete failed: invalid path".to_string(),
@@ -134,8 +113,8 @@ impl App {
         // The profile store owns remembered-credential cleanup as part of its
         // crash-safe delete transaction. The App only clears transient run
         // artifacts in this detached compatibility path.
-        if matches!(protocol, Protocol::OpenVPN) {
-            utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &profile_name);
+        if matches!(protocol, ProtocolKind::OpenVpn) {
+            crate::openvpn::cleanup_openvpn_run_files_compat(profile_id.as_str(), &profile_name);
         }
 
         // Adjust selection
@@ -148,21 +127,9 @@ impl App {
             }
         }
 
+        self.sync_profiles();
         self.show_toast("Profile deleted".to_string(), ToastType::Success);
         self.input_mode = InputMode::Normal;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn confirm_delete(&mut self, idx: usize) {
-        let Some(profile_id) = self
-            .runtime
-            .profiles
-            .get(idx)
-            .map(|profile| profile.id.clone())
-        else {
-            return;
-        };
-        self.confirm_delete_profile(&profile_id);
     }
 
     pub(crate) fn rename_profile_by_id(&mut self, profile_id: &ProfileId, new_name: &str) {
@@ -193,38 +160,12 @@ impl App {
         let old_path = self.runtime.profiles[idx].config_path.clone();
         let stable_id = self.runtime.profiles[idx].id.clone();
 
-        if self.control_session.is_some() {
-            if self.registry.snapshot(&stable_id).is_some() {
-                self.show_toast(
-                    "Cannot rename an active profile — disconnect first".to_string(),
-                    ToastType::Warning,
-                );
-                return;
-            }
-            if self
-                .issue_control_command(crate::vortix_core::control::UserCommand::RenameProfile {
-                    profile_id: stable_id,
-                    new_display_name: trimmed.to_string(),
-                })
-                .is_some()
-            {
-                self.input_mode = InputMode::Normal;
-                self.show_toast(format!("Renaming '{old_name}'…"), ToastType::Info);
-            }
-            return;
-        }
-
         if let Some(parent) = old_path.parent() {
             // The rename overlay may have been open while a connection
             // started. Re-check the stable identity at the mutation point;
             // an index or display-name check can be invalidated by sorting or
             // another rename while the dialog is open.
-            use crate::vortix_core::engine::state::Connection;
-            if self
-                .registry
-                .snapshot(&stable_id)
-                .is_some_and(|snapshot| !matches!(snapshot.state, Connection::Disconnected { .. }))
-            {
+            if self.tunnel(&stable_id).is_some() {
                 self.show_toast(
                     "Cannot rename an active profile — disconnect first".to_string(),
                     ToastType::Warning,
@@ -244,15 +185,11 @@ impl App {
             self.runtime.profiles[idx].name = renamed.display_name;
             self.runtime.profiles[idx].config_path = renamed.config_path;
 
-            if self.runtime.last_connected_profile.as_deref() == Some(&old_name) {
-                self.runtime.last_connected_profile = Some(trimmed.to_string());
-            }
-
             // Registry/retry state is keyed by stable ProfileId, so no
             // in-memory re-keying is required for a display-name change.
 
-            self.runtime.save_metadata();
             self.runtime.sort_profiles();
+            self.sync_profiles();
 
             if let Some(new_idx) = self.runtime.profiles.iter().position(|p| p.name == trimmed) {
                 self.profile_list_state.select(Some(new_idx));
@@ -265,22 +202,9 @@ impl App {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn rename_profile(&mut self, idx: usize, new_name: &str) {
-        let Some(profile_id) = self
-            .runtime
-            .profiles
-            .get(idx)
-            .map(|profile| profile.id.clone())
-        else {
-            return;
-        };
-        self.rename_profile_by_id(&profile_id, new_name);
-    }
-
     /// Import a profile from a file path or bulk import from directory
     pub(crate) fn import_profile_from_path(&mut self, path_str: &str) {
-        use crate::core::importer::{resolve_target, ImportTarget};
+        use crate::config::import::{resolve_target, ImportTarget};
         use crate::message::Message;
 
         let mut last_imported_name: Option<String> = None;
@@ -293,7 +217,7 @@ impl App {
                 should_close_overlay = false;
 
                 std::thread::spawn(
-                    move || match crate::core::downloader::download_profile(&url) {
+                    move || match crate::config::import::download_profile(&url) {
                         Ok(path) => {
                             let path_string = path.to_string_lossy().to_string();
                             let _ = tx.send(Message::Import(path_string));
@@ -310,7 +234,7 @@ impl App {
             Ok(ImportTarget::File(path)) => {
                 last_imported_name = self.import_single_file(&path);
                 should_close_overlay = last_imported_name.is_some();
-                crate::core::downloader::cleanup_temp_download(&path);
+                crate::config::import::cleanup_temp_download(&path);
             }
             Ok(ImportTarget::Directory(path)) => {
                 let count = self.import_from_directory(&path);
@@ -336,15 +260,11 @@ impl App {
 
     /// Import a single VPN profile file
     fn import_single_file(&mut self, path: &Path) -> Option<String> {
-        if self.control_session.is_some() {
-            let name = self.issue_control_import(path)?;
-            self.show_toast(format!("Import queued: {name}"), ToastType::Info);
-            return Some(name);
-        }
-        match crate::vpn::import_profile(path) {
+        match crate::config::profiles::import_profile(path) {
             Ok(profile) => {
                 let name = profile.name.clone();
                 self.runtime.profiles.push(profile);
+                self.sync_profiles();
 
                 self.show_toast(
                     format!("{}{}", constants::MSG_IMPORT_SUCCESS, name),
@@ -367,10 +287,6 @@ impl App {
     /// Returns the number imported synchronously in legacy mode or scheduled
     /// for bounded canonical admission.
     fn import_from_directory(&mut self, dir_path: &Path) -> usize {
-        if self.control_session.is_some() {
-            return self.queue_directory_import(dir_path);
-        }
-
         let mut imported = 0;
         let mut failed = 0;
 
@@ -428,151 +344,11 @@ impl App {
         imported
     }
 
-    fn queue_directory_import(&mut self, dir_path: &Path) -> usize {
-        if self.pending_profile_imports.is_some() {
-            self.show_toast(
-                "A profile batch is already being queued".to_string(),
-                ToastType::Warning,
-            );
-            return 0;
-        }
-
-        let paths = match importable_profile_paths(dir_path) {
-            Ok(paths) => paths,
-            Err(error) => {
-                self.log(&format!("ERR: Failed to read directory: {error}"));
-                self.show_toast(
-                    format!("Error reading directory: {error}"),
-                    ToastType::Error,
-                );
-                return 0;
-            }
-        };
-        let count = paths.len();
-        if count == 0 {
-            self.show_toast(
-                constants::MSG_NO_FILES_FOUND.to_string(),
-                ToastType::Warning,
-            );
-            return 0;
-        }
-
-        self.pending_profile_imports = Some(super::PendingProfileImports {
-            source: dir_path.to_path_buf(),
-            remaining: paths.into(),
-            queued: 0,
-            failed: 0,
-            active: None,
-        });
-        self.pump_pending_profile_imports();
-        count
-    }
-
-    pub(crate) fn pump_pending_profile_imports(&mut self) {
-        let Some(mut batch) = self.pending_profile_imports.take() else {
-            return;
-        };
-        if batch.active.is_some() {
-            self.pending_profile_imports = Some(batch);
-            return;
-        }
-
-        for _ in 0..PROFILE_IMPORT_ATTEMPTS_PER_TURN {
-            let Some(path) = batch.remaining.pop_front() else {
-                break;
-            };
-            match self.try_issue_control_import(&path) {
-                Ok((_, request_key)) => {
-                    batch.queued += 1;
-                    batch.active =
-                        Some(super::PendingProfileImport::AwaitingAdmission(request_key));
-                    break;
-                }
-                Err(crate::cli::control::LocalControlError::Busy) => {
-                    batch.remaining.push_front(path);
-                    break;
-                }
-                Err(error) => {
-                    batch.failed += 1;
-                    self.log(&format!(
-                        "ERR: Failed to import {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-
-        if !batch.remaining.is_empty() || batch.active.is_some() {
-            self.pending_profile_imports = Some(batch);
-            return;
-        }
-
-        let summary = if batch.failed == 0 {
-            format!("Queued {} profile import(s)", batch.queued)
-        } else {
-            format!(
-                "Queued {} profile import(s), {} rejected",
-                batch.queued, batch.failed
-            )
-        };
-        self.show_toast(
-            summary.clone(),
-            if batch.failed == 0 {
-                ToastType::Success
-            } else {
-                ToastType::Warning
-            },
-        );
-        self.log(&format!("INFO: {summary} from {}", batch.source.display()));
-    }
-
-    pub(crate) fn admit_pending_profile_import(
-        &mut self,
-        request_key: &str,
-        operation_id: crate::vortix_core::control::OperationId,
-    ) {
-        let Some(batch) = self.pending_profile_imports.as_mut() else {
-            return;
-        };
-        if matches!(
-            &batch.active,
-            Some(super::PendingProfileImport::AwaitingAdmission(expected))
-                if expected == request_key
-        ) {
-            batch.active = Some(super::PendingProfileImport::Admitted(operation_id));
-        }
-    }
-
-    pub(crate) fn reject_pending_profile_import(&mut self, request_key: &str) {
-        let Some(batch) = self.pending_profile_imports.as_mut() else {
-            return;
-        };
-        if matches!(
-            &batch.active,
-            Some(super::PendingProfileImport::AwaitingAdmission(expected))
-                if expected == request_key
-        ) {
-            batch.active = None;
-            batch.failed = batch.failed.saturating_add(1);
-        }
-    }
-
-    pub(crate) fn settle_pending_profile_import(
-        &mut self,
-        operation_id: &crate::vortix_core::control::OperationId,
-        succeeded: bool,
-    ) {
-        let Some(batch) = self.pending_profile_imports.as_mut() else {
-            return;
-        };
-        if matches!(
-            &batch.active,
-            Some(super::PendingProfileImport::Admitted(expected)) if expected == operation_id
-        ) {
-            batch.active = None;
-            if !succeeded {
-                batch.failed = batch.failed.saturating_add(1);
-            }
+    /// Tell the engine the catalog changed.
+    fn sync_profiles(&mut self) {
+        let profiles = self.runtime.profiles.clone();
+        if let Some(control) = &self.control {
+            control.send(crate::control::Command::Profiles(profiles));
         }
     }
 }

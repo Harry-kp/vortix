@@ -1,17 +1,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead as _, Write as _};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 use serde::Serialize;
-use vortix::vortix_core::ports::process::{
+use vortix::process::{
     CommandSpec, ManagedProcessId, ProcessError, ProcessLifecycle, ProcessOwnership,
 };
-use vortix::vortix_core::profile::ProfileId;
-use vortix::vortix_process::{CustodianError, StandardCustodian};
+use vortix::process::{Custodian, CustodianError};
+use vortix::profile::ProfileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
@@ -96,7 +94,7 @@ fn identity(generation: u64) -> ManagedProcessId {
 #[test]
 fn foreground_child_handshake_then_graceful_stop_and_reap() {
     let fake = FakeProcess::default();
-    let mut custodian = StandardCustodian::new(fake, Duration::from_millis(10));
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
     let id = identity(7);
     let handshake = custodian
         .start(id.clone(), CommandSpec::oneshot("fake-openvpn", Vec::new()))
@@ -114,7 +112,7 @@ fn deadline_escalates_to_process_group_kill_then_reaps() {
         waits: VecDeque::from([false, true]),
         ..FakeProcess::default()
     };
-    let mut custodian = StandardCustodian::new(fake, Duration::from_millis(10));
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
     let id = identity(8);
     custodian
         .start(id.clone(), CommandSpec::oneshot("fake-openvpn", Vec::new()))
@@ -129,7 +127,7 @@ fn failed_startup_is_force_killed_reaped_and_never_owned() {
         fail_start_probe: true,
         ..FakeProcess::default()
     };
-    let mut custodian = StandardCustodian::new(fake, Duration::from_millis(10));
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
     let id = identity(9);
     assert!(matches!(
         custodian.start(id.clone(), CommandSpec::oneshot("fake-openvpn", Vec::new())),
@@ -141,7 +139,7 @@ fn failed_startup_is_force_killed_reaped_and_never_owned() {
 #[test]
 fn crash_containment_cleans_every_child_without_control_authority() {
     let fake = FakeProcess::default();
-    let mut custodian = StandardCustodian::new(fake, Duration::from_millis(10));
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
     let first = identity(10);
     let mut second = identity(11);
     second.profile_id = ProfileId::new("other-stable-profile");
@@ -333,164 +331,44 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     let _env = EnvGuard;
 
     let first = real_identity('a');
-    let handshake = vortix::vortix_process::start_managed_foreground(
+    let handshake = vortix::process::custodian::spawn_custodian(
         first.clone(),
         CommandSpec::oneshot("/bin/sleep", vec!["30".into()]),
         Vec::new(),
+        None,
     )
     .unwrap();
-    assert!(vortix::vortix_process::status_managed_foreground(&first).unwrap());
+    assert!(vortix::process::custodian::remote_status(&first).unwrap());
     assert_eq!(
-        vortix::vortix_process::managed_identity_for_profile(&first.profile_id)
+        vortix::process::custodian::load_identity(&first.profile_id)
             .unwrap()
             .as_ref(),
         Some(&first)
     );
 
-    // A later one-shot Standard-mode authority reconstructs the exact
+    // A later one-shot authority reconstructs the exact
     // OpenVPN handle from the authenticated custodian receipt and can stop it
     // without an in-memory executor ledger.
     let recovered_identity = real_identity('0');
-    let operation: vortix::vortix_core::control::OperationId =
+    let operation: vortix::tunnel::OperationId =
         serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap();
     let recovered_child_pid_path = temp.path().join("recovered-openvpn-child.pid");
-    let recovered_handshake = vortix::vortix_process::start_managed_foreground_for_operation(
+    let recovered_handshake = vortix::process::custodian::spawn_custodian(
         recovered_identity.clone(),
         pid_recording_sleep(&recovered_child_pid_path),
         Vec::new(),
-        operation.clone(),
+        Some(operation.clone()),
     )
     .unwrap();
-    let recovered_child_pid = wait_for_pid_file(&recovered_child_pid_path);
+    wait_for_pid_file(&recovered_child_pid_path);
     assert_eq!(
-        vortix::vortix_process::custodian::load_handshake(&recovered_identity.profile_id)
+        vortix::process::custodian::load_handshake(&recovered_identity.profile_id)
             .unwrap()
             .and_then(|handshake| handshake.operation_id),
         Some(operation.clone()),
         "authenticated receipt must retain the connect operation independently of history",
     );
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use vortix::core::scanner::ActiveSession;
-        use vortix::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
-        use vortix::tunnel::{CanonicalTunnelExecutor, CanonicalTunnelSettings};
-        use vortix::vortix_core::control::supervisor::Supervisor;
-        use vortix::vortix_core::control::worker::{
-            CancellationToken, PolicyBarrier, PolicyExecutor, TopologyPolicy, TunnelExecutor,
-            TunnelMutation, TunnelRevision, TunnelWork,
-        };
-        use vortix::vortix_core::control::AuthorityEpoch;
-        use vortix::vortix_core::ports::tunnel::TunnelKindTag;
-        use vortix::vortix_core::profile::{Profile, ProtocolKind};
-
-        struct NoopPolicy;
-        impl PolicyExecutor for NoopPolicy {
-            fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
-                Ok(())
-            }
-            fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
-                Ok(())
-            }
-        }
-
-        let config = temp.path().join("owned.ovpn");
-        std::fs::write(&config, "client\n").unwrap();
-        let profile = Profile::new(
-            recovered_identity.profile_id.clone(),
-            "owned",
-            ProtocolKind::OpenVpn,
-            config,
-        );
-        let run_dir = temp.path().join("run");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::write(
-            run_dir.join(format!("{}.log", profile.id.as_str())),
-            format!(
-                "PUSH_REPLY,ping 10\n{}\n",
-                vortix::constants::OVPN_LOG_SUCCESS
-            ),
-        )
-        .unwrap();
-        // SAFETY: geteuid returns one scalar credential without side effects.
-        #[allow(unsafe_code)]
-        let uid = unsafe { libc::geteuid() };
-        let ownership = Arc::new(
-            StandardTunnelOwnershipStore::new(
-                temp.path().join("standard-ownership"),
-                uid,
-                uid,
-                "test-boot",
-            )
-            .unwrap(),
-        );
-        let profile_for_lookup = profile.clone();
-        let profile_for_scan = profile.clone();
-        let scanner_pid = Arc::new(AtomicU32::new(1));
-        let scanner_pid_for_lookup = Arc::clone(&scanner_pid);
-        let executor = Arc::new(CanonicalTunnelExecutor::new_standard(
-            CanonicalTunnelSettings {
-                config_dir: temp.path().to_path_buf(),
-                openvpn_verbosity: "3".into(),
-                connect_timeout_secs: 1,
-                wireguard_handshake_timeout_secs: 1,
-                wireguard_health_targets: Vec::new(),
-            },
-            move |id| (id == &profile_for_lookup.id).then(|| profile_for_lookup.clone()),
-            ownership,
-            move |id| {
-                (id == &profile_for_scan.id).then(|| ActiveSession {
-                    name: profile_for_scan.display_name.clone(),
-                    pid: Some(scanner_pid_for_lookup.load(Ordering::Relaxed)),
-                    interface: "tun0".into(),
-                    interface_authoritative: true,
-                    ..ActiveSession::default()
-                })
-            },
-        ));
-        let supervisor = Supervisor::new(
-            AuthorityEpoch(1),
-            executor.clone(),
-            Arc::new(NoopPolicy),
-            1,
-            4,
-        );
-        let revision = TunnelRevision {
-            authority_epoch: AuthorityEpoch(1),
-            generation: recovered_identity.generation,
-        };
-        let mismatch = executor
-            .restore_standard_profile(
-                &supervisor,
-                &recovered_identity.profile_id,
-                revision,
-                operation.clone(),
-            )
-            .expect_err("scanner PID must belong to the authenticated process group");
-        assert!(
-            mismatch.contains("not contained by the authenticated custodian group"),
-            "unexpected recovery error: {mismatch}"
-        );
-        scanner_pid.store(recovered_child_pid, Ordering::Relaxed);
-        let cleanup_operation: vortix::vortix_core::control::OperationId =
-            serde_json::from_str("\"op-0000000000000001-0000000000000002\"").unwrap();
-        TunnelExecutor::execute(
-            executor.as_ref(),
-            &TunnelWork {
-                profile_id: recovered_identity.profile_id.clone(),
-                operation_id: cleanup_operation,
-                revision: TunnelRevision {
-                    authority_epoch: AuthorityEpoch(1),
-                    generation: revision.generation + 1,
-                },
-                resource_revision: revision,
-                mutation: TunnelMutation::Disconnect,
-                protocol: TunnelKindTag::OpenVpn,
-                deadline: Instant::now() + Duration::from_secs(3),
-            },
-            &CancellationToken::default(),
-        )
-        .unwrap();
-    }
+    vortix::process::custodian::remote_stop(&recovered_identity).unwrap();
     assert!(!group_has_live_members(recovered_handshake.pid));
 
     let mut wrong = first.clone();
@@ -500,52 +378,54 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
         "0"
     };
     wrong.ownership_token.replace_range(63..64, replacement);
-    assert!(vortix::vortix_process::status_managed_foreground(&wrong).is_err());
+    assert!(vortix::process::custodian::remote_status(&wrong).is_err());
     assert!(group_has_live_members(handshake.pid));
-    vortix::vortix_process::stop_managed_foreground(&first).unwrap();
+    vortix::process::custodian::remote_stop(&first).unwrap();
     assert!(!group_has_live_members(handshake.pid));
-    assert!(vortix::vortix_process::status_managed_foreground(&first).is_err());
+    assert!(vortix::process::custodian::remote_status(&first).is_err());
 
     // A stale capability cannot stop a newer attempt for the same profile.
     let newer = ManagedProcessId::generate(first.profile_id.clone()).unwrap();
-    vortix::vortix_process::start_managed_foreground(
+    vortix::process::custodian::spawn_custodian(
         newer.clone(),
         CommandSpec::oneshot("/bin/sleep", vec!["30".into()]),
         Vec::new(),
+        None,
     )
     .unwrap();
-    assert!(vortix::vortix_process::stop_managed_foreground(&first).is_err());
-    assert!(vortix::vortix_process::status_managed_foreground(&newer).unwrap());
-    vortix::vortix_process::stop_managed_foreground(&newer).unwrap();
+    assert!(vortix::process::custodian::remote_stop(&first).is_err());
+    assert!(vortix::process::custodian::remote_status(&newer).unwrap());
+    vortix::process::custodian::remote_stop(&newer).unwrap();
 
     // Per-profile actors stop concurrently rather than waiting behind a
     // process-global mutex.
     let second = real_identity('b');
     let third = real_identity('c');
     for identity in [&second, &third] {
-        vortix::vortix_process::start_managed_foreground(
+        vortix::process::custodian::spawn_custodian(
             identity.clone(),
             CommandSpec::oneshot("/bin/sleep", vec!["30".into()]),
             Vec::new(),
+            None,
         )
         .unwrap();
     }
-    let second_stop =
-        thread::spawn(move || vortix::vortix_process::stop_managed_foreground(&second));
-    let third_stop = thread::spawn(move || vortix::vortix_process::stop_managed_foreground(&third));
+    let second_stop = thread::spawn(move || vortix::process::custodian::remote_stop(&second));
+    let third_stop = thread::spawn(move || vortix::process::custodian::remote_stop(&third));
     second_stop.join().unwrap().unwrap();
     third_stop.join().unwrap().unwrap();
 
     // Natural exit releases the exact receipt and permits reconnect.
     let natural = real_identity('e');
-    let natural_handshake = vortix::vortix_process::start_managed_foreground(
+    let natural_handshake = vortix::process::custodian::spawn_custodian(
         natural.clone(),
         CommandSpec::oneshot("/bin/sleep", vec!["1".into()]),
         Vec::new(),
+        None,
     )
     .unwrap();
     for _ in 0..100 {
-        if vortix::vortix_process::managed_identity_for_profile(&natural.profile_id)
+        if vortix::process::custodian::load_identity(&natural.profile_id)
             .unwrap()
             .is_none()
         {
@@ -554,28 +434,30 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
         thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        vortix::vortix_process::managed_identity_for_profile(&natural.profile_id)
+        vortix::process::custodian::load_identity(&natural.profile_id)
             .unwrap()
             .is_none()
     );
-    vortix::vortix_process::stop_failed_managed_foreground_startup(&natural_handshake)
+    vortix::process::custodian::remote_stop_after_startup(&natural_handshake)
         .expect("the startup owner can prove an already-clean natural exit");
 
     // Spawn failure is fully cleaned and does not poison a later attempt.
     let failed = real_identity('f');
-    assert!(vortix::vortix_process::start_managed_foreground(
+    assert!(vortix::process::custodian::spawn_custodian(
         failed.clone(),
         CommandSpec::oneshot("/definitely/not/a/program", Vec::new()),
         Vec::new(),
+        None,
     )
     .is_err());
-    vortix::vortix_process::start_managed_foreground(
+    vortix::process::custodian::spawn_custodian(
         failed.clone(),
         CommandSpec::oneshot("/bin/sleep", vec!["30".into()]),
         Vec::new(),
+        None,
     )
     .unwrap();
-    vortix::vortix_process::stop_managed_foreground(&failed).unwrap();
+    vortix::process::custodian::remote_stop(&failed).unwrap();
 
     // Simulate a one-shot parent dying before COMMIT: EOF on the handoff pipe
     // makes the hidden custodian contain and reap its already-spawned child.
@@ -649,10 +531,11 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     // A status client may disappear before reading its response. Framing and
     // EPIPE are connection-local and must not stop a healthy owned tunnel.
     let dropped = real_identity('4');
-    vortix::vortix_process::start_managed_foreground(
+    vortix::process::custodian::spawn_custodian(
         dropped.clone(),
         CommandSpec::oneshot("/bin/sleep", vec!["30".into()]),
         Vec::new(),
+        None,
     )
     .unwrap();
     let socket_suffix = format!(
@@ -676,6 +559,6 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     stream.flush().unwrap();
     drop(stream);
     thread::sleep(Duration::from_millis(100));
-    assert!(vortix::vortix_process::status_managed_foreground(&dropped).unwrap());
-    vortix::vortix_process::stop_managed_foreground(&dropped).unwrap();
+    assert!(vortix::process::custodian::remote_status(&dropped).unwrap());
+    vortix::process::custodian::remote_stop(&dropped).unwrap();
 }

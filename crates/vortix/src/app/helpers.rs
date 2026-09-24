@@ -1,36 +1,17 @@
 //! Logging, scrolling, toast notifications, and utility helpers.
 
-use std::path::Path;
 use std::time::Instant;
 
 use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
-use time::OffsetDateTime;
 
 use super::{App, FocusedPanel, Toast, ToastType};
 use crate::constants;
 use crate::logger::{self, LogLevel};
-use crate::utils;
 
 impl App {
-    /// Derive a legacy `ConnectionState` view from the registry primary.
-    ///
-    /// Post-P5d the App layer no longer carries a `connection_state`
-    /// field on `VpnRuntime`; this method computes the single-tunnel
-    /// view from `registry.primary()`. Falls back to the first
-    /// non-Disconnected entry when no primary is set (so Connecting
-    /// transitions surface before the FSM owns the default route).
-    ///
-    /// Used by code paths that still think in single-tunnel terms
-    /// (kill switch sync, profile delete safety, scanner dispatch).
-    /// All multi-tunnel-aware paths read `app.registry.snapshot_all`
-    /// directly.
-    #[must_use]
     /// Profile name for logs and dialogs. Profile ids are 64-char digests and
     /// mean nothing to the reader.
-    pub(crate) fn profile_display_name(
-        &self,
-        profile_id: &crate::vortix_core::profile::ProfileId,
-    ) -> String {
+    pub(crate) fn profile_display_name(&self, profile_id: &crate::profile::ProfileId) -> String {
         self.runtime
             .profiles
             .iter()
@@ -41,85 +22,15 @@ impl App {
             )
     }
 
-    pub fn legacy_state(&self) -> crate::vpn_runtime::ConnectionState {
-        use crate::vortix_core::engine::state::Connection;
-        use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
-
-        let snap = self
-            .registry
-            .primary()
-            .and_then(|pid| self.registry.snapshot(pid))
-            .or_else(|| {
-                self.registry
-                    .snapshot_all()
-                    .into_iter()
-                    .find(|s| !matches!(s.state, Connection::Disconnected { .. }))
-            });
-        let Some(snap) = snap else {
-            return ConnectionState::Disconnected;
-        };
-        let display_name = self.profile_display_name(&snap.profile_id);
-
-        let now = std::time::SystemTime::now();
-        let to_instant = |t: std::time::SystemTime| {
-            now.duration_since(t)
-                .ok()
-                .and_then(|d| Instant::now().checked_sub(d))
-                .unwrap_or_else(Instant::now)
-        };
-
-        match snap.state {
-            Connection::Disconnected { .. } => ConnectionState::Disconnected,
-            Connection::Connecting { started_at, .. }
-            | Connection::Reconnecting { started_at, .. } => ConnectionState::Connecting {
-                started: to_instant(started_at),
-                profile: display_name.clone(),
-            },
-            Connection::AwaitingUserInput { since, .. } => ConnectionState::Connecting {
-                started: to_instant(since),
-                profile: display_name.clone(),
-            },
-            Connection::Connected { since, details, .. } => {
-                let server_location = self
-                    .runtime
-                    .profiles
-                    .iter()
-                    .find(|p| p.id == snap.profile_id)
-                    .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
-                ConnectionState::Connected {
-                    since: to_instant(since),
-                    profile: display_name,
-                    server_location,
-                    latency_ms: 0,
-                    // The legacy view is a projection: ownership, teardown and
-                    // DNS intent stay with the canonical registry rather than
-                    // riding along here.
-                    details: Box::new(DetailedConnectionInfo {
-                        interface: details.interface.clone(),
-                        internal_ip: details.internal_ip.clone(),
-                        endpoint: details.endpoint.clone(),
-                        mtu: details.mtu.clone(),
-                        public_key: details.public_key.clone(),
-                        listen_port: details.listen_port.clone(),
-                        transfer_rx: details.transfer_rx.clone(),
-                        transfer_tx: details.transfer_tx.clone(),
-                        latest_handshake: details.latest_handshake.clone(),
-                        generation: details.generation,
-                        handshake: details.handshake.clone(),
-                        probe_receipts: details.probe_receipts.clone(),
-                        pid: details.pid,
-                        ..Default::default()
-                    }),
-                }
-            }
-            Connection::Disconnecting { started_at, .. } => ConnectionState::Disconnecting {
-                started: to_instant(started_at),
-                profile: display_name,
-            },
-        }
-    }
-    /// Whether the registry currently has at least one Connected tunnel.
+    /// The tunnel the dashboard treats as current: the primary, else the
+    /// first one.
     #[must_use]
+    pub fn current_tunnel(&self) -> Option<&crate::control::TunnelView> {
+        self.primary_id()
+            .and_then(|pid| self.tunnel(pid))
+            .or_else(|| self.tunnels().into_iter().next())
+    }
+
     /// How long one telemetry observation may go unrefreshed before its
     /// value stops standing for the present.
     ///
@@ -147,11 +58,10 @@ impl App {
     }
 
     pub(crate) fn has_active_connection(&self) -> bool {
-        use crate::vortix_core::engine::state::Connection;
-        self.registry
-            .snapshot_all()
+        self.control_snapshot
+            .tunnels
             .iter()
-            .any(|s| matches!(s.state, Connection::Connected { .. }))
+            .any(|tunnel| tunnel.phase == crate::control::Phase::Up)
     }
 
     /// Add a log message via centralized logger
@@ -166,9 +76,9 @@ impl App {
         }
 
         // Auto-save to log file
-        let timestamp = utils::format_local_time();
+        let timestamp = crate::ui::helpers::format_local_time();
         let level_tag = level.prefix();
-        Self::append_to_log_file_batch(
+        crate::logger::append_to_file(
             &[format!("{timestamp} [{level_tag}] {category}: {content}")],
             &self.runtime.config_dir,
             self.runtime.config.log_rotation_size,
@@ -176,47 +86,13 @@ impl App {
         );
     }
 
-    /// Add a bounded group of messages while opening the persistent log once.
-    pub(crate) fn log_batch(&mut self, messages: &[String]) {
-        let mut persisted = Vec::with_capacity(messages.len());
-        for message in messages {
-            let (category, content, level) = classify_log_message(message);
-            logger::log(level, category, content);
-            let timestamp = utils::format_local_time();
-            let level_tag = level.prefix();
-            persisted.push(format!("{timestamp} [{level_tag}] {category}: {content}"));
-        }
-        if self.logs_auto_scroll {
-            self.logs_scroll = self.logs_max_scroll;
-        }
-        Self::append_to_log_file_batch(
-            &persisted,
-            &self.runtime.config_dir,
-            self.runtime.config.log_rotation_size,
-            self.runtime.config.log_retention_days,
-        );
-    }
-
-    /// Count active tunnels for keybinding decisions (multi-tunnel
-    /// work). "Active" means the FSM is not `Disconnected` — that
-    /// includes `Connecting`, `Connected`, `Disconnecting`,
-    /// `AwaitingUserInput`, and any other in-flight states.
-    #[must_use]
-    pub(crate) fn active_tunnel_count(&self) -> usize {
-        use crate::vortix_core::engine::state::Connection;
-        self.registry
-            .snapshot_all()
-            .iter()
-            .filter(|s| !matches!(s.state, Connection::Disconnected { .. }))
-            .count()
-    }
     /// Resolve a user/scanner-facing display name at the App boundary.
-    /// Internal registry and lifecycle code carries the returned stable ID.
+    /// Internal engine snapshot and lifecycle code carries the returned stable ID.
     #[must_use]
     pub(crate) fn profile_id_for_name(
         &self,
         display_name: &str,
-    ) -> Option<crate::vortix_core::profile::ProfileId> {
+    ) -> Option<crate::profile::ProfileId> {
         self.runtime
             .profiles
             .iter()
@@ -224,30 +100,23 @@ impl App {
             .map(|profile| profile.id.clone())
     }
 
-    /// Whether the named profile is currently in any non-`Disconnected` state
-    /// (`Connecting` / `Connected` / `Disconnecting` / `Reconnecting` /
-    /// `AwaitingUserInput`). Used by deletion-safety checks where we need
-    /// to refuse to delete a profile that has an in-flight or active
-    /// tunnel.
+    /// Whether the named profile has a tunnel in any phase; deletion refuses
+    /// while it does.
     #[must_use]
     pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
-        use crate::vortix_core::engine::state::Connection;
         self.profile_id_for_name(profile_name)
-            .and_then(|id| self.registry.snapshot(&id))
-            .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected { .. }))
+            .is_some_and(|id| self.tunnel(&id).is_some())
     }
 
     /// Whether the profile at `idx` is currently Connecting (in-flight).
-    /// Used by the `c` cancel keybinding ().
+    /// Used by the `c` cancel keybinding.
     #[must_use]
     pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
-        use crate::vortix_core::engine::state::Connection;
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };
-        self.registry
-            .snapshot(&profile.id)
-            .is_some_and(|snap| matches!(snap.state, Connection::Connecting { .. }))
+        self.tunnel(&profile.id)
+            .is_some_and(|tunnel| tunnel.phase == crate::control::Phase::Starting)
     }
 
     /// Resolve the profile index that the Connection Details panel is
@@ -427,108 +296,6 @@ impl App {
                 format!("Failed to copy to clipboard: {error}"),
                 ToastType::Error,
             ),
-        }
-    }
-
-    /// Append log entry to file with automatic rotation
-    pub(super) fn append_to_log_file_batch(
-        entries: &[String],
-        config_dir: &std::path::Path,
-        rotation_size: u64,
-        retention_days: u64,
-    ) {
-        static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        use std::io::Write;
-
-        if entries.is_empty() {
-            return;
-        }
-        let log_dir = config_dir.join(constants::LOGS_DIR_NAME);
-
-        // Create log directory if needed
-        if crate::utils::create_user_dir(&log_dir).is_err() {
-            return;
-        }
-
-        // Use date-based log file
-        let today = OffsetDateTime::now_local()
-            .unwrap_or_else(|_| OffsetDateTime::now_utc())
-            .date();
-        let log_file = log_dir.join(format!("vortix-{today}.log"));
-
-        let mut current_len = std::fs::metadata(&log_file).map_or(0, |metadata| metadata.len());
-        let mut file = None;
-        for entry in entries {
-            let encoded_len = u64::try_from(entry.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
-            if current_len > 0 && current_len.saturating_add(encoded_len) > rotation_size {
-                drop(file.take());
-                Self::rotate_log_file(&log_file, &log_dir, today);
-                current_len = 0;
-            }
-            if file.is_none() {
-                let is_new = !log_file.exists();
-                file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_file)
-                    .ok();
-                if is_new && file.is_some() {
-                    crate::config::fix_ownership(&log_file);
-                }
-            }
-            let Some(writer) = file.as_mut() else {
-                break;
-            };
-            if writeln!(writer, "{entry}").is_err() {
-                break;
-            }
-            current_len = current_len.saturating_add(encoded_len);
-        }
-
-        // Clean up old logs periodically
-        let added = u32::try_from(entries.len()).unwrap_or(u32::MAX);
-        let count = CLEANUP_COUNTER.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
-        let last = count.saturating_add(added.saturating_sub(1));
-        if count % constants::LOG_CLEANUP_INTERVAL == 0
-            || count / constants::LOG_CLEANUP_INTERVAL != last / constants::LOG_CLEANUP_INTERVAL
-        {
-            Self::cleanup_old_logs(&log_dir, retention_days);
-        }
-    }
-
-    fn rotate_log_file(log_file: &Path, log_dir: &Path, today: time::Date) {
-        if !log_file.exists() {
-            return;
-        }
-        let rotated = (1_u32..=u32::from(u16::MAX))
-            .map(|suffix| log_dir.join(format!("vortix-{today}.{suffix}.log")))
-            .find(|candidate| !candidate.exists());
-        if let Some(rotated) = rotated {
-            let _ = std::fs::rename(log_file, rotated);
-        }
-    }
-
-    /// Remove log files older than `retention_days` days.
-    fn cleanup_old_logs(log_dir: &Path, retention_days: u64) {
-        use std::time::{Duration, SystemTime};
-
-        let max_age = Duration::from_secs(retention_days * 24 * 60 * 60);
-        let cutoff = SystemTime::now()
-            .checked_sub(max_age)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-
-        if let Ok(entries) = std::fs::read_dir(log_dir) {
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified < cutoff {
-                            let _ = std::fs::remove_file(entry.path());
-                        }
-                    }
-                }
-            }
         }
     }
 }

@@ -1,9 +1,9 @@
-# Plan 015 phase B / plan 012 — CI integration tests
+# CI integration tests
 #
-# Drives the vortix binary against real wg-quick + openvpn + iptables /
-# nftables in privileged Docker containers with `ip netns` namespaces.
-# Matrix covers Ubuntu (iptables-nft compat) + Fedora (native nft) so
-# we catch behavioral differences between the two firewall backends.
+# Drives the vortix binary against real wg-quick + nftables in
+# privileged Docker containers with `ip netns` namespaces. The kill switch
+# is nftables only. Matrix covers Ubuntu (iptables-nft compat image) +
+# Fedora (native nft) to catch distro differences.
 #
 # Full macOS integration parity is still deferred — GitHub Actions' macOS
 # runners don't easily support netns / sandboxed wg-quick. The release-smoke
@@ -16,7 +16,7 @@ name: Integration Tests
 
 on:
   # Doc-only changes skip Integration — these tests drive the real
-  # vortix binary against real wg-quick + iptables; markdown can't
+  # vortix binary against real wg-quick + nftables; markdown can't
   # affect kernel behavior. Cron + workflow_dispatch are unaffected
   # by paths-ignore so nightly runs continue regardless of PR shape.
   pull_request:
@@ -95,7 +95,7 @@ jobs:
             integration-cargo-${{ matrix.distro.label }}-
 
       - name: Run integration tests (${{ matrix.distro.label }})
-        # --privileged: required for `ip netns` + iptables manipulation
+        # --privileged: required for `ip netns` + nftables manipulation
         # --network host: avoid docker0 interfering with the test netns
         run: |
           docker run --privileged --network host --rm \

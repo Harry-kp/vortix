@@ -3,10 +3,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, AuthField, FocusedPanel, InputMode, ToastType};
+use crate::app::state::help_max_scroll_for_terminal_height;
 use crate::constants;
+use crate::control::Phase;
 use crate::message::{self, Message, ScrollMove, SelectionMove};
-use crate::state::help_max_scroll_for_terminal_height;
-use crate::vortix_core::engine::state::Connection;
 
 enum ConfirmAction {
     Confirmed,
@@ -21,20 +21,19 @@ pub(crate) enum FocusedTunnelAction {
     Connect,
     Cancel,
     Disconnect,
-    ForceDisconnect,
+    /// Already stopping; a stuck process is killed without being asked.
+    Stopping,
 }
 
 /// Classify one focused tunnel without falling back to another active tunnel.
-pub(crate) const fn focused_tunnel_action(state: Option<&Connection>) -> FocusedTunnelAction {
-    match state {
-        Some(Connection::Disconnecting { .. }) => FocusedTunnelAction::ForceDisconnect,
-        Some(
-            Connection::Connecting { .. }
-            | Connection::Reconnecting { .. }
-            | Connection::AwaitingUserInput { .. },
-        ) => FocusedTunnelAction::Cancel,
-        Some(Connection::Connected { .. }) => FocusedTunnelAction::Disconnect,
-        Some(Connection::Disconnected { .. }) | None => FocusedTunnelAction::Connect,
+pub(crate) const fn focused_tunnel_action(phase: Option<Phase>) -> FocusedTunnelAction {
+    match phase {
+        Some(Phase::Stopping) => FocusedTunnelAction::Stopping,
+        Some(Phase::Starting | Phase::Waiting { .. } | Phase::AwaitingCredentials) => {
+            FocusedTunnelAction::Cancel
+        }
+        Some(Phase::Up) => FocusedTunnelAction::Disconnect,
+        None => FocusedTunnelAction::Connect,
     }
 }
 
@@ -69,27 +68,24 @@ fn handle_confirm_keys(key: KeyEvent, confirm_selected: &mut bool) -> ConfirmAct
 impl App {
     /// Apply the sidebar disconnect shortcut to the focused profile only.
     ///
-    /// An inactive row is deliberately a no-op: falling back to the registry
+    /// An inactive row is deliberately a no-op: falling back to the engine snapshot
     /// primary here would disconnect a different profile than the one the user
     /// selected.
     fn handle_focused_profile_disconnect(&mut self) {
         let Some(idx) = self.profile_list_state.selected() else {
             return;
         };
-        let state = self.runtime.profiles.get(idx).and_then(|profile| {
-            self.registry
-                .snapshot(&profile.id)
-                .map(|snapshot| snapshot.state)
-        });
-        match focused_tunnel_action(state.as_ref()) {
+        let phase = self
+            .runtime
+            .profiles
+            .get(idx)
+            .and_then(|profile| self.tunnel(&profile.id).map(|tunnel| tunnel.phase));
+        match focused_tunnel_action(phase) {
             FocusedTunnelAction::Disconnect => {
                 self.handle_message(Message::DisconnectProfile { idx });
             }
-            FocusedTunnelAction::ForceDisconnect => {
-                self.handle_message(Message::ForceDisconnectProfile { idx });
-            }
             FocusedTunnelAction::Cancel => self.handle_message(Message::CancelConnect { idx }),
-            FocusedTunnelAction::Connect => {}
+            FocusedTunnelAction::Connect | FocusedTunnelAction::Stopping => {}
         }
     }
 
@@ -152,47 +148,6 @@ impl App {
         // Handle based on Input Mode
         let input_mode = self.input_mode.clone();
         match input_mode {
-            InputMode::BackgroundSetup { mut state } => {
-                use crate::background::BackgroundFocus;
-                match key.code {
-                    KeyCode::Esc if !state.committed => {
-                        self.handle_message(Message::CloseOverlay);
-                    }
-                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
-                        state.focus = state.focus.next();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        state.scroll = state.scroll.saturating_add(1).min(
-                            crate::ui::overlays::background_setup::max_scroll(
-                                &self.background_mode,
-                                state.workflow,
-                                self.terminal_size.0,
-                                self.terminal_size.1,
-                            ),
-                        );
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.scroll = state.scroll.saturating_sub(1);
-                    }
-                    KeyCode::Home | KeyCode::Char('g') => state.scroll = 0,
-                    KeyCode::End | KeyCode::Char('G') => {
-                        state.scroll = crate::ui::overlays::background_setup::max_scroll(
-                            &self.background_mode,
-                            state.workflow,
-                            self.terminal_size.0,
-                            self.terminal_size.1,
-                        );
-                    }
-                    KeyCode::Enter if state.focus == BackgroundFocus::Continue => {
-                        self.handle_message(Message::ConfirmBackgroundAction);
-                    }
-                    KeyCode::Enter => self.handle_message(Message::CloseOverlay),
-                    _ => {}
-                }
-                if matches!(self.input_mode, InputMode::BackgroundSetup { .. }) {
-                    self.input_mode = InputMode::BackgroundSetup { state };
-                }
-            }
             InputMode::Import {
                 mut path,
                 mut cursor,
@@ -250,11 +205,6 @@ impl App {
                         static_challenge_prompt,
                         reveal_secrets,
                     };
-                }
-            }
-            InputMode::DependencyError { .. } | InputMode::PermissionDenied { .. } => {
-                if key.code == KeyCode::Esc {
-                    self.handle_message(Message::CloseOverlay);
                 }
             }
             InputMode::Help {
@@ -577,13 +527,13 @@ impl crate::app::App {
     fn handle_input_auth(
         &mut self,
         key: KeyEvent,
-        profile_id: &crate::vortix_core::profile::ProfileId,
+        profile_id: &crate::profile::ProfileId,
         _profile_name: &str,
-        username: &mut crate::state::SecretText,
+        username: &mut crate::app::state::SecretText,
         username_cursor: &mut usize,
-        password: &mut crate::state::SecretText,
+        password: &mut crate::app::state::SecretText,
         password_cursor: &mut usize,
-        otp: &mut crate::state::SecretText,
+        otp: &mut crate::app::state::SecretText,
         otp_cursor: &mut usize,
         focused_field: &mut AuthField,
         save_credentials: &mut bool,
@@ -624,7 +574,7 @@ impl crate::app::App {
                 }
                 // When this profile declares static-challenge, require OTP.
                 // Trim the OTP at submit (covers paste-with-newline).
-                let trimmed_otp = crate::state::SecretText::from(otp.trim());
+                let trimmed_otp = crate::app::state::SecretText::from(otp.trim());
                 if has_otp_field && trimmed_otp.is_empty() {
                     self.show_toast("OTP required".to_string(), ToastType::Warning);
                     return;
@@ -854,12 +804,11 @@ impl crate::app::App {
                     let Some(idx) = self.profile_list_state.selected() else {
                         return;
                     };
-                    let state = self.runtime.profiles.get(idx).and_then(|profile| {
-                        self.registry
-                            .snapshot(&profile.id)
-                            .map(|snapshot| snapshot.state)
-                    });
-                    match focused_tunnel_action(state.as_ref()) {
+                    let phase =
+                        self.runtime.profiles.get(idx).and_then(|profile| {
+                            self.tunnel(&profile.id).map(|tunnel| tunnel.phase)
+                        });
+                    match focused_tunnel_action(phase) {
                         FocusedTunnelAction::Connect => {
                             self.handle_message(Message::ToggleConnect(Some(idx)));
                         }
@@ -869,9 +818,7 @@ impl crate::app::App {
                         FocusedTunnelAction::Disconnect => {
                             self.handle_message(Message::DisconnectProfile { idx });
                         }
-                        FocusedTunnelAction::ForceDisconnect => {
-                            self.handle_message(Message::ForceDisconnectProfile { idx });
-                        }
+                        FocusedTunnelAction::Stopping => {}
                     }
                 }
                 KeyCode::Char('v') => {
@@ -996,7 +943,7 @@ impl crate::app::App {
     fn handle_rename_keys(
         &mut self,
         key: KeyEvent,
-        profile_id: &crate::vortix_core::profile::ProfileId,
+        profile_id: &crate::profile::ProfileId,
         new_name: &mut String,
         cursor: &mut usize,
     ) {

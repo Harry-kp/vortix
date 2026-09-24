@@ -10,6 +10,15 @@ PRs that only touch `**/*.md`, `LICENSE`, or `CHANGELOG.md` skip every heavy CI 
 
 If your PR mixes a doc change with anything else (any `.rs`, `Cargo.toml`, `Cargo.lock`, or workflow YAML touch), CI fires normally. The skip only triggers when EVERY changed file matches the doc patterns.
 
+## One command
+
+```bash
+scripts/ci-local.sh           # full set, including Linux cross-clippy and rustdoc on macOS
+scripts/ci-local.sh --quick   # skips the release build
+```
+
+The script runs steps 1 and 3–6 below, then clippy and rustdoc for the Linux target (Trap 2; CI builds docs on Linux, so a doc link to a macOS-only item fails only there), and without `--quick` the release build and `release_smoke.sh` from step 7. Steps are listed so a failure can be re-run on its own.
+
 ## The full set
 
 ```bash
@@ -33,7 +42,6 @@ cargo xtask check-subprocess
 cargo xtask check-platform-leak
 cargo xtask check-protocol-leak
 cargo xtask check-no-shell-regressions
-cargo xtask check-control-boundaries
 
 # 7. Release-profile smoke — the ONLY step that builds `release`; steps 1-6 all
 #    build dev, so a profile-only breakage is invisible to them. Mirrors the
@@ -66,12 +74,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### Trap 2 — `#[cfg(target_os = "...")]` blocks are skipped on the wrong host
 
-Code gated to Linux (`vortix_platform_linux/*`, `daemon/server.rs` SO_PEERCRED block) never compiles on macOS, and vice versa. Local clippy on a macOS host **cannot** catch a Linux-only lint. CI runs the matrix; humans usually don't.
+Code gated to Linux (`linux/*`) never compiles on macOS, and vice versa, so a plain local clippy misses the other OS's lints.
 
-**Mitigations:**
-- Where feasible, cross-compile-check before pushing: `cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu` (or `aarch64-apple-darwin` from a Linux box). Linker errors are expected for non-host targets; the lint pass still runs.
-  **This usually does not work from macOS.** `ring` runs a build script that needs a Linux C cross-compiler, so the build fails there and never reaches the lint pass. Adding the rustup target is not enough. Treat this bullet as available only where a cross toolchain is already installed, and do not plan a verification step around it.
-- Otherwise: push to a feature branch, watch CI, fix from the failure log. Don't merge until all matrix legs are green. On this repo that is the normal path, not the fallback: a single branch shipped three separate Linux-only failures (a DNS regression invisible to macOS tests, then `clippy::unnecessary_wraps` and `clippy::items_after_test_module`) where every local run was green.
+**Fix:** on macOS, `scripts/ci-local.sh` also runs clippy for `x86_64-unknown-linux-gnu` once the target is installed (`rustup target add x86_64-unknown-linux-gnu`). `ring`'s build script uses macOS clang pointed at the SDK's libc headers; clippy never links:
+```bash
+SDK=$(xcrun --show-sdk-path) \
+CC_x86_64_unknown_linux_gnu=clang AR_x86_64_unknown_linux_gnu=ar \
+CFLAGS_x86_64_unknown_linux_gnu="--target=x86_64-unknown-linux-gnu -isystem $SDK/usr/include" \
+cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+```
+Linux-only runtime behaviour (tests under `cfg(target_os = "linux")`) still runs only in CI; don't merge until every matrix leg is green.
 
 ### Trap 3 — `cargo clippy` does NOT run rustdoc lints
 
@@ -97,17 +109,16 @@ cargo fmt --all -- --check
 
 ### Trap 5 — Forgetting the boundary checks
 
-`cargo xtask check-{subprocess,platform,protocol}-leak`, `check-no-shell-regressions`, and `check-control-boundaries` enforce architectural boundaries (no platform imports from `vortix_core`, no protocol imports from `vortix_platform_*`, no new client-side mutation imports, seed/mirror writers, misplaced root requests, or unbounded production channels). They are NOT part of `cargo test`. CI runs them as separate jobs.
+`cargo xtask check-{subprocess,platform,protocol}-leak` and `check-no-shell-regressions` enforce architectural boundaries (OS `cfg` only in `macos/`/`linux/`/`platform.rs`, subprocesses only through `process/`, protocol binaries only in their protocol module, no new shell-outs to replaced system binaries). They are NOT part of `cargo test`. CI runs them as separate jobs.
 
 ## When to run what
 
 | Situation | Minimum set |
 |---|---|
 | Tight edit loop on a single function | `cargo check -p vortix --lib` |
-| Before opening a PR | Full set above |
-| Before declaring a unit done (per-unit verification in plan docs) | Full set above |
+| Before opening a PR or pushing | `scripts/ci-local.sh` |
 | After dependency bumps (rand, sha2, libc, tokio) | Full set above + manual smoke per `docs/manual-testing/<feature>.md` |
-| After cross-platform code touches | Full set, plus cross-compile-check (`--target`) where possible |
+| After cross-platform code touches | `scripts/ci-local.sh` (includes Linux cross-clippy and rustdoc on macOS) |
 | Checking a build-time or binary-size regression | `scripts/bench-build.sh` — see [`docs/performance.md`](performance.md) |
 | After touching a cargo profile, a dependency feature, or CLI output | Full set **including step 7** |
 

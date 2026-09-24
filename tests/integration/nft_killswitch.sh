@@ -73,8 +73,12 @@ nft_after="$(ip netns exec "$NS_B" "$REAL_NFT" --stateless list table inet vorti
     echo "FAIL: failed nft replacement changed the prior owned table"
     exit 1
 }
-grep -q '"state": "Armed"' "$VORTIX_CONFIG_DIR/killswitch.state"
-grep -q '"effective_state": "Degraded"' "$VORTIX_CONFIG_DIR/killswitch.state"
+if ! grep -q '"state": "Armed"' "$VORTIX_CONFIG_DIR/killswitch.state" \
+    || ! grep -q '"effective_state": "Degraded"' "$VORTIX_CONFIG_DIR/killswitch.state"; then
+    echo "FAIL: a failed nft replacement must persist Armed/Degraded; state file:"
+    cat "$VORTIX_CONFIG_DIR/killswitch.state"
+    exit 1
+fi
 ip netns exec "$NS_B" "$REAL_NFT" list table inet host_sentinel >/dev/null
 
 echo "OK: nft replacement is owned, atomic on failure, and degrades truth"

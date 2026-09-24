@@ -7,7 +7,7 @@
 //! Privacy-by-design: only collects non-identifying data. Never touches IPs,
 //! server endpoints, profile names, credentials, DNS servers, or log contents.
 
-use crate::vortix_process::CommandSpec;
+use crate::process::CommandSpec;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::Path;
@@ -154,9 +154,9 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
     };
 
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let profile_counts = super::commands::count_profiles(&profiles_dir);
+    let profile_counts = super::profiles::count_profiles(&profiles_dir);
 
-    let ks_state = loaded_killswitch_summary(crate::core::killswitch::load_state_checked());
+    let ks_state = loaded_killswitch_summary(crate::control::killswitch::load_state_checked());
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((0, 0));
     let terminal_size = if term_cols > 0 {
@@ -173,7 +173,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
         terminal: std::env::var("TERM").unwrap_or_else(|_| "unknown".to_string()),
         terminal_size,
         shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string()),
-        is_root: crate::utils::is_root(),
+        is_root: crate::platform::is_root(),
         tools: collect_tool_statuses(),
         config_dir: redact_home_prefix(&config_dir.display().to_string()),
         config_source: config_source.to_string(),
@@ -185,22 +185,22 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
 
 fn loaded_killswitch_summary(
     loaded: Result<
-        Option<crate::core::killswitch::PersistedState>,
-        crate::core::killswitch::PersistedStateLoadError,
+        Option<crate::control::killswitch::PersistedState>,
+        crate::control::killswitch::PersistedStateLoadError,
     >,
 ) -> String {
     match loaded {
-        Ok(Some(persisted)) => {
-            persisted_killswitch_summary(persisted.mode, persisted.recovered_state())
-        }
-        Ok(None) => crate::state::KillSwitchMode::Off.display_name().to_string(),
+        Ok(Some(persisted)) => persisted_killswitch_summary(persisted.mode, persisted.live_state()),
+        Ok(None) => crate::control::killswitch::KillSwitchMode::Off
+            .display_name()
+            .to_string(),
         Err(error) => format!("Unknown — state could not be verified ({error})"),
     }
 }
 
 fn persisted_killswitch_summary(
-    mode: crate::state::KillSwitchMode,
-    state: crate::state::KillSwitchState,
+    mode: crate::control::killswitch::KillSwitchMode,
+    state: crate::control::killswitch::KillSwitchState,
 ) -> String {
     format!("{} ({})", mode.display_name(), state.display_status())
 }
@@ -236,103 +236,7 @@ fn install_method_from_path(exe: &str) -> &'static str {
 // ── OS detection ────────────────────────────────────────────────────────────
 
 fn get_os_info() -> String {
-    #[cfg(target_os = "macos")]
-    // xtask:allow-platform-cfg: bug-report OS info is intrinsically OS-specific
-    {
-        let version = macos_product_version().unwrap_or_default();
-        let kernel = uname_release().unwrap_or_default();
-        if version.is_empty() {
-            format!("macOS (Darwin {kernel})")
-        } else {
-            format!("macOS {version} (Darwin {kernel})")
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    // xtask:allow-platform-cfg: bug-report OS info is intrinsically OS-specific
-    {
-        let distro = linux_distro_name().unwrap_or_else(|| "Linux".to_string());
-        let kernel = uname_release().unwrap_or_default();
-        if kernel.is_empty() {
-            distro
-        } else {
-            format!("{distro} (kernel {kernel})")
-        }
-    }
-}
-
-/// Read the `release` field from `libc::uname` — equivalent to `uname -r`.
-///
-/// Replaces the shell-out to `uname` in `get_os_info`. Pure libc; no
-/// PATH dependency; ~10× faster than spawning a subprocess.
-///
-#[cfg(unix)] // xtask:allow-platform-cfg: utsname is a Unix concept
-fn uname_release() -> Option<String> {
-    // SAFETY: `libc::uname` writes a `utsname` struct's worth of bytes
-    // into the pointer we provide. We pass a zero-initialised stack
-    // buffer of exactly the right size; the kernel cannot write past
-    // it. Return value is 0 on success, -1 on failure.
-    #[allow(unsafe_code)]
-    unsafe {
-        let mut buf: libc::utsname = std::mem::zeroed();
-        if libc::uname(std::ptr::from_mut(&mut buf)) != 0 {
-            return None;
-        }
-        // `release` is a fixed-size C char array; convert to &str via
-        // CStr to honor null termination.
-        let release_ptr = buf.release.as_ptr();
-        let cstr = std::ffi::CStr::from_ptr(release_ptr);
-        cstr.to_str().ok().map(str::to_string)
-    }
-}
-
-/// Read `kern.osproductversion` via `sysctlbyname` — equivalent to
-/// `sw_vers -productVersion` on macOS (returns e.g. "14.5", "13.7.1").
-///
-#[cfg(target_os = "macos")] // xtask:allow-platform-cfg: sw_vers replacement is intrinsically macOS-only
-fn macos_product_version() -> Option<String> {
-    use std::ffi::CString;
-    let key = CString::new("kern.osproductversion").ok()?;
-    // Preallocate enough buffer for any plausible version string.
-    // macOS product versions are at most "X.Y.Z" with single-digit
-    // components today; 64 bytes is comfortable headroom.
-    let mut buf = vec![0u8; 64];
-    let mut len = buf.len();
-
-    // SAFETY: `sysctlbyname(name, oldp, oldlenp, newp, newlen)`. We
-    // pass: name = CString-owned C-string; oldp = buf.as_mut_ptr() cast
-    // to *mut c_void; oldlenp = &mut len; newp = null (not setting);
-    // newlen = 0. The kernel writes at most `len` bytes into buf and
-    // updates len with the actual byte count written.
-    #[allow(unsafe_code)]
-    let rc = unsafe {
-        libc::sysctlbyname(
-            key.as_ptr(),
-            buf.as_mut_ptr().cast::<libc::c_void>(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    // `len` now holds the number of bytes written (including the
-    // trailing NUL). Trim to len-1 to drop the NUL before UTF-8 decode.
-    let written = len.saturating_sub(1);
-    buf.truncate(written);
-    String::from_utf8(buf).ok()
-}
-
-#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: distro name lives in /etc/os-release on Linux only
-fn linux_distro_name() -> Option<String> {
-    let content = std::fs::read_to_string("/etc/os-release").ok()?;
-    for line in content.lines() {
-        if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
-            return Some(value.trim_matches('"').to_string());
-        }
-    }
-    None
+    crate::platform::os_description()
 }
 
 // ── Tool status checks ─────────────────────────────────────────────────────
@@ -345,15 +249,8 @@ fn collect_tool_statuses() -> Vec<ToolStatus> {
         check_tool("openvpn", &["--version"]),
     ];
 
-    #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: pfctl is the macOS killswitch tool
-    tools.push(check_tool_exists("pfctl"));
-
-    #[cfg(target_os = "linux")]
-    // xtask:allow-platform-cfg: iptables/nft are the Linux killswitch tools
-    {
-        tools.push(check_tool("iptables", &["--version"]));
-        tools.push(check_tool("nft", &["--version"]));
-    }
+    let (firewall, version_args) = crate::platform::FIREWALL_TOOL;
+    tools.push(check_tool(firewall, version_args));
 
     tools
 }
@@ -364,12 +261,18 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
     // `which` itself is not preinstalled on every distro (e.g. Fedora
     // minimal), and our own diagnostic surface shouldn't false-fail
     // because of a missing diagnostic tool.
-    let path = crate::utils::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
+    let path = crate::platform::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
 
+    if version_args.is_empty() {
+        return ToolStatus {
+            name,
+            path,
+            version: None,
+        };
+    }
     // wg-quick --version exits non-zero on some systems; try to get version anyway
     let owned_args: Vec<String> = version_args.iter().map(|s| (*s).to_string()).collect();
-    let version = match crate::vortix_process::run_to_output(CommandSpec::oneshot(name, owned_args))
-    {
+    let version = match crate::process::run(CommandSpec::oneshot(name, owned_args)) {
         Ok(output) => {
             let raw = if output.stdout.is_empty() {
                 String::from_utf8_lossy(&output.stderr).to_string()
@@ -385,18 +288,6 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
         name,
         path,
         version,
-    }
-}
-
-/// Check if a tool exists (path only, no version — for tools like `pfctl`).
-#[cfg(target_os = "macos")] // xtask:allow-platform-cfg: helper only used by the macOS pfctl branch above
-fn check_tool_exists(name: &'static str) -> ToolStatus {
-    // same PATH-walking as `check_tool` — see comment above.
-    let path = crate::utils::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
-    ToolStatus {
-        name,
-        path,
-        version: None,
     }
 }
 
@@ -589,7 +480,7 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
 
     // Diagnostic Journal — surface the JSONL session path
     // and the in-memory tail so triagers can replay locally.
-    if let Some(journal) = crate::vortix_core::journal::global_journal() {
+    if let Some(journal) = crate::journal::global_journal() {
         let _ = writeln!(body, "## Diagnostic Journal\n");
         let _ = writeln!(body, "```");
         if let Some(path) = &journal.session_path {
@@ -682,35 +573,17 @@ fn build_github_url(body: &str) -> String {
 // ── Clipboard ───────────────────────────────────────────────────────────────
 
 fn copy_to_clipboard(text: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    // xtask:allow-platform-cfg: pbcopy is macOS-only; future Clipboard port
-    let result = pipe_to_command("pbcopy", text);
-
-    #[cfg(target_os = "linux")]
-    // xtask:allow-platform-cfg: wl-copy/xclip/xsel selection is Linux-only
-    let result = if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        pipe_to_command("wl-copy", text)
-            .or_else(|| pipe_to_command("xclip", text))
-            .or_else(|| pipe_to_command("xsel", text))
-    } else {
-        pipe_to_command("xclip", text)
-            .or_else(|| pipe_to_command("xsel", text))
-            .or_else(|| pipe_to_command("wl-copy", text))
-    };
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let result: Option<()> = None;
-
-    result.is_some()
+    crate::platform::clipboard_commands()
+        .into_iter()
+        .any(|command| pipe_to_command(command, text).is_some())
 }
 
 /// Pipe `text` to a command's stdin.
 fn pipe_to_command(cmd: &str, text: &str) -> Option<()> {
-    let output = crate::vortix_process::run_to_output(
-        CommandSpec::oneshot(cmd, vec![]).stdin(text.as_bytes().to_vec()),
-    )
-    .ok()?;
-    output.status.success().then_some(())
+    let output =
+        crate::process::run(CommandSpec::oneshot(cmd, vec![]).stdin(text.as_bytes().to_vec()))
+            .ok()?;
+    output.success().then_some(())
 }
 
 /// Fallback when clipboard is unavailable.
@@ -727,7 +600,7 @@ fn print_fallback(body: &str) {
 
 /// Replace the user's home directory prefix with `~` for privacy.
 fn redact_home_prefix(path: &str) -> String {
-    if let Some(home) = crate::utils::home_dir() {
+    if let Some(home) = crate::config::user_home() {
         let home_str = home.to_string_lossy();
         if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
             return format!("~{rest}");
@@ -740,21 +613,21 @@ fn redact_home_prefix(path: &str) -> String {
 mod tests {
     use super::*;
 
-    /// `recovered_state` owns the "a durable request is not kernel proof"
-    /// rule (see `core::killswitch`); this pins the rendering around it.
+    /// `PersistedState::live_state` owns the "a durable request is not kernel
+    /// proof" rule; this pins the rendering around it.
     #[test]
-    fn persisted_state_renders_mode_and_recovered_state() {
+    fn persisted_state_renders_mode_and_live_state() {
         assert_eq!(
             persisted_killswitch_summary(
-                crate::state::KillSwitchMode::AlwaysOn,
-                crate::state::KillSwitchState::Degraded,
+                crate::control::killswitch::KillSwitchMode::AlwaysOn,
+                crate::control::killswitch::KillSwitchState::Degraded,
             ),
             "VPN-only (Degraded)"
         );
         assert_eq!(
             persisted_killswitch_summary(
-                crate::state::KillSwitchMode::Auto,
-                crate::state::KillSwitchState::Armed,
+                crate::control::killswitch::KillSwitchMode::Auto,
+                crate::control::killswitch::KillSwitchState::Armed,
             ),
             "Block on drop (Watching)"
         );
@@ -763,7 +636,7 @@ mod tests {
     #[test]
     fn unsupported_persisted_state_is_never_reported_as_off() {
         let summary = loaded_killswitch_summary(Err(
-            crate::core::killswitch::PersistedStateLoadError::UnsupportedSchema(99),
+            crate::control::killswitch::PersistedStateLoadError::UnsupportedSchema(99),
         ));
         assert!(summary.starts_with("Unknown"));
         assert!(!summary.starts_with("Off"));
