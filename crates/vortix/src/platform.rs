@@ -288,20 +288,6 @@ pub(crate) fn supplementary_groups_for_user(
     }
 }
 
-/// The command that shows this platform's Vortix-owned firewall rules, so a
-/// reader who is told Vortix cannot confirm them can look for themselves.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn firewall_inspect_hint() -> &'static str {
-    "sudo pfctl -a com.apple/vortix.killswitch -sr"
-}
-
-#[cfg(target_os = "linux")]
-#[must_use]
-pub fn firewall_inspect_hint() -> &'static str {
-    "sudo nft list table inet vortix_killswitch"
-}
-
 /// Platform-appropriate install hint for a package.
 #[cfg(target_os = "macos")]
 #[must_use]

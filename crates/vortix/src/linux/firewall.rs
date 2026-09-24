@@ -14,6 +14,7 @@ use crate::process::{CommandOutcome, CommandSpec, PrivilegeReq, ProcessError};
 use tracing::{debug, error, info};
 
 const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
+const NFT_TABLE_NAME: &str = "vortix_killswitch";
 use super::POLICY_COMMENT_PREFIX;
 use nft_policy::BatchMode;
 
@@ -21,6 +22,30 @@ use nft_policy::BatchMode;
 pub struct NftFirewall;
 
 impl NftFirewall {
+    /// The command that shows the Vortix-owned rules.
+    #[must_use]
+    pub fn inspect_hint() -> String {
+        format!("sudo nft list table inet {NFT_TABLE_NAME}")
+    }
+
+    /// Manual removal of every Vortix-owned rule when release fails.
+    #[must_use]
+    pub fn emergency_hint() -> String {
+        format!(
+            "Remove only Vortix-owned state: sudo nft delete table inet {NFT_TABLE_NAME}; \
+             while sudo iptables -C OUTPUT -j {CHAIN_NAME} 2>/dev/null; \
+             do sudo iptables -D OUTPUT -j {CHAIN_NAME}; \
+             done; \
+             sudo iptables -F {CHAIN_NAME}; \
+             sudo iptables -X {CHAIN_NAME}; \
+             while sudo ip6tables -C OUTPUT -j {CHAIN_NAME} 2>/dev/null; \
+             do sudo ip6tables -D OUTPUT -j {CHAIN_NAME}; \
+             done; \
+             sudo ip6tables -F {CHAIN_NAME}; \
+             sudo ip6tables -X {CHAIN_NAME}"
+        )
+    }
+
     fn nft_command(args: Vec<String>) -> CommandSpec {
         let mut command = Self::firewall_command("nft", args);
         command.env.insert("LC_ALL".to_string(), "C".to_string());
@@ -268,7 +293,7 @@ impl NftFirewall {
                 "list".into(),
                 "table".into(),
                 "inet".into(),
-                crate::constants::NFT_TABLE_NAME.into(),
+                NFT_TABLE_NAME.into(),
             ])
             .privilege(PrivilegeReq::Root),
         )
@@ -348,7 +373,7 @@ impl NftFirewall {
                 "delete".into(),
                 "table".into(),
                 "inet".into(),
-                crate::constants::NFT_TABLE_NAME.into(),
+                NFT_TABLE_NAME.into(),
             ])
             .privilege(PrivilegeReq::Root),
         )
@@ -482,7 +507,7 @@ mod nft_policy {
     use std::fmt::Write as _;
     use std::net::IpAddr;
 
-    use super::POLICY_COMMENT_PREFIX;
+    use super::{NFT_TABLE_NAME, POLICY_COMMENT_PREFIX};
     use crate::cidr::Cidr;
     use crate::control::killswitch::{lan_allowance, ActiveTunnelInfo};
 
@@ -570,22 +595,16 @@ mod nft_policy {
 
         let mut ruleset = String::new();
         if matches!(mode, BatchMode::Replace) {
-            writeln!(
-                ruleset,
-                "delete table inet {}",
-                crate::constants::NFT_TABLE_NAME
-            )
-            .unwrap();
+            writeln!(ruleset, "delete table inet {NFT_TABLE_NAME}").unwrap();
         }
         write!(
             ruleset,
-            r#"table inet {} {{
+            r#"table inet {NFT_TABLE_NAME} {{
   chain output {{
     type filter hook output priority 0; policy drop;
 
     oifname "lo" accept
 "#,
-            crate::constants::NFT_TABLE_NAME,
         )
         .unwrap();
         for range in local_ranges {
@@ -871,16 +890,10 @@ mod tests {
                 "list".into(),
                 "table".into(),
                 "inet".into(),
-                crate::constants::NFT_TABLE_NAME.into(),
+                NFT_TABLE_NAME.into(),
             ])
             .args,
-            [
-                "-n",
-                "list",
-                "table",
-                "inet",
-                crate::constants::NFT_TABLE_NAME,
-            ]
+            ["-n", "list", "table", "inet", NFT_TABLE_NAME,]
         );
     }
 
@@ -920,7 +933,7 @@ mod tests {
         ];
         let digest = crate::control::killswitch::policy_digest(&active);
         let expected = format!(
-            "table inet {table} {{
+            "table inet {NFT_TABLE_NAME} {{
   chain output {{
     type filter hook output priority 0; policy drop;
 
@@ -935,8 +948,7 @@ mod tests {
     counter drop comment \"{POLICY_COMMENT_PREFIX}{digest}\"
   }}
 }}
-",
-            table = crate::constants::NFT_TABLE_NAME,
+"
         );
         assert_eq!(nft(&active), expected);
     }

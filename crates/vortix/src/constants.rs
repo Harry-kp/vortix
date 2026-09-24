@@ -124,12 +124,6 @@ pub const TELEMETRY_STALE_FLOOR_SECS: u64 = 90;
 /// macOS `WireGuard` runtime directory.
 #[cfg(target_os = "macos")]
 pub const WIREGUARD_RUN_DIR: &str = "/var/run/wireguard";
-/// Linux network device statistics pseudo-file.
-#[cfg(target_os = "linux")]
-pub const PROC_NET_DEV_PATH: &str = "/proc/net/dev";
-/// Linux nftables table name for kill switch.
-#[cfg(target_os = "linux")]
-pub const NFT_TABLE_NAME: &str = "vortix_killswitch";
 
 // === Logging Defaults ===
 // These are the compiled-in defaults. Users can override them via config.toml.
@@ -208,14 +202,6 @@ pub const MSG_NO_DATA: &str = "---";
 pub const MSG_UNAVAILABLE: &str = "unavailable";
 
 // === Platform Defaults ===
-
-/// Emergency instructions for the user if the kill switch cannot be disabled normally.
-#[cfg(target_os = "macos")]
-pub const KILLSWITCH_EMERGENCY_MSG: &str =
-    "You may need to run: sudo pfctl -a com.apple/vortix.killswitch -F rules";
-#[cfg(target_os = "linux")]
-pub const KILLSWITCH_EMERGENCY_MSG: &str =
-    "Remove only Vortix-owned state: sudo nft delete table inet vortix_killswitch; while sudo iptables -C OUTPUT -j VORTIX_KILLSWITCH 2>/dev/null; do sudo iptables -D OUTPUT -j VORTIX_KILLSWITCH; done; sudo iptables -F VORTIX_KILLSWITCH; sudo iptables -X VORTIX_KILLSWITCH; while sudo ip6tables -C OUTPUT -j VORTIX_KILLSWITCH 2>/dev/null; do sudo ip6tables -D OUTPUT -j VORTIX_KILLSWITCH; done; sudo ip6tables -F VORTIX_KILLSWITCH; sudo ip6tables -X VORTIX_KILLSWITCH";
 
 // === OpenVPN Runtime Configuration ===
 

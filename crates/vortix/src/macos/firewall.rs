@@ -80,6 +80,18 @@ fn read_pf_state() -> io::Result<(
 pub struct PfFirewall;
 
 impl PfFirewall {
+    /// The command that shows the Vortix-owned rules.
+    #[must_use]
+    pub fn inspect_hint() -> String {
+        format!("sudo pfctl -a {PF_ANCHOR} -sr")
+    }
+
+    /// Manual removal of every Vortix-owned rule when release fails.
+    #[must_use]
+    pub fn emergency_hint() -> String {
+        format!("You may need to run: sudo pfctl -a {PF_ANCHOR} -F rules")
+    }
+
     fn pfctl_command(args: Vec<String>) -> CommandSpec {
         CommandSpec::oneshot("pfctl", args)
             .privilege(PrivilegeReq::Root)

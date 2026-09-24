@@ -309,7 +309,7 @@ fn print_killswitch_status(
         println!("  Vortix cannot confirm this mode's firewall rules from here,");
         println!("  so it will not claim you are protected. Traffic may or may not");
         println!("  be blocked — check the rules directly to be sure:");
-        println!("    {}", crate::platform::firewall_inspect_hint());
+        println!("    {}", crate::platform::Firewall::inspect_hint());
         println!(
             "  Re-apply with `vortix killswitch {}`, or clear it with `vortix release-killswitch`.",
             mode.cli_verb()
@@ -457,7 +457,7 @@ pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
             CliError {
                 code: "persistence_failed",
                 message: format!("Could not durably save kill switch mode off: {error}"),
-                hint: Some(crate::constants::KILLSWITCH_EMERGENCY_MSG.to_string()),
+                hint: Some(crate::platform::Firewall::emergency_hint()),
             },
             ExitCode::GeneralError,
         )
@@ -505,7 +505,7 @@ fn emergency_release_failed(mode: OutputMode, message: String) -> ! {
         CliError {
             code: "release_failed",
             message,
-            hint: Some(crate::constants::KILLSWITCH_EMERGENCY_MSG.to_string()),
+            hint: Some(crate::platform::Firewall::emergency_hint()),
         },
         ExitCode::GeneralError,
     )
