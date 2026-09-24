@@ -89,8 +89,11 @@ pub struct VpnRuntime {
     pub sort_order: ProfileSortOrder,
 
     // === Async Communication ===
-    pub(crate) telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
-    pub telemetry_nudge: Option<mpsc::Sender<()>>,
+    pub(crate) telemetry_rx: Option<mpsc::Receiver<(u64, TelemetryUpdate)>>,
+    pub telemetry_nudge: Option<mpsc::Sender<u64>>,
+    /// Bumped whenever the tunnel set changes; telemetry started before the
+    /// bump describes an egress path that may no longer exist.
+    pub telemetry_epoch: u64,
     pub(crate) cmd_tx: mpsc::Sender<Message>,
     pub(crate) cmd_rx: mpsc::Receiver<Message>,
     pub(crate) netstats_rx: Option<mpsc::Receiver<(u64, u64)>>,
@@ -159,6 +162,7 @@ impl VpnRuntime {
 
             telemetry_rx: None,
             telemetry_nudge: None,
+            telemetry_epoch: 0,
             cmd_tx,
             cmd_rx,
             netstats_rx: None,

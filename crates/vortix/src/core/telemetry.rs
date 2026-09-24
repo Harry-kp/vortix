@@ -8,7 +8,7 @@
 //! updates via an MPSC channel to the main application.
 
 use std::collections::VecDeque;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,20 @@ impl From<&crate::config::AppConfig> for TelemetryConfig {
             ip_api_fallbacks: config.ip_api_fallbacks.clone(),
             geolocation_api_fallback: config.geolocation_api_fallback.clone(),
         }
+    }
+}
+
+/// Sends updates tagged with the tunnel-topology epoch the probe started in,
+/// so the app can drop a sample taken through a tunnel that has since gone.
+#[derive(Clone)]
+struct Tx {
+    inner: mpsc::Sender<(u64, TelemetryUpdate)>,
+    epoch: u64,
+}
+
+impl Tx {
+    fn send(&self, update: TelemetryUpdate) -> Result<(), mpsc::SendError<(u64, TelemetryUpdate)>> {
+        self.inner.send((self.epoch, update))
     }
 }
 
@@ -137,12 +151,7 @@ impl EgressIdentityState {
     }
 
     /// Log a state transition, never a per-poll repetition.
-    fn announce_once(
-        flag: &mut bool,
-        tx: &Sender<TelemetryUpdate>,
-        level: LogLevel,
-        message: &str,
-    ) {
+    fn announce_once(flag: &mut bool, tx: &Tx, level: LogLevel, message: &str) {
         if *flag {
             let _ = tx.send(TelemetryUpdate::Log(LogLevel::Debug, message.to_string()));
             return;
@@ -155,7 +164,7 @@ impl EgressIdentityState {
         }
     }
 
-    fn announce_egress_unavailable(&mut self, tx: &Sender<TelemetryUpdate>) {
+    fn announce_egress_unavailable(&mut self, tx: &Tx) {
         Self::announce_once(
             &mut self.egress_unavailable_announced,
             tx,
@@ -164,7 +173,7 @@ impl EgressIdentityState {
         );
     }
 
-    fn announce_egress_recovered(&mut self, tx: &Sender<TelemetryUpdate>) {
+    fn announce_egress_recovered(&mut self, tx: &Tx) {
         if !self.egress_unavailable_announced {
             return;
         }
@@ -175,7 +184,7 @@ impl EgressIdentityState {
         ));
     }
 
-    fn announce_primary_unavailable(&mut self, tx: &Sender<TelemetryUpdate>) {
+    fn announce_primary_unavailable(&mut self, tx: &Tx) {
         Self::announce_once(
             &mut self.primary_unavailable_announced,
             tx,
@@ -214,7 +223,7 @@ enum PrimaryLookup {
 }
 
 impl IpSuccessLog {
-    fn publish(&mut self, tx: &Sender<TelemetryUpdate>, identity: &EgressIdentity) {
+    fn publish(&mut self, tx: &Tx, identity: &EgressIdentity) {
         if self.last_identity.as_ref() == Some(identity) {
             return;
         }
@@ -242,21 +251,29 @@ impl IpSuccessLog {
 /// # Returns
 ///
 /// A tuple of:
-/// - `Receiver<TelemetryUpdate>` — yields telemetry data as it arrives
-/// - `Sender<()>` — send on this to trigger an immediate refresh (e.g. after connect/disconnect)
+/// - a receiver of updates, each tagged with the topology epoch its probe
+///   started under
+/// - a sender that triggers an immediate refresh under a new epoch
 ///
 /// # Panics
 ///
 /// This function does not panic. All errors in background threads are silently handled.
 #[must_use]
-pub fn spawn_telemetry_worker(config: TelemetryConfig) -> (Receiver<TelemetryUpdate>, Sender<()>) {
-    let (tx, rx) = mpsc::channel();
-    let (nudge_tx, nudge_rx) = mpsc::channel::<()>();
+pub fn spawn_telemetry_worker(
+    config: TelemetryConfig,
+) -> (Receiver<(u64, TelemetryUpdate)>, mpsc::Sender<u64>) {
+    let (sender, rx) = mpsc::channel();
+    let (nudge_tx, nudge_rx) = mpsc::channel::<u64>();
+    let mut epoch = 0;
     let config = std::sync::Arc::new(config);
     let mut ip_success_log = IpSuccessLog::default();
     let mut identity_state = EgressIdentityState::default();
 
     thread::spawn(move || loop {
+        let tx = Tx {
+            inner: sender.clone(),
+            epoch,
+        };
         // These probes spawn their own bounded workers, so start them without
         // waiting for the serialized identity lookup's network timeouts.
         fetch_latency(&tx, &config);
@@ -265,8 +282,12 @@ pub fn spawn_telemetry_worker(config: TelemetryConfig) -> (Receiver<TelemetryUpd
 
         // Wait for the poll interval, but wake up immediately if nudged.
         // Drain any extra nudges that accumulated while we were fetching.
-        let _ = nudge_rx.recv_timeout(config.poll_rate);
-        while nudge_rx.try_recv().is_ok() {}
+        if let Ok(next) = nudge_rx.recv_timeout(config.poll_rate) {
+            epoch = epoch.max(next);
+        }
+        while let Ok(next) = nudge_rx.try_recv() {
+            epoch = epoch.max(next);
+        }
     });
 
     (rx, nudge_tx)
@@ -274,7 +295,7 @@ pub fn spawn_telemetry_worker(config: TelemetryConfig) -> (Receiver<TelemetryUpd
 
 /// Fetches public IP address and ISP information with fallback APIs.
 fn fetch_ip_and_isp(
-    tx: &Sender<TelemetryUpdate>,
+    tx: &Tx,
     cfg: &std::sync::Arc<TelemetryConfig>,
     ip_success_log: &mut IpSuccessLog,
     identity_state: &mut EgressIdentityState,
@@ -311,7 +332,7 @@ fn fetch_ip_and_isp(
 }
 
 fn publish_observed_ip(
-    tx: &Sender<TelemetryUpdate>,
+    tx: &Tx,
     cfg: &TelemetryConfig,
     ip_success_log: &mut IpSuccessLog,
     identity_state: &mut EgressIdentityState,
@@ -330,17 +351,13 @@ fn publish_observed_ip(
     publish_identity(tx, ip_success_log, identity);
 }
 
-fn publish_identity(
-    tx: &Sender<TelemetryUpdate>,
-    ip_success_log: &mut IpSuccessLog,
-    identity: EgressIdentity,
-) {
+fn publish_identity(tx: &Tx, ip_success_log: &mut IpSuccessLog, identity: EgressIdentity) {
     ip_success_log.publish(tx, &identity);
     let _ = tx.send(TelemetryUpdate::EgressIdentity(identity));
 }
 
 fn lookup_location_identity(
-    tx: &Sender<TelemetryUpdate>,
+    tx: &Tx,
     cfg: &TelemetryConfig,
     state: &mut EgressIdentityState,
     public_ip: Option<&str>,
@@ -400,7 +417,7 @@ fn lookup_location_identity(
 }
 
 /// Try the configured primary geolocation API with bounded retry.
-fn try_primary_geolocation(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> PrimaryLookup {
+fn try_primary_geolocation(tx: &Tx, cfg: &TelemetryConfig) -> PrimaryLookup {
     let timeout = Duration::from_secs(cfg.api_timeout);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
@@ -456,7 +473,7 @@ fn try_primary_geolocation(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) 
 }
 
 fn try_geolocation_fallback(
-    tx: &Sender<TelemetryUpdate>,
+    tx: &Tx,
     cfg: &TelemetryConfig,
     public_ip: Option<&str>,
 ) -> Option<EgressIdentity> {
@@ -538,11 +555,7 @@ fn ip_echo_providers(cfg: &TelemetryConfig) -> [IpEchoProvider; 3] {
 /// the IPv4 one. Requests go out over IPv4 (see `telemetry_http`), and this
 /// check is the second, independent guard on the same guarantee: nothing
 /// that is not an IPv4 address can reach an IPv4 field.
-fn try_ip_echo(
-    tx: &Sender<TelemetryUpdate>,
-    cfg: &TelemetryConfig,
-    provider: &IpEchoProvider,
-) -> Option<String> {
+fn try_ip_echo(tx: &Tx, cfg: &TelemetryConfig, provider: &IpEchoProvider) -> Option<String> {
     let timeout = Duration::from_secs(cfg.api_timeout);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
@@ -671,7 +684,7 @@ fn parse_ip_api_response(json: &str) -> Option<(String, Option<String>, Option<S
 /// with `core::icmp::measure_latency`. Same outputs (`latency_ms`,
 /// `packet_loss` %, `jitter_ms`); same retry-across-targets behavior;
 /// same zero-latency, total-loss quality sample when every target fails.
-fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
+fn fetch_latency(tx: &Tx, cfg: &std::sync::Arc<TelemetryConfig>) {
     // 3 probes, matching the prior `ping -c 3 -i 0.2` cadence.
     const PROBES_PER_TARGET: u32 = 3;
 
@@ -712,7 +725,7 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
 }
 
 /// Fetches DNS configuration and probes the current public IPv6.
-fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
+fn fetch_security_info(tx: &Tx, cfg: &std::sync::Arc<TelemetryConfig>) {
     let tx_clone = tx.clone();
     let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
@@ -740,9 +753,26 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
 mod tests {
     use super::*;
 
+    struct UntaggedRx(Receiver<(u64, TelemetryUpdate)>);
+
+    impl UntaggedRx {
+        fn try_iter(&self) -> impl Iterator<Item = TelemetryUpdate> + '_ {
+            self.0.try_iter().map(|(_, update)| update)
+        }
+
+        fn try_recv(&self) -> Result<TelemetryUpdate, mpsc::TryRecvError> {
+            self.0.try_recv().map(|(_, update)| update)
+        }
+    }
+
+    fn test_channel() -> (Tx, UntaggedRx) {
+        let (inner, rx) = mpsc::channel();
+        (Tx { inner, epoch: 0 }, UntaggedRx(rx))
+    }
+
     #[test]
     fn ip_success_log_emits_changes_and_recovery_only_once() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = test_channel();
         let mut log = IpSuccessLog::default();
         let identity = EgressIdentity {
             public_ip: "192.0.2.1".to_string(),
@@ -940,7 +970,7 @@ mod tests {
     fn an_ipv6_answer_is_never_accepted_as_the_public_ipv4() {
         let (url, stop) = spawn_echo_server("2401:4900:890d:3cd5:a7be:9ed1:f79:dea7");
         let cfg = probe_config(&url);
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = test_channel();
 
         let observed = try_ip_echo(&tx, &cfg, &ip_echo_providers(&cfg)[0]);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -955,7 +985,7 @@ mod tests {
     fn a_valid_ipv4_answer_is_accepted() {
         let (url, stop) = spawn_echo_server("168.144.212.123\n");
         let cfg = probe_config(&url);
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = test_channel();
 
         let observed = try_ip_echo(&tx, &cfg, &ip_echo_providers(&cfg)[0]);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -967,7 +997,7 @@ mod tests {
     /// event-log line. One line on the way in, one on the way out.
     #[test]
     fn a_standing_outage_is_announced_once_not_once_per_poll() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = test_channel();
         let mut state = EgressIdentityState::default();
 
         for _ in 0..5 {
@@ -997,7 +1027,7 @@ mod tests {
 
     #[test]
     fn an_unreachable_location_provider_is_announced_once_and_paused() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = test_channel();
         let mut state = EgressIdentityState::default();
         let now = Instant::now();
 
@@ -1051,7 +1081,7 @@ mod tests {
             ip_api_fallbacks: Vec::new(),
             geolocation_api_fallback: String::new(),
         };
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = test_channel();
 
         assert_eq!(
             try_primary_geolocation(&tx, &cfg),

@@ -15,15 +15,20 @@ impl App {
             return;
         };
 
-        for update in updates {
-            self.handle_message(Message::Telemetry(update));
+        for (epoch, update) in updates {
+            if epoch == self.runtime.telemetry_epoch
+                || matches!(update, crate::core::telemetry::TelemetryUpdate::Log(..))
+            {
+                self.handle_message(Message::Telemetry(update));
+            }
         }
     }
 
     /// Wake the telemetry worker so it refreshes IP/ISP/latency immediately.
-    pub(crate) fn refresh_telemetry(&self) {
+    pub(crate) fn refresh_telemetry(&mut self) {
+        self.runtime.telemetry_epoch += 1;
         if let Some(nudge) = &self.runtime.telemetry_nudge {
-            let _ = nudge.send(());
+            let _ = nudge.send(self.runtime.telemetry_epoch);
         }
     }
     /// Poll the network stats channel and kick off a new fetch if idle.

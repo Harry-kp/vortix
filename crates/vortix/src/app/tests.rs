@@ -2404,6 +2404,28 @@ fn a_stale_wireguard_handshake_reaches_the_dashboard() {
 }
 
 #[test]
+fn an_egress_sample_from_before_a_tunnel_change_is_dropped() {
+    use crate::core::telemetry::{EgressIdentity, TelemetryUpdate};
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.runtime.telemetry_rx = Some(rx);
+    app.runtime.telemetry_epoch = 1;
+    let sample = |ip: &str| {
+        TelemetryUpdate::EgressIdentity(EgressIdentity {
+            public_ip: ip.into(),
+            isp: None,
+            location: None,
+        })
+    };
+    tx.send((0, sample("139.59.71.126"))).unwrap();
+    app.process_telemetry();
+    assert_ne!(app.runtime.public_ip, "139.59.71.126");
+    tx.send((1, sample("203.0.113.9"))).unwrap();
+    app.process_telemetry();
+    assert_eq!(app.runtime.public_ip, "203.0.113.9");
+}
+
+#[test]
 fn an_unexpected_drop_counts_once() {
     use crate::control::state::Phase;
     use crate::control::{Snapshot, TunnelView};
