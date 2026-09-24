@@ -74,7 +74,7 @@ pub(crate) mod route_probe {
                 }
             }
 
-            let result = crate::process::run_to_output(spec);
+            let result = crate::process::run(spec);
             let mut state = state.lock().expect("backoff state mutex poisoned");
             if let Ok(output) = result {
                 state.consecutive_failures = 0;

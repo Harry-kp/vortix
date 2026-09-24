@@ -40,26 +40,26 @@ const PF_RULE_LABEL_MAX_BYTES: usize = 63;
 const FIREWALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const FIREWALL_OUTPUT_LIMIT: usize = 1024 * 1024;
 
-fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
+fn pfctl(args: &[&str]) -> io::Result<crate::process::CommandOutcome> {
     let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    crate::process::run_to_output(PfFirewall::pfctl_command(owned))
+    Ok(crate::process::run(PfFirewall::pfctl_command(owned))?)
 }
 
 /// Invoke anchor-scoped `pfctl -f -` with the given ruleset on stdin.
 /// is atomic: the in-kernel ruleset is replaced in a single operation. No
 /// leak window — earlier rules stay live until the new set parses and
 /// commits.
-fn pfctl_load_stdin(ruleset: &[u8]) -> std::io::Result<std::process::Output> {
-    crate::process::run_to_output(
+fn pfctl_load_stdin(ruleset: &[u8]) -> io::Result<crate::process::CommandOutcome> {
+    Ok(crate::process::run(
         PfFirewall::pfctl_command(PF_APPLY_ARGS.map(str::to_string).to_vec())
             .stdin(ruleset.to_vec()),
-    )
+    )?)
 }
 
 fn read_pf_state() -> io::Result<(
-    std::process::Output,
-    std::process::Output,
-    std::process::Output,
+    crate::process::CommandOutcome,
+    crate::process::CommandOutcome,
+    crate::process::CommandOutcome,
 )> {
     std::thread::scope(|scope| {
         let root = scope.spawn(|| pfctl(&["-sr"]));
@@ -394,7 +394,7 @@ impl PfFirewall {
         // populated but inert anchor must not mutate global PF state.
         let output = pfctl(&["-sr"])?;
         let root_rules = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || !Self::root_traverses_anchor(&root_rules) {
+        if !output.success() || !Self::root_traverses_anchor(&root_rules) {
             return Err(KillswitchError::CommandFailed(
                 "root pf ruleset does not traverse the Vortix anchor".to_string(),
             ));
@@ -415,7 +415,7 @@ impl PfFirewall {
         // atomically replaces the in-kernel rules. If parsing fails the
         // prior ruleset stays in force.
         let output = pfctl_load_stdin(rules.as_bytes())?;
-        if !output.status.success() {
+        if !output.success() {
             let err = String::from_utf8_lossy(&output.stderr).to_string();
             error!(target: "vortix::killswitch", stderr = %err, "pfctl -f - failed");
             return Err(KillswitchError::CommandFailed(err));
@@ -424,7 +424,7 @@ impl PfFirewall {
         // Ensure pf is enabled. Idempotent — emits "pf already enabled" on
         // refresh, which we treat as success.
         let output = pfctl(&["-e"])?;
-        if !output.status.success() {
+        if !output.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("enabled") {
                 error!(target: "vortix::killswitch", stderr = %stderr, "pfctl -e failed");
@@ -457,7 +457,7 @@ impl PfFirewall {
         }
 
         let output = pfctl(&PF_RELEASE_ARGS)?;
-        if !output.status.success() {
+        if !output.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("not enabled") && !stderr.contains("does not exist") {
                 error!(target: "vortix::killswitch", stderr = %stderr, "pf anchor flush failed");
@@ -466,7 +466,7 @@ impl PfFirewall {
         }
 
         let output = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
-        if !output.status.success() {
+        if !output.success() {
             return Err(KillswitchError::CommandFailed(format!(
                 "pf anchor read-back failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -486,9 +486,9 @@ impl PfFirewall {
 
     pub fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
         let (root, anchor, status) = read_pf_state()?;
-        if root.status.success()
-            && anchor.status.success()
-            && status.status.success()
+        if root.success()
+            && anchor.success()
+            && status.success()
             && Self::state_matches_policy(
                 active,
                 &String::from_utf8_lossy(&root.stdout),
@@ -506,7 +506,7 @@ impl PfFirewall {
 
     pub fn verify_disabled() -> Result<()> {
         let anchor = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
-        if anchor.status.success()
+        if anchor.success()
             && Self::canonical_pf_rules(&String::from_utf8_lossy(&anchor.stdout)).is_empty()
         {
             Ok(())

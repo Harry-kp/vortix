@@ -74,7 +74,7 @@ pub enum ScriptedOutcome {
         stderr: Vec<u8>,
         exit_code: i32,
     },
-    Failure(String), // error message; turned into ProcessError::NonZeroExit
+    Failure(String), // stderr of a command that exits 1
     PrivilegeDenied,
     ProgramNotFound,
     Timeout,
@@ -200,10 +200,16 @@ impl MockRunner {
                     started_at: SystemTime::now(),
                 })
             }
-            ScriptedOutcome::Failure(stderr) => Err(ProcessError::NonZeroExit {
-                program: spec.program,
-                code: Some(1),
+            ScriptedOutcome::Failure(stderr) => Ok(CommandOutcome {
+                stdout: Vec::new(),
                 stderr: stderr.into_bytes(),
+                exit_status: ExitStatusInfo {
+                    code: Some(1),
+                    signal: None,
+                    success: false,
+                },
+                duration: Duration::from_millis(1),
+                started_at: SystemTime::now(),
             }),
             ScriptedOutcome::PrivilegeDenied => Err(ProcessError::PrivilegeDenied {
                 program: spec.program,
@@ -300,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scripted_failure_returns_error() {
+    async fn scripted_failure_exits_non_zero_like_the_real_runner() {
         let runner = MockRunner::new();
         runner.expect(
             SpecMatcher::ExactProgram("wg-quick".into()),
@@ -308,7 +314,7 @@ mod tests {
         );
         // xtask:allow-protocol-leak: mock-runner test fixture, not a real wg-quick invocation
         let result = runner.run_sync(CommandSpec::oneshot("wg-quick", vec!["up".into()]));
-        assert!(matches!(result, Err(ProcessError::NonZeroExit { .. })));
+        assert!(!result.unwrap().success());
     }
 
     #[tokio::test]

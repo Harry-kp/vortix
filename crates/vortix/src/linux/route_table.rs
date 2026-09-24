@@ -50,8 +50,8 @@ impl LinuxRouteTable {
         let spec = CommandSpec::oneshot("ip", bind_route_args(cidr, interface))
             .timeout(ROUTE_QUERY_TIMEOUT)
             .output_limit(64 * 1024);
-        match crate::process::run_to_output(spec) {
-            Ok(output) if output.status.success() => Ok(()),
+        match crate::process::run(spec) {
+            Ok(output) if output.success() => Ok(()),
             _ => Err(format!("route {cidr} could not be bound to {interface}")),
         }
     }
@@ -61,9 +61,9 @@ impl LinuxRouteTable {
         let spec = CommandSpec::oneshot("ip", bind_host_route_args(destination, gateway))
             .timeout(ROUTE_QUERY_TIMEOUT)
             .output_limit(64 * 1024);
-        match crate::process::run_to_output(spec) {
+        match crate::process::run(spec) {
             Ok(output)
-                if output.status.success()
+                if output.success()
                     && selected_gateway(destination).as_deref() == Some(gateway) =>
             {
                 Ok(())
@@ -97,10 +97,10 @@ impl LinuxRouteTable {
             CommandSpec::oneshot("ip", vec!["route".into(), "get".into(), target.to_string()])
                 .timeout(ROUTE_QUERY_TIMEOUT)
                 .output_limit(64 * 1024);
-        let Ok(output) = crate::process::run_to_output(spec) else {
+        let Ok(output) = crate::process::run(spec) else {
             return DefaultRouteObservation::ProbeFailed;
         };
-        if !output.status.success() {
+        if !output.success() {
             return DefaultRouteObservation::ProbeFailed;
         }
         let text = String::from_utf8_lossy(&output.stdout);
@@ -116,10 +116,10 @@ fn run_ip_route_delete(args: Vec<String>, description: &str) -> Result<(), Strin
     let spec = CommandSpec::oneshot("ip", args)
         .timeout(ROUTE_QUERY_TIMEOUT)
         .output_limit(64 * 1024);
-    let output = crate::process::run_to_output(spec)
-        .map_err(|_| format!("{description} could not be removed"))?;
+    let output =
+        crate::process::run(spec).map_err(|_| format!("{description} could not be removed"))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.success() || stderr.contains("No such process") {
+    if output.success() || stderr.contains("No such process") {
         Ok(())
     } else {
         Err(format!("{description} could not be removed"))
@@ -131,9 +131,8 @@ fn selected_gateway(target: IpAddr) -> Option<String> {
     let spec = CommandSpec::oneshot("ip", vec!["route".into(), "get".into(), target.to_string()])
         .timeout(ROUTE_QUERY_TIMEOUT)
         .output_limit(64 * 1024);
-    let output = crate::process::run_to_output(spec).ok()?;
+    let output = crate::process::run(spec).ok()?;
     output
-        .status
         .success()
         .then(|| parse_gateway(&String::from_utf8_lossy(&output.stdout)))
         .flatten()

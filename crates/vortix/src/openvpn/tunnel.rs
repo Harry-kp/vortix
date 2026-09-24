@@ -708,11 +708,11 @@ fn poll_log_until_ready(
         if start.elapsed() > Duration::from_secs(OVPN_HEALTH_CHECK_DELAY_SECS) {
             if let Ok(content) = std::fs::read_to_string(pid_path) {
                 if let Ok(pid) = content.trim().parse::<u32>() {
-                    let alive = crate::process::run_to_output(CommandSpec::oneshot(
+                    let alive = crate::process::run(CommandSpec::oneshot(
                         "kill",
                         vec!["-0".into(), pid.to_string()],
                     ))
-                    .is_ok_and(|o| o.status.success());
+                    .is_ok_and(|o| o.success());
                     if !alive {
                         let log = std::fs::read_to_string(log_path).unwrap_or_default();
                         let last_lines = tail_lines(&log, OVPN_ERROR_LOG_TAIL_LINES);

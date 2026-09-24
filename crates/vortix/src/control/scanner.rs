@@ -228,7 +228,7 @@ fn get_all_openvpn_pids() -> Option<Vec<(PathBuf, u32)>> {
     let mut processes = Vec::new();
     // Use ps -ax -o pid,args to get PID and full command line
     let output = cmd_output("ps", &["-ax", "-o", "pid,command"])?;
-    if !output.status.success() {
+    if !output.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);

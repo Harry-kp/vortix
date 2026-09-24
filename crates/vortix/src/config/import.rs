@@ -182,7 +182,7 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
     // -S: Show errors even in silent mode
     // --max-time: Timeout
     // -o: Output file
-    let output = crate::process::run_to_output(CommandSpec::oneshot(
+    let output = crate::process::run(CommandSpec::oneshot(
         "curl",
         vec![
             "-f".into(),
@@ -207,7 +207,7 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
         format!("{}: {e}", constants::ERR_HTTP_CLIENT_BUILD_FAILED)
     })?;
 
-    if !output.status.success() {
+    if !output.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         logger::log(
             LogLevel::Error,

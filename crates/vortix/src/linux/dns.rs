@@ -45,9 +45,9 @@ struct RealDnsCommandRunner;
 
 impl DnsCommandRunner for RealDnsCommandRunner {
     fn run(&mut self, spec: CommandSpec) -> Result<DnsCommandOutput, String> {
-        let output = crate::process::run_to_output(spec).map_err(|error| error.to_string())?;
+        let output = crate::process::run(spec).map_err(|error| error.to_string())?;
         Ok(DnsCommandOutput {
-            success: output.status.success(),
+            success: output.success(),
             stdout: output.stdout,
             stderr: output.stderr,
         })
@@ -1172,10 +1172,9 @@ pub(crate) fn parse_resolv_conf_server(content: &str) -> Option<String> {
 /// Try to get DNS from resolvectl (systemd-resolved, most modern distros).
 fn try_get_dns_resolvectl() -> Option<String> {
     let output =
-        crate::process::run_to_output(CommandSpec::oneshot("resolvectl", vec!["status".into()]))
-            .ok()?;
+        crate::process::run(CommandSpec::oneshot("resolvectl", vec!["status".into()])).ok()?;
 
-    if !output.status.success() {
+    if !output.success() {
         return None;
     }
 
@@ -1184,13 +1183,13 @@ fn try_get_dns_resolvectl() -> Option<String> {
 
 /// Try to get DNS from `nmcli` (`NetworkManager` distros).
 fn try_get_dns_nmcli() -> Option<String> {
-    let output = crate::process::run_to_output(CommandSpec::oneshot(
+    let output = crate::process::run(CommandSpec::oneshot(
         "nmcli",
         vec!["dev".into(), "show".into()],
     ))
     .ok()?;
 
-    if !output.status.success() {
+    if !output.success() {
         return None;
     }
 
@@ -1242,11 +1241,11 @@ pub(crate) fn resolvconf_works() -> bool {
     // timeout we return `false`, which routes the user to the existing
     // "resolvconf not available" error path — strictly better than a
     // wedged panel.
-    crate::process::run_to_output(
+    crate::process::run(
         CommandSpec::oneshot("resolvconf", vec!["--version".into()])
             .timeout(Duration::from_secs(10)),
     )
-    .is_ok_and(|o| o.status.success())
+    .is_ok_and(|o| o.success())
 }
 
 /// Check whether `resolvectl` is installed and functional.
@@ -1265,11 +1264,11 @@ pub(crate) fn resolvectl_works() -> bool {
     if !crate::platform::binary_exists("resolvectl") {
         return false;
     }
-    crate::process::run_to_output(
+    crate::process::run(
         CommandSpec::oneshot("resolvectl", vec!["--version".into()])
             .timeout(Duration::from_secs(10)),
     )
-    .is_ok_and(|o| o.status.success())
+    .is_ok_and(|o| o.success())
 }
 
 /// Should the resolvectl-based DNS path be used on this Linux host?

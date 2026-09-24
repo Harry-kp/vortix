@@ -90,49 +90,10 @@ pub fn global_runner() -> &'static CommandRunner {
     }
 }
 
-/// Run a one-shot subprocess through the process-wide runner.
+/// Run a one-shot subprocess through the process-wide runner. A non-zero
+/// exit is `Ok`: check `CommandOutcome::success`.
 pub fn run(spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
     global_runner().run_blocking(spec)
-}
-
-/// Adapter: run a spec and return an `std::process::Output`-shaped result.
-///
-/// Many existing callsites match against `std::process::Output`, treating both
-/// non-zero exit and I/O errors uniformly. This helper preserves that shape so
-/// the migration stays mechanical — `NonZeroExit` becomes a successful
-/// `Output` with a non-success status, and only spawn/I/O failures become
-/// `Err(std::io::Error)`.
-pub fn run_to_output(spec: CommandSpec) -> std::io::Result<std::process::Output> {
-    match run(spec) {
-        Ok(outcome) => Ok(outcome_to_output(outcome)),
-        Err(ProcessError::NonZeroExit { code, stderr, .. }) => {
-            Ok(make_output(code.unwrap_or(1), Vec::new(), stderr))
-        }
-        Err(ProcessError::Timeout { program, duration }) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("`{program}` timed out after {duration:?}"),
-        )),
-        Err(ProcessError::OutputLimitExceeded { program, limit }) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("`{program}` output exceeded {limit} bytes"),
-        )),
-        Err(ProcessError::ProgramNotFound { program }) => Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("`{program}` not found on PATH"),
-        )),
-        Err(ProcessError::PrivilegeDenied { program }) => Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("`{program}` requires root"),
-        )),
-        Err(ProcessError::InvalidCredentials { program, reason }) => Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("`{program}` has invalid owner credentials: {reason}"),
-        )),
-        Err(ProcessError::Killed { program, signal }) => Err(std::io::Error::other(format!(
-            "`{program}` killed by signal {signal}"
-        ))),
-        Err(ProcessError::IoError { source, .. }) => Err(source),
-    }
 }
 
 /// Run a simple unprivileged command and discard invocation errors.
@@ -140,32 +101,12 @@ pub fn run_to_output(spec: CommandSpec) -> std::io::Result<std::process::Output>
 /// This helper is used by scanner probes, which must never retain a blocking
 /// worker indefinitely during control-runtime shutdown.
 #[must_use]
-pub fn simple_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
+pub fn simple_output(program: &str, args: &[&str]) -> Option<CommandOutcome> {
     let args = args.iter().map(|arg| (*arg).to_string()).collect();
-    run_to_output(
-        CommandSpec::oneshot(program, args)
-            .timeout(std::time::Duration::from_secs(2))
-            .output_limit(1024 * 1024),
-    )
+    run(CommandSpec::oneshot(program, args)
+        .timeout(std::time::Duration::from_secs(2))
+        .output_limit(1024 * 1024))
     .ok()
-}
-
-fn outcome_to_output(outcome: CommandOutcome) -> std::process::Output {
-    let fallback_code = i32::from(!outcome.exit_status.success);
-    make_output(
-        outcome.exit_status.code.unwrap_or(fallback_code),
-        outcome.stdout,
-        outcome.stderr,
-    )
-}
-
-fn make_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> std::process::Output {
-    use std::os::unix::process::ExitStatusExt;
-    std::process::Output {
-        status: std::process::ExitStatus::from_raw(code << 8),
-        stdout,
-        stderr,
-    }
 }
 
 use std::collections::HashMap;
@@ -435,13 +376,6 @@ pub enum ProcessError {
     /// A captured stream exceeded the caller's explicit memory bound.
     #[error("subprocess `{program}` output exceeded {limit} bytes")]
     OutputLimitExceeded { program: String, limit: usize },
-    /// The subprocess exited non-zero.
-    #[error("subprocess `{program}` exited with code {code:?}")]
-    NonZeroExit {
-        program: String,
-        code: Option<i32>,
-        stderr: Vec<u8>,
-    },
     /// The subprocess was killed by a signal.
     #[error("subprocess `{program}` killed by signal {signal}")]
     Killed { program: String, signal: i32 },
@@ -452,4 +386,22 @@ pub enum ProcessError {
         #[source]
         source: std::io::Error,
     },
+}
+impl From<ProcessError> for std::io::Error {
+    fn from(error: ProcessError) -> Self {
+        use std::io::ErrorKind;
+        if let ProcessError::IoError { source, .. } = error {
+            return source;
+        }
+        let kind = match &error {
+            ProcessError::Timeout { .. } => ErrorKind::TimedOut,
+            ProcessError::OutputLimitExceeded { .. } => ErrorKind::InvalidData,
+            ProcessError::ProgramNotFound { .. } => ErrorKind::NotFound,
+            ProcessError::PrivilegeDenied { .. } | ProcessError::InvalidCredentials { .. } => {
+                ErrorKind::PermissionDenied
+            }
+            _ => ErrorKind::Other,
+        };
+        std::io::Error::new(kind, error)
+    }
 }

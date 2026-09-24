@@ -205,8 +205,10 @@ impl MacDynamicStore {
                 .timeout(std::time::Duration::from_secs(5))
                 .contain_process_group(),
             )
-            .map(drop)
-            .map_err(|error| format!("macOS DNS cache flush failed: {error}")),
+            .map_err(|error| format!("macOS DNS cache flush failed: {error}"))?
+            .success()
+            .then_some(())
+            .ok_or_else(|| "macOS DNS cache flush failed".to_string()),
             #[cfg(test)]
             Self::Memory(_) => Ok(()),
         }

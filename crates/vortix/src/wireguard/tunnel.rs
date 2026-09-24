@@ -683,7 +683,7 @@ fn observe_interface_with_generation(
     if timeout.is_zero() {
         return Err(TunnelError::Timeout(Duration::ZERO));
     }
-    let output = crate::process::run_to_output(
+    let output = crate::process::run(
         CommandSpec::oneshot(
             "wg",
             vec!["show".into(), interface_name.into(), "dump".into()],
@@ -692,7 +692,7 @@ fn observe_interface_with_generation(
         .output_limit(MAX_WG_DUMP_BYTES),
     )
     .map_err(|error| TunnelError::Subprocess(format!("wg show {interface_name} dump: {error}")))?;
-    if !output.status.success() {
+    if !output.success() {
         return Err(TunnelError::Subprocess(format!(
             "wg show {interface_name} dump: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -708,9 +708,9 @@ impl WgTunnel {
     /// One protocol-owned, bounded observation for every `WireGuard` interface.
     pub fn observe_all_interfaces() -> Result<BTreeMap<String, WgStatus>, TunnelError> {
         observe_all_interfaces_with(|spec| {
-            let output = crate::process::run_to_output(spec.clone())
+            let output = crate::process::run(spec.clone())
                 .map_err(|error| TunnelError::Subprocess(format!("wg show all dump: {error}")))?;
-            if !output.status.success() {
+            if !output.success() {
                 return Err(TunnelError::Subprocess(format!(
                     "wg show all dump: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
@@ -1321,7 +1321,7 @@ impl WgTunnel {
                 TunnelError::Timeout(Duration::ZERO)
             });
         }
-        let output = crate::process::run_to_output(
+        let output = crate::process::run(
             CommandSpec::oneshot("wg-quick", vec!["up".into(), path_str.clone()])
                 .privilege(PrivilegeReq::Root)
                 .timeout(command_timeout),
@@ -1341,7 +1341,7 @@ impl WgTunnel {
             }
         };
 
-        if !output.status.success() {
+        if !output.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             self.inflight = None;
             return Err(self.settle_failed_up(
@@ -1457,7 +1457,7 @@ impl WgTunnel {
         }
 
         let prepared = prepare_down_target(handle)?;
-        let output = crate::process::run_to_output(wg_quick_down_spec(prepared.target));
+        let output = crate::process::run(wg_quick_down_spec(prepared.target));
 
         if let Some(path) = &prepared.cleanup_after_attempt {
             cleanup_managed_temp_config(path);
@@ -1465,7 +1465,7 @@ impl WgTunnel {
 
         let output = output.map_err(|e| TunnelError::Subprocess(format!("wg-quick down: {e}")))?;
 
-        if !output.status.success() {
+        if !output.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             // `wg-quick` prints commands and paths here, never the private-key
             // values from its input. Preserve this diagnostic because a

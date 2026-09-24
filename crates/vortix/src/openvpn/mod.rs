@@ -131,7 +131,7 @@ pub mod version {
 
     fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
         // xtask:allow-protocol-leak: dependency-version probe runs before any tunnel exists; pre-flight gate
-        let version_output = process::run_to_output(
+        let version_output = process::run(
             CommandSpec::oneshot("openvpn", vec!["--version".into()]).timeout(PROBE_TIMEOUT),
         );
         if let Ok(out) = version_output {
@@ -146,7 +146,7 @@ pub mod version {
         }
 
         // xtask:allow-protocol-leak: dependency-feature probe runs before any tunnel exists; pre-flight gate
-        let help_output = process::run_to_output(
+        let help_output = process::run(
             CommandSpec::oneshot("openvpn", vec!["--help".into()]).timeout(PROBE_TIMEOUT),
         );
         if let Ok(out) = help_output {

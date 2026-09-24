@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use crate::control::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
-use crate::process::{CommandSpec, PrivilegeReq};
+use crate::process::{CommandOutcome, CommandSpec, PrivilegeReq, ProcessError};
 use tracing::{debug, error, info};
 
 const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
@@ -36,8 +36,8 @@ impl NftFirewall {
             .contain_process_group()
     }
 
-    fn backend_error(context: &str, error: &std::io::Error) -> KillswitchError {
-        if error.kind() == std::io::ErrorKind::NotFound {
+    fn backend_error(context: &str, error: &ProcessError) -> KillswitchError {
+        if matches!(error, ProcessError::ProgramNotFound { .. }) {
             KillswitchError::NoBackendAvailable
         } else {
             KillswitchError::CommandFailed(format!("{context}: {error}"))
@@ -50,14 +50,14 @@ impl NftFirewall {
     /// kernel performs an atomic ruleset replace — if the parse fails,
     /// the prior ruleset stays in force, no leak window.
     fn iptables_restore_stdin(program: &str, ruleset: &[u8]) -> std::result::Result<(), String> {
-        let output = crate::process::run_to_output(
+        let output = crate::process::run(
             Self::firewall_command(program, vec!["--noflush".into()])
                 .privilege(PrivilegeReq::Root)
                 .stdin(ruleset.to_vec()),
         )
         .map_err(|e| format!("Failed to spawn {program}: {e}"))?;
 
-        if output.status.success() {
+        if output.success() {
             Ok(())
         } else {
             Err(String::from_utf8_lossy(&output.stderr).to_string())
@@ -66,38 +66,38 @@ impl NftFirewall {
 
     fn iptables_command(program: &str, args: &[&str]) -> std::result::Result<bool, String> {
         let args = args.iter().map(|arg| (*arg).to_string()).collect();
-        let output = crate::process::run_to_output(
+        let output = crate::process::run(
             Self::firewall_command(program, args).privilege(PrivilegeReq::Root),
         )
         .map_err(|e| format!("Failed to run {program}: {e}"))?;
-        Ok(output.status.success())
+        Ok(output.success())
     }
 
     fn iptables_snapshot(program: &str) -> std::result::Result<String, String> {
-        let output = crate::process::run_to_output(
+        let output = crate::process::run(
             Self::firewall_command(program, vec!["-t".into(), "filter".into()])
                 .privilege(PrivilegeReq::Root),
         )
         .map_err(|e| format!("Failed to run {program}: {e}"))?;
-        if !output.status.success() {
+        if !output.success() {
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn optional_iptables_listing(program: &str) -> Result<Option<String>> {
-        let output = match crate::process::run_to_output(
+        let output = match crate::process::run(
             Self::firewall_command(program, vec!["-S".into()]).privilege(PrivilegeReq::Root),
         ) {
             Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(ProcessError::ProgramNotFound { .. }) => return Ok(None),
             Err(error) => {
                 return Err(KillswitchError::CommandFailed(format!(
                     "Failed to inspect {program}: {error}"
                 )))
             }
         };
-        if !output.status.success() {
+        if !output.success() {
             return Err(KillswitchError::CommandFailed(format!(
                 "{program} inspection failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -264,7 +264,7 @@ impl NftFirewall {
     // ─── nftables backend ───────────────────────────────────────────────
 
     fn nft_table_snapshot() -> Result<Option<String>> {
-        let output = crate::process::run_to_output(
+        let output = crate::process::run(
             Self::nft_command(vec![
                 "-n".into(),
                 "list".into(),
@@ -275,7 +275,7 @@ impl NftFirewall {
             .privilege(PrivilegeReq::Root),
         )
         .map_err(|error| Self::backend_error("nft read-back", &error))?;
-        if output.status.success() {
+        if output.success() {
             return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
         }
 
@@ -289,12 +289,9 @@ impl NftFirewall {
         }
     }
 
-    fn apply_nft_batch(
-        active: &[ActiveTunnelInfo],
-        mode: BatchMode,
-    ) -> Result<std::process::Output> {
+    fn apply_nft_batch(active: &[ActiveTunnelInfo], mode: BatchMode) -> Result<CommandOutcome> {
         let ruleset = nft_policy::ruleset(active, mode);
-        crate::process::run_to_output(
+        crate::process::run(
             Self::nft_command(vec!["-f".into(), "-".into()])
                 .privilege(PrivilegeReq::Root)
                 .stdin(ruleset.into_bytes()),
@@ -305,11 +302,11 @@ impl NftFirewall {
     fn setup_nftables(active: &[ActiveTunnelInfo]) -> Result<()> {
         let mut output = Self::apply_nft_batch(active, BatchMode::Replace)?;
         let mut verified_snapshot = None;
-        if !output.status.success()
+        if !output.success()
             && String::from_utf8_lossy(&output.stderr).contains(nft_policy::MISSING_ERROR)
         {
             output = Self::apply_nft_batch(active, BatchMode::Create)?;
-            if !output.status.success() {
+            if !output.success() {
                 match Self::nft_table_snapshot()? {
                     Some(snapshot) if nft_policy::snapshot_matches(active, &snapshot) => {
                         verified_snapshot = Some(snapshot);
@@ -322,7 +319,7 @@ impl NftFirewall {
             }
         }
 
-        if verified_snapshot.is_none() && !output.status.success() {
+        if verified_snapshot.is_none() && !output.success() {
             return Err(KillswitchError::CommandFailed(format!(
                 "nft failed to replace owned table: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -348,7 +345,7 @@ impl NftFirewall {
 
     /// Remove the kill switch nftables table.
     fn teardown_nftables() -> Result<()> {
-        let delete = crate::process::run_to_output(
+        let delete = crate::process::run(
             Self::nft_command(vec![
                 "delete".into(),
                 "table".into(),
@@ -359,7 +356,7 @@ impl NftFirewall {
         )
         .map_err(|error| Self::backend_error("nft delete", &error))?;
         let delete_error = String::from_utf8_lossy(&delete.stderr);
-        if !delete.status.success() && !delete_error.contains(nft_policy::MISSING_ERROR) {
+        if !delete.success() && !delete_error.contains(nft_policy::MISSING_ERROR) {
             return Err(KillswitchError::CommandFailed(format!(
                 "nft delete failed: {delete_error}"
             )));

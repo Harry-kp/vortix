@@ -369,7 +369,7 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
 
     // wg-quick --version exits non-zero on some systems; try to get version anyway
     let owned_args: Vec<String> = version_args.iter().map(|s| (*s).to_string()).collect();
-    let version = match crate::process::run_to_output(CommandSpec::oneshot(name, owned_args)) {
+    let version = match crate::process::run(CommandSpec::oneshot(name, owned_args)) {
         Ok(output) => {
             let raw = if output.stdout.is_empty() {
                 String::from_utf8_lossy(&output.stderr).to_string()
@@ -703,11 +703,10 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 /// Pipe `text` to a command's stdin.
 fn pipe_to_command(cmd: &str, text: &str) -> Option<()> {
-    let output = crate::process::run_to_output(
-        CommandSpec::oneshot(cmd, vec![]).stdin(text.as_bytes().to_vec()),
-    )
-    .ok()?;
-    output.status.success().then_some(())
+    let output =
+        crate::process::run(CommandSpec::oneshot(cmd, vec![]).stdin(text.as_bytes().to_vec()))
+            .ok()?;
+    output.success().then_some(())
 }
 
 /// Fallback when clipboard is unavailable.

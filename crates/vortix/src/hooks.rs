@@ -601,9 +601,7 @@ mod runner {
     fn map_failure(error: &ProcessError) -> HookFailure {
         match error {
             ProcessError::Timeout { .. } => HookFailure::Timeout,
-            ProcessError::NonZeroExit { .. } | ProcessError::Killed { .. } => {
-                HookFailure::NonZeroExit
-            }
+            ProcessError::Killed { .. } => HookFailure::NonZeroExit,
             ProcessError::OutputLimitExceeded { .. } => HookFailure::OutputLimitExceeded,
             ProcessError::ProgramNotFound { .. } | ProcessError::IoError { .. } => {
                 HookFailure::RunnerFailure

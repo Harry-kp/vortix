@@ -605,13 +605,13 @@ fn handle_update(mode: OutputMode) {
         println!("Updating vortix...");
     }
 
-    let result = crate::process::run_to_output(crate::process::CommandSpec::oneshot(
+    let result = crate::process::run(crate::process::CommandSpec::oneshot(
         "cargo",
         vec!["install".into(), "vortix".into(), "--force".into()],
     ));
 
     match result {
-        Ok(s) if s.status.success() => match mode {
+        Ok(s) if s.success() => match mode {
             OutputMode::Human => {
                 println!("Updated successfully!");
                 println!("Verify: vortix --version");

@@ -136,10 +136,10 @@ impl MacRouteTable {
         let spec = CommandSpec::oneshot("route", route_get_args(target))
             .timeout(ROUTE_QUERY_TIMEOUT)
             .output_limit(64 * 1024);
-        let Ok(output) = crate::process::run_to_output(spec) else {
+        let Ok(output) = crate::process::run(spec) else {
             return DefaultRouteObservation::ProbeFailed;
         };
-        if !output.status.success() {
+        if !output.success() {
             return DefaultRouteObservation::ProbeFailed;
         }
         let text = String::from_utf8_lossy(&output.stdout);
@@ -157,7 +157,7 @@ impl MacRouteTable {
 /// no default at all once the tunnel went away.
 fn add_or_change(args: impl Fn(&str) -> Vec<String>) -> bool {
     let run = |verb| {
-        crate::process::run_to_output(
+        crate::process::run(
             CommandSpec::oneshot("route", args(verb))
                 .timeout(ROUTE_QUERY_TIMEOUT)
                 .output_limit(64 * 1024),
@@ -176,10 +176,10 @@ fn run_route_delete(args: Vec<String>, description: &str) -> Result<(), String> 
     let spec = CommandSpec::oneshot("route", args)
         .timeout(ROUTE_QUERY_TIMEOUT)
         .output_limit(64 * 1024);
-    let output = crate::process::run_to_output(spec)
-        .map_err(|_| format!("{description} could not be removed"))?;
+    let output =
+        crate::process::run(spec).map_err(|_| format!("{description} could not be removed"))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.success() || stderr.contains("not in table") {
+    if output.success() || stderr.contains("not in table") {
         Ok(())
     } else {
         Err(format!("{description} could not be removed"))
@@ -190,9 +190,8 @@ fn selected_gateway(target: IpAddr) -> Option<String> {
     let spec = CommandSpec::oneshot("route", route_get_args(target))
         .timeout(ROUTE_QUERY_TIMEOUT)
         .output_limit(64 * 1024);
-    let output = crate::process::run_to_output(spec).ok()?;
+    let output = crate::process::run(spec).ok()?;
     output
-        .status
         .success()
         .then(|| parse_gateway(&String::from_utf8_lossy(&output.stdout)))
         .flatten()
