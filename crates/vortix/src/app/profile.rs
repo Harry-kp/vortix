@@ -196,10 +196,6 @@ impl App {
             self.runtime.profiles[idx].name = renamed.display_name;
             self.runtime.profiles[idx].config_path = renamed.config_path;
 
-            if self.runtime.last_connected_profile.as_deref() == Some(&old_name) {
-                self.runtime.last_connected_profile = Some(trimmed.to_string());
-            }
-
             // Registry/retry state is keyed by stable ProfileId, so no
             // in-memory re-keying is required for a display-name change.
 

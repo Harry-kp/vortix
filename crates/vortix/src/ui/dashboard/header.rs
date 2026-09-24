@@ -198,7 +198,12 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
             Style::default().fg(theme::current().text_secondary),
         ),
         Span::styled(
-            app.runtime.public_ip.clone(),
+            // The last egress sample may still be the tunnel's exit right
+            // after a disconnect; the gated real address is the truth.
+            app.runtime
+                .real_ip
+                .clone()
+                .unwrap_or_else(|| app.runtime.public_ip.clone()),
             Style::default().fg(theme::current().text_primary),
         ),
         helpers::divider(),
@@ -952,6 +957,16 @@ mod tests {
     }
 
     // ─────────── State 0: no tunnels → ⚠ Real ───────────
+
+    #[test]
+    fn disconnected_header_prefers_the_real_address_over_a_stale_exit() {
+        let mut app = App::new_test();
+        app.runtime.public_ip = "139.59.71.126".to_string();
+        app.runtime.real_ip = Some("203.0.113.7".to_string());
+        let out = render_to_string(&app, 100, 1);
+        assert!(out.contains("203.0.113.7"), "{out}");
+        assert!(!out.contains("139.59.71.126"), "{out}");
+    }
 
     #[test]
     fn empty_registry_renders_disconnected_title_and_real_ip() {

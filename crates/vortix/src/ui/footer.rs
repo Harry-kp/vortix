@@ -92,7 +92,7 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
     let disconnect_hint = if app.focused_panel == crate::app::FocusedPanel::Sidebar {
         focused_disconnect_hint(focused_state)
     } else {
-        global_disconnect_hint(active_state, app.runtime.last_connected_profile.is_some())
+        global_disconnect_hint(active_state, app.last_control_connected_profile.is_some())
     };
     if let Some(disconnect_hint) = disconnect_hint {
         context_hints.push(disconnect_hint);

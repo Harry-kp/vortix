@@ -505,7 +505,7 @@ fn test_publicipv6_clears_when_probe_returns_none() {
 fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
     let mut app = test_app();
     add_profiles(&mut app, &["my-vpn"]);
-    assert!(app.runtime.last_connected_profile.is_none());
+    assert!(app.last_control_connected_profile.is_none());
 
     app.reconnect();
 
@@ -1063,43 +1063,6 @@ fn test_end_in_logs_enables_auto_scroll() {
     assert!(
         app.logs_auto_scroll,
         "End in Logs should re-enable auto-scroll"
-    );
-}
-
-#[test]
-fn test_rename_updates_last_connected_profile() {
-    let mut app = test_app();
-    let dir = tempfile::tempdir().unwrap();
-    let conf_path = dir.path().join("old-name.conf");
-    let stable_id = crate::core::profile::ProfileId::parse("22".repeat(32)).unwrap();
-    let stored = crate::core::profile::Profile::new(
-        stable_id.clone(),
-        "old-name",
-        crate::core::profile::ProtocolKind::WireGuard,
-        conf_path.clone(),
-    );
-    crate::config::profile_store::ProfileStore::insert(
-        &crate::config::profile_store::FsProfileStore::new(dir.path().to_path_buf()),
-        &stored,
-        b"dummy",
-    )
-    .unwrap();
-    app.runtime.profiles.push(VpnProfile {
-        id: stable_id.clone(),
-        name: "old-name".to_string(),
-        protocol: ProtocolKind::WireGuard,
-        config_path: conf_path,
-        location: String::new(),
-        last_used: None,
-    });
-    app.profile_list_state.select(Some(0));
-    app.runtime.last_connected_profile = Some("old-name".to_string());
-
-    app.rename_profile(0, "new-name");
-    assert_eq!(
-        app.runtime.last_connected_profile.as_deref(),
-        Some("new-name"),
-        "Rename should update last_connected_profile"
     );
 }
 

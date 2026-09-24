@@ -799,7 +799,6 @@ pub struct VpnRuntime {
     /// refreshed by its own probe on its own schedule.
     pub last_security_check: Option<Instant>,
     pub ip_unchanged_warned: bool,
-    pub last_connected_profile: Option<String>,
 
     /// True once the scanner has completed at least one
     /// `Message::SyncSystemState` tick. Until then we don't know
@@ -890,7 +889,6 @@ impl VpnRuntime {
             last_dns_check: None,
             last_security_check: None,
             ip_unchanged_warned: false,
-            last_connected_profile: None,
             scanner_first_tick_done: false,
             last_kernel_session_count: 0,
             default_route_interface: None,
