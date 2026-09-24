@@ -614,20 +614,6 @@ pub fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
         .create(path)
 }
 
-/// Write a file owned by the real user.
-///
-/// Under sudo, `fs::write` produces root-owned files.
-/// This wraps that call and hands ownership to the invoking user.
-///
-/// # Errors
-///
-/// Returns an error if the write fails.
-pub fn write_user_file(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    std::fs::write(path, contents)?;
-    crate::config::fix_ownership(path);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -53,7 +53,7 @@ impl EndpointCache {
     fn save(&self, config_dir: &Path) {
         if let Ok(bytes) = serde_json::to_vec_pretty(self) {
             let _ =
-                crate::config::owned_file::write_user_file(&config_dir.join(CACHE_FILE), &bytes);
+                crate::config::owned_file::write_user_file_atomic(config_dir, CACHE_FILE, &bytes);
         }
     }
 

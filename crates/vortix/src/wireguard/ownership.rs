@@ -5,7 +5,7 @@
 //! root capability used only by the short-lived local canonical authority.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -323,35 +323,21 @@ impl TunnelOwnershipStore {
     }
 
     fn atomic_write_path(&self, final_path: &Path, bytes: &[u8]) -> Result<(), OwnershipError> {
+        use crate::config::owned_file::{open_owned_directory, write_owned_atomic};
         self.ensure_root()?;
         let leaf = final_path
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or(OwnershipError::UnsafePath)?;
-        let temporary = self
-            .root
-            .join(format!(".{leaf}.{}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let mut file = options.open(&temporary)?;
-        let result = (|| -> Result<(), OwnershipError> {
-            validate_owned_file(&file, self.expected_runtime_uid, MAX_CONFIG_BYTES)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, final_path)?;
-            File::open(&self.root)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(temporary);
-        }
-        result
+        let (uid, gid) = (
+            self.expected_runtime_uid,
+            crate::platform::effective_user_group_ids().1,
+        );
+        let directory = open_owned_directory(&self.root, false, uid, gid)
+            .map_err(|_| OwnershipError::UnsafePath)?
+            .ok_or(OwnershipError::UnsafePath)?;
+        write_owned_atomic(&directory, leaf, bytes, uid, gid).map_err(std::io::Error::other)?;
+        Ok(())
     }
 
     fn record_path(&self, profile_id: &ProfileId) -> PathBuf {

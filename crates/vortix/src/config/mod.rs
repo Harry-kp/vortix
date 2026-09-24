@@ -819,11 +819,8 @@ fn acquire_nonblocking_lock(path: &std::path::Path) -> std::io::Result<std::fs::
         .write(true)
         .open(path)?;
 
-    // The dashboard needs root, so this lock is created root-owned by the
-    // first `sudo vortix`. It then needs write access to be re-locked, and an
-    // unprivileged run could never open it again — every later launch failed
-    // on EACCES with no way back. Same contract as `create_user_dir` and
-    // `write_user_file` above; a no-op when not root.
+    // A root-owned lock left by the first `sudo vortix` would make every
+    // unprivileged launch fail on EACCES; a no-op when not root.
     crate::config::fix_ownership(path);
 
     // SAFETY: flock is a thin syscall wrapper over a valid owned fd; no

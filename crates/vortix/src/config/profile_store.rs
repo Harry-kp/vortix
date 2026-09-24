@@ -1133,12 +1133,8 @@ fn reject_symlink_io(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Create the profile directory private to its owner.
-///
-/// `create_dir_all` applies the caller's umask, and 002 is the Debian-family
-/// default, which left this directory group-writable. The profiles and their
-/// sidecars are 0600, but a group-writable directory still allows renaming or
-/// replacing them.
+/// Atomically replace `path`, creating its directory private to the
+/// invoking user.
 pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a file path");
     let parent = path.parent().ok_or_else(invalid)?;
@@ -1151,15 +1147,7 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
 }
 
 fn sync_dir(path: &Path) -> std::io::Result<()> {
-    FileSync::sync(path)
-}
-
-struct FileSync;
-
-impl FileSync {
-    fn sync(path: &Path) -> std::io::Result<()> {
-        std::fs::File::open(path)?.sync_all()
-    }
+    std::fs::File::open(path)?.sync_all()
 }
 
 #[cfg(test)]

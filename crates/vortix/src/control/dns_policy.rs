@@ -61,11 +61,7 @@ pub fn save(config_dir: &Path, coordinator: &DnsPolicyCoordinator) -> std::io::R
         coordinator: coordinator.clone(),
     };
     let content = serde_json::to_vec_pretty(&state).map_err(std::io::Error::other)?;
-    atomic_write_user_file(config_dir, &content)
-}
-
-fn atomic_write_user_file(config_dir: &Path, content: &[u8]) -> std::io::Result<()> {
-    atomic_write_user_file_with_hook(config_dir, content, || {})
+    atomic_write_user_file_with_hook(config_dir, &content, || {})
 }
 
 fn atomic_write_user_file_with_hook(
