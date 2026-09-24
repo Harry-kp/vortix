@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::cidr::Cidr;
@@ -115,23 +115,14 @@ pub fn start(
     timeout: Duration,
 ) -> Result<Live, StartError> {
     let deadline = Instant::now() + timeout;
-    let mut kind = tunnel_for_with_wireguard_policy(
-        profile.protocol,
-        &settings.config_dir,
-        &settings.openvpn_verbosity,
-        settings.connect_timeout_secs,
-        settings.wireguard_handshake_timeout_secs,
-        &settings.wireguard_health_targets,
-    )
-    .for_generation(generation)
-    .for_operation(OperationId::from_parts(EPOCH, generation))
-    .with_execution_context(TunnelExecutionContext {
-        cancellation,
-        deadline,
-    });
-    if let Some(credentials) = credentials {
-        kind = kind.with_openvpn_static_challenge(credentials);
-    }
+    let mut kind = TunnelKind::new(profile.protocol, settings).for_start(
+        generation,
+        TunnelExecutionContext {
+            cancellation,
+            deadline,
+        },
+        credentials,
+    );
     let Ok(result) = panic::catch_unwind(AssertUnwindSafe(|| kind.up(profile))) else {
         let _ = kind.compensate_inflight();
         return Err(StartError::Failed("the protocol adapter panicked".into()));
@@ -201,12 +192,7 @@ pub fn adopt(
                 openvpn_routes: None,
             };
             Ok(Some(Live {
-                kind: tunnel_for(
-                    ProtocolKind::WireGuard,
-                    &settings.config_dir,
-                    &settings.openvpn_verbosity,
-                    settings.connect_timeout_secs,
-                ),
+                kind: TunnelKind::new(ProtocolKind::WireGuard, settings),
                 handle,
             }))
         }
@@ -214,12 +200,7 @@ pub fn adopt(
             let Some(owner) = standard_openvpn_owner(&profile.id, session)? else {
                 return Ok(None);
             };
-            let kind = tunnel_for(
-                ProtocolKind::OpenVpn,
-                &settings.config_dir,
-                &settings.openvpn_verbosity,
-                settings.connect_timeout_secs,
-            );
+            let kind = TunnelKind::new(ProtocolKind::OpenVpn, settings);
             let TunnelKind::OpenVpn(openvpn) = &kind else {
                 return Err("OpenVPN adoption built the wrong adapter".into());
             };
@@ -331,41 +312,53 @@ pub enum TunnelKind {
 
 impl TunnelKind {
     #[must_use]
-    pub fn for_generation(self, generation: u64) -> Self {
-        match self {
-            Self::WireGuard(tunnel) => Self::WireGuard(tunnel.for_generation(generation)),
-            Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.for_generation(generation)),
+    pub fn new(protocol: ProtocolKind, settings: &Settings) -> Self {
+        let config_dir = &settings.config_dir;
+        match protocol {
+            ProtocolKind::WireGuard => Self::WireGuard(
+                WgTunnel::new().with_handshake_policy(
+                    Duration::from_secs(settings.wireguard_handshake_timeout_secs),
+                    settings
+                        .wireguard_health_targets
+                        .iter()
+                        .filter_map(|target| target.parse().ok()),
+                ),
+            ),
+            ProtocolKind::OpenVpn => Self::OpenVpn(
+                OvpnTunnel::new(config_dir.join(crate::constants::OPENVPN_RUN_DIR))
+                    .with_auth_dir(config_dir.join(crate::constants::OPENVPN_AUTH_DIR))
+                    .with_verbosity(&settings.openvpn_verbosity)
+                    .with_connect_timeout(settings.connect_timeout_secs),
+            ),
         }
     }
 
     #[must_use]
-    pub fn for_operation(self, operation_id: crate::tunnel::OperationId) -> Self {
-        match self {
-            Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.for_operation(operation_id)),
-            tunnel @ Self::WireGuard(_) => tunnel,
-        }
-    }
-
-    #[must_use]
-    pub fn with_execution_context(self, context: TunnelExecutionContext) -> Self {
-        match self {
-            Self::WireGuard(tunnel) => Self::WireGuard(tunnel.with_execution_context(context)),
-            Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.with_execution_context(context)),
-        }
-    }
-
-    #[must_use]
-    pub fn with_openvpn_static_challenge(
+    fn for_start(
         self,
-        credentials: crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials,
+        generation: u64,
+        context: TunnelExecutionContext,
+        credentials: Option<OpenVpnStaticChallengeCredentials>,
     ) -> Self {
         match self {
+            Self::WireGuard(tunnel) => Self::WireGuard(
+                tunnel
+                    .for_generation(generation)
+                    .with_execution_context(context),
+            ),
             Self::OpenVpn(tunnel) => {
-                Self::OpenVpn(tunnel.with_static_challenge_credentials(credentials))
+                let tunnel = tunnel
+                    .for_generation(generation)
+                    .for_operation(OperationId::from_parts(EPOCH, generation))
+                    .with_execution_context(context);
+                Self::OpenVpn(match credentials {
+                    Some(credentials) => tunnel.with_static_challenge_credentials(credentials),
+                    None => tunnel,
+                })
             }
-            tunnel @ Self::WireGuard(_) => tunnel,
         }
     }
+
     pub fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
         match self {
             Self::WireGuard(t) => t.up(profile),
@@ -449,51 +442,4 @@ pub(crate) fn standard_openvpn_owner(
         custody,
         protocol_pid: scanner_pid,
     }))
-}
-
-/// THE single routing function: protocol → `TunnelKind`.
-///
-/// Engine and CLI call this once per connect/disconnect and never branch on
-/// protocol again. Adding a third protocol means adding one variant here.
-#[must_use]
-pub fn tunnel_for(
-    protocol: ProtocolKind,
-    config_dir: &Path,
-    ovpn_verbosity: &str,
-    connect_timeout_secs: u64,
-) -> TunnelKind {
-    match protocol {
-        ProtocolKind::WireGuard => TunnelKind::WireGuard(WgTunnel::new()),
-        ProtocolKind::OpenVpn => TunnelKind::OpenVpn(
-            OvpnTunnel::new(config_dir.join(crate::constants::OPENVPN_RUN_DIR))
-                .with_auth_dir(config_dir.join(crate::constants::OPENVPN_AUTH_DIR))
-                .with_verbosity(ovpn_verbosity)
-                .with_connect_timeout(connect_timeout_secs),
-        ),
-    }
-}
-
-/// Construct a tunnel with the configured `WireGuard` handshake gate.
-#[must_use]
-pub fn tunnel_for_with_wireguard_policy(
-    protocol: ProtocolKind,
-    config_dir: &Path,
-    ovpn_verbosity: &str,
-    connect_timeout_secs: u64,
-    wireguard_handshake_timeout_secs: u64,
-    wireguard_health_targets: &[String],
-) -> TunnelKind {
-    match protocol {
-        ProtocolKind::WireGuard => TunnelKind::WireGuard(
-            WgTunnel::new().with_handshake_policy(
-                std::time::Duration::from_secs(wireguard_handshake_timeout_secs),
-                wireguard_health_targets
-                    .iter()
-                    .filter_map(|target| target.parse().ok()),
-            ),
-        ),
-        ProtocolKind::OpenVpn => {
-            tunnel_for(protocol, config_dir, ovpn_verbosity, connect_timeout_secs)
-        }
-    }
 }
