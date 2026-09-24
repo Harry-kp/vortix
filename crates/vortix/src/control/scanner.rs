@@ -496,9 +496,6 @@ fn check_openvpn_by_pid(
         }
     }
 
-    // Set cipher info (OpenVPN default or from config)
-    session.details.public_key = "OpenVPN".to_string();
-
     // Read config file once for both endpoint and cipher extraction
     if let Ok(config_content) = std::fs::read_to_string(config_path) {
         // If no endpoint from args, try parsing the config file

@@ -92,6 +92,7 @@ pub enum Outcome {
 pub struct TunnelView {
     pub profile_id: ProfileId,
     pub name: String,
+    pub protocol: crate::profile::ProtocolKind,
     pub phase: Phase,
     pub interface: Option<String>,
     pub since: SystemTime,

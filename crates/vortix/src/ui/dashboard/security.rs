@@ -896,10 +896,11 @@ fn derive_encryption(primary_snap: Option<&TunnelView>) -> String {
     match primary_snap {
         Some(TunnelView {
             phase: Phase::Up,
+            protocol,
             details,
             ..
         }) => {
-            if details.public_key == "OpenVPN" || details.public_key.is_empty() {
+            if *protocol == crate::profile::ProtocolKind::OpenVpn {
                 if details.latest_handshake.starts_with("Cipher:") {
                     details.latest_handshake.replace("Cipher: ", "")
                 } else {

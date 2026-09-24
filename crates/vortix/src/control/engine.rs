@@ -873,6 +873,7 @@ impl Engine {
             .map(|tunnel| TunnelView {
                 profile_id: tunnel.spec.profile_id.clone(),
                 name: tunnel.spec.name.clone(),
+                protocol: tunnel.spec.protocol,
                 phase: tunnel.phase,
                 interface: tunnel.interface.clone(),
                 since: tunnel.since,

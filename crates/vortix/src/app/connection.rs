@@ -438,6 +438,7 @@ pub(crate) fn test_view(name: &str, phase: Phase) -> TunnelView {
     TunnelView {
         profile_id: ProfileId::new(name),
         name: name.into(),
+        protocol: crate::profile::ProtocolKind::WireGuard,
         phase,
         interface: None,
         since: std::time::SystemTime::UNIX_EPOCH,

@@ -45,6 +45,7 @@ fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
     snapshot.tunnels.push(crate::control::TunnelView {
         profile_id,
         name: name.to_owned(),
+        protocol: crate::profile::ProtocolKind::WireGuard,
         phase,
         interface: Some("wg0".to_owned()),
         since: std::time::SystemTime::UNIX_EPOCH,
@@ -2375,6 +2376,7 @@ fn an_unexpected_drop_counts_once() {
     let view = |phase| TunnelView {
         profile_id: details.clone(),
         name: "corp".into(),
+        protocol: crate::profile::ProtocolKind::WireGuard,
         phase,
         interface: Some("utun4".into()),
         since: std::time::SystemTime::UNIX_EPOCH,

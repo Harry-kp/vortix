@@ -284,7 +284,7 @@ pub mod auth {
             ),
             Span::styled("  ·  ", Style::default().fg(theme::current().inactive)),
             Span::styled(
-                "OpenVPN",
+                crate::profile::ProtocolKind::OpenVpn.to_string(),
                 Style::default().fg(theme::current().text_secondary),
             ),
         ]));

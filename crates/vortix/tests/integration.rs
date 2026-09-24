@@ -79,6 +79,7 @@ fn set_connected(app: &mut App, name: &str) {
     snapshot.tunnels.push(TunnelView {
         profile_id,
         name: name.to_owned(),
+        protocol: vortix::profile::ProtocolKind::WireGuard,
         phase: Phase::Up,
         interface: Some("wg0".into()),
         since: std::time::SystemTime::now(),

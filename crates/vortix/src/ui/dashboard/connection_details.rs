@@ -268,7 +268,7 @@ fn render_connected(
     details: &DetailedConnectionInfo,
     is_focused_primary: bool,
 ) {
-    let is_openvpn = details.public_key == "OpenVPN" || details.public_key.is_empty();
+    let is_openvpn = snap.protocol == crate::profile::ProtocolKind::OpenVpn;
 
     let mtu_str = helpers::nonempty_or(&details.mtu, "-");
 
