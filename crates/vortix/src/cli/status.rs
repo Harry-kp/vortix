@@ -13,9 +13,9 @@ use crate::config::AppConfig;
 use serde::Serialize;
 use std::path::Path;
 
-/// Result of a CLI status scan.
-#[derive(Debug)]
-pub struct StatusSnapshot {
+/// One active tunnel as the CLI scan sees it.
+#[derive(Debug, Clone)]
+pub struct SessionStatus {
     pub connection_state: String,
     /// Typed health for a Vortix-issued connected generation. Scanner-only
     /// observations intentionally leave this absent.
@@ -31,22 +31,35 @@ pub struct StatusSnapshot {
     pub internal_ip: Option<String>,
     pub download_bytes: Option<String>,
     pub upload_bytes: Option<String>,
-    /// Kill switch mode — the typed enum. Call sites format it via
-    /// [`crate::control::killswitch::KillSwitchMode::display_name`] (prose for humans:
-    /// `Off` / `Block on drop` / `VPN-only`) or
-    /// [`crate::control::killswitch::KillSwitchMode::cli_verb`] (slug for the CLI verb +
-    /// JSON envelope: `off` / `block-on-drop` / `vpn-only`). One
-    /// vocabulary, two casings, no duplicated string fields.
+}
+
+/// Result of a CLI status scan.
+#[derive(Debug)]
+pub struct StatusSnapshot {
+    /// Every active tunnel, in scanner order.
+    pub sessions: Vec<SessionStatus>,
+    /// Index into `sessions` of the tunnel carrying the default route.
+    pub primary: Option<usize>,
     pub killswitch_mode: crate::control::killswitch::KillSwitchMode,
-    /// Kill switch state — typed enum. See the helpers
-    /// [`crate::control::killswitch::KillSwitchState::display_status`] (prose) and
-    /// [`crate::control::killswitch::KillSwitchState::cli_verb`] (slug).
     pub killswitch_state: crate::control::killswitch::KillSwitchState,
+}
+
+impl StatusSnapshot {
+    /// The tunnel a one-line summary describes: the primary, else the first.
+    #[must_use]
+    pub fn focus(&self) -> Option<&SessionStatus> {
+        self.primary
+            .and_then(|index| self.sessions.get(index))
+            .or_else(|| self.sessions.first())
+    }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// One-shot status scan for CLI.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn scan_status(
     profiles: &[VpnProfile],
     config: &AppConfig,
@@ -54,127 +67,95 @@ pub fn scan_status(
 ) -> StatusSnapshot {
     let (killswitch_mode, killswitch_state) = crate::control::killswitch::persisted();
     let active = scanner::get_active_profiles(profiles);
-    let session = active.first();
-    let (mut state, profile, protocol, uptime, server, interface, internal_ip, dl, ul) =
-        if let Some(s) = session {
-            let proto = profiles
-                .iter()
-                .find(|p| p.name == s.name)
-                .map(|p| p.protocol);
-
-            // Direct scanner state is observation-only. Even a fresh or
-            // historically non-zero handshake timestamp cannot recreate
-            // the current attempt generation and ownership receipt.
-            let observed_state = if matches!(proto, Some(ProtocolKind::WireGuard)) {
-                "handshaking"
-            } else {
-                "connected"
-            };
-
-            let uptime = s.started_at.and_then(|started| {
-                std::time::SystemTime::now()
-                    .duration_since(started)
-                    .ok()
-                    .map(|d| d.as_secs())
-            });
-
-            (
-                observed_state.to_string(),
-                Some(s.name.clone()),
-                proto.map(|p| format!("{p}")),
-                uptime,
-                if s.details.endpoint.is_empty() {
-                    None
-                } else {
-                    Some(s.details.endpoint.clone())
-                },
-                if s.details.interface.is_empty() {
-                    None
-                } else {
-                    Some(s.details.interface.clone())
-                },
-                if s.details.internal_ip.is_empty() {
-                    None
-                } else {
-                    Some(s.details.internal_ip.clone())
-                },
-                if s.details.transfer_rx.is_empty() {
-                    None
-                } else {
-                    Some(s.details.transfer_rx.clone())
-                },
-                if s.details.transfer_tx.is_empty() {
-                    None
-                } else {
-                    Some(s.details.transfer_tx.clone())
-                },
-            )
-        } else {
-            (
-                "disconnected".to_string(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-        };
-
-    let mut health = None;
-    let mut generation = None;
-    if let Some(session) = session {
-        if let Some(profile) = profiles.iter().find(|profile| {
-            profile.name == session.name && profile.protocol == ProtocolKind::WireGuard
-        }) {
-            if let Some(mut receipt) = crate::wireguard::receipt::load(config_dir, &profile.id)
-                .filter(|receipt| receipt.validates(&profile.id, session))
-            {
-                let mut activity = crate::wireguard::receipt::PeerActivity::new();
-                let current = crate::wireguard::receipt::health_from_peers(
-                    &session.wireguard_peers,
-                    &mut activity,
-                    &receipt.probe_receipts,
-                    Duration::from_secs(config.wireguard_handshake_stale_secs),
-                );
-                if let Ok(Some(old)) = crate::wireguard::receipt::update_health(
-                    config_dir,
-                    &mut receipt,
-                    current.clone(),
-                ) {
-                    if let Some(journal) = crate::journal::global_journal() {
-                        let _ =
-                            journal.append(crate::journal::JournalEvent::ConnectionHealthChanged {
-                                profile_id: profile.id.clone(),
-                                old,
-                                new: current.clone(),
-                            });
-                    }
-                }
-                state = "connected".into();
-                generation = Some(receipt.generation);
-                health = Some(current);
-            }
-        }
-    }
-
+    let default_interface = if active.is_empty() {
+        None
+    } else {
+        crate::platform::Routes::default_route_observation()
+            .interface()
+            .map(str::to_string)
+    };
+    let sessions: Vec<SessionStatus> = active
+        .iter()
+        .map(|session| session_status(session, profiles, config, config_dir))
+        .collect();
+    let primary = default_interface.and_then(|interface| {
+        sessions
+            .iter()
+            .position(|session| session.interface.as_deref() == Some(interface.as_str()))
+    });
     StatusSnapshot {
-        connection_state: state,
-        health,
-        generation,
-        profile,
-        protocol,
-        uptime_secs: uptime,
-        server,
-        interface,
-        internal_ip,
-        download_bytes: dl,
-        upload_bytes: ul,
+        sessions,
+        primary,
         killswitch_mode,
         killswitch_state,
     }
+}
+
+fn session_status(
+    session: &scanner::ActiveSession,
+    profiles: &[VpnProfile],
+    config: &AppConfig,
+    config_dir: &std::path::Path,
+) -> SessionStatus {
+    let profile = profiles.iter().find(|p| p.name == session.name);
+    let proto = profile.map(|p| p.protocol);
+    // Direct scanner state is observation-only. Even a fresh or historically
+    // non-zero handshake timestamp cannot recreate the current attempt
+    // generation and ownership receipt.
+    let mut status = SessionStatus {
+        connection_state: if matches!(proto, Some(ProtocolKind::WireGuard)) {
+            "handshaking"
+        } else {
+            "connected"
+        }
+        .to_string(),
+        health: None,
+        generation: None,
+        profile: Some(session.name.clone()),
+        protocol: proto.map(|p| format!("{p}")),
+        uptime_secs: session.started_at.and_then(|started| {
+            std::time::SystemTime::now()
+                .duration_since(started)
+                .ok()
+                .map(|d| d.as_secs())
+        }),
+        server: nonempty(&session.details.endpoint),
+        interface: nonempty(&session.details.interface),
+        internal_ip: nonempty(&session.details.internal_ip),
+        download_bytes: nonempty(&session.details.transfer_rx),
+        upload_bytes: nonempty(&session.details.transfer_tx),
+    };
+    let Some(profile) = profile.filter(|profile| profile.protocol == ProtocolKind::WireGuard)
+    else {
+        return status;
+    };
+    let Some(mut receipt) = crate::wireguard::receipt::load(config_dir, &profile.id)
+        .filter(|receipt| receipt.validates(&profile.id, session))
+    else {
+        return status;
+    };
+    let mut activity = crate::wireguard::receipt::PeerActivity::new();
+    let current = crate::wireguard::receipt::health_from_peers(
+        &session.wireguard_peers,
+        &mut activity,
+        &receipt.probe_receipts,
+        Duration::from_secs(config.wireguard_handshake_stale_secs),
+    );
+    if let Ok(Some(old)) =
+        crate::wireguard::receipt::update_health(config_dir, &mut receipt, current.clone())
+    {
+        if let Some(journal) = crate::journal::global_journal() {
+            let _ = journal.append(crate::journal::JournalEvent::ConnectionHealthChanged {
+                profile_id: profile.id.clone(),
+                old,
+                new: current.clone(),
+            });
+        }
+    }
+    status.connection_state = "connected".into();
+    status.generation = Some(receipt.generation);
+    status.health = Some(current);
+    status
 }
 
 /// `status` command JSON payload.
@@ -184,16 +165,10 @@ pub fn scan_status(
 ///
 /// - `connections`: all currently active tunnels. Empty when nothing is
 ///   connected. v2 readers should prefer this field.
-/// - `primary`: profile id of the primary tunnel, or `null` when no
-///   primary is elected (no active tunnels, or only secondaries).
-/// - `connection`: v1 back-compat. Set to the primary's [`ConnectionEntry`]
-///   when a primary exists, `null` otherwise. v0.3.x consumers reading
-///   `data.connection.{state,profile,protocol,uptime_secs}` continue to
-///   work in the primary-only case.
-///
-/// A follow-up will replace the transitional single-entry construction below
-/// with a engine snapshot-driven snapshot; this stage's job is just to make the v2
-/// envelope shape available.
+/// - `primary`: profile of the tunnel carrying the default route, or `null`
+///   when none does (no tunnels, or only split tunnels).
+/// - `connection`: v1 back-compat. The focused tunnel (primary, else the
+///   first) when it is connected, `null` otherwise.
 #[derive(Serialize)]
 struct StatusData {
     connections: Vec<ConnectionEntry>,
@@ -241,86 +216,40 @@ pub(super) fn handle_status(
 
     let profiles = crate::config::profiles::load_profiles();
     let snap = crate::cli::status::scan_status(&profiles, config, config_dir);
-    let is_connected = snap.connection_state == "connected";
-    let is_present = snap.connection_state != "disconnected";
+    let focus = snap.focus();
+    let is_connected = focus.is_some_and(|session| session.connection_state == "connected");
+    let is_present = focus.is_some();
 
-    // Transitional shape: the engine snapshot-driven multi-tunnel snapshot
-    // lands later. Until then, "primary" is the single active tunnel
-    // (when connected), and `connections` is a one-element vec mirroring
-    // it. When disconnected, `connections` is empty and `primary` /
-    // `connection` are both `null`.
-    let visible_entry = if is_present {
-        Some(ConnectionEntry {
-            state: snap.connection_state.clone(),
-            profile: snap.profile.clone(),
-            protocol: snap.protocol.clone(),
-            uptime_secs: snap.uptime_secs,
-            health: snap.health.as_ref().map(connection_health_entry),
-            generation: snap.generation,
-        })
-    } else {
-        None
-    };
-    let connections: Vec<ConnectionEntry> = visible_entry.iter().cloned().collect();
-    let primary: Option<String> = if is_connected {
-        snap.profile.clone()
-    } else {
-        None
-    };
-
-    let data = StatusData {
-        connections,
-        primary,
-        connection: if is_connected {
-            visible_entry.clone()
-        } else {
-            None
-        },
-        network: if is_connected {
-            Some(StatusNetwork {
-                server: snap.server.clone(),
-                interface: snap.interface.clone(),
-                internal_ip: snap.internal_ip.clone(),
-                download: snap.download_bytes.clone(),
-                upload: snap.upload_bytes.clone(),
-            })
-        } else {
-            None
-        },
-        security: StatusSecurity {
-            killswitch_mode: snap.killswitch_mode.cli_verb().to_string(),
-            killswitch_state: snap.killswitch_state.cli_verb().to_string(),
-        },
-    };
+    let data = status_data(&snap);
 
     match mode {
         OutputMode::Human => {
             if brief {
-                println!("{}", human_status_headline(&snap));
-            } else if is_connected {
-                let profile = snap.profile.as_deref().unwrap_or("unknown");
-                let protocol = snap.protocol.as_deref().unwrap_or("");
+                println!("{}", human_status_headline(focus));
+            } else if let Some(session) = focus.filter(|_| is_connected) {
+                let profile = session.profile.as_deref().unwrap_or("unknown");
+                let protocol = session.protocol.as_deref().unwrap_or("");
                 println!("● Connected to {profile} ({protocol})");
                 println!();
-                if let Some(s) = &snap.server {
+                if let Some(s) = &session.server {
                     println!("  Server       {s}");
                 }
-                if let Some(i) = &snap.interface {
+                if let Some(i) = &session.interface {
                     println!("  Interface    {i}");
                 }
-                if let Some(ip) = &snap.internal_ip {
+                if let Some(ip) = &session.internal_ip {
                     println!("  Internal IP  {ip}");
                 }
-                if let Some(up) = &snap.uptime_secs {
+                if let Some(up) = &session.uptime_secs {
                     let h = up / 3600;
                     let m = (up % 3600) / 60;
                     let s = up % 60;
                     println!("  Uptime       {h}h {m}m {s}s");
                 }
-                if let Some(dl) = &snap.download_bytes {
+                if let Some(dl) = &session.download_bytes {
                     println!("  Transfer     ↓ {dl}");
                 }
-                if let Some(ul) = &snap.upload_bytes {
+                if let Some(ul) = &session.upload_bytes {
                     println!("               ↑ {ul}");
                 }
                 println!(
@@ -328,17 +257,22 @@ pub(super) fn handle_status(
                     snap.killswitch_mode.display_name(),
                     snap.killswitch_state.display_status()
                 );
-                if let Some(health) = &snap.health {
+                if let Some(health) = &session.health {
                     println!("  Health       {}", connection_health_human(health));
                 }
             } else {
-                println!("{}", human_status_headline(&snap));
+                println!("{}", human_status_headline(focus));
                 println!();
                 println!(
                     "  Kill Switch  {} ({})",
                     snap.killswitch_mode.display_name(),
                     snap.killswitch_state.display_status()
                 );
+            }
+            if !brief {
+                for line in other_tunnel_lines(&snap) {
+                    println!("{line}");
+                }
             }
         }
         OutputMode::Json => {
@@ -360,6 +294,38 @@ pub(super) fn handle_status(
     ExitCode::Success.code()
 }
 
+fn status_data(snap: &StatusSnapshot) -> StatusData {
+    let focus = snap.focus();
+    let is_connected = focus.is_some_and(|session| session.connection_state == "connected");
+    let entry = |session: &SessionStatus| ConnectionEntry {
+        state: session.connection_state.clone(),
+        profile: session.profile.clone(),
+        protocol: session.protocol.clone(),
+        uptime_secs: session.uptime_secs,
+        health: session.health.as_ref().map(connection_health_entry),
+        generation: session.generation,
+    };
+    StatusData {
+        connections: snap.sessions.iter().map(entry).collect(),
+        primary: snap
+            .primary
+            .and_then(|index| snap.sessions.get(index))
+            .and_then(|session| session.profile.clone()),
+        connection: focus.filter(|_| is_connected).map(entry),
+        network: focus.filter(|_| is_connected).map(|session| StatusNetwork {
+            server: session.server.clone(),
+            interface: session.interface.clone(),
+            internal_ip: session.internal_ip.clone(),
+            download: session.download_bytes.clone(),
+            upload: session.upload_bytes.clone(),
+        }),
+        security: StatusSecurity {
+            killswitch_mode: snap.killswitch_mode.cli_verb().to_string(),
+            killswitch_state: snap.killswitch_state.cli_verb().to_string(),
+        },
+    }
+}
+
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
     loop {
         let profiles = crate::config::profiles::load_profiles();
@@ -379,29 +345,40 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                     health: Option<ConnectionHealthEntry>,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     generation: Option<u64>,
+                    tunnels: usize,
                 }
+                let focus = snap.focus();
                 let line = WatchLine {
                     ts: chrono_now(),
-                    state: snap.connection_state,
-                    profile: snap.profile,
-                    uptime_secs: snap.uptime_secs,
-                    health: snap.health.as_ref().map(connection_health_entry),
-                    generation: snap.generation,
+                    state: focus.map_or_else(
+                        || "disconnected".to_string(),
+                        |session| session.connection_state.clone(),
+                    ),
+                    profile: focus.and_then(|session| session.profile.clone()),
+                    uptime_secs: focus.and_then(|session| session.uptime_secs),
+                    health: focus
+                        .and_then(|session| session.health.as_ref())
+                        .map(connection_health_entry),
+                    generation: focus.and_then(|session| session.generation),
+                    tunnels: snap.sessions.len(),
                 };
                 println!("{}", serde_json::to_string(&line).unwrap_or_default());
             }
             OutputMode::Human => {
                 use std::io::Write;
-                if snap.connection_state == "connected" {
-                    print!("\r{}", human_status_headline(&snap));
-                    if let Some(up) = snap.uptime_secs {
+                let focus = snap.focus();
+                if let Some(session) =
+                    focus.filter(|session| session.connection_state == "connected")
+                {
+                    print!("\r{}", human_status_headline(focus));
+                    if let Some(up) = session.uptime_secs {
                         let m = up / 60;
                         let s = up % 60;
                         print!(" ({m}m{s}s)");
                     }
                     print!("    ");
                 } else {
-                    print!("\r{}    ", human_status_headline(&snap));
+                    print!("\r{}    ", human_status_headline(focus));
                 }
                 let _ = std::io::stdout().flush();
             }
@@ -412,7 +389,38 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
     }
 }
 
-pub(super) fn human_status_headline(snap: &crate::cli::status::StatusSnapshot) -> String {
+/// One line per tunnel besides the focused one, so a multi-tunnel host is
+/// not reported as a single connection.
+fn other_tunnel_lines(snap: &StatusSnapshot) -> Vec<String> {
+    let focus = snap.focus().and_then(|focus| focus.profile.clone());
+    let others: Vec<&SessionStatus> = snap
+        .sessions
+        .iter()
+        .filter(|session| session.profile != focus)
+        .collect();
+    if others.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![String::new(), "  Also active".to_string()];
+    for session in others {
+        let profile = session.profile.as_deref().unwrap_or("unknown");
+        let protocol = session.protocol.as_deref().unwrap_or("");
+        let interface = session
+            .interface
+            .as_deref()
+            .map_or_else(String::new, |interface| format!(" [{interface}]"));
+        lines.push(format!(
+            "    {profile} ({protocol}){interface} — {}",
+            session.connection_state
+        ));
+    }
+    lines
+}
+
+pub(super) fn human_status_headline(session: Option<&SessionStatus>) -> String {
+    let Some(snap) = session else {
+        return "○ Disconnected".to_string();
+    };
     let profile = snap.profile.as_deref().unwrap_or("unknown");
     let protocol = snap.protocol.as_deref().unwrap_or("");
     match snap.connection_state.as_str() {
@@ -527,8 +535,8 @@ mod handshake_status_tests {
     }
     use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 
-    fn snapshot(state: &str, protocol: &str) -> crate::cli::status::StatusSnapshot {
-        crate::cli::status::StatusSnapshot {
+    fn snapshot(state: &str, protocol: &str) -> SessionStatus {
+        SessionStatus {
             connection_state: state.into(),
             health: None,
             generation: None,
@@ -540,19 +548,59 @@ mod handshake_status_tests {
             internal_ip: None,
             download_bytes: None,
             upload_bytes: None,
+        }
+    }
+
+    fn tunnels(sessions: Vec<SessionStatus>, primary: Option<usize>) -> StatusSnapshot {
+        StatusSnapshot {
+            sessions,
+            primary,
             killswitch_mode: KillSwitchMode::Off,
             killswitch_state: KillSwitchState::Disabled,
         }
     }
 
+    fn session(name: &str, interface: &str) -> SessionStatus {
+        SessionStatus {
+            profile: Some(name.into()),
+            interface: Some(interface.into()),
+            ..snapshot("connected", "OpenVPN")
+        }
+    }
+
+    #[test]
+    fn status_lists_every_tunnel_and_only_the_route_owner_is_primary() {
+        let snap = tunnels(
+            vec![session("split", "utun5"), session("full", "utun4")],
+            Some(1),
+        );
+        let value = serde_json::to_value(status_data(&snap)).unwrap();
+        assert_eq!(value["connections"].as_array().unwrap().len(), 2);
+        assert_eq!(value["primary"], "full");
+        assert_eq!(value["connection"]["profile"], "full");
+        assert_eq!(value["network"]["interface"], "utun4");
+        let others = other_tunnel_lines(&snap).join("\n");
+        assert!(others.contains("split (OpenVPN) [utun5]"), "{others}");
+        assert!(!others.contains("full"), "{others}");
+    }
+
+    #[test]
+    fn a_split_tunnel_alone_is_not_primary() {
+        let snap = tunnels(vec![session("split", "utun5")], None);
+        let value = serde_json::to_value(status_data(&snap)).unwrap();
+        assert!(value["primary"].is_null());
+        assert_eq!(value["connection"]["profile"], "split");
+        assert!(other_tunnel_lines(&snap).is_empty());
+    }
+
     #[test]
     fn human_and_watch_headline_distinguish_wireguard_from_openvpn() {
         assert_eq!(
-            human_status_headline(&snapshot("handshaking", "WireGuard")),
+            human_status_headline(Some(&snapshot("handshaking", "WireGuard"))),
             "◐ Handshaking with corp (WireGuard)"
         );
         assert_eq!(
-            human_status_headline(&snapshot("connecting", "OpenVPN")),
+            human_status_headline(Some(&snapshot("connecting", "OpenVPN"))),
             "◐ Connecting to corp (OpenVPN)"
         );
     }
@@ -609,7 +657,7 @@ mod handshake_status_tests {
         let mut snap = snapshot("connected", "WireGuard");
         snap.health = Some(degraded.clone());
         snap.generation = Some(7);
-        assert!(human_status_headline(&snap).contains("stale for 181s"));
+        assert!(human_status_headline(Some(&snap)).contains("stale for 181s"));
         let projected = connection_health_entry(snap.health.as_ref().unwrap());
         assert_eq!(projected.status, "degraded");
         assert!(projected.reason.unwrap().contains("peer-pub"));

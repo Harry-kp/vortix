@@ -177,4 +177,3 @@ build-time numbers live in [`docs/performance.md`](docs/performance.md).
 - `process::run` returns `Ok` for a command that exits non-zero; check
   `CommandOutcome::success()`. Treating `Ok` as success shipped a DNS flush
   that silently ignored failures.
-- `vortix status` (CLI) reports a single tunnel; the TUI shows all of them.

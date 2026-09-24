@@ -20,7 +20,7 @@ fn engine_new_headless_starts_disconnected() {
     let config = vortix::config::AppConfig::default();
     let dir = tempfile::tempdir().unwrap();
     let snap = vortix::cli::status::scan_status(&[], &config, dir.path());
-    assert_eq!(snap.connection_state, "disconnected");
+    assert!(snap.sessions.is_empty());
 }
 
 #[test]
@@ -126,9 +126,8 @@ fn engine_scan_status_when_disconnected() {
         &vortix::config::AppConfig::default(),
         std::path::Path::new("/nonexistent"),
     );
-    assert_eq!(snap.connection_state, "disconnected");
-    assert!(snap.profile.is_none());
-    assert!(snap.uptime_secs.is_none());
+    assert!(snap.sessions.is_empty());
+    assert!(snap.primary.is_none());
 }
 
 // ============================================================================
