@@ -7,15 +7,13 @@
 //! never subtracted, its interface rule covers it); DHCP; and per tunnel its
 //! interface plus each server address, so it can reconnect after a drop.
 
-use std::time::Duration;
-
-use crate::control::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
+use crate::control::killswitch::{
+    ActiveTunnelInfo, KillswitchError, Result, FIREWALL_COMMAND_TIMEOUT, FIREWALL_OUTPUT_LIMIT,
+};
 use crate::process::{CommandOutcome, CommandSpec, PrivilegeReq, ProcessError};
 use tracing::{debug, error, info};
 
 const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
-const FIREWALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const FIREWALL_OUTPUT_LIMIT: usize = 1024 * 1024;
 use super::POLICY_COMMENT_PREFIX;
 use nft_policy::BatchMode;
 
@@ -485,9 +483,8 @@ mod nft_policy {
     use std::net::IpAddr;
 
     use super::POLICY_COMMENT_PREFIX;
-    use crate::cidr::cidr_subtract;
-    use crate::cidr::{rfc1918_ranges, Cidr};
-    use crate::control::killswitch::ActiveTunnelInfo;
+    use crate::cidr::Cidr;
+    use crate::control::killswitch::{lan_allowance, ActiveTunnelInfo};
 
     pub(super) const MISSING_ERROR: &str = "No such file or directory";
 
@@ -569,12 +566,7 @@ mod nft_policy {
     }
 
     fn render(active: &[ActiveTunnelInfo], mode: BatchMode, digest: &str) -> String {
-        let secondary_cidrs: Vec<Cidr> = active
-            .iter()
-            .filter(|tunnel| !tunnel.is_primary)
-            .flat_map(|tunnel| tunnel.declared_cidrs.iter().copied())
-            .collect();
-        let local_ranges = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
+        let local_ranges = lan_allowance(active);
 
         let mut ruleset = String::new();
         if matches!(mode, BatchMode::Replace) {
@@ -728,31 +720,7 @@ mod nft_policy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cidr::Cidr;
-    use std::net::IpAddr;
-
-    fn cidr(s: &str) -> Cidr {
-        s.parse().expect("valid cidr in test")
-    }
-
-    fn ip(s: &str) -> IpAddr {
-        s.parse().expect("valid ip in test")
-    }
-
-    /// Convenience: build an `ActiveTunnelInfo`.
-    fn tunnel(
-        interface: &str,
-        server_ips: &[&str],
-        declared: &[&str],
-        is_primary: bool,
-    ) -> ActiveTunnelInfo {
-        ActiveTunnelInfo {
-            interface: interface.to_string(),
-            server_ips: server_ips.iter().map(|s| ip(s)).collect(),
-            declared_cidrs: declared.iter().map(|s| cidr(s)).collect(),
-            is_primary,
-        }
-    }
+    use crate::control::killswitch::test_tunnel as tunnel;
 
     fn nft(active: &[ActiveTunnelInfo]) -> String {
         nft_policy::ruleset(active, BatchMode::Create)

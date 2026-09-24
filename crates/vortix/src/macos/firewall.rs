@@ -13,11 +13,11 @@ use std::fs;
 use std::io::{self, Write as IoWrite};
 use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::time::Duration;
 
-use crate::cidr::cidr_subtract;
-use crate::cidr::{rfc1918_ranges, Cidr};
-use crate::control::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
+use crate::control::killswitch::{
+    lan_allowance, ActiveTunnelInfo, KillswitchError, Result, FIREWALL_COMMAND_TIMEOUT,
+    FIREWALL_OUTPUT_LIMIT,
+};
 use crate::process::{CommandSpec, PrivilegeReq};
 use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use tracing::{debug, error, info};
@@ -37,8 +37,6 @@ pub(crate) const PF_APPLY_ARGS: [&str; 6] = ["-o", "none", "-a", PF_ANCHOR, "-f"
 pub(crate) const PF_RELEASE_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-F", "rules"];
 const POLICY_LABEL_PREFIX: &str = "vortix-policy:";
 const PF_RULE_LABEL_MAX_BYTES: usize = 63;
-const FIREWALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const FIREWALL_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 fn pfctl(args: &[&str]) -> io::Result<crate::process::CommandOutcome> {
     let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
@@ -123,16 +121,7 @@ impl PfFirewall {
         writeln!(rules, "pass out quick on lo0 all").unwrap();
         writeln!(rules).unwrap();
 
-        // Secondaries' declared CIDRs are subtracted from RFC1918. Primaries
-        // (claiming 0/0) are excluded — their interface allow rule covers
-        // their egress, and subtracting the default route would carve up
-        // loopback. See cidr_subtract docs / Q-DEF-9 D-6.
-        let secondary_cidrs: Vec<Cidr> = active
-            .iter()
-            .filter(|t| !t.is_primary)
-            .flat_map(|t| t.declared_cidrs.iter().copied())
-            .collect();
-        let rfc1918 = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
+        let rfc1918 = lan_allowance(active);
 
         writeln!(
             rules,
@@ -531,28 +520,11 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    fn cidr(s: &str) -> Cidr {
+    fn cidr(s: &str) -> crate::cidr::Cidr {
         s.parse().expect("valid cidr in test")
     }
 
-    fn ip(s: &str) -> IpAddr {
-        s.parse().expect("valid ip in test")
-    }
-
-    /// Convenience: build an `ActiveTunnelInfo`.
-    fn tunnel(
-        interface: &str,
-        server_ips: &[&str],
-        declared: &[&str],
-        is_primary: bool,
-    ) -> ActiveTunnelInfo {
-        ActiveTunnelInfo {
-            interface: interface.to_string(),
-            server_ips: server_ips.iter().map(|s| ip(s)).collect(),
-            declared_cidrs: declared.iter().map(|s| cidr(s)).collect(),
-            is_primary,
-        }
-    }
+    use crate::control::killswitch::test_tunnel as tunnel;
 
     fn without_policy_label(rules: &str) -> String {
         let mut normalized = rules

@@ -1400,6 +1400,35 @@ pub struct ActiveTunnelInfo {
     pub is_primary: bool,
 }
 
+pub(crate) const FIREWALL_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const FIREWALL_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+/// The LAN egress both firewalls allow: RFC1918 minus every secondary's
+/// declared CIDRs, so traffic to those nets cannot escape onto the underlay.
+pub(crate) fn lan_allowance(active: &[ActiveTunnelInfo]) -> Vec<Cidr> {
+    let secondary_cidrs: Vec<Cidr> = active
+        .iter()
+        .filter(|tunnel| !tunnel.is_primary)
+        .flat_map(|tunnel| tunnel.declared_cidrs.iter().copied())
+        .collect();
+    crate::cidr::cidr_subtract(&crate::cidr::rfc1918_ranges(), &secondary_cidrs)
+}
+
+#[cfg(test)]
+pub(crate) fn test_tunnel(
+    interface: &str,
+    server_ips: &[&str],
+    declared: &[&str],
+    is_primary: bool,
+) -> ActiveTunnelInfo {
+    ActiveTunnelInfo {
+        interface: interface.to_string(),
+        server_ips: server_ips.iter().map(|s| s.parse().unwrap()).collect(),
+        declared_cidrs: declared.iter().map(|s| s.parse().unwrap()).collect(),
+        is_primary,
+    }
+}
+
 impl ActiveTunnelInfo {
     /// Policy-only endpoint allowance used while a tunnel interface does not
     /// exist yet. Platform adapters emit only the destination exceptions and
