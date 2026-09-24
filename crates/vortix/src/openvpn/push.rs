@@ -112,6 +112,8 @@ pub(crate) fn openvpn_route_evidence(
         .iter()
         .map(canonical_openvpn_route)
         .collect::<Result<Vec<_>, _>>()?;
+    // `bypass-dhcp` needs nothing: the connected LAN route never moves into
+    // the tunnel. `bypass-dns` is Windows-only in OpenVPN itself.
     let supported_redirect = |redirect: &OpenVpnRedirectGateway| {
         redirect.flags().iter().all(|flag| {
             matches!(
