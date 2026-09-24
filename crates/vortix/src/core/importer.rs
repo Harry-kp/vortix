@@ -12,7 +12,7 @@ pub enum ImportTarget {
 #[must_use]
 pub fn expand_home(path_str: &str) -> PathBuf {
     if let Some(stripped) = path_str.strip_prefix("~/") {
-        if let Some(home) = crate::utils::home_dir() {
+        if let Some(home) = crate::config::user_home() {
             return home.join(stripped);
         }
     }
@@ -79,6 +79,16 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_expands_to_the_invoking_users_home() {
+        let home = crate::config::user_home().expect("test runs with a home directory");
+        assert_eq!(expand_home("~/corp.conf"), home.join("corp.conf"));
+        assert_eq!(
+            expand_home("/etc/corp.conf"),
+            PathBuf::from("/etc/corp.conf")
+        );
+    }
 
     #[test]
     fn test_is_valid_url_https() {

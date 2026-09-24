@@ -724,7 +724,7 @@ fn print_fallback(body: &str) {
 
 /// Replace the user's home directory prefix with `~` for privacy.
 fn redact_home_prefix(path: &str) -> String {
-    if let Some(home) = crate::utils::home_dir() {
+    if let Some(home) = crate::config::user_home() {
         let home_str = home.to_string_lossy();
         if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
             return format!("~{rest}");

@@ -274,7 +274,7 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
 /// Uses `SUDO_USER` to resolve the real user's home when running under sudo,
 /// then checks `XDG_CONFIG_HOME`, and falls back to `~/.config/vortix`.
 fn default_config_dir() -> std::io::Result<PathBuf> {
-    let home = real_user_home().ok_or_else(|| {
+    let home = user_home().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "Home directory not found")
     })?;
 
@@ -295,13 +295,13 @@ fn default_config_dir() -> std::io::Result<PathBuf> {
 /// When running as root via `sudo`, `$HOME` points to `/root`. This function
 /// checks `SUDO_USER` and looks up that user's actual home directory from
 /// `/etc/passwd` so config files land in the invoking user's home.
-fn real_user_home() -> Option<PathBuf> {
+pub(crate) fn user_home() -> Option<PathBuf> {
     if crate::utils::is_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
             return home_dir_for_user(&sudo_user);
         }
     }
-    crate::utils::home_dir()
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
 
 /// Looks up a user's home directory from `/etc/passwd` via `getpwnam`.
@@ -427,14 +427,10 @@ pub(crate) fn config_owner(config_dir: &Path) -> Result<(u32, u32), String> {
             .then_some(effective)
             .ok_or_else(|| "configuration owner mismatch".into());
     }
-    let uid = std::env::var("SUDO_UID")
+    let (uid, gid) = sudo_ids()
         .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(metadata.uid());
-    let gid = std::env::var("SUDO_GID")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(metadata.gid());
+        .flatten()
+        .unwrap_or((metadata.uid(), metadata.gid()));
     (metadata.uid() == uid)
         .then_some((uid, gid))
         .ok_or_else(|| "sudo owner does not own configuration".into())
@@ -702,17 +698,47 @@ pub fn fix_ownership(path: &Path) {
     }
 }
 
+/// The invoking user's uid and gid under sudo; `None` outside sudo, an error
+/// when sudo's variables are present but malformed.
+pub(crate) fn sudo_ids() -> std::io::Result<Option<(u32, u32)>> {
+    let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
+        return Ok(None);
+    };
+    let parse = |name: &str, value: &str| {
+        value.parse::<u32>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid {name}: {error}"),
+            )
+        })
+    };
+    Ok(Some((parse("SUDO_UID", &uid)?, parse("SUDO_GID", &gid)?)))
+}
+
+/// Give a file Vortix created as root back to the sudo user.
+#[allow(unsafe_code)]
+pub(crate) fn chown_to_invoking_user(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    if !crate::utils::is_root() {
+        return Ok(());
+    }
+    let Some((uid, gid)) = sudo_ids()? else {
+        return Ok(());
+    };
+    // SAFETY: the descriptor stays open for the call; uid/gid are plain values.
+    if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Recursively chowns a path to `SUDO_UID`:`SUDO_GID`.
 #[allow(unsafe_code)]
 fn chown_to_real_user(path: &Path) -> std::io::Result<()> {
-    let uid: u32 = std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "SUDO_UID not set"))?;
-    let gid: u32 = std::env::var("SUDO_GID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "SUDO_GID not set"))?;
+    let (uid, gid) = sudo_ids()?.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "SUDO_UID/SUDO_GID not set")
+    })?;
 
     chown_recursive(path, uid, gid)
 }

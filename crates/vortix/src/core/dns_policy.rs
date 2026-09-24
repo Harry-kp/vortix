@@ -34,7 +34,7 @@ fn acquire_policy_lock_with_hook(
         0o600,
     )?;
     require_regular_file(&file, "DNS policy lock")?;
-    chown_open_file_to_real_user(&file)?;
+    crate::config::chown_to_invoking_user(&file)?;
     #[allow(unsafe_code)]
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc == 0 {
@@ -89,7 +89,7 @@ fn atomic_write_user_file_with_hook(
     let result = (|| {
         file.write_all(content)?;
         file.sync_all()?;
-        chown_open_file_to_real_user(&file)?;
+        crate::config::chown_to_invoking_user(&file)?;
         renameat(&directory, &temp_name, DNS_POLICY_STATE_FILE)?;
         directory.sync_all()?;
         Ok(())
@@ -98,35 +98,6 @@ fn atomic_write_user_file_with_hook(
         let _ = unlinkat(&directory, &temp_name);
     }
     result
-}
-
-#[allow(unsafe_code)]
-fn chown_open_file_to_real_user(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-
-    if !crate::utils::is_root() {
-        return Ok(());
-    }
-    let Some(uid) = std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-    else {
-        return Ok(());
-    };
-    let Some(gid) = std::env::var("SUDO_GID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-    else {
-        return Ok(());
-    };
-    // SAFETY: the descriptor remains live for this call and uid/gid are
-    // plain values parsed from sudo's environment contract.
-    let result = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 fn create_private_temp(directory: &std::fs::File) -> std::io::Result<(String, std::fs::File)> {
@@ -219,7 +190,7 @@ fn open_pinned_config_dir(path: &Path) -> std::io::Result<std::fs::File> {
             ));
         }
         if created {
-            chown_open_file_to_real_user(&child)?;
+            crate::config::chown_to_invoking_user(&child)?;
             directory.sync_all()?;
         }
         directory = child;

@@ -171,8 +171,10 @@ mod runner {
                 });
             }
 
-            let uid = parse_sudo_id("SUDO_UID")?;
-            let gid = parse_sudo_id("SUDO_GID")?;
+            let (uid, gid) = crate::config::sudo_ids()
+                .ok()
+                .flatten()
+                .ok_or(HookOwnerError::AmbiguousRoot)?;
             if uid == 0 || gid == 0 {
                 return Err(HookOwnerError::RootOwner);
             }
@@ -231,13 +233,6 @@ mod runner {
         UnknownUser,
         #[error("cannot read process groups: {source}")]
         Groups { source: std::io::Error },
-    }
-
-    fn parse_sudo_id(name: &'static str) -> Result<u32, HookOwnerError> {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .ok_or(HookOwnerError::AmbiguousRoot)
     }
 
     fn current_groups() -> Result<Vec<u32>, HookOwnerError> {

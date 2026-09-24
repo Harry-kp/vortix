@@ -702,15 +702,6 @@ pub fn format_relative_time(time: std::time::SystemTime) -> String {
     }
 }
 
-/// Returns the user's home directory.
-///
-/// Uses the same platform-aware base-directory resolver as settings and
-/// journal persistence.
-#[must_use]
-pub fn home_dir() -> Option<std::path::PathBuf> {
-    directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
-}
-
 /// Returns a unique path by appending (n) if the file already exists.
 ///
 /// # Arguments
@@ -751,74 +742,22 @@ pub fn get_unique_path(dir: &std::path::Path, filename: &str) -> std::path::Path
     path
 }
 
-/// Check whether a named executable exists somewhere on `PATH`.
-///
-/// Walks `$PATH` entries directly via `std::env::split_paths` and checks
-/// each for the binary — does NOT shell out to `which`. The earlier
-/// `which`-based implementation broke on Fedora minimal containers
-/// (and any other distro where the `which` binary itself is in a
-/// separate package), where it would falsely report system-installed
-/// binaries as missing. Catching this was the first regression the
-/// matrixed Fedora integration test surfaced.
-///
-/// On Unix, also requires the file to have an executable bit set; on
-/// other platforms, presence as a regular file is sufficient.
-pub(crate) fn binary_exists(name: &str) -> bool {
-    use std::env;
-
-    let Ok(path) = env::var("PATH") else {
-        return false;
-    };
-
-    for dir in env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if !candidate.is_file() {
-            continue;
-        }
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = candidate.metadata() {
-                if meta.permissions().mode() & 0o111 != 0 {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// First executable named `name` on `$PATH`. Walks `PATH` itself rather
+/// than running `which`, which minimal distros (Fedora containers) lack.
+pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
 }
 
-/// Locate a named executable on `$PATH` and return the first matching path.
-///
-/// Same PATH-walking + exec-bit check as [`binary_exists`], but returns
-/// the actual path (`Some(PathBuf)`) instead of `bool`. Used by diagnostic
-/// output (`vortix doctor` / `vortix info`) that needs to print where a
-/// tool is installed.
-///
-/// replaces the residual `cmd_stdout("which", ...)` shell-outs
-/// in `cli/report.rs` so vortix doesn't break on minimal-install systems
-/// where `which` itself isn't in the default package set (e.g. Fedora
-/// minimal containers).
-pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
-    use std::env;
-
-    let path = env::var("PATH").ok()?;
-
-    for dir in env::split_paths(&path) {
-        let candidate = dir.join(name);
-        let Ok(metadata) = candidate.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 != 0 {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+/// Whether an executable named `name` is on `$PATH`.
+pub(crate) fn binary_exists(name: &str) -> bool {
+    find_binary_path(name).is_some()
 }
 
 /// Check whether `resolvconf` is installed and functional.
@@ -1319,14 +1258,6 @@ mod tests {
         // Unicode characters should be counted correctly
         assert_eq!(truncate("héllo", 5), "héllo");
         assert_eq!(truncate("héllo world", 8), "héllo...");
-    }
-
-    #[test]
-    fn test_home_dir_exists() {
-        // On most systems, HOME should be set
-        let home = home_dir();
-        assert!(home.is_some());
-        assert!(home.unwrap().exists());
     }
 
     #[test]

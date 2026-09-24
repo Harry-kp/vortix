@@ -248,7 +248,7 @@ fn save(config_dir: &Path, receipt: &ManagedWireGuardReceipt) -> std::io::Result
     let result = (|| {
         file.write_all(&bytes)?;
         file.sync_all()?;
-        chown_open_file_to_real_user(&file)?;
+        crate::config::chown_to_invoking_user(&file)?;
         std::fs::rename(&temp, &path)?;
         sync_directory(&directory)
     })();
@@ -274,7 +274,7 @@ fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
-    chown_open_file_to_real_user(&file)?;
+    crate::config::chown_to_invoking_user(&file)?;
     {
         use std::os::fd::AsRawFd as _;
         // SAFETY: `file` owns a valid descriptor for the duration of the lock.
@@ -285,30 +285,6 @@ fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
         }
     }
     Ok(file)
-}
-
-fn chown_open_file_to_real_user(file: &File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-
-    if !crate::utils::is_root() {
-        return Ok(());
-    }
-    let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
-        return Ok(());
-    };
-    let uid = uid
-        .parse::<libc::uid_t>()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let gid = gid
-        .parse::<libc::gid_t>()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    // SAFETY: `file` owns a valid descriptor and uid/gid are parsed values.
-    #[allow(unsafe_code)]
-    if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 fn receipt_path(config_dir: &Path, profile_id: &ProfileId) -> PathBuf {

@@ -685,7 +685,7 @@ fn archive_legacy_sidecars_platform(
     if unsafe { libc::fchmod(archive.as_raw_fd(), 0o700) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    chown_open_file_to_invoking_user(&archive)?;
+    crate::config::chown_to_invoking_user(&archive)?;
     if created {
         // The archive name must be durable before any source name is removed.
         profiles.sync_all()?;
@@ -720,7 +720,7 @@ fn archive_legacy_sidecars_platform(
             })?;
             require_same_file(&source, &archived, entry)?;
             require_link_count(&archived, 2, entry)?;
-            chown_open_file_to_invoking_user(&archived)?;
+            crate::config::chown_to_invoking_user(&archived)?;
             archived.sync_all()?;
             archive.sync_all()?;
 
@@ -745,7 +745,7 @@ fn archive_legacy_sidecars_platform(
                 ))
             })?;
             require_link_count(&archived, 1, entry)?;
-            chown_open_file_to_invoking_user(&archived)?;
+            crate::config::chown_to_invoking_user(&archived)?;
             archived.sync_all()?;
         }
     }
@@ -843,28 +843,6 @@ fn openat_verified_regular(
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     verify_archive_file(&file, expected)?;
     Ok(Some(file))
-}
-
-#[allow(unsafe_code)]
-fn chown_open_file_to_invoking_user(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-
-    if !crate::utils::is_root() {
-        return Ok(());
-    }
-    let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
-        return Ok(());
-    };
-    let uid = uid
-        .parse::<libc::uid_t>()
-        .map_err(|error| invalid_data(format!("invalid SUDO_UID: {error}")))?;
-    let gid = gid
-        .parse::<libc::gid_t>()
-        .map_err(|error| invalid_data(format!("invalid SUDO_GID: {error}")))?;
-    if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn verify_archive_file(
