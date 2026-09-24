@@ -181,11 +181,7 @@ impl App {
                     }
                 );
                 if closing_prompt {
-                    if let Some(prompt) = self.control_prompt.take() {
-                        if let Some(control) = &self.control {
-                            control.answer(prompt, None);
-                        }
-                    }
+                    self.answer_prompt(None);
                 }
                 self.show_config = false;
                 self.cached_config = None;
@@ -548,8 +544,7 @@ impl App {
                 .iter()
                 .any(|prompt| prompt.id == id && prompt.profile_id == profile_id)
         });
-        if let Some(prompt) = self.control_prompt.filter(|_| answers_prompt) {
-            self.control_prompt = None;
+        if answers_prompt {
             let answer = crate::control::Credentials {
                 username: username.expose().to_owned(),
                 password: password.expose().to_owned(),
@@ -558,9 +553,7 @@ impl App {
                     .map(|answer| answer.expose().to_owned()),
                 remember: save,
             };
-            if let Some(control) = &self.control {
-                control.answer(prompt, Some(answer));
-            }
+            self.answer_prompt(Some(answer));
             self.input_mode = InputMode::Normal;
             self.log("AUTH: Credentials submitted");
             return;

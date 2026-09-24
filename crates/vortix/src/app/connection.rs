@@ -103,21 +103,7 @@ impl App {
 
     pub fn apply_control_snapshot(&mut self, snapshot: Arc<Snapshot>) {
         self.sync_last_used(&snapshot);
-        let drops = snapshot
-            .tunnels
-            .iter()
-            .filter(|tunnel| {
-                matches!(tunnel.phase, Phase::Waiting { .. })
-                    && self
-                        .control_snapshot
-                        .tunnel(&tunnel.profile_id)
-                        .is_some_and(|old| old.phase == Phase::Up)
-            })
-            .count();
-        self.runtime.connection_drops = self
-            .runtime
-            .connection_drops
-            .saturating_add(u32::try_from(drops).unwrap_or(u32::MAX));
+        self.runtime.connection_drops = snapshot.drops;
 
         let egress_changed = self.control_snapshot.primary != snapshot.primary
             || self
@@ -230,6 +216,7 @@ impl App {
             // Another dialog is open: the prompt waits instead of replacing it.
             Some(prompt)
                 if self.control_prompt != Some(prompt.id)
+                    && self.answered_prompt < prompt.id
                     && matches!(self.input_mode, InputMode::Normal) =>
             {
                 // It must be seen to be answered: nothing may draw over it.
@@ -273,6 +260,17 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Answer (or, with `None`, cancel) the open engine prompt. Prompt ids
+    /// only grow, so a stale snapshot still listing it cannot reopen it.
+    pub(crate) fn answer_prompt(&mut self, answer: Option<crate::control::Credentials>) {
+        if let Some(prompt) = self.control_prompt.take() {
+            self.answered_prompt = prompt;
+            if let Some(control) = &self.control {
+                control.answer(prompt, answer);
+            }
         }
     }
 

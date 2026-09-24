@@ -121,6 +121,8 @@ pub struct App {
     pub control_snapshot: std::sync::Arc<crate::control::Snapshot>,
     /// Engine prompt the credential overlay is answering.
     pub(crate) control_prompt: Option<u64>,
+    /// Newest engine prompt already answered or cancelled.
+    pub(crate) answered_prompt: u64,
     /// Highest engine notice already shown.
     pub(crate) notices_seen: u64,
     /// Kept when every tunnel is gone, so reconnect means "the last one".
@@ -193,6 +195,7 @@ impl App {
                 ..crate::control::Snapshot::default()
             }),
             control_prompt: None,
+            answered_prompt: 0,
             notices_seen: 0,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
@@ -337,6 +340,7 @@ impl App {
             control_starting: false,
             control_snapshot: std::sync::Arc::default(),
             control_prompt: None,
+            answered_prompt: 0,
             notices_seen: 0,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
