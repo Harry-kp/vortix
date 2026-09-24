@@ -50,7 +50,7 @@ impl Net {
         self.apply(&NetworkPlan::default(), KillSwitchMode::Off)
     }
 
-    fn apply_routes(&self, target: &NetworkPlan) -> Result<(), String> {
+    fn apply_routes(&mut self, target: &NetworkPlan) -> Result<(), String> {
         use crate::platform::Routes as table;
         // A prefix the target still carries is retargeted in place, never
         // deleted first: that gap leaks traffic onto the real address.
@@ -66,19 +66,45 @@ impl Net {
                 tracing::warn!(target: "vortix::net", %endpoint, %error, "server route removal failed");
             }
         }
-        if !target.host_routes.is_empty() {
-            let gateway = table::default_gateway()
-                .ok_or("no physical default gateway to pin the VPN server route to")?;
-            for endpoint in &target.host_routes {
-                table::bind_host_route(*endpoint, &gateway)?;
+        // Recorded before binding, so whatever a failed bind leaves behind is
+        // still unbound by the next diff.
+        self.applied.routes.clone_from(&target.routes);
+        self.applied.host_routes.clone_from(&target.host_routes);
+        let mut first_error = None;
+        let v4_endpoints: Vec<_> = target
+            .host_routes
+            .iter()
+            .filter(|ip| ip.is_ipv4())
+            .collect();
+        if !v4_endpoints.is_empty() {
+            match table::default_gateway() {
+                Some(gateway) => {
+                    for endpoint in v4_endpoints {
+                        if let Err(error) = table::bind_host_route(*endpoint, &gateway) {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                None => {
+                    first_error.get_or_insert(
+                        "no physical default gateway to pin the VPN server route to".into(),
+                    );
+                }
             }
+        }
+        for endpoint in target.host_routes.iter().filter(|ip| ip.is_ipv6()) {
+            // ponytail: only the IPv4 default gateway is read; pinning an
+            // IPv6 server needs its IPv6 gateway.
+            tracing::warn!(target: "vortix::net", %endpoint, "IPv6 server route not pinned");
         }
         for (cidr, interface) in &target.routes {
             if !Self::routes_through(target, *cidr, interface) {
-                table::bind_route(&cidr.to_string(), interface)?;
+                if let Err(error) = table::bind_route(&cidr.to_string(), interface) {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn apply_dns(&mut self, target: &NetworkPlan) -> Result<(), String> {
@@ -128,6 +154,8 @@ impl Net {
         )
         .map_err(|error| error.to_string())?;
         applied.map_err(|error| error.to_string())?;
+        self.applied.firewall = target.firewall.clone();
+        self.applied.kill_switch_state = target.kill_switch_state;
         self.saved_mode = Some(mode);
         Ok(())
     }

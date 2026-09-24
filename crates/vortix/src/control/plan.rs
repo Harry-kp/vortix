@@ -74,24 +74,45 @@ pub struct NetworkPlan {
 }
 
 impl NetworkPlan {
-    /// Address whose kernel route lookup proves `cidr` is bound, avoiding any
-    /// address a host route pins elsewhere.
+    /// Address whose kernel route lookup proves `cidr` is bound: inside
+    /// `cidr`, but outside every more-specific planned route and pinned host,
+    /// which would answer the lookup instead.
     #[must_use]
     pub fn probe_address(&self, cidr: Cidr) -> Option<IpAddr> {
-        let probe = match cidr.addr {
+        let host = |ip: IpAddr| Cidr::new(ip, if ip.is_ipv4() { 32 } else { 128 });
+        let covered: Vec<Cidr> = self
+            .routes
+            .keys()
+            .filter(|route| route.prefix_len > cidr.prefix_len && route.intersects(&cidr))
+            .copied()
+            .chain(self.host_routes.iter().filter_map(|ip| host(*ip)))
+            .collect();
+        let free = crate::cidr::cidr_subtract(&[cidr], &covered);
+        let is_free = |ip: IpAddr| {
+            host(ip).is_some_and(|probe| free.iter().any(|block| block.intersects(&probe)))
+        };
+        let preferred = match cidr.addr {
             IpAddr::V4(addr) if addr.is_unspecified() => IpAddr::from([1, 1, 1, 1]),
             IpAddr::V6(addr) if addr.is_unspecified() => {
                 IpAddr::from([0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111])
             }
-            IpAddr::V4(addr) if cidr.prefix_len < 32 => {
-                IpAddr::V4(u32::from(addr).saturating_add(1).into())
-            }
-            IpAddr::V6(addr) if cidr.prefix_len < 128 => {
-                IpAddr::V6(u128::from(addr).saturating_add(1).into())
-            }
-            addr => addr,
+            addr => first_host(addr, cidr.prefix_len),
         };
-        (!self.host_routes.contains(&probe)).then_some(probe)
+        if is_free(preferred) {
+            return Some(preferred);
+        }
+        free.first()
+            .map(|block| first_host(block.addr, block.prefix_len))
+    }
+}
+
+/// The first address after the network address, or the address itself for a
+/// single host.
+fn first_host(addr: IpAddr, prefix_len: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) if prefix_len < 32 => IpAddr::V4(u32::from(v4).saturating_add(1).into()),
+        IpAddr::V6(v6) if prefix_len < 128 => IpAddr::V6(u128::from(v6).saturating_add(1).into()),
+        addr => addr,
     }
 }
 
@@ -325,11 +346,32 @@ pub(crate) mod tests {
         let mut full = live("01", "utun4", FULL, 1);
         full.server_ips = BTreeSet::from([IpAddr::from([1, 1, 1, 1])]);
         let plan = plan(&input(vec![full]));
-        assert_eq!(plan.probe_address(cidr("0.0.0.0/1")), None);
+        let probe = plan.probe_address(cidr("0.0.0.0/1")).unwrap();
+        assert_ne!(probe, IpAddr::from([1, 1, 1, 1]));
+        assert!(cidr("0.0.0.0/1").intersects(&cidr(&format!("{probe}/32"))));
         assert_eq!(
             plan.probe_address(cidr("128.0.0.0/1")),
             Some(IpAddr::from([128, 0, 0, 1]))
         );
+    }
+
+    #[test]
+    fn a_probe_avoids_a_more_specific_route_of_another_tunnel() {
+        let wide = live("01", "utun4", "10.0.0.0/8", 1);
+        let narrow = live("02", "utun5", "10.0.0.0/24", 2);
+        let plan = plan(&input(vec![wide, narrow]));
+        let probe = plan.probe_address(cidr("10.0.0.0/8")).unwrap();
+        assert!(!cidr("10.0.0.0/24").intersects(&cidr(&format!("{probe}/32"))));
+        assert!(cidr("10.0.0.0/8").intersects(&cidr(&format!("{probe}/32"))));
+    }
+
+    #[test]
+    fn a_default_probe_avoids_a_split_route_covering_it() {
+        let full = live("01", "utun4", FULL, 1);
+        let split = live("02", "utun5", "1.0.0.0/8", 2);
+        let plan = plan(&input(vec![full, split]));
+        let probe = plan.probe_address(cidr("0.0.0.0/1")).unwrap();
+        assert!(!cidr("1.0.0.0/8").intersects(&cidr(&format!("{probe}/32"))));
     }
 
     #[test]
