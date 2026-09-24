@@ -304,9 +304,9 @@ fn write_managed_temp_config_at(
 
     write_secret_file(&temp_path, stripped_body).map_err(|e| match e {
         SecretFileError::Io(io) => {
-            TunnelError::Subprocess(format!("write managed WG temp config: {io}"))
+            TunnelError::Subprocess(format!("write managed WG config: {io}"))
         }
-        other => TunnelError::Subprocess(format!("write managed WG temp config: {other}")),
+        other => TunnelError::Subprocess(format!("write managed WG config: {other}")),
     })?;
 
     Ok(temp_path)
@@ -342,40 +342,18 @@ fn write_managed_config_in_wireguard_dir(
     user_conf_path: &Path,
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
-    use crate::config::secret::{write_secret_file, SecretFileError};
-
-    interface_name_from_path(user_conf_path)?;
-    let basename = user_conf_path
-        .file_name()
-        .ok_or_else(|| TunnelError::Subprocess("WireGuard config has no basename".into()))?;
-
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(directory)
-            .map_err(|error| {
-                TunnelError::Subprocess(format!(
-                    "create {}: {error}. WireGuard needs this directory because wg-quick is confined to it.",
-                    directory.display()
-                ))
-            })?;
-    }
-
-    let staged = directory.join(basename);
-    // Best-effort unlink of a stale leaf from a same-session reconnect, as in
-    // the unconfined path.
-    let _ = std::fs::remove_file(&staged);
-
-    write_secret_file(&staged, stripped_body).map_err(|e| match e {
-        SecretFileError::Io(io) => {
-            TunnelError::Subprocess(format!("write managed WG config: {io}"))
-        }
-        other => TunnelError::Subprocess(format!("write managed WG config: {other}")),
-    })?;
-
-    Ok(staged)
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .map_err(|error| {
+            TunnelError::Subprocess(format!(
+                "create {}: {error}. WireGuard needs this directory because wg-quick is confined to it.",
+                directory.display()
+            ))
+        })?;
+    write_managed_temp_config_at(directory, user_conf_path, stripped_body)
 }
 
 /// Original staging behaviour, retained where `wg-quick` is unconfined.
