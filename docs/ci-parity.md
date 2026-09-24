@@ -65,7 +65,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### Trap 2 — `#[cfg(target_os = "...")]` blocks are skipped on the wrong host
 
-Code gated to Linux (`linux/*`, `daemon/server.rs` SO_PEERCRED block) never compiles on macOS, and vice versa. Local clippy on a macOS host **cannot** catch a Linux-only lint. CI runs the matrix; humans usually don't.
+Code gated to Linux (`linux/*`) never compiles on macOS, and vice versa. Local clippy on a macOS host **cannot** catch a Linux-only lint. CI runs the matrix; humans usually don't.
 
 **Mitigations:**
 - Where feasible, cross-compile-check before pushing: `cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu` (or `aarch64-apple-darwin` from a Linux box). Linker errors are expected for non-host targets; the lint pass still runs.
@@ -96,7 +96,7 @@ cargo fmt --all -- --check
 
 ### Trap 5 — Forgetting the boundary checks
 
-`cargo xtask check-{subprocess,platform,protocol}-leak` and `check-no-shell-regressions` enforce architectural boundaries (OS `cfg` only in `macos/`/`linux/`/`platform/`, subprocesses only through `process/`, protocol binaries only in their protocol module, no new shell-outs to replaced system binaries). They are NOT part of `cargo test`. CI runs them as separate jobs.
+`cargo xtask check-{subprocess,platform,protocol}-leak` and `check-no-shell-regressions` enforce architectural boundaries (OS `cfg` only in `macos/`/`linux/`/`platform.rs`, subprocesses only through `process/`, protocol binaries only in their protocol module, no new shell-outs to replaced system binaries). They are NOT part of `cargo test`. CI runs them as separate jobs.
 
 ## When to run what
 

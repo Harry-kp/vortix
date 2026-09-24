@@ -179,7 +179,7 @@ fn is_allowlisted_file(path: &Path, workspace_root: &Path) -> bool {
 /// boundaries.
 ///
 /// Allowlist:
-/// - `crates/vortix/src/{macos,linux,platform}/**` — platform modules.
+/// - `crates/vortix/src/{macos,linux}/**` and `platform.rs` — platform modules.
 /// - `crates/vortix/src/platform/**` — binary-side platform aggregate.
 /// - `crates/vortix/src/constants.rs` — OS-specific compile-time constants.
 /// - `crates/xtask/src/main.rs` — this lint references the pattern.
@@ -255,7 +255,7 @@ fn is_platform_leak_allowlisted(path: &Path, workspace_root: &Path) -> bool {
 
     rel_str.starts_with("crates/vortix/src/macos/")
         || rel_str.starts_with("crates/vortix/src/linux/")
-        || rel_str.starts_with("crates/vortix/src/platform/")
+        || rel_str == "crates/vortix/src/platform.rs"
         || rel_str == "crates/vortix/src/lib.rs"
         || rel_str == "crates/vortix/src/constants.rs"
         || rel_str.starts_with("crates/xtask/")

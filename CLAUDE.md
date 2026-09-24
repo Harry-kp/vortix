@@ -9,7 +9,7 @@ CI failed four times on a single PR because each push verified a different subse
 
 Common traps documented there (each cost one CI cycle):
 - `-p vortix --lib` skips test code; `clippy::pedantic` is workspace-wide so test code gets pedantic lints too
-- macOS host cannot validate Linux-cfg code paths (`linux/*`, `daemon/server.rs` SO_PEERCRED block) and vice versa
+- macOS host cannot validate Linux-cfg code paths (`linux/*`) and vice versa
 - `cargo clippy` does NOT run rustdoc lints — only `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps` exercises them
 - `cargo fmt` (without `--all`) skips workspace members on rustfmt diffs
 
@@ -17,7 +17,7 @@ Common traps documented there (each cost one CI cycle):
 
 ## Architectural boundaries are enforced by xtask, not just convention
 
-- `cfg(target_os)` lives in `macos/`, `linux/` and `platform/` only (`check-platform-leak`)
+- `cfg(target_os)` lives in `macos/`, `linux/` and `platform.rs` only (`check-platform-leak`)
 - Raw `Command::new` lives in `process/real.rs` only (`check-subprocess`)
 - `wg`/`wg-quick` belong in `wireguard/`, `openvpn` in `openvpn/` — anywhere else needs a `// xtask:allow-protocol-leak: <reason>` annotation (`check-protocol-leak`)
 
