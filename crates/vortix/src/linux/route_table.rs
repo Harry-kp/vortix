@@ -38,10 +38,12 @@ static ROUTE_PROBE: RouteProbe = RouteProbe::new();
 pub struct LinuxRouteTable;
 
 impl LinuxRouteTable {
+    /// The physical default gateway for one address family; an IPv6 one
+    /// carries its device (`fe80::1%wlp3s0`).
     #[must_use]
-    pub fn default_gateway() -> Option<String> {
-        let text = run_ip_route_show_default()?;
-        parse_gateway(&text)
+    pub fn default_gateway(v4: bool) -> Option<String> {
+        let text = run_ip_route_show_default(v4)?;
+        parse_default_gateway(&text)
     }
 
     pub fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
@@ -63,7 +65,7 @@ impl LinuxRouteTable {
         match crate::process::run(spec) {
             Ok(output)
                 if output.success()
-                    && selected_gateway(destination).as_deref() == Some(gateway) =>
+                    && selected_gateway(destination).as_deref() == gateway.split('%').next() =>
             {
                 Ok(())
             }
@@ -143,13 +145,17 @@ pub(crate) fn bind_route_args(cidr: &str, interface: &str) -> Vec<String> {
 }
 
 pub(crate) fn bind_host_route_args(destination: IpAddr, gateway: &str) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "route".into(),
         "replace".into(),
         crate::cidr::Cidr::host(destination).to_string(),
         "via".into(),
-        gateway.into(),
-    ]
+    ];
+    match gateway.split_once('%') {
+        Some((address, device)) => args.extend([address.into(), "dev".into(), device.into()]),
+        None => args.push(gateway.into()),
+    }
+    args
 }
 
 pub(crate) fn unbind_route_args(cidr: &str, interface: &str) -> Vec<String> {
@@ -174,11 +180,20 @@ pub(crate) fn unbind_host_route_args(destination: IpAddr) -> Vec<String> {
 /// network, which is the gateway needed for VPN server escape routes.
 ///
 /// Returns `None` if the subprocess fails so callers can degrade gracefully.
-fn run_ip_route_show_default() -> Option<String> {
+fn run_ip_route_show_default(v4: bool) -> Option<String> {
+    let family = if v4 { "-4" } else { "-6" };
     match ROUTE_PROBE.run(
         // xtask:allow-shell-regression: `ip route show default` is the canonical Linux default-gateway inspection.
-        CommandSpec::oneshot("ip", vec!["route".into(), "show".into(), "default".into()])
-            .timeout(ROUTE_QUERY_TIMEOUT),
+        CommandSpec::oneshot(
+            "ip",
+            vec![
+                family.into(),
+                "route".into(),
+                "show".into(),
+                "default".into(),
+            ],
+        )
+        .timeout(ROUTE_QUERY_TIMEOUT),
     ) {
         ProbeOutcome::Success(stdout) => Some(stdout),
         ProbeOutcome::BackedOff => None,
@@ -196,6 +211,22 @@ fn run_ip_route_show_default() -> Option<String> {
             }
             None
         }
+    }
+}
+
+/// The `via` gateway of a default route; an IPv6 one gets `%<dev>`, since a
+/// link-local next hop means nothing without its device.
+fn parse_default_gateway(text: &str) -> Option<String> {
+    let gateway = parse_gateway(text)?;
+    let device = text
+        .split_whitespace()
+        .skip_while(|token| *token != "dev")
+        .nth(1);
+    match device {
+        Some(device) if gateway.parse::<std::net::Ipv6Addr>().is_ok() => {
+            Some(format!("{gateway}%{device}"))
+        }
+        _ => Some(gateway),
     }
 }
 
@@ -317,6 +348,31 @@ mod tests {
         assert_eq!(
             bind_host_route_args("198.51.100.7".parse().unwrap(), "192.168.1.1"),
             ["route", "replace", "198.51.100.7/32", "via", "192.168.1.1"]
+        );
+    }
+
+    /// An IPv6 default gateway is link-local, so the host route needs the
+    /// device it lives on.
+    #[test]
+    fn an_ipv6_server_is_pinned_via_the_link_local_gateway_and_its_device() {
+        let gateway =
+            parse_default_gateway("default via fe80::1 dev wlp3s0 proto ra metric 600 pref low\n");
+        assert_eq!(gateway.as_deref(), Some("fe80::1%wlp3s0"));
+        assert_eq!(
+            bind_host_route_args("2001:db8::7".parse().unwrap(), "fe80::1%wlp3s0"),
+            [
+                "route",
+                "replace",
+                "2001:db8::7/128",
+                "via",
+                "fe80::1",
+                "dev",
+                "wlp3s0"
+            ]
+        );
+        assert_eq!(
+            parse_default_gateway("default via 192.168.1.1 dev wlp3s0 proto dhcp\n").as_deref(),
+            Some("192.168.1.1")
         );
     }
 

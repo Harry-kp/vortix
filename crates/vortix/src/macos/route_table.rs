@@ -47,8 +47,10 @@ static ROUTE_PROBE: RouteProbe = RouteProbe::new();
 pub struct MacRouteTable;
 
 impl MacRouteTable {
+    /// The physical default gateway for one address family; an IPv6 one
+    /// keeps its zone (`fe80::1%en0`).
     #[must_use]
-    pub fn default_gateway() -> Option<String> {
+    pub fn default_gateway(v4: bool) -> Option<String> {
         // Read the literal default (/0) row, NOT `route get default`. That query
         // resolves the destination 0.0.0.0, which longest-prefix-matches our own
         // `0.0.0.0/1 -> utunN` once it is installed — so it answers with the
@@ -58,9 +60,16 @@ impl MacRouteTable {
         // leaves on the physical link, so it is the reliable source here.
         match ROUTE_PROBE.run(
             // xtask:allow-shell-regression: `netstat -rn` is the supported macOS read of the literal default-route slot; `route get` cannot express "the /0 entry".
-            CommandSpec::oneshot("netstat", vec!["-rn".into(), "-f".into(), "inet".into()])
-                .timeout(ROUTE_QUERY_TIMEOUT)
-                .output_limit(256 * 1024),
+            CommandSpec::oneshot(
+                "netstat",
+                vec![
+                    "-rn".into(),
+                    "-f".into(),
+                    if v4 { "inet" } else { "inet6" }.into(),
+                ],
+            )
+            .timeout(ROUTE_QUERY_TIMEOUT)
+            .output_limit(256 * 1024),
         ) {
             ProbeOutcome::Success(stdout) => {
                 let gateway = parse_default_slot_gateway(&stdout);
@@ -110,7 +119,10 @@ impl MacRouteTable {
 
     pub fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String> {
         let ran = add_or_change(|verb| bind_host_route_args(verb, destination, gateway));
-        if ran && selected_gateway(destination).as_deref() == Some(gateway) {
+        if ran
+            && selected_gateway(destination)
+                .is_some_and(|selected| same_gateway(&selected, gateway))
+        {
             Ok(())
         } else {
             Err(format!(
@@ -248,18 +260,28 @@ pub(crate) fn unbind_host_route_args(destination: IpAddr) -> Vec<String> {
 
 /// Gateway of the literal `default` (/0) row in `netstat -rn` output.
 ///
-/// Only a real IP counts: an interface-scoped route renders its gateway as a
-/// link (`index: 20 utun4`), which is never a usable physical gateway.
+/// Only a real IP on a physical interface counts: an interface-scoped route
+/// renders its gateway as a link (`index: 20 utun4`), and macOS lists its own
+/// utun tunnels as IPv6 defaults. An IPv6 gateway keeps its `%zone`.
 pub(crate) fn parse_default_slot_gateway(text: &str) -> Option<String> {
     text.lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let destination = fields.next()?;
-            let gateway = fields.next()?;
-            (destination == "default").then_some(gateway)
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let (destination, gateway) = (*fields.first()?, *fields.get(1)?);
+            let on_tunnel = fields.get(3).is_some_and(|netif| netif.starts_with("utun"));
+            (destination == "default" && !on_tunnel).then_some(gateway)
         })
-        .find(|gateway| gateway.parse::<IpAddr>().is_ok())
+        .find(|gateway| address_part(gateway).parse::<IpAddr>().is_ok())
         .map(ToOwned::to_owned)
+}
+
+fn address_part(gateway: &str) -> &str {
+    gateway.split('%').next().unwrap_or(gateway)
+}
+
+/// `route get` may print a link-local gateway with or without its zone.
+fn same_gateway(selected: &str, gateway: &str) -> bool {
+    address_part(selected) == address_part(gateway)
 }
 
 /// Extract the `gateway:` line from `route get <target>` output.
@@ -366,6 +388,27 @@ default            192.168.1.1        UGScg                 en0
         assert_eq!(
             parse_default_slot_gateway(netstat),
             Some("192.168.1.1".to_owned())
+        );
+    }
+
+    /// macOS lists Apple's own utun tunnels as IPv6 defaults; only a row on
+    /// a physical interface is the escape gateway, zone included.
+    #[test]
+    fn the_ipv6_physical_gateway_keeps_its_zone_and_skips_tunnels() {
+        let netstat = "\
+Destination                             Gateway                                 Flags               Netif Expire
+default                                 fe80::%utun0                            UGcIg               utun0
+default                                 fe80::1%en0                             UGcg                  en0
+";
+        assert_eq!(
+            parse_default_slot_gateway(netstat),
+            Some("fe80::1%en0".to_owned())
+        );
+        assert_eq!(
+            parse_default_slot_gateway(
+                "default   fe80::%utun0   UGcIg   utun0\ndefault   fe80::%utun1   UGcIg   utun1\n"
+            ),
+            None
         );
     }
 
