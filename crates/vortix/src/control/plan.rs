@@ -45,6 +45,10 @@ pub struct PlanInput {
     /// Servers of tunnels still starting or recovering. The firewall must let
     /// their transport out before an interface exists.
     pub pending_endpoints: BTreeSet<IpAddr>,
+    /// The subset whose tunnel will claim the default route. Their transport
+    /// is pinned to the physical gateway before they come up, so a switch
+    /// from one full tunnel to another never opens the new one inside the old.
+    pub pending_full_endpoints: BTreeSet<IpAddr>,
     /// A tunnel dropped without being asked to.
     pub dropped: bool,
     pub kill_switch: KillSwitchMode,
@@ -164,6 +168,7 @@ pub fn plan(input: &PlanInput) -> NetworkPlan {
         .iter()
         .filter(|tunnel| tunnel.is_full())
         .flat_map(|tunnel| tunnel.server_ips.iter().copied())
+        .chain(input.pending_full_endpoints.iter().copied())
         .collect();
 
     let dns = tunnels
@@ -353,6 +358,15 @@ pub(crate) mod tests {
             plan.probe_address(cidr("128.0.0.0/1")),
             Some(IpAddr::from([128, 0, 0, 1]))
         );
+    }
+
+    #[test]
+    fn a_starting_full_tunnel_reaches_its_server_outside_the_current_one() {
+        let mut input = input(vec![live("01", "utun4", FULL, 1)]);
+        let next_server = IpAddr::from([198, 51, 100, 7]);
+        input.pending_endpoints.insert(next_server);
+        input.pending_full_endpoints.insert(next_server);
+        assert!(plan(&input).host_routes.contains(&next_server));
     }
 
     #[test]

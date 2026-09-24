@@ -319,6 +319,17 @@ impl State {
             })
             .flat_map(|tunnel| tunnel.spec.server_ips.iter().copied())
             .collect();
+        let pending_full_endpoints = self
+            .tunnels
+            .values()
+            .filter(|tunnel| {
+                matches!(
+                    tunnel.phase,
+                    Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
+                ) && tunnel.spec.routes.iter().any(|cidr| cidr.prefix_len == 0)
+            })
+            .flat_map(|tunnel| tunnel.spec.server_ips.iter().copied())
+            .collect();
         let dropped = self
             .tunnels
             .values()
@@ -326,6 +337,7 @@ impl State {
         PlanInput {
             live,
             pending_endpoints,
+            pending_full_endpoints,
             dropped,
             kill_switch: self.kill_switch,
         }
