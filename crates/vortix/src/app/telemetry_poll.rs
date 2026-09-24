@@ -26,6 +26,14 @@ impl App {
 
     /// Wake the telemetry worker so it refreshes IP/ISP/latency immediately.
     pub(crate) fn refresh_telemetry(&mut self) {
+        // The route changed, so the last exit is no longer the exit: show it
+        // as pending rather than as a fresh reading of the old path.
+        let detecting = crate::constants::MSG_DETECTING.to_string();
+        self.runtime.public_ip.clone_from(&detecting);
+        self.runtime.isp.clone_from(&detecting);
+        self.runtime.location = detecting;
+        self.runtime.public_ipv6 = None;
+        self.runtime.last_egress_check = None;
         self.runtime.telemetry_epoch += 1;
         if let Some(nudge) = &self.runtime.telemetry_nudge {
             let _ = nudge.send(self.runtime.telemetry_epoch);

@@ -70,21 +70,12 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Reflects what `d` will do against the most relevant tunnel. Priority:
-    // Disconnecting (already tearing down → no action) > Connecting /
-    // Reconnecting / AwaitingCredentials (in-flight → Cancel) > Connected
-    // (steady → Disconnect). When no tunnel is active but a prior session
-    // exists, surface `r Reconnect`.
+    // Describes the tunnel `d` acts on outside the sidebar: the primary, else
+    // the first. With none active but a prior session, `r Reconnect`.
     let active_state = app
-        .control_snapshot
-        .tunnels
-        .iter()
-        .map(|tunnel| tunnel.phase)
-        .min_by_key(|phase| match phase {
-            Phase::Stopping => 0,
-            Phase::Starting | Phase::Waiting { .. } | Phase::AwaitingCredentials => 1,
-            Phase::Up => 2,
-        });
+        .primary_or_first()
+        .and_then(|profile_id| app.tunnel(&profile_id))
+        .map(|tunnel| tunnel.phase);
     let disconnect_hint = if app.focused_panel == crate::app::FocusedPanel::Sidebar {
         focused_disconnect_hint(focused_state)
     } else {

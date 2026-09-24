@@ -647,7 +647,7 @@ fn awaiting_input_hint() -> Line<'static> {
     Line::from(vec![
         Span::styled("⚠ ", Style::default().fg(theme::current().warning)),
         Span::styled(
-            "Press [Enter] to provide input",
+            "Waiting for credentials in the prompt",
             Style::default()
                 .fg(theme::current().warning)
                 .add_modifier(Modifier::BOLD),
@@ -1043,7 +1043,10 @@ mod tests {
         );
         let out = render_to_string(&mut app, 80, 12);
         assert!(out.contains("Awaiting input"), "{out}");
-        assert!(out.contains("Press [Enter] to provide input"), "{out}");
+        assert!(
+            out.contains("Waiting for credentials in the prompt"),
+            "{out}"
+        );
     }
 
     /// The panel's address / network / resolver rows read straight off the

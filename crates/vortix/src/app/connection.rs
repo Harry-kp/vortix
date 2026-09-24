@@ -49,7 +49,10 @@ impl App {
     #[must_use]
     pub fn role(&self, tunnel: &TunnelView) -> Role {
         let allowed_ips = tunnel.routes.clone();
-        if self.primary_id() == Some(&tunnel.profile_id) {
+        let primary = self.primary_id();
+        if primary == Some(&tunnel.profile_id) || (primary.is_none() && tunnel.is_full()) {
+            // A full tunnel with no other default-route owner is the exit,
+            // including while it reconnects.
             Role::Primary { allowed_ips }
         } else if tunnel.is_full() {
             Role::AddressableSuppressed { allowed_ips }
@@ -216,9 +219,25 @@ impl App {
         }
     }
 
+    /// Show a pending engine prompt once no other dialog owns the screen.
+    pub(crate) fn show_pending_prompt(&mut self) {
+        let snapshot = Arc::clone(&self.control_snapshot);
+        self.show_prompt(&snapshot);
+    }
+
     fn show_prompt(&mut self, snapshot: &Snapshot) {
         match snapshot.prompts.first() {
-            Some(prompt) if self.control_prompt != Some(prompt.id) => {
+            // Another dialog is open: the prompt waits instead of replacing it.
+            Some(prompt)
+                if self.control_prompt != Some(prompt.id)
+                    && matches!(self.input_mode, InputMode::Normal) =>
+            {
+                // It must be seen to be answered: nothing may draw over it.
+                self.show_config = false;
+                self.cached_config = None;
+                self.show_action_menu = false;
+                self.show_bulk_menu = false;
+                self.zoomed_panel = None;
                 self.control_prompt = Some(prompt.id);
                 let (username, password) = match self
                     .control
@@ -371,13 +390,11 @@ impl App {
         );
     }
 
-    fn primary_or_first(&self) -> Option<ProfileId> {
-        self.control_snapshot.primary.clone().or_else(|| {
-            self.control_snapshot
-                .tunnels
-                .first()
-                .map(|tunnel| tunnel.profile_id.clone())
-        })
+    /// The tunnel global actions target; the same one the dashboard shows as
+    /// current.
+    pub(crate) fn primary_or_first(&self) -> Option<ProfileId> {
+        self.current_tunnel()
+            .map(|tunnel| tunnel.profile_id.clone())
     }
 
     /// Disconnect the primary tunnel, or the first one.

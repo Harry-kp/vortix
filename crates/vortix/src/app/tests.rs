@@ -2425,3 +2425,72 @@ fn actions_during_control_startup_explain_the_wait_without_an_error_alarm() {
     assert_eq!(toast.toast_type, ToastType::Info);
     assert!(toast.message.contains("still starting"));
 }
+
+fn with_prompt(app: &mut App, name: &str) {
+    add_profiles(app, &[name]);
+    let mut snapshot = (*app.control_snapshot).clone();
+    snapshot.prompts = vec![crate::control::Prompt {
+        id: 7,
+        profile_id: crate::profile::ProfileId::new(name),
+        name: name.to_owned(),
+        otp_label: None,
+    }];
+    snapshot.version += 1;
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
+}
+
+#[test]
+fn a_credential_prompt_waits_for_an_open_dialog_then_shows() {
+    let mut app = test_app();
+    app.input_mode = InputMode::Import {
+        path: "/tmp/half-typed".into(),
+        cursor: 3,
+    };
+    with_prompt(&mut app, "corp");
+    assert!(
+        matches!(app.input_mode, InputMode::Import { .. }),
+        "the open dialog is not replaced"
+    );
+    assert!(app.control_prompt.is_none());
+
+    app.input_mode = InputMode::Normal;
+    app.handle_message(Message::Tick);
+    assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
+    assert_eq!(app.control_prompt, Some(7));
+}
+
+#[test]
+fn a_credential_prompt_is_drawn_above_every_overlay() {
+    let mut app = test_app();
+    app.show_config = true;
+    app.show_action_menu = true;
+    app.zoomed_panel = Some(FocusedPanel::Logs);
+    with_prompt(&mut app, "corp");
+    assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
+    assert!(!app.show_config && !app.show_action_menu && app.zoomed_panel.is_none());
+}
+
+#[test]
+fn a_reconnecting_full_tunnel_with_no_other_exit_is_still_primary() {
+    let mut app = test_app();
+    let mut tunnel = crate::app::connection::test_view(
+        "corp",
+        crate::control::Phase::Waiting { retry_at: None },
+    );
+    tunnel.routes = vec!["0.0.0.0/0".parse().unwrap()];
+    app.set_tunnels_for_test(vec![tunnel.clone()], None);
+    assert!(matches!(
+        app.role(&tunnel),
+        crate::app::Role::Primary { .. }
+    ));
+
+    let other = crate::app::connection::test_view("home", crate::control::Phase::Up);
+    app.set_tunnels_for_test(
+        vec![tunnel.clone(), other],
+        Some(crate::profile::ProfileId::new("home")),
+    );
+    assert!(matches!(
+        app.role(&tunnel),
+        crate::app::Role::AddressableSuppressed { .. }
+    ));
+}

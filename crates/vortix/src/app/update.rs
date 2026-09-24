@@ -146,10 +146,8 @@ impl App {
                     .selected()
                     .and_then(|idx| Some((idx, self.runtime.profiles.get(idx)?.id.clone())))
                 {
-                    let connected = self.current_tunnel().is_some_and(|tunnel| {
-                        tunnel.profile_id == profile_id && tunnel.phase == crate::control::Phase::Up
-                    });
-                    if connected {
+                    // The selected row's own tunnel, primary or not.
+                    if self.tunnel(&profile_id).is_some() {
                         self.send(crate::control::Command::Reconnect(profile_id));
                     } else {
                         self.toggle_connection(idx);
@@ -181,9 +179,19 @@ impl App {
                 }
             }
             Message::CloseOverlay => {
-                if let Some(prompt) = self.control_prompt.take() {
-                    if let Some(control) = &self.control {
-                        control.answer(prompt, None);
+                // Only closing the prompt's own form cancels the connect.
+                let closing_prompt = matches!(
+                    self.input_mode,
+                    InputMode::AuthPrompt {
+                        connect_after: true,
+                        ..
+                    }
+                );
+                if closing_prompt {
+                    if let Some(prompt) = self.control_prompt.take() {
+                        if let Some(control) = &self.control {
+                            control.answer(prompt, None);
+                        }
                     }
                 }
                 self.show_config = false;
@@ -191,6 +199,7 @@ impl App {
                 self.show_action_menu = false;
                 self.show_bulk_menu = false;
                 self.input_mode = InputMode::Normal;
+                self.show_pending_prompt();
             }
             Message::OpenActionMenu => {
                 if self.profile_list_state.selected().is_some()
@@ -289,7 +298,10 @@ impl App {
                 self.log("APP: Logs cleared");
             }
             Message::Telemetry(update) => self.handle_telemetry(update),
-            Message::Tick => self.handle_tick(),
+            Message::Tick => {
+                self.handle_tick();
+                self.show_pending_prompt();
+            }
             Message::Resize(width, height) => {
                 self.terminal_size = (width, height);
             }
@@ -536,7 +548,15 @@ impl App {
         save: bool,
         connect_after: bool,
     ) {
-        if let Some(prompt) = self.control_prompt.take() {
+        // Only the form opened for the pending prompt may answer it.
+        let answers_prompt = self.control_prompt.is_some_and(|id| {
+            self.control_snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == id && prompt.profile_id == profile_id)
+        });
+        if let Some(prompt) = self.control_prompt.filter(|_| answers_prompt) {
+            self.control_prompt = None;
             let answer = crate::control::Credentials {
                 username: username.expose().to_owned(),
                 password: password.expose().to_owned(),
