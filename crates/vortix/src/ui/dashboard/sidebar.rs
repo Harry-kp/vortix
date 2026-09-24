@@ -251,7 +251,7 @@ fn profile_row(
         Style::default().fg(theme::current().inactive)
     };
 
-    let display_name = utils::truncate(&profile.name, name_budget);
+    let display_name = crate::ui::helpers::truncate_to_width(&profile.name, name_budget);
     let mut name_spans = vec![Span::styled(display_name, name_style)];
     if show_primary_marker {
         name_spans.push(Span::styled(

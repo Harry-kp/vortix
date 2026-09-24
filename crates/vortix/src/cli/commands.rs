@@ -1233,6 +1233,13 @@ fn short_peer(peer: &str) -> &str {
 #[cfg(test)]
 mod handshake_status_tests {
     use super::*;
+
+    #[test]
+    fn watch_timestamps_are_whole_second_utc() {
+        let ts = chrono_now();
+        assert_eq!(ts.len(), 20, "{ts}");
+        assert!(ts.ends_with('Z') && ts.as_bytes()[10] == b'T', "{ts}");
+    }
     use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 
     fn snapshot(state: &str, protocol: &str) -> crate::cli::status::StatusSnapshot {
@@ -1356,46 +1363,16 @@ mod handshake_status_tests {
 }
 
 #[allow(clippy::cast_possible_wrap)]
+/// Current UTC time as `YYYY-MM-DDTHH:MM:SSZ`.
 fn chrono_now() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .ok()
+        .and_then(|now| {
+            now.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
         .unwrap_or_default()
-        .as_secs();
-    // ISO 8601 UTC — computed without extra crate features
-    let secs_per_min = 60u64;
-    let secs_per_hour = 3600u64;
-    let secs_per_day = 86_400u64;
-
-    let total_days = now / secs_per_day;
-    let time_of_day = now % secs_per_day;
-    let hour = time_of_day / secs_per_hour;
-    let minute = (time_of_day % secs_per_hour) / secs_per_min;
-    let second = time_of_day % secs_per_min;
-
-    // Days since epoch → year/month/day (civil calendar from days)
-    let (y, m, d) = days_to_ymd(total_days as i64);
-    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::cast_lossless
-)]
-fn days_to_ymd(days: i64) -> (i64, u32, u32) {
-    // Algorithm from Howard Hinnant's date library (public domain)
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 // ── Profile Management ──────────────────────────────────────────────────

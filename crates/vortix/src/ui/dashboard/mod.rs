@@ -7,7 +7,7 @@ mod sidebar;
 
 use super::helpers::centered_rect;
 use crate::app::{App, FocusedPanel, InputMode};
-use crate::{constants, message, theme, utils};
+use crate::{constants, message, theme};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -283,7 +283,7 @@ fn render_delete_confirm(frame: &mut Frame, name: &str, confirm_selected: bool) 
     let name_budget = usize::from(dialog_w)
         .saturating_sub(4 + prefix.len() + 1)
         .max(3);
-    let truncated = utils::truncate(name, name_budget);
+    let truncated = crate::ui::helpers::truncate_to_width(name, name_budget);
 
     confirm_dialog::render(
         frame,

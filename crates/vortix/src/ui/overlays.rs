@@ -386,7 +386,7 @@ pub mod config_viewer {
             " Config Viewer ".to_string()
         } else {
             let max_name = (area.width as usize).saturating_sub(14); // " " + " - Config " + borders
-            let short = crate::utils::truncate(&profile_name, max_name);
+            let short = crate::ui::helpers::truncate_to_width(&profile_name, max_name);
             format!(" {short} - Config ")
         };
 

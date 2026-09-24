@@ -311,12 +311,12 @@ fn render_connected(
                 Style::default().fg(theme::current().text_secondary),
             ),
             Span::styled(
-                utils::truncate(&app.runtime.isp, isp_budget),
+                crate::ui::helpers::truncate_to_width(&app.runtime.isp, isp_budget),
                 Style::default().fg(theme::current().text_primary),
             ),
             Span::styled(" (", Style::default().fg(theme::current().text_secondary)),
             Span::styled(
-                utils::truncate(&app.runtime.location, loc_budget),
+                crate::ui::helpers::truncate_to_width(&app.runtime.location, loc_budget),
                 Style::default().fg(theme::current().text_primary),
             ),
             Span::styled(")", Style::default().fg(theme::current().text_secondary)),
@@ -516,7 +516,7 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
             text.push(Line::from(vec![
                 Span::styled("Config  : ", Style::default().fg(palette.text_secondary)),
                 Span::styled(
-                    utils::truncate(
+                    crate::ui::helpers::truncate_to_width(
                         &profile.config_path.display().to_string(),
                         inner.width.saturating_sub(10) as usize,
                     ),

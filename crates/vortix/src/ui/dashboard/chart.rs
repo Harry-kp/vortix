@@ -79,15 +79,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let max_down = app.runtime.down_history.iter().copied().fold(0.0, f64::max);
     let max_up = app.runtime.up_history.iter().copied().fold(0.0, f64::max);
-    let peak = (max_down.max(max_up) * 1.2).max(1024.0 * 1024.0 * 0.5);
-    let (scale_val, scale_unit) = if peak >= 1024.0 * 1024.0 * 1024.0 {
-        (peak / 1024.0 / 1024.0 / 1024.0, "GB/s")
-    } else if peak >= 1024.0 * 1024.0 {
-        (peak / 1024.0 / 1024.0, "MB/s")
-    } else {
-        (peak / 1024.0, "KB/s")
-    };
-    let peak_label = format!(" Peak: {scale_val:.1} {scale_unit} ");
+    let peak = (max_down.max(max_up) * 1.2).max(500_000.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scale = crate::utils::format_bytes_speed(peak as u64);
+    let peak_label = format!(" Peak: {scale} ");
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -102,7 +97,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         )
         .title_bottom(
             Line::from(Span::styled(
-                format!(" Scale: 0 – {scale_val:.1} {scale_unit} "),
+                format!(" Scale: 0 – {scale} "),
                 Style::default().fg(theme::current().key_hint_desc),
             ))
             .right_aligned(),

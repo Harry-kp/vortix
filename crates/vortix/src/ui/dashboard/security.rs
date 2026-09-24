@@ -2,7 +2,7 @@ use crate::app::App;
 use crate::core::engine::registry::TunnelSnapshot;
 use crate::core::engine::state::Connection;
 use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
-use crate::{constants, theme, utils};
+use crate::{constants, theme};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -282,7 +282,7 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
     let value_budget = inner_width
         .saturating_sub(LABEL_COLUMN_WIDTH)
         .saturating_sub(SIGIL_COLUMN_WIDTH);
-    let value_truncated = utils::truncate(value, value_budget);
+    let value_truncated = crate::ui::helpers::truncate_to_width(value, value_budget);
     let value_chars = value_truncated.chars().count();
     let padding = " ".repeat(value_budget.saturating_sub(value_chars));
 
@@ -432,7 +432,7 @@ fn location_row(s: &PanelState, w: usize) -> Line<'static> {
 fn alarm_subline(text: &str, inner_width: usize) -> Line<'static> {
     let indent = " ".repeat(LABEL_COLUMN_WIDTH);
     let budget = inner_width.saturating_sub(LABEL_COLUMN_WIDTH);
-    let truncated = utils::truncate(text, budget);
+    let truncated = crate::ui::helpers::truncate_to_width(text, budget);
     Line::from(vec![
         Span::raw(indent),
         Span::styled(

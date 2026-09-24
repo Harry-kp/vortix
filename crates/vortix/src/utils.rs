@@ -192,7 +192,9 @@ pub fn write_user_file(path: &std::path::Path, contents: impl AsRef<[u8]>) -> st
 #[must_use]
 pub fn format_bytes_speed(bytes: u64) -> String {
     #[allow(clippy::cast_precision_loss)]
-    if bytes >= 1_000_000 {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB/s", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
         format!("{:.1} MB/s", bytes as f64 / 1_000_000.0)
     } else if bytes >= 1_000 {
         format!("{:.1} KB/s", bytes as f64 / 1_000.0)
@@ -611,25 +613,6 @@ pub fn openvpn_config_needs_auth(config_path: &std::path::Path) -> bool {
     }
 
     false
-}
-
-/// Truncates a string to a maximum number of characters.
-///
-/// If the string exceeds `max_chars`, it is truncated and "..." is appended.
-///
-/// # Arguments
-///
-/// * `s` - The string to truncate
-/// * `max_chars` - Maximum number of characters (including ellipsis)
-#[must_use]
-pub fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() > max_chars {
-        let mut t: String = s.chars().take(max_chars.saturating_sub(3)).collect();
-        t.push_str("...");
-        t
-    } else {
-        s.to_string()
-    }
 }
 
 /// Returns the current local time formatted as HH:MM:SS.
@@ -1218,6 +1201,7 @@ mod tests {
     #[test]
     fn test_format_bytes_speed_bytes() {
         assert_eq!(format_bytes_speed(0), "0 B/s");
+        assert_eq!(format_bytes_speed(2_500_000_000), "2.5 GB/s");
         assert_eq!(format_bytes_speed(500), "500 B/s");
         assert_eq!(format_bytes_speed(999), "999 B/s");
     }
@@ -1234,30 +1218,6 @@ mod tests {
         assert_eq!(format_bytes_speed(1_000_000), "1.0 MB/s");
         assert_eq!(format_bytes_speed(1_500_000), "1.5 MB/s");
         assert_eq!(format_bytes_speed(100_000_000), "100.0 MB/s");
-    }
-
-    #[test]
-    fn test_truncate_short_string() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("test", 4), "test");
-    }
-
-    #[test]
-    fn test_truncate_exact_length() {
-        assert_eq!(truncate("hello", 5), "hello");
-    }
-
-    #[test]
-    fn test_truncate_long_string() {
-        assert_eq!(truncate("hello world", 8), "hello...");
-        assert_eq!(truncate("this is a long string", 10), "this is...");
-    }
-
-    #[test]
-    fn test_truncate_with_unicode() {
-        // Unicode characters should be counted correctly
-        assert_eq!(truncate("héllo", 5), "héllo");
-        assert_eq!(truncate("héllo world", 8), "héllo...");
     }
 
     #[test]
@@ -1467,13 +1427,6 @@ mod tests {
     #[test]
     fn test_sanitize_profile_name_empty() {
         assert_eq!(sanitize_profile_name(""), "");
-    }
-
-    #[test]
-    fn test_truncate_very_small_budget() {
-        assert_eq!(truncate("hello world", 3), "...");
-        assert_eq!(truncate("hello world", 2), "...");
-        assert_eq!(truncate("hello world", 0), "...");
     }
 
     // --- wireguard_config_has_dns tests ---

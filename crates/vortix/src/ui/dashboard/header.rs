@@ -4,7 +4,7 @@ use crate::core::engine::state::Connection;
 use crate::core::engine::TunnelSnapshot;
 use crate::core::profile::ProfileId;
 use crate::ui::helpers;
-use crate::{constants, theme, utils};
+use crate::{constants, theme};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -239,7 +239,7 @@ fn connected_line(
     // removing that prefix cannot clip the kill-switch signal.
     let compact = area_width < 84;
     let profile_name = if compact {
-        utils::truncate(&profile_name, 10)
+        crate::ui::helpers::truncate_to_width(&profile_name, 10)
     } else {
         profile_name
     };
@@ -310,7 +310,7 @@ fn connected_line(
             Style::default().fg(theme::current().text_secondary),
         ));
         header_spans.push(Span::styled(
-            utils::truncate(&app.runtime.location, loc_budget),
+            crate::ui::helpers::truncate_to_width(&app.runtime.location, loc_budget),
             Style::default().fg(theme::current().accent_primary),
         ));
     }
