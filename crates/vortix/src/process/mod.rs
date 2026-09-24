@@ -1,8 +1,5 @@
-//! `vortix-process`: concrete `CommandRunner` implementations.
-//!
-//! Owns the tokio + tracing dependency surface. Exposes `CommandRunner` as a
-//! hand-dispatched enum carrying `Real(RealRunner)` and `Mock(MockRunner)`
-//! variants. Callers hold the enum by value; no `Box<dyn>`.
+//! Every subprocess goes through here: `CommandRunner` is the real runner,
+//! or a scripted mock in tests.
 //!
 
 #![allow(clippy::missing_errors_doc)]
@@ -17,8 +14,6 @@ pub use mock::MockRunner;
 pub use orphan_scan::{filter_untracked, scan_orphans, OrphanProcess};
 pub use real::{RealProcessLifecycle, RealRunner};
 
-// Re-export the port types so callers don't have to depend on vortix-core directly
-// just to construct specs.
 pub use crate::core::ports::process::{
     CommandOutcome, CommandSpec, ExitStatusInfo, ManagedProcessId, PrivilegeReq,
     ProcessCredentials, ProcessError, ProcessLifecycle, ProcessOwnership,
@@ -42,8 +37,7 @@ impl CommandRunner {
 
     /// Synchronous wrapper around `run`. Drives the async future via the
     /// runtime bundled in `RealRunner` (or directly for `MockRunner`, which
-    /// never awaits). Use this from sync callers like the TUI loop and CLI
-    /// commands until idea 3's `EngineHandle` makes the seam fully async.
+    /// never awaits). Used by the synchronous TUI loop and CLI commands.
     pub fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
         match self {
             CommandRunner::Real(r) => r.run_blocking(spec),

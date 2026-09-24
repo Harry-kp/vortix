@@ -811,8 +811,7 @@ fn resolve_standard_openvpn_binary() -> Result<PathBuf, TunnelError> {
     // Standard mode deliberately accepts the owner's full client and package
     // installation as root-trusted input (including Homebrew). Canonicalizing
     // the existing PATH result prevents a second lookup inside the privileged
-    // child; package-owned identity/digest verification belongs to U12's
-    // Background-mode helper boundary.
+    // child.
     let candidate = crate::utils::find_binary_path("openvpn").ok_or_else(|| {
         TunnelError::Subprocess("OpenVPN executable was not found on PATH".into())
     })?;
@@ -993,7 +992,7 @@ impl OvpnTunnel {
             "ovpn.up: DNS mutation suppressed for coordinator-owned policy"
         );
 
-        // Plan 2026-06-02-001, #191, Approach B-minimal: if the
+        // #191: if the
         // credentials bundle file is present, this is a
         // static-challenge connect. Read user/pass/otp out of the
         // bundle (the file is consumed/deleted on read), spawn

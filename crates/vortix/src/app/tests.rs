@@ -1147,8 +1147,7 @@ fn delete_dialog_keeps_its_profile_when_background_sorting_reorders_the_list() {
 
 #[test]
 fn test_rename_on_active_profile_is_refused_at_overlay() {
-    // Post-P5d the legacy connection_state field is gone, and the
-    // rename path no longer mutates an in-flight state. Active
+    // The rename path no longer mutates an in-flight state. Active
     // profiles are blocked at the overlay-open step
     // (`handle_open_rename` consults `is_profile_active`); the test
     // here exercises that guard.

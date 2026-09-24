@@ -242,9 +242,7 @@ pub mod state {
         },
     }
 
-    /// Technical details parsed from the VPN interface (relocated from the
-    /// binary-side `crates/vortix/src/state/connection.rs`; a later cleanup prunes
-    /// the duplicate).
+    /// Technical details parsed from the VPN interface.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct DetailedConnectionInfo {
         pub interface: String,
@@ -332,8 +330,6 @@ pub mod state {
         }
     }
 
-    // U7/U8 compatibility name. Interactive challenge vocabulary is canonical in
-    // the control model so credential-bearing flows cannot drift independently.
     /// What a mid-connect prompt asks the user for.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]

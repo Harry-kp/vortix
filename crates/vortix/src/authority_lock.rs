@@ -6,10 +6,7 @@
 //! bootstrap installs this owner-readable lock below a fixed root-owned
 //! directory. Current clients retain the legacy lock before acquiring this
 //! one, so they remain serialized with a process that started before package
-//! installation. Bootstrap transitions use the installed lock, but this
-//! preparatory release does not activate a remote writer; U13 still requires
-//! its minimum-version and local-admission drain gates before authority
-//! cutover. A present-but-malformed installation always fails closed.
+//! installation. A present-but-malformed installation always fails closed.
 
 #![allow(
     unsafe_code,

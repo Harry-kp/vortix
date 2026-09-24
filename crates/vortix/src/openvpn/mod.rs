@@ -1,4 +1,4 @@
-//! `vortix-protocol-openvpn`: `OpenVPN` `Tunnel` impl.
+//! `OpenVPN`.
 //!
 //! Runs the `openvpn` binary as a custodian-owned foreground child and watches the
 //! `--log` file for `Initialization Sequence Completed` to declare the

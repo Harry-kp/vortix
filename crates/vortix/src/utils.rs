@@ -25,7 +25,7 @@ pub(crate) fn effective_user_group_ids() -> (u32, u32) {
 }
 
 /// Stable OS boot identity shared by persisted authority and verification.
-#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: boot identity uses the OS kernel primitive until U12 moves it behind a platform port
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: boot identity reads an OS kernel primitive
 pub(crate) fn boot_identity() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
@@ -35,7 +35,7 @@ pub(crate) fn boot_identity() -> Option<String> {
 
 /// Stable OS boot identity shared by persisted authority and verification.
 #[cfg(target_os = "macos")]
-// xtask:allow-platform-cfg: boot identity uses the OS kernel primitive until U12 moves it behind a platform port
+// xtask:allow-platform-cfg: boot identity reads an OS kernel primitive
 #[allow(unsafe_code)]
 pub(crate) fn boot_identity() -> Option<String> {
     let mut boot_time = libc::timeval {

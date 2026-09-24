@@ -502,10 +502,7 @@ pub mod interface {
 pub mod killswitch {
     //! `Killswitch` port — kill-switch firewall control.
     //!
-    //! Implementations live in `vortix-platform-{macos,linux,windows}`. The
-    //! trait is intentionally sync today; the async engine migration
-    //! adds `&CommandRunner` arguments and `async fn` where useful. For now,
-    //! impls reach the global runner via `crate::process::run_to_output(...)`.
+    //! The per-OS firewalls in `macos/` and `linux/` use these types.
     //!
     //! The multi-tunnel rework replaced the single-tunnel `enable_blocking`
     //! signature with `enable_blocking_multi`, which accepts a slice of
@@ -594,8 +591,8 @@ pub mod network_stats {
 pub mod process {
     //! `CommandRunner` port — the typed seam through which every subprocess flows.
     //!
-    //! Concrete impls (`RealRunner`, `MockRunner`) live in `vortix-process`. This module
-    //! contains only the trait, the data types, and the error enum. No tokio dependency.
+    //! The runners live in `process/`; this module holds the data types and
+    //! the error enum.
     //!
 
     use std::collections::HashMap;
@@ -614,7 +611,7 @@ pub mod process {
     ///
     /// `RealRunner` checks the running uid against this requirement and fails fast with
     /// `ProcessError::PrivilegeDenied` when the requirement is unmet — vortix does NOT
-    /// auto-escalate. Privilege resolution is the daemon's job (see idea 4 Phase B).
+    /// auto-escalate.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
     pub enum PrivilegeReq {
         /// Runs as the current user. Used for read-only ops (`wg show`, `ps`, `which`, etc.).
@@ -917,9 +914,7 @@ pub mod route_table {
 pub mod socket_audit {
     //! `SocketAudit` capability port.
     //!
-    //! Pull-based per-process socket inventory. Implementations live in
-    //! `vortix-platform-{linux,macos,windows}`. Consumers query via the
-    //! `Platform` aggregate (`vortix/src/platform/aggregate.rs`).
+    //! Pull-based per-process socket inventory, read by `platform::SocketAudit`.
 
     use std::net::SocketAddr;
 
@@ -1065,9 +1060,6 @@ pub mod tunnel {
     //! construction — it routes once via `profile.protocol → TunnelKind` (the
     //! aggregate carrier defined in the binary) and dispatches statically.
     //!
-    //! Plan #004 keeps trait methods sync (engine is sync today; mocks and real
-    //! impls reach the global runner directly). The async engine
-    //! migration adds `&CommandRunner` arguments and `async fn` where useful.
 
     use std::collections::{BTreeMap, BTreeSet};
     use std::net::IpAddr;

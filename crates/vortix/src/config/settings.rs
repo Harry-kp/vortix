@@ -51,7 +51,7 @@ impl Default for Settings {
     }
 }
 
-/// Engine retry + reconnect knobs. Plan 005's FSM consumes these.
+/// Engine retry + reconnect knobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineSettings {
@@ -89,7 +89,7 @@ impl Default for EngineSettings {
     }
 }
 
-/// Journal persistence knobs. Plan 005's `Journal` consumes these.
+/// Journal persistence knobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JournalSettings {

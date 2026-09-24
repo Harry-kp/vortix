@@ -30,8 +30,7 @@ pub struct ActiveSession {
     /// collides across multiple `OpenVPN` PIDs and so cannot
     /// truthfully identify which utun belongs to which process.
     /// Scanner evidence remains observational regardless of this bit. It is
-    /// useful for display attribution, but U6 no longer grants primary or
-    /// retry authority to scanner-only sessions.
+    /// useful for display attribution, never for primary or retry authority.
     ///
     /// Defaults to `true` — most platforms / protocols / paths are
     /// reliable. The macOS `OpenVPN` Method-B fallback is the narrow

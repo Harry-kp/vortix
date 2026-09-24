@@ -1,11 +1,9 @@
-//! `vortix-platform-linux`: Linux platform adapters.
-//!
-//! Implements the capability ports defined in `vortix-core::ports::*`:
-//! - `Killswitch` via one atomic nftables `inet` transaction.
-//! - `DnsResolver` via resolvectl → nmcli → /etc/resolv.conf.
-//! - `Interface` via direct kernel/sysfs observation.
-//! - `NetworkStats` via /proc/net/dev.
-//! - `RouteTable` via `ip route show default`.
+//! Linux adapters:
+//! - firewall via one atomic nftables `inet` transaction.
+//! - DNS via resolvectl → nmcli → /etc/resolv.conf.
+//! - interfaces via direct kernel/sysfs observation.
+//! - byte counters via /proc/net/dev.
+//! - routes via `ip route show default`.
 
 #![allow(clippy::missing_errors_doc)]
 

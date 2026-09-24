@@ -1,9 +1,7 @@
 //! Unified profile identity shared across the workspace.
 //!
-//! Plan #004 introduces `Profile` and `ProfileId` as the Tunnel-trait input
-//! vocabulary. The binary crate's richer `VpnProfile` (with on-disk path,
-//! last-used timestamp, etc.) lives on alongside this type;
-//! a config/secrets consolidation reconciles them.
+//! `Profile` is what a protocol needs to start a tunnel; the richer
+//! `config::profiles::VpnProfile` is what the UI lists.
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
@@ -137,11 +135,6 @@ impl std::fmt::Display for ProfileId {
 }
 
 /// Which tunnel protocol a profile uses.
-///
-/// Mirrors `vortix::app::state::Protocol` — the binary-side type stays put until
-/// profile storage is consolidated. Keeping a separate `ProtocolKind`
-/// here lets `vortix-core` declare the Tunnel-trait vocabulary without
-/// pulling in the richer profile types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ProtocolKind {

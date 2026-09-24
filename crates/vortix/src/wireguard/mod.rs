@@ -1,4 +1,4 @@
-//! `vortix-protocol-wireguard`: `WireGuard` `Tunnel` impl.
+//! `WireGuard`.
 //!
 //! Wraps `wg-quick` for lifecycle and owns machine-readable `wg show` status
 //! parsing. Scanner and control code consume typed observations only.

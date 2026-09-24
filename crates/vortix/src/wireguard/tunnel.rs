@@ -20,8 +20,7 @@ use crate::wireguard::parser::parse_wg_conf;
 
 /// `wg-quick`-based `WireGuard` tunnel.
 ///
-/// Plan #004 v1 supports kernel `WireGuard` only — `wireguard-go`/`boringtun`
-/// user-space backends land with idea 5's daemon work.
+/// Kernel `WireGuard` only; user-space backends are not supported.
 ///
 /// DNS directives are always removed from the `wg-quick` input. The parsed
 /// request is returned on [`TunnelHandle`] for the protocol-neutral policy

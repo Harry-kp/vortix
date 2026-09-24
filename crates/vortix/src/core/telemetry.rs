@@ -665,10 +665,6 @@ fn parse_ip_api_response(json: &str) -> Option<(String, Option<String>, Option<S
     Some((ip, isp, location))
 }
 
-// Note: `parse_proc_net_dev` and `parse_ip_addr_output` moved to
-// `vortix-platform-linux::network_stats` and `vortix-platform-linux::interface`
-// respectively.
-
 /// Measures network latency, packet loss, and jitter by pinging reliable hosts.
 ///
 /// replaced the `ping -c 3 -i 0.2 -W <timeout>` shell-out
@@ -810,10 +806,6 @@ mod tests {
     }
 
     // === Ping output parsing tests ===
-
-    // /proc/net/dev and `ip addr` parsing tests moved to
-    // `vortix-platform-linux::{network_stats, interface}` along with the
-    // parsers themselves.
 
     // === DNS parsing tests ===
 

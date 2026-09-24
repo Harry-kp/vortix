@@ -761,12 +761,6 @@ pub fn current() -> &'static Theme {
     SCOPED_THEME.with(|choice| choice.get().render_palette())
 }
 
-// ── Backward-compatible const aliases ────────────────────────────────────
-//
-// Existing code references `theme::ACCENT_PRIMARY` etc. These aliases
-// delegate to the built-in theme so nothing breaks. Phase 2 will migrate
-// call-sites to `theme::current().field` for runtime theme switching.
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -211,10 +211,6 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
     ])
 }
 
-/// Render the primary-tunnel section (CONNECTING / CONNECTED / etc.). This
-/// is the existing single-tunnel rendering preserved verbatim from U6B; the
-/// only behavioural delta is that the `(+N more)` suffix has been retired
-/// in favour of the explicit Tunnels strip appended by the caller.
 /// Session uptime as `▲Nd HH:MM:SS`, dropping the units it doesn't need.
 fn format_uptime(elapsed: u64) -> String {
     let (h, m, s) = (elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);

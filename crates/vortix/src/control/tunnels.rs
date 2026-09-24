@@ -500,10 +500,7 @@ pub fn tunnel_for_with_wireguard_policy(
     }
 }
 
-/// Build a `vortix-core` [`Profile`] view from the binary-side `VpnProfile`.
-///
-/// Plan 007 reconciles the two profile types; until then the engine
-/// translates at the trait boundary.
+/// The protocol-facing [`Profile`] for a listed `VpnProfile`.
 #[must_use]
 pub fn profile_view(p: &VpnProfile) -> Profile {
     Profile::new(p.id.clone(), &p.name, p.protocol, p.config_path.clone())

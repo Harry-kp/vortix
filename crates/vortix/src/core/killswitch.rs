@@ -1,7 +1,5 @@
-//! Kill switch firewall control — relocated trait now lives in `vortix-core`
-//!. This module keeps the binary-crate-side state persistence
-//! and the platform dispatch shim until a later sweep swaps callers over to
-//! the `Platform` aggregate.
+//! Kill switch: the mode/state vocabulary, its persisted record, and the
+//! calls into this OS's firewall.
 
 pub use mode::{KillSwitchMode, KillSwitchState};
 
