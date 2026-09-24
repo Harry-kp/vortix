@@ -11,9 +11,15 @@ the gate in step 9 passes. Never `sudo` on the Mac, force-push, push to `main`,
 or touch other branches or PRs. Read `CLAUDE.md` first; it is the rulebook.
 
 `git push` and `gh pr merge` still ask for approval (`.claude/settings.json`).
-Keep it to one push and one merge: finish the review (step 6) and
+Keep it to one push and one merge: finish both reviews (step 6) and
 `scripts/ci-local.sh` before the first push. If a prompt is denied or nobody
 answers, stop and report the branch name and the exact command left to run.
+
+**Several issues at once:** one branch and one PR for all of them, with one
+commit per issue (each ending `Fixes #<n>`). Run steps 1–6 per issue and
+commit it before starting the next; push and open the PR once, after the last.
+Merge that PR with `gh pr merge --rebase --delete-branch` so every issue keeps
+its own commit on `main`.
 
 ## 1. Understand the report
 
@@ -118,13 +124,21 @@ Safety, so a check never cuts off this session:
   appears, skip that check and note it in the PR — credentials are typed by
   the user.
 
-## 6. Review before pushing
+## 6. Review before committing
 
-Review `git diff origin/main...HEAD` as a skeptical reviewer: run the
-`/code-review` skill if available, otherwise read the diff and check
-correctness, missed sibling callers, test strength, and CLAUDE.md rules
-(boundaries, kill switch vocabulary, no plan IDs in comments, no stray
-`#[allow]`). Fix real findings, then re-run `scripts/ci-local.sh`.
+Two passes over `git diff origin/main` (staged and unstaged), both required:
+
+1. **Simplicity (mandatory):** run the `ponytail:ponytail-review` skill on the
+   diff. Apply every `delete`/`yagni`/`shrink` finding, or say in the PR why
+   it stays. A fix that grew a second mechanism "to be safe" usually shows up
+   here; keep the one that covers every path.
+2. **Correctness:** run `/code-review` if available, otherwise read the diff
+   and check correctness, missed sibling callers, test strength, and CLAUDE.md
+   rules (boundaries, kill switch vocabulary, no plan IDs in comments, no stray
+   `#[allow]`).
+
+Fix real findings, then re-run `scripts/ci-local.sh`. Commit only after both
+passes; if a later change lands on the branch, review that change the same way.
 
 ## 7. Commit, push once, open the PR
 

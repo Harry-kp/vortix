@@ -161,7 +161,11 @@ copy or commit them. Credentials are typed by the user.
 - End commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - The pre-commit hook (`scripts/install-hooks.sh`) runs fmt, clippy, gitleaks
   (secret scan of staged changes) and tests. `.DS_Store` is ignored.
-- PRs squash-merge into `main`. `main` has no branch protection, so the green
+- **Before every commit, run the `ponytail:ponytail-review` skill on the diff**
+  and apply its cuts (or note in the PR why one stays). It is a skill, so no
+  git hook can run it; it is still mandatory.
+- PRs squash-merge into `main`; a PR that fixes several issues (one commit
+  each) rebase-merges so each fix stays its own commit. `main` has no branch protection, so the green
   check is ours to enforce: merge only when every `gh pr checks` row is `pass`
   or `skipping` (release jobs always skip) and none is failing or pending.
 - Push only when asked, or as part of `/fix-bug`.
