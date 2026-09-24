@@ -639,11 +639,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let body = match verdict {
         Verdict::Protected => {
-            let state = collect_protected_state(app, primary_snap, inner.width);
+            let state = collect_state(app, primary_snap, inner.width);
             build_protected_audit(&state)
         }
         Verdict::Partial => {
-            let state = collect_partial_state(app, primary_snap, inner.width);
+            let state = collect_state(app, primary_snap, inner.width);
             build_partial_audit(&state)
         }
         Verdict::Exposed => build_exposed_audit(app, inner.width),
@@ -818,58 +818,8 @@ fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
     }
 }
 
-fn collect_protected_state(
-    app: &App,
-    primary_snap: Option<&TunnelView>,
-    inner_width: u16,
-) -> PanelState {
-    let ip_status = derive_ip_status(app);
-
-    let dns_server = dns_display_value(app);
-    let dns_observed = app.control_snapshot.dns.intended_servers.is_empty();
-    let dns_provider = dns_provider_label(&dns_server);
-    let encryption = derive_encryption(primary_snap);
-
-    let location = if constants::is_pending(&app.runtime.location) {
-        None
-    } else {
-        Some(app.runtime.location.clone())
-    };
-
-    PanelState {
-        inner_width,
-        show_section_headers: true,
-        real_ip: RealAddress::new(app.runtime.real_ip.clone(), app.runtime.real_ip_from_cache),
-        // Protected is only reached with a primary on the default route.
-        has_primary: true,
-        public_ip: app.runtime.public_ip.clone(),
-        real_ipv6: RealAddress::new(
-            app.runtime.real_ipv6.clone(),
-            app.runtime.real_ipv6_from_cache,
-        ),
-        public_ipv6: app.runtime.public_ipv6.clone(),
-        location,
-        ip_status,
-        ipv6_status: derive_ipv6_row_status(app),
-        dns_server,
-        dns_provider,
-        dns_status: app.control_snapshot.dns.status,
-        egress_age: app.runtime.last_egress_check.map(|at| at.elapsed()),
-        dns_age: app.runtime.last_dns_check.map(|at| at.elapsed()),
-        ipv6_age: app.runtime.last_ipv6_check.map(|at| at.elapsed()),
-        dns_observed,
-        stale_after: app.telemetry_stale_after(),
-        killswitch_mode: app.control_snapshot.kill_switch,
-        killswitch_state: app.control_snapshot.kill_switch_state,
-        encryption,
-    }
-}
-
-fn collect_partial_state(
-    app: &App,
-    primary_snap: Option<&TunnelView>,
-    inner_width: u16,
-) -> PanelState {
+/// Protected and Partial share one state; only the primary decides the exit rows.
+fn collect_state(app: &App, primary_snap: Option<&TunnelView>, inner_width: u16) -> PanelState {
     // Cipher source: prefer the primary (when verdict is Partial because
     // of degraded defense), otherwise pick the first Connected tunnel
     // from the snapshot (split-only topology). Ciphers are usually
@@ -2344,7 +2294,7 @@ mod tests {
         app.runtime.last_egress_check = Some(now);
         app.runtime.last_dns_check = Some(long_ago);
 
-        let state = collect_partial_state(&app, None, 60);
+        let state = collect_state(&app, None, 60);
 
         assert!(
             !state.is_stale(state.egress_age),
