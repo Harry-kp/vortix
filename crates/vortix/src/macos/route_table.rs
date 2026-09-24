@@ -213,14 +213,18 @@ pub(crate) fn route_get_args(target: IpAddr) -> Vec<String> {
 /// Argv for `route -n <verb> -net <cidr> -interface <iface>`: an
 /// interface-scoped route that binds to the named utun regardless of gateway.
 pub(crate) fn bind_route_args(verb: &str, cidr: &str, interface: &str) -> Vec<String> {
-    vec![
-        "-n".into(),
-        verb.into(),
+    let mut args = vec!["-n".into(), verb.into()];
+    // `route` does not infer IPv6 from the address; it answers "bad address".
+    if cidr.contains(':') {
+        args.push("-inet6".into());
+    }
+    args.extend([
         "-net".into(),
         cidr.into(),
         "-interface".into(),
         interface.into(),
-    ]
+    ]);
+    args
 }
 
 pub(crate) fn bind_host_route_args(verb: &str, destination: IpAddr, gateway: &str) -> Vec<String> {
@@ -388,6 +392,32 @@ default            192.168.1.1        UGScg                 en0
         assert_eq!(
             parse_default_slot_gateway(netstat),
             Some("192.168.1.1".to_owned())
+        );
+    }
+
+    /// `route` does not infer the family from an IPv6 `-net`: without
+    /// `-inet6` it answers "bad address", so every IPv6 default half failed.
+    #[test]
+    fn ipv6_routes_name_their_family() {
+        assert_eq!(
+            bind_route_args("add", "::/1", "utun4"),
+            ["-n", "add", "-inet6", "-net", "::/1", "-interface", "utun4"]
+        );
+        assert_eq!(
+            unbind_route_args("8000::/1", "utun4"),
+            [
+                "-n",
+                "delete",
+                "-inet6",
+                "-net",
+                "8000::/1",
+                "-interface",
+                "utun4"
+            ]
+        );
+        assert_eq!(
+            bind_route_args("add", "0.0.0.0/1", "utun4"),
+            ["-n", "add", "-net", "0.0.0.0/1", "-interface", "utun4"]
         );
     }
 
