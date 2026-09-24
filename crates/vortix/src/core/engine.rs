@@ -12,7 +12,6 @@ pub mod registry {
     use crate::core::cidr::Cidr;
     use crate::core::engine::state::{Connection, ConnectionHealth};
     use crate::core::profile::ProfileId;
-    use crate::core::state::killswitch::{KillSwitchMode, KillSwitchState};
 
     /// Per-tunnel role derived from declared `AllowedIPs` + current primary.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,8 +110,6 @@ pub mod registry {
     pub struct TunnelRegistry {
         tunnels: BTreeMap<ProfileId, TunnelSnapshot>,
         primary: Option<ProfileId>,
-        killswitch_mode: KillSwitchMode,
-        killswitch_state: KillSwitchState,
         default_route_interface: Option<String>,
     }
 
@@ -130,24 +127,6 @@ pub mod registry {
         #[must_use]
         pub fn primary(&self) -> Option<&ProfileId> {
             self.primary.as_ref()
-        }
-
-        #[must_use]
-        pub const fn killswitch_mode(&self) -> KillSwitchMode {
-            self.killswitch_mode
-        }
-
-        #[must_use]
-        pub const fn killswitch_state(&self) -> KillSwitchState {
-            self.killswitch_state
-        }
-
-        pub fn set_killswitch_mode(&mut self, mode: KillSwitchMode) {
-            self.killswitch_mode = mode;
-        }
-
-        pub fn set_killswitch_state(&mut self, state: KillSwitchState) {
-            self.killswitch_state = state;
         }
 
         #[must_use]

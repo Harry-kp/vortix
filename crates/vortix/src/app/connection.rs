@@ -151,14 +151,9 @@ impl App {
             self.last_control_connected_profile = Some(profile_id);
         }
 
-        self.runtime.killswitch_mode = snapshot.kill_switch;
         if self.pending_control_killswitch_mode == Some(snapshot.kill_switch) {
             self.pending_control_killswitch_mode = None;
         }
-        self.registry.set_killswitch_mode(snapshot.kill_switch);
-        self.runtime.killswitch_state = snapshot.kill_switch_state;
-        self.registry
-            .set_killswitch_state(snapshot.kill_switch_state);
 
         self.show_prompt(&snapshot);
         self.show_notices(&snapshot);

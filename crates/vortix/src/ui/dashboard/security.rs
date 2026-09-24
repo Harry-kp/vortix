@@ -675,8 +675,8 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
         app.control_snapshot.dns.status != crate::control::DnsSecurityStatus::Protected;
     let ks_alarm = matches!(
         (
-            app.registry.killswitch_mode(),
-            app.registry.killswitch_state()
+            app.control_snapshot.kill_switch,
+            app.control_snapshot.kill_switch_state
         ),
         (
             crate::state::KillSwitchMode::Auto,
@@ -869,8 +869,8 @@ fn collect_protected_state(
         ipv6_age: app.runtime.last_ipv6_check.map(|at| at.elapsed()),
         dns_observed,
         stale_after: app.telemetry_stale_after(),
-        killswitch_mode: app.registry.killswitch_mode(),
-        killswitch_state: app.registry.killswitch_state(),
+        killswitch_mode: app.control_snapshot.kill_switch,
+        killswitch_state: app.control_snapshot.kill_switch_state,
         encryption,
     }
 }
@@ -940,8 +940,8 @@ fn collect_partial_state(
         ipv6_age: app.runtime.last_ipv6_check.map(|at| at.elapsed()),
         dns_observed,
         stale_after: app.telemetry_stale_after(),
-        killswitch_mode: app.registry.killswitch_mode(),
-        killswitch_state: app.registry.killswitch_state(),
+        killswitch_mode: app.control_snapshot.kill_switch,
+        killswitch_state: app.control_snapshot.kill_switch_state,
         encryption,
     }
 }
@@ -1194,8 +1194,8 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
 
     lines.push(audit_row(
         "Killswitch",
-        killswitch_mode_label(app.registry.killswitch_mode()),
-        match app.registry.killswitch_mode() {
+        killswitch_mode_label(app.control_snapshot.kill_switch),
+        match app.control_snapshot.kill_switch {
             KillSwitchMode::Off => Sigil::AlarmError,
             _ => Sigil::OkMuted,
         },
@@ -2397,10 +2397,9 @@ mod tests {
         insert_idle_tunnel(&mut app, "alpha");
         // Deliberately diverge the obsolete runtime mirror: renderers must
         // follow the registry's canonical policy projection exclusively.
-        app.runtime.killswitch_mode = KillSwitchMode::Off;
-        app.runtime.killswitch_state = KillSwitchState::Disabled;
-        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
-        app.registry.set_killswitch_state(KillSwitchState::Blocking);
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::AlwaysOn;
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
+            KillSwitchState::Blocking;
 
         let out = render_to_string(&app, 60, 20);
         assert!(out.contains("PARTIAL"), "PARTIAL banner missing:\n{out}");
@@ -2415,8 +2414,9 @@ mod tests {
     fn a_leaking_ipv6_cannot_be_headlined_as_protected() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
-        app.registry.set_killswitch_state(KillSwitchState::Blocking);
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::AlwaysOn;
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
+            KillSwitchState::Blocking;
         std::sync::Arc::make_mut(&mut app.control_snapshot)
             .dns
             .status = crate::control::DnsSecurityStatus::Protected;
@@ -2452,8 +2452,9 @@ mod tests {
     fn partial_killswitch_off_renders_off_with_alarm() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::Off);
-        app.registry.set_killswitch_state(KillSwitchState::Disabled);
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::Off;
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
+            KillSwitchState::Disabled;
 
         let out = render_to_string(&app, 70, 20);
         assert!(
@@ -2470,8 +2471,9 @@ mod tests {
     fn partial_killswitch_auto_renders_block_on_drop() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
-        app.registry.set_killswitch_mode(KillSwitchMode::Auto);
-        app.registry.set_killswitch_state(KillSwitchState::Armed);
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::Auto;
+        std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
+            KillSwitchState::Armed;
 
         let out = render_to_string(&app, 70, 20);
         assert!(

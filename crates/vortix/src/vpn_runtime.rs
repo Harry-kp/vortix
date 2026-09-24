@@ -144,6 +144,7 @@ pub mod connection {
         #[must_use]
         #[allow(clippy::too_many_lines)]
         pub fn scan_status(&self) -> StatusSnapshot {
+            let (killswitch_mode, killswitch_state) = crate::core::killswitch::persisted();
             let active = scanner::get_active_profiles(&self.profiles);
             let session = active.first();
             let (mut state, profile, protocol, uptime, server, interface, internal_ip, dl, ul) =
@@ -266,8 +267,8 @@ pub mod connection {
                 internal_ip,
                 download_bytes: dl,
                 upload_bytes: ul,
-                killswitch_mode: self.killswitch_mode,
-                killswitch_state: self.killswitch_state,
+                killswitch_mode,
+                killswitch_state,
             }
         }
     }
@@ -737,9 +738,8 @@ use std::time::{Duration, Instant};
 use crate::config::AppConfig;
 use crate::constants;
 use crate::core::telemetry::{self, TelemetryUpdate};
-use crate::logger;
 use crate::message::Message;
-use crate::state::{KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile};
+use crate::state::{ProfileSortOrder, Protocol, VpnProfile};
 
 use crate::utils;
 
@@ -831,10 +831,6 @@ pub struct VpnRuntime {
     pub connection_drops: u32,
     pub sort_order: ProfileSortOrder,
 
-    // === Kill Switch ===
-    pub killswitch_mode: KillSwitchMode,
-    pub killswitch_state: KillSwitchState,
-
     // === Async Communication ===
     pub(crate) telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
     pub telemetry_nudge: Option<mpsc::Sender<()>>,
@@ -905,9 +901,6 @@ impl VpnRuntime {
             connection_drops: 0,
             sort_order: ProfileSortOrder::default(),
 
-            killswitch_mode: KillSwitchMode::default(),
-            killswitch_state: KillSwitchState::default(),
-
             telemetry_rx: None,
             telemetry_nudge: None,
             cmd_tx,
@@ -918,29 +911,6 @@ impl VpnRuntime {
         }
     }
 
-    fn recover_killswitch_truth(&mut self) {
-        match crate::core::killswitch::load_state_checked() {
-            Ok(Some(persisted)) => {
-                self.killswitch_mode = persisted.mode;
-                self.killswitch_state = persisted.recovered_state();
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.killswitch_state = KillSwitchState::Degraded;
-                logger::log(
-                    logger::LogLevel::Warning,
-                    "SEC",
-                    format!("Kill-switch state could not be verified: {error}"),
-                );
-            }
-        }
-    }
-
-    /// Adopt the kill-switch state already on disk.
-    fn restore_persisted_state(&mut self) {
-        self.recover_killswitch_truth();
-    }
-
     /// Long-lived engine for the TUI: detects telemetry and runs background workers.
     #[must_use]
     pub fn new(config: AppConfig, config_dir: PathBuf) -> Self {
@@ -949,7 +919,6 @@ impl VpnRuntime {
         engine.isp = constants::MSG_DETECTING.to_string();
         engine.dns_server = constants::MSG_DETECTING.to_string();
         engine.public_ip = constants::MSG_DETECTING.to_string();
-        engine.restore_persisted_state();
 
         // Remembered only until reconfirmed, so launch-with-VPN-up still shows a real IP.
         let (remembered_ipv4, remembered_ipv6) = remembered_real_addresses(&engine.config_dir);
@@ -971,7 +940,6 @@ impl VpnRuntime {
     #[must_use]
     pub fn new_headless(config: AppConfig, config_dir: PathBuf) -> Self {
         let mut engine = Self::blank(config, config_dir);
-        engine.restore_persisted_state();
         engine.profiles = crate::vpn::load_profiles();
         engine
     }

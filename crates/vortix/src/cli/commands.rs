@@ -2360,7 +2360,8 @@ fn handle_killswitch(
     config_dir: &Path,
     output_mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let (mut mode, mut state) = crate::core::killswitch::persisted();
 
     if let Some(new_mode) = mode_arg {
         let Some(ks_mode) = crate::state::KillSwitchMode::from_cli_verb(new_mode) else {
@@ -2396,8 +2397,8 @@ fn handle_killswitch(
             Duration::from_secs(config.disconnect_operation_timeout_secs()),
         ) {
             Ok(snapshot) => {
-                engine.killswitch_mode = snapshot.kill_switch;
-                engine.killswitch_state = snapshot.kill_switch_state;
+                mode = snapshot.kill_switch;
+                state = snapshot.kill_switch_state;
             }
             Err(message) => print_error_and_exit(
                 output_mode,
@@ -2420,13 +2421,13 @@ fn handle_killswitch(
     // Human-facing rendering uses the title-cased prose form from
     // `display_name`; the two are derived from one vocabulary.
     let data = KsData {
-        mode: engine.killswitch_mode.cli_verb().to_string(),
-        state: engine.killswitch_state.cli_verb().to_string(),
+        mode: mode.cli_verb().to_string(),
+        state: state.cli_verb().to_string(),
     };
 
     match output_mode {
         OutputMode::Human => {
-            print_killswitch_status(engine.killswitch_mode, engine.killswitch_state);
+            print_killswitch_status(mode, state);
         }
         OutputMode::Json => print_success(output_mode, "killswitch", &data, vec![]),
         OutputMode::Quiet => {}

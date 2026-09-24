@@ -7,7 +7,7 @@
 mod control_scenarios;
 
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
-use vortix::state::{KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
+use vortix::state::{Protocol, VpnProfile};
 use vortix::vpn_runtime::VpnRuntime;
 
 // ============================================================================
@@ -31,8 +31,6 @@ fn engine_new_headless_starts_disconnected() {
 fn engine_new_test_has_empty_profiles() {
     let engine = VpnRuntime::new_test();
     assert!(engine.profiles.is_empty());
-    assert_eq!(engine.killswitch_mode, KillSwitchMode::Off);
-    assert_eq!(engine.killswitch_state, KillSwitchState::Disabled);
 }
 
 #[test]

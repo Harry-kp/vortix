@@ -720,8 +720,8 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
     }
 
     match (
-        app.registry.killswitch_mode(),
-        app.registry.killswitch_state(),
+        app.control_snapshot.kill_switch,
+        app.control_snapshot.kill_switch_state,
     ) {
         (_, KillSwitchState::Degraded) => Span::styled(
             " KS:DEGRADED ",
@@ -932,14 +932,11 @@ mod tests {
     }
 
     #[test]
-    fn kill_switch_indicator_reads_registry_when_runtime_mirror_diverges() {
+    fn kill_switch_indicator_reads_the_snapshot() {
         let mut app = App::new_test();
-        app.runtime.killswitch_mode = crate::state::KillSwitchMode::Off;
-        app.runtime.killswitch_state = crate::state::KillSwitchState::Disabled;
-        app.registry
-            .set_killswitch_mode(crate::state::KillSwitchMode::AlwaysOn);
-        app.registry
-            .set_killswitch_state(crate::state::KillSwitchState::Degraded);
+        let snapshot = std::sync::Arc::make_mut(&mut app.control_snapshot);
+        snapshot.kill_switch = crate::state::KillSwitchMode::AlwaysOn;
+        snapshot.kill_switch_state = crate::state::KillSwitchState::Degraded;
         assert_eq!(
             get_killswitch_indicator(&app).content.as_ref(),
             " KS:DEGRADED "

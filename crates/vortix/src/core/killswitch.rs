@@ -687,6 +687,20 @@ fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
+/// The kill-switch mode and state recorded on disk; `Degraded` when the
+/// record exists but cannot be verified.
+#[must_use]
+pub fn persisted() -> (KillSwitchMode, KillSwitchState) {
+    match load_state_checked() {
+        Ok(Some(persisted)) => (persisted.mode, persisted.recovered_state()),
+        Ok(None) => (KillSwitchMode::default(), KillSwitchState::default()),
+        Err(error) => {
+            tracing::warn!(%error, "kill-switch state could not be verified");
+            (KillSwitchMode::default(), KillSwitchState::Degraded)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

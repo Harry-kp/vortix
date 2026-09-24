@@ -200,19 +200,21 @@ impl App {
         // Apply user's logging preferences
         logger::configure(&runtime.config.log_level, runtime.config.max_log_entries);
 
-        // Registry is the TUI's protection truth from the first frame. Seed
-        // it from recovered runtime state so startup cannot briefly render
-        // Off while a persisted firewall is still present.
-        let mut registry = TunnelRegistry::new();
-        registry.set_killswitch_mode(runtime.killswitch_mode);
-        registry.set_killswitch_state(runtime.killswitch_state);
+        // Seed from disk so the first frame cannot show Off while a
+        // persisted firewall is still present.
+        let (kill_switch, kill_switch_state) = crate::core::killswitch::persisted();
+        let registry = TunnelRegistry::new();
 
         let mut app = Self {
             runtime,
             registry,
             control: None,
             control_starting: true,
-            control_snapshot: std::sync::Arc::default(),
+            control_snapshot: std::sync::Arc::new(crate::control::Snapshot {
+                kill_switch,
+                kill_switch_state,
+                ..crate::control::Snapshot::default()
+            }),
             control_prompt: None,
             notices_seen: 0,
             last_control_connected_profile: None,
@@ -260,11 +262,6 @@ impl App {
         {
             let log_path = app.runtime.config_dir.join(constants::LOGS_DIR_NAME);
             app.log(&format!("IO: Auto-logging to {}", log_path.display()));
-        }
-
-        // Log kill switch recovery if it happened
-        if app.runtime.killswitch_state == crate::state::KillSwitchState::Disabled {
-            // Check if we recovered from crash — the engine already handled this
         }
 
         app.log("INIT: Interface ready; VPN service starting in the background");
