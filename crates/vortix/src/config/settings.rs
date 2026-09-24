@@ -1,8 +1,7 @@
 //! `Settings` struct + figment-layered resolution.
 //!
-//! Layer precedence (last wins): defaults → `/etc/vortix/config.toml` →
-//! user file (`${XDG_CONFIG_HOME}/vortix/settings.toml`, SUDO_USER-aware) →
-//! `VORTIX_*` env vars → CLI overrides.
+//! Layer precedence (last wins): defaults → `<config_dir>/settings.toml` →
+//! `VORTIX_*` env vars.
 
 use std::path::Path;
 
@@ -27,14 +26,12 @@ fn default_schema_version() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Schema version of the user's `settings.toml`. When this differs
-    /// from [`SETTINGS_SCHEMA_VERSION`], [`migrate_settings`] is invoked
-    /// to upgrade. Files without an explicit field default to 1.
+    /// Schema version of the user's `settings.toml`. Files without the field
+    /// read as 1; a newer version than this build knows is refused.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub engine: EngineSettings,
     pub journal: JournalSettings,
-    pub ui: UiSettings,
     /// Global, asynchronous lifecycle observers. Empty means no runner task.
     pub hooks: Vec<HookSpec>,
 }
@@ -45,20 +42,15 @@ impl Default for Settings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             engine: EngineSettings::default(),
             journal: JournalSettings::default(),
-            ui: UiSettings::default(),
             hooks: Vec::new(),
         }
     }
 }
 
-/// Engine retry + reconnect knobs.
+/// Protocol and handshake knobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineSettings {
-    /// Overall budget for connect + reconnect attempts.
-    pub retry_budget_secs: u64,
-    /// Initial backoff before the first retry; doubles each attempt.
-    pub retry_initial_backoff_ms: u64,
     /// Default `OpenVPN --verb` value.
     pub openvpn_verbosity: String,
     /// Connect timeout used by `OvpnTunnel::with_connect_timeout`.
@@ -74,8 +66,6 @@ pub struct EngineSettings {
 impl Default for EngineSettings {
     fn default() -> Self {
         Self {
-            retry_budget_secs: 300,
-            retry_initial_backoff_ms: 2_000,
             openvpn_verbosity: "3".to_string(),
             connect_timeout_secs: crate::constants::DEFAULT_CONNECT_TIMEOUT,
             wireguard_handshake_timeout_secs: crate::constants::DEFAULT_WIREGUARD_HANDSHAKE_TIMEOUT,
@@ -109,28 +99,6 @@ impl Default for JournalSettings {
     }
 }
 
-/// UI / startup defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct UiSettings {
-    pub start_mode: StartMode,
-}
-
-impl Default for UiSettings {
-    fn default() -> Self {
-        Self {
-            start_mode: StartMode::Tui,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StartMode {
-    Tui,
-    Cli,
-}
-
 /// Errors produced during `Settings::load`. Boxed for `clippy::result_large_err`.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -149,33 +117,6 @@ pub enum SettingsError {
     InvalidHook(#[from] HookConfigError),
 }
 
-/// Migrate a parsed `Settings` from an older schema version to the
-/// current [`SETTINGS_SCHEMA_VERSION`].
-///
-/// v0.3.0 only knows `schema_version` = 1; older or newer versions
-/// return `UnsupportedSchema`. Future versions will add upgrade arms
-/// here.
-///
-/// # Errors
-///
-/// Returns [`SettingsError::UnsupportedSchema`] when the input's
-/// `schema_version` is not handled by this build.
-pub fn migrate_settings(mut s: Settings) -> Result<Settings, SettingsError> {
-    match s.schema_version {
-        0 | 1 => {
-            // v0 ⇒ treat as v1 (older files didn't carry the field;
-            // serde default reads as 1 anyway, but cover the 0 case for
-            // explicit-zero writes).
-            s.schema_version = SETTINGS_SCHEMA_VERSION;
-            Ok(s)
-        }
-        found => Err(SettingsError::UnsupportedSchema {
-            found,
-            supported_max: SETTINGS_SCHEMA_VERSION,
-        }),
-    }
-}
-
 impl From<figment::Error> for SettingsError {
     fn from(e: figment::Error) -> Self {
         Self::Figment(Box::new(e))
@@ -183,72 +124,34 @@ impl From<figment::Error> for SettingsError {
 }
 
 impl Settings {
-    /// Load settings from the already-resolved application configuration
-    /// directory. This is the authoritative production entry point: the
-    /// same `--config-dir` / `VORTIX_CONFIG_DIR` / sudo-user decision that
-    /// selects profiles and `config.toml` also selects `settings.toml`.
+    /// Load `<config_dir>/settings.toml` over `engine` defaults, then the
+    /// `VORTIX_*` environment. The config dir is the same one that selects
+    /// profiles and `config.toml`.
     ///
     /// # Errors
     ///
-    /// Returns [`SettingsError`] when the selected file or environment layer
-    /// cannot be decoded.
-    pub fn load_from_config_dir(config_dir: &Path) -> Result<Self, SettingsError> {
-        Self::load_from(None, Some(&config_dir.join("settings.toml")))
-    }
-
-    /// Load compatibility defaults and then layer the authoritative
-    /// `${config_dir}/settings.toml` and `VORTIX_*` environment values.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SettingsError`] when the selected file or environment layer
-    /// cannot be decoded.
-    pub fn load_from_config_dir_with_engine_defaults(
-        config_dir: &Path,
-        engine: EngineSettings,
-    ) -> Result<Self, SettingsError> {
-        Self::load_from_with_engine_defaults(None, Some(&config_dir.join("settings.toml")), engine)
-    }
-
-    /// Load with explicit `system` and `user` paths
-    /// (`None` skips that layer). Useful for tests.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SettingsError::Figment`] when a present layer fails to
-    /// parse.
-    pub fn load_from(system: Option<&Path>, user: Option<&Path>) -> Result<Self, SettingsError> {
-        Self::load_from_with_engine_defaults(system, user, EngineSettings::default())
-    }
-
-    fn load_from_with_engine_defaults(
-        system: Option<&Path>,
-        user: Option<&Path>,
-        engine: EngineSettings,
-    ) -> Result<Self, SettingsError> {
+    /// Returns [`SettingsError`] when the file or environment layer cannot be
+    /// decoded, the schema is newer than this build, or a hook is invalid.
+    pub fn load(config_dir: &Path, engine: EngineSettings) -> Result<Self, SettingsError> {
         let defaults = Self {
             engine,
             ..Self::default()
         };
         let mut fig = Figment::new().merge(Serialized::defaults(defaults));
-        if let Some(p) = system {
-            if p.exists() {
-                fig = fig.merge(Toml::file(p));
-            }
+        let user = config_dir.join("settings.toml");
+        if user.exists() {
+            fig = fig.merge(Toml::file(user));
         }
-        if let Some(p) = user {
-            if p.exists() {
-                fig = fig.merge(Toml::file(p));
-            }
+        let mut settings: Self = fig.merge(Env::prefixed("VORTIX_").split("__")).extract()?;
+        if settings.schema_version > SETTINGS_SCHEMA_VERSION {
+            return Err(SettingsError::UnsupportedSchema {
+                found: settings.schema_version,
+                supported_max: SETTINGS_SCHEMA_VERSION,
+            });
         }
-        fig = fig.merge(Env::prefixed("VORTIX_").split("__"));
-        let s: Self = fig.extract()?;
-        // route through migrate_settings so an unsupported
-        // schema_version surfaces as a typed error instead of silently
-        // accepting unknown fields.
-        let s = migrate_settings(s)?;
-        validate_hooks(&s.hooks)?;
-        Ok(s)
+        settings.schema_version = SETTINGS_SCHEMA_VERSION;
+        validate_hooks(&settings.hooks)?;
+        Ok(settings)
     }
 }
 
@@ -257,73 +160,62 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn load(body: Option<&str>) -> Result<Settings, SettingsError> {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(body) = body {
+            fs::write(dir.path().join("settings.toml"), body).unwrap();
+        }
+        Settings::load(dir.path(), EngineSettings::default())
+    }
+
     #[test]
     fn defaults_load_without_files() {
-        let s = Settings::load_from(None, None).unwrap();
-        assert_eq!(s.engine.retry_budget_secs, 300);
-        assert_eq!(s.engine.retry_initial_backoff_ms, 2_000);
+        let s = load(None).unwrap();
         assert_eq!(s.engine.connect_timeout_secs, 35);
         assert_eq!(s.engine.wireguard_handshake_timeout_secs, 20);
         assert_eq!(s.engine.wireguard_handshake_stale_secs, 180);
         assert!(!s.engine.wireguard_health_targets.is_empty());
         assert!(s.journal.disk);
         assert_eq!(s.journal.retention_days, 30);
+        assert_eq!(s.schema_version, 1);
     }
 
     #[test]
-    fn user_file_overrides_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.toml");
-        fs::write(
-            &path,
-            "
-[engine]
-retry_budget_secs = 60
-[journal]
-disk = false
-",
-        )
+    fn the_file_overrides_defaults_and_keeps_the_rest() {
+        let s = load(Some(
+            "[engine]\nconnect_timeout_secs = 60\n[journal]\ndisk = false\n",
+        ))
         .unwrap();
-
-        let s = Settings::load_from(None, Some(&path)).unwrap();
-        assert_eq!(s.engine.retry_budget_secs, 60);
+        assert_eq!(s.engine.connect_timeout_secs, 60);
         assert!(!s.journal.disk);
-        // Other fields keep defaults.
         assert_eq!(s.journal.retention_days, 30);
     }
 
     #[test]
-    fn invalid_hook_fails_the_settings_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.toml");
-        fs::write(
-            &path,
-            r#"
-[[hooks]]
-event = "connected"
-executable = "notify-send VPN-connected"
-"#,
-        )
+    fn an_old_file_with_removed_keys_still_loads() {
+        let s = load(Some(
+            "[engine]\nretry_budget_secs = 60\nconnect_timeout_secs = 50\n[ui]\nstart_mode = \"cli\"\n",
+        ))
         .unwrap();
+        assert_eq!(s.engine.connect_timeout_secs, 50);
+    }
 
+    #[test]
+    fn invalid_hook_fails_the_settings_boundary() {
         assert!(matches!(
-            Settings::load_from(None, Some(&path)),
+            load(Some(
+                "[[hooks]]\nevent = \"connected\"\nexecutable = \"notify-send VPN-connected\"\n"
+            )),
             Err(SettingsError::InvalidHook(_))
         ));
     }
 
     #[test]
     fn explicit_engine_settings_override_legacy_compatibility_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.toml");
+        let dir = tempfile::tempdir().unwrap();
         fs::write(
-            &path,
-            r#"
-[engine]
-wireguard_handshake_timeout_secs = 7
-wireguard_handshake_stale_secs = 91
-wireguard_health_targets = ["10.0.0.1"]
-"#,
+            dir.path().join("settings.toml"),
+            "[engine]\nwireguard_handshake_timeout_secs = 7\nwireguard_handshake_stale_secs = 91\nwireguard_health_targets = [\"10.0.0.1\"]\n",
         )
         .unwrap();
         let legacy = EngineSettings {
@@ -332,7 +224,7 @@ wireguard_health_targets = ["10.0.0.1"]
             wireguard_health_targets: vec!["192.0.2.1".into()],
             ..EngineSettings::default()
         };
-        let resolved = Settings::load_from_with_engine_defaults(None, Some(&path), legacy).unwrap();
+        let resolved = Settings::load(dir.path(), legacy).unwrap();
         assert_eq!(resolved.engine.wireguard_handshake_timeout_secs, 7);
         assert_eq!(resolved.engine.wireguard_handshake_stale_secs, 91);
         assert_eq!(resolved.engine.wireguard_health_targets, ["10.0.0.1"]);
@@ -340,100 +232,44 @@ wireguard_health_targets = ["10.0.0.1"]
 
     #[test]
     fn old_partial_settings_keep_legacy_wireguard_values() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.toml");
-        fs::write(&path, "[engine]\nretry_budget_secs = 60\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("settings.toml"),
+            "[engine]\nconnect_timeout_secs = 60\n",
+        )
+        .unwrap();
         let legacy = EngineSettings {
             wireguard_handshake_timeout_secs: 44,
             wireguard_handshake_stale_secs: 444,
             wireguard_health_targets: vec!["192.0.2.1".into()],
             ..EngineSettings::default()
         };
-        let resolved = Settings::load_from_with_engine_defaults(None, Some(&path), legacy).unwrap();
-        assert_eq!(resolved.engine.retry_budget_secs, 60);
+        let resolved = Settings::load(dir.path(), legacy).unwrap();
+        assert_eq!(resolved.engine.connect_timeout_secs, 60);
         assert_eq!(resolved.engine.wireguard_handshake_timeout_secs, 44);
         assert_eq!(resolved.engine.wireguard_handshake_stale_secs, 444);
         assert_eq!(resolved.engine.wireguard_health_targets, ["192.0.2.1"]);
     }
 
     #[test]
-    fn authoritative_config_dir_selects_settings_file() {
-        let selected = tempfile::tempdir().unwrap();
-        let unrelated = tempfile::tempdir().unwrap();
-        fs::write(
-            selected.path().join("settings.toml"),
-            "[engine]\nwireguard_handshake_timeout_secs = 7\n",
-        )
-        .unwrap();
-        fs::write(
-            unrelated.path().join("settings.toml"),
-            "[engine]\nwireguard_handshake_timeout_secs = 99\n",
-        )
-        .unwrap();
-
-        let resolved = Settings::load_from_config_dir(selected.path()).unwrap();
-        assert_eq!(resolved.engine.wireguard_handshake_timeout_secs, 7);
-    }
-
-    #[test]
-    fn user_file_overrides_system_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sys = tmp.path().join("system.toml");
-        let user = tmp.path().join("user.toml");
-        fs::write(&sys, "[engine]\nretry_budget_secs = 60\n").unwrap();
-        fs::write(&user, "[engine]\nretry_budget_secs = 120\n").unwrap();
-
-        let s = Settings::load_from(Some(&sys), Some(&user)).unwrap();
-        assert_eq!(s.engine.retry_budget_secs, 120);
-    }
-
-    #[test]
     fn invalid_toml_surfaces_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("bad.toml");
-        fs::write(&path, "[engine]\nretry_budget_secs = \"not a number\"\n").unwrap();
-        let err = Settings::load_from(None, Some(&path)).unwrap_err();
-        assert!(matches!(err, SettingsError::Figment(_)));
-    }
-    #[test]
-    fn schema_version_defaults_to_one() {
-        let s = Settings::load_from(None, None).unwrap();
-        assert_eq!(s.schema_version, 1);
+        assert!(matches!(
+            load(Some("[engine]\nconnect_timeout_secs = \"not a number\"\n")),
+            Err(SettingsError::Figment(_))
+        ));
     }
 
     #[test]
-    fn missing_schema_version_in_file_defaults_to_one() {
-        // Pre-008 settings files don't carry schema_version; they
-        // should load as v1 via the serde default.
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("legacy.toml");
-        fs::write(&path, "[engine]\nretry_budget_secs = 60\n").unwrap();
-        let s = Settings::load_from(None, Some(&path)).unwrap();
-        assert_eq!(s.schema_version, 1);
-        assert_eq!(s.engine.retry_budget_secs, 60);
-    }
-
-    #[test]
-    fn explicit_schema_version_one_loads_cleanly() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("v1.toml");
-        fs::write(
-            &path,
-            "schema_version = 1\n[engine]\nretry_budget_secs = 90\n",
-        )
-        .unwrap();
-        let s = Settings::load_from(None, Some(&path)).unwrap();
-        assert_eq!(s.schema_version, 1);
-        assert_eq!(s.engine.retry_budget_secs, 90);
+    fn schema_versions_zero_and_one_load_as_current() {
+        for version in [0, 1] {
+            let s = load(Some(&format!("schema_version = {version}\n"))).unwrap();
+            assert_eq!(s.schema_version, SETTINGS_SCHEMA_VERSION);
+        }
     }
 
     #[test]
     fn unsupported_schema_version_returns_typed_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("v999.toml");
-        fs::write(&path, "schema_version = 999\n").unwrap();
-        let err = Settings::load_from(None, Some(&path)).unwrap_err();
-        match err {
+        match load(Some("schema_version = 999\n")).unwrap_err() {
             SettingsError::UnsupportedSchema {
                 found,
                 supported_max,
@@ -446,42 +282,11 @@ wireguard_health_targets = ["10.0.0.1"]
     }
 
     #[test]
-    fn migrate_settings_normalises_zero_to_current() {
-        // schema_version = 0 (older serializer write) is accepted and
-        // normalised to the current version, preserving other fields.
-        let engine = EngineSettings {
-            retry_budget_secs: 42,
-            ..EngineSettings::default()
-        };
-        let s = Settings {
-            schema_version: 0,
-            engine,
-            journal: JournalSettings::default(),
-            ui: UiSettings::default(),
-            hooks: Vec::new(),
-        };
-        let migrated = migrate_settings(s).unwrap();
-        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
-        assert_eq!(migrated.engine.retry_budget_secs, 42);
-    }
-
-    #[test]
     fn lifecycle_hooks_load_as_absolute_argv_specs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.toml");
-        fs::write(
-            &path,
-            r#"
-[[hooks]]
-event = "connected"
-executable = "/usr/bin/notify-send"
-args = ["VPN connected"]
-timeout_secs = 7
-"#,
-        )
+        let settings = load(Some(
+            "[[hooks]]\nevent = \"connected\"\nexecutable = \"/usr/bin/notify-send\"\nargs = [\"VPN connected\"]\ntimeout_secs = 7\n",
+        ))
         .unwrap();
-
-        let settings = Settings::load_from(None, Some(&path)).unwrap();
         assert_eq!(settings.hooks.len(), 1);
         assert_eq!(settings.hooks[0].timeout_secs, 7);
         assert_eq!(settings.hooks[0].event, crate::hooks::HookEvent::Connected);

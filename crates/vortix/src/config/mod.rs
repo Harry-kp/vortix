@@ -20,7 +20,7 @@ pub mod settings;
 pub use hooks_config::{HookConfigError, HookSpec};
 pub use migration::{migrate_legacy_profiles, MigrationStats};
 pub use profile_store::{ProfileStoreError, ProfileSummary};
-pub use settings::{EngineSettings, JournalSettings, Settings, SettingsError, UiSettings};
+pub use settings::{EngineSettings, JournalSettings, Settings, SettingsError};
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -455,13 +455,9 @@ pub fn load_effective_config(config_dir: &Path) -> Result<AppConfig, String> {
         wireguard_handshake_timeout_secs: config.wireguard_handshake_timeout_secs,
         wireguard_handshake_stale_secs: config.wireguard_handshake_stale_secs,
         wireguard_health_targets: config.ping_targets.clone(),
-        ..crate::config::EngineSettings::default()
     };
-    let settings = crate::config::Settings::load_from_config_dir_with_engine_defaults(
-        config_dir,
-        legacy_engine,
-    )
-    .map_err(|error| format!("Failed to resolve engine settings: {error}"))?;
+    let settings = crate::config::Settings::load(config_dir, legacy_engine)
+        .map_err(|error| format!("Failed to resolve engine settings: {error}"))?;
     validate_engine_settings(&settings.engine)?;
     Ok(with_engine_settings(config, settings.engine))
 }
@@ -910,7 +906,6 @@ mod tests {
                 wireguard_handshake_timeout_secs: 8,
                 wireguard_handshake_stale_secs: 99,
                 wireguard_health_targets: vec!["10.0.0.1".into()],
-                ..crate::config::EngineSettings::default()
             },
         );
         assert_eq!(resolved.openvpn_verbosity, "6");

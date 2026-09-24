@@ -889,8 +889,9 @@ pub use runner::{
 /// runtime.
 pub(crate) fn start(config_dir: &Path) -> Option<HookRunner> {
     let started = (|| {
-        let settings = crate::config::Settings::load_from_config_dir(config_dir)
-            .map_err(|error| error.to_string())?;
+        let settings =
+            crate::config::Settings::load(config_dir, crate::config::EngineSettings::default())
+                .map_err(|error| error.to_string())?;
         if settings.hooks.is_empty() {
             return Ok(None);
         }

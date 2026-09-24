@@ -154,7 +154,10 @@ fn main() -> Result<()> {
     // config.toml. Resolve this only after clap/env/sudo-user selection so an
     // old default-path settings file can never silently override
     // `--config-dir` or `VORTIX_CONFIG_DIR`.
-    let settings = match vortix::config::Settings::load_from_config_dir(&config_dir) {
+    let settings = match vortix::config::Settings::load(
+        &config_dir,
+        vortix::config::EngineSettings::default(),
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: failed to load settings ({e}); using defaults");
