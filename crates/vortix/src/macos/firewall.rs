@@ -882,13 +882,7 @@ mod tests {
         );
         let encoded_digest = label.strip_prefix(POLICY_LABEL_PREFIX).unwrap();
         let decoded_digest = URL_SAFE_NO_PAD.decode(encoded_digest).unwrap();
-        let decoded_hex = decoded_digest.iter().fold(
-            String::with_capacity(decoded_digest.len() * 2),
-            |mut encoded, byte| {
-                write!(encoded, "{byte:02x}").unwrap();
-                encoded
-            },
-        );
+        let decoded_hex = crate::core::profile::hex(&decoded_digest);
         assert_eq!(decoded_hex, crate::core::killswitch::policy_digest(&policy));
     }
 

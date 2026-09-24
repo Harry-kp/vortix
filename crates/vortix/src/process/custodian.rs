@@ -6,7 +6,6 @@
 //! exact profile/generation/token capability; it has no policy authority.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -18,7 +17,6 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::core::ids::OperationId;
@@ -846,12 +844,7 @@ fn runtime_dir() -> PathBuf {
 }
 
 fn profile_key(profile_id: &ProfileId) -> String {
-    let digest = Sha256::digest(profile_id.as_str().as_bytes());
-    let mut key = String::with_capacity(24);
-    for byte in digest.iter().take(12) {
-        let _ = write!(key, "{byte:02x}");
-    }
-    key
+    profile_id.digest_key(12)
 }
 
 fn socket_path(identity: &ManagedProcessId) -> PathBuf {

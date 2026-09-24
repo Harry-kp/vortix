@@ -621,19 +621,7 @@ fn read_legacy_sidecar_bytes(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    lower_hex(&Sha256::digest(bytes))
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    bytes.iter().fold(
-        String::with_capacity(bytes.len() * 2),
-        |mut output, byte| {
-            write!(output, "{byte:02x}").expect("writing to String cannot fail");
-            output
-        },
-    )
+    crate::core::profile::hex(&Sha256::digest(bytes))
 }
 
 fn archive_legacy_sidecars(
@@ -1051,7 +1039,7 @@ fn legacy_v1_profile_id(config_path: &Path, display_name: &str) -> std::io::Resu
     hasher.update(display_name.as_bytes());
     hasher.update(b"\0");
     hasher.update(&prefix[..read]);
-    Ok(lower_hex(&hasher.finalize()))
+    Ok(crate::core::profile::hex(&hasher.finalize()))
 }
 
 fn validate_pending_archive(

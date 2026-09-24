@@ -8,15 +8,14 @@ use std::path::{Path, PathBuf};
 
 use super::libproc_ffi::{self, SocketView};
 
-const WIREGUARD_RUN_DIR: &str = "/var/run/wireguard";
-
 /// macOS interface detection using libc + /var/run/wireguard/*.name files.
 pub struct MacInterface;
 
 impl MacInterface {
     #[must_use]
     pub fn resolve_wireguard_interface(name: &str) -> Option<String> {
-        let pid_file = PathBuf::from(WIREGUARD_RUN_DIR).join(format!("{name}.name"));
+        let pid_file =
+            PathBuf::from(crate::constants::WIREGUARD_RUN_DIR).join(format!("{name}.name"));
         if pid_file.exists() {
             Some(
                 std::fs::read_to_string(&pid_file)
@@ -31,7 +30,8 @@ impl MacInterface {
 
     #[must_use]
     pub fn get_wireguard_pid(interface: &str) -> Option<u32> {
-        let sock_path = PathBuf::from(WIREGUARD_RUN_DIR).join(format!("{interface}.sock"));
+        let sock_path =
+            PathBuf::from(crate::constants::WIREGUARD_RUN_DIR).join(format!("{interface}.sock"));
 
         // primary path is libproc — walk every PID's socket
         // FDs and match the bound unix-socket path against `sock_path`.

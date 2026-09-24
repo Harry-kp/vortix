@@ -30,7 +30,8 @@ impl Entry {
     /// blocked resolver cannot stop a connect.
     #[must_use]
     pub fn core_profile(&self) -> Profile {
-        crate::control::tunnels::profile_view(&self.profile)
+        let p = &self.profile;
+        Profile::new(p.id.clone(), &p.name, p.protocol, p.config_path.clone())
             .with_endpoint_resolutions(self.endpoints.clone())
             .require_managed_endpoint_resolution()
     }

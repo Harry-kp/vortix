@@ -582,14 +582,7 @@ impl OvpnTunnel {
     }
 
     fn management_socket_path(&self, profile_id: &str) -> PathBuf {
-        let digest = Sha256::digest(profile_id.as_bytes());
-        let key = digest
-            .iter()
-            .take(16)
-            .fold(String::with_capacity(32), |mut encoded, byte| {
-                let _ = write!(encoded, "{byte:02x}");
-                encoded
-            });
+        let key = crate::core::profile::hex(&Sha256::digest(profile_id.as_bytes())[..16]);
         self.run_dir.join(format!("{key}.mgmt.sock"))
     }
 

@@ -21,7 +21,6 @@ use crate::core::scanner::ActiveSession;
 use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 
-use crate::config::profiles::VpnProfile;
 use crate::core::ports::tunnel::{TunnelError, TunnelStatus};
 use crate::openvpn::OvpnTunnel;
 use crate::wireguard::WgTunnel;
@@ -498,10 +497,4 @@ pub fn tunnel_for_with_wireguard_policy(
             tunnel_for(protocol, config_dir, ovpn_verbosity, connect_timeout_secs)
         }
     }
-}
-
-/// The protocol-facing [`Profile`] for a listed `VpnProfile`.
-#[must_use]
-pub fn profile_view(p: &VpnProfile) -> Profile {
-    Profile::new(p.id.clone(), &p.name, p.protocol, p.config_path.clone())
 }

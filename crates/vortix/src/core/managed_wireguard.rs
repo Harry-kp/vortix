@@ -5,7 +5,6 @@
 //! policy. Lifecycle cleanup still requires protocol ownership plus a fresh
 //! kernel absence observation.
 
-use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -13,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::core::engine::state::ConnectionHealth;
 use crate::core::ports::tunnel::{HandshakeEvidence, ProbeReceipt};
@@ -288,14 +286,7 @@ fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
 }
 
 fn receipt_path(config_dir: &Path, profile_id: &ProfileId) -> PathBuf {
-    let digest = Sha256::digest(profile_id.as_str().as_bytes());
-    let key = digest
-        .iter()
-        .take(16)
-        .fold(String::with_capacity(32), |mut key, byte| {
-            let _ = write!(key, "{byte:02x}");
-            key
-        });
+    let key = profile_id.digest_key(16);
     config_dir.join(DIRECTORY).join(format!("{key}.json"))
 }
 

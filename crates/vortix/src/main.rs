@@ -452,8 +452,8 @@ fn prompt_migration(old_dir: &std::path::Path, new_dir: &std::path::Path) -> std
         match config::migrate_data(old_dir, new_dir) {
             Ok(()) => {
                 // Verify profiles were actually migrated
-                let profiles_exist = new_dir.join("profiles").is_dir()
-                    && std::fs::read_dir(new_dir.join("profiles"))
+                let profiles_exist = new_dir.join(vortix::constants::PROFILES_DIR_NAME).is_dir()
+                    && std::fs::read_dir(new_dir.join(vortix::constants::PROFILES_DIR_NAME))
                         .map(|mut d| d.next().is_some())
                         .unwrap_or(false);
                 if profiles_exist {
@@ -461,7 +461,7 @@ fn prompt_migration(old_dir: &std::path::Path, new_dir: &std::path::Path) -> std
                 } else {
                     eprintln!(
                         "  Warning: Move completed but no profiles found at {}",
-                        new_dir.join("profiles").display()
+                        new_dir.join(vortix::constants::PROFILES_DIR_NAME).display()
                     );
                     eprintln!(
                         "  Check if your profiles are still at {}\n",

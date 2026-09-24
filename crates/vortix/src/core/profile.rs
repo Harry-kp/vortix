@@ -2,7 +2,6 @@
 //!
 //! `Profile` is what a protocol needs to start a tunnel; the richer
 //! `config::profiles::VpnProfile` is what the UI lists.
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
 use std::net::IpAddr;
@@ -93,11 +92,16 @@ impl ProfileId {
     pub fn generate() -> std::io::Result<Self> {
         let mut bytes = [0_u8; Self::HEX_LEN / 2];
         File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        let mut value = String::with_capacity(Self::HEX_LEN);
-        for byte in bytes {
-            let _ = write!(value, "{byte:02x}");
-        }
-        Ok(Self(value))
+        Ok(Self(hex(&bytes)))
+    }
+
+    /// The first `bytes` of SHA-256(id) in hex: a fixed-length,
+    /// filesystem-safe key. Callers' lengths are persisted in file and socket
+    /// names, so never change one.
+    #[must_use]
+    pub fn digest_key(&self, bytes: usize) -> String {
+        use sha2::{Digest as _, Sha256};
+        hex(&Sha256::digest(self.as_str().as_bytes())[..bytes])
     }
 
     #[must_use]
@@ -242,9 +246,30 @@ impl Profile {
     }
 }
 
+/// Lowercase hex encoding.
+#[must_use]
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{unambiguous_legacy_artifact_key, ProfileId};
+    use super::{hex, unambiguous_legacy_artifact_key, ProfileId};
+
+    #[test]
+    fn digest_keys_are_stable_sha256_prefixes() {
+        // Persisted file and socket names depend on these exact strings.
+        let id = ProfileId::new("corp");
+        assert_eq!(id.digest_key(16), "19f4c684a3ff4f2dfa73b8d9098257cf");
+        assert_eq!(id.digest_key(12), "19f4c684a3ff4f2dfa73b8d9");
+        assert_eq!(hex(&[0x00, 0xab, 0xff]), "00abff");
+    }
 
     #[test]
     fn legacy_artifact_keys_are_nonempty_and_unchanged_by_sanitizing() {

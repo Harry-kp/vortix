@@ -590,7 +590,6 @@ pub mod process {
     //!
 
     use std::collections::HashMap;
-    use std::fmt::Write as _;
     use std::fs::File;
     use std::io::Read as _;
     use std::path::PathBuf;
@@ -786,10 +785,7 @@ pub mod process {
         pub fn generate(profile_id: ProfileId) -> std::io::Result<Self> {
             let mut bytes = [0_u8; 32];
             File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-            let mut ownership_token = String::with_capacity(bytes.len() * 2);
-            for byte in bytes {
-                let _ = write!(ownership_token, "{byte:02x}");
-            }
+            let ownership_token = crate::core::profile::hex(&bytes);
             let generation =
                 u64::from_be_bytes(bytes[..8].try_into().expect("fixed-size prefix")).max(1);
             Ok(Self {

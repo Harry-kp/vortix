@@ -423,7 +423,7 @@ use crate::constants;
 use crate::logger::{self, LogLevel};
 use crate::utils;
 use sha2::{Digest, Sha256};
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -504,12 +504,7 @@ fn local_executor_epoch() -> &'static str {
 /// never promote protection truth.
 #[must_use]
 pub fn policy_digest(active: &[ActiveTunnelInfo]) -> String {
-    let digest = policy_digest_bytes(active);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
+    crate::core::profile::hex(&policy_digest_bytes(active))
 }
 
 /// Raw policy digest for platform formats with constrained encodings.

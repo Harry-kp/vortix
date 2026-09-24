@@ -4,7 +4,6 @@
 //! The latter is owner-readable display evidence; this module is a private
 //! root capability used only by the short-lived local canonical authority.
 
-use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -403,14 +402,7 @@ fn profile_wg_quick_interface(profile: &Profile) -> Result<String, StandardOwner
 }
 
 fn record_key(profile_id: &ProfileId) -> String {
-    let digest = Sha256::digest(profile_id.as_str().as_bytes());
-    digest
-        .iter()
-        .take(16)
-        .fold(String::with_capacity(32), |mut key, byte| {
-            let _ = write!(key, "{byte:02x}");
-            key
-        })
+    profile_id.digest_key(16)
 }
 
 fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, StandardOwnershipError> {
@@ -443,12 +435,7 @@ fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, Standa
 }
 
 fn content_identity(contents: &[u8]) -> String {
-    Sha256::digest(contents)
-        .iter()
-        .fold(String::with_capacity(64), |mut value, byte| {
-            let _ = write!(value, "{byte:02x}");
-            value
-        })
+    crate::core::profile::hex(&Sha256::digest(contents))
 }
 
 fn validate_owned_file(

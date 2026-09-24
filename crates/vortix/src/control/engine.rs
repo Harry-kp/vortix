@@ -1006,7 +1006,7 @@ impl Engine {
             return ready;
         };
         let path = &entry.profile.config_path;
-        if entry.core_profile().protocol != ProtocolKind::OpenVpn
+        if entry.profile.protocol != ProtocolKind::OpenVpn
             || !crate::utils::openvpn_config_needs_auth(path)
         {
             return ready;
@@ -1132,7 +1132,7 @@ impl Engine {
             event,
             profile_id: profile_id.clone(),
             display_name: entry.profile.name.clone(),
-            protocol: entry.core_profile().protocol,
+            protocol: entry.profile.protocol,
             occurred_at_millis: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |elapsed| {
