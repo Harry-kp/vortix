@@ -71,31 +71,33 @@ impl Net {
         self.applied.routes.clone_from(&target.routes);
         self.applied.host_routes.clone_from(&target.host_routes);
         let mut first_error = None;
-        let v4_endpoints: Vec<_> = target
-            .host_routes
-            .iter()
-            .filter(|ip| ip.is_ipv4())
-            .collect();
-        if !v4_endpoints.is_empty() {
-            match table::default_gateway() {
+        for v4 in [true, false] {
+            let endpoints: Vec<_> = target
+                .host_routes
+                .iter()
+                .filter(|ip| ip.is_ipv4() == v4)
+                .collect();
+            if endpoints.is_empty() {
+                continue;
+            }
+            match table::default_gateway(v4) {
                 Some(gateway) => {
-                    for endpoint in v4_endpoints {
+                    for endpoint in endpoints {
                         if let Err(error) = table::bind_host_route(*endpoint, &gateway) {
                             first_error.get_or_insert(error);
                         }
                     }
                 }
-                None => {
+                None if v4 => {
                     first_error.get_or_insert(
                         "no physical default gateway to pin the VPN server route to".into(),
                     );
                 }
+                // No IPv6 uplink: the server cannot be reached over IPv6 anyway.
+                None => {
+                    tracing::warn!(target: "vortix::net", "no physical IPv6 gateway; IPv6 server routes not pinned");
+                }
             }
-        }
-        for endpoint in target.host_routes.iter().filter(|ip| ip.is_ipv6()) {
-            // ponytail: only the IPv4 default gateway is read; pinning an
-            // IPv6 server needs its IPv6 gateway (#308).
-            tracing::warn!(target: "vortix::net", %endpoint, "IPv6 server route not pinned");
         }
         for (cidr, interface) in &target.routes {
             if !Self::routes_through(target, *cidr, interface) {
