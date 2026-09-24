@@ -1499,16 +1499,7 @@ fn body_has_generation(body: &str, generation: u64) -> bool {
 /// Try to get DNS from `/etc/resolv.conf`.
 fn try_resolv_conf() -> Option<String> {
     let content = std::fs::read_to_string(RESOLV_CONF_PATH).ok()?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("nameserver") {
-            let dns = rest.trim().to_string();
-            if !dns.is_empty() {
-                return Some(dns);
-            }
-        }
-    }
-    None
+    crate::control::dns::parse_resolv_conf_server(&content)
 }
 
 /// Read the primary nameserver from `State:/Network/Global/DNS`.
