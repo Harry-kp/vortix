@@ -136,7 +136,11 @@ impl Engine {
         }
 
         let mut engine = Self {
-            net: Net::new(config.config_dir.clone(), NetworkPlan::default()),
+            net: Net::new(
+                config.config_dir.clone(),
+                NetworkPlan::default(),
+                Arc::clone(&ownership),
+            ),
             hooks: start_hooks(&config.config_dir),
             health: BTreeMap::new(),
             config,
@@ -170,6 +174,7 @@ impl Engine {
         engine.net = Net::new(
             engine.config.config_dir.clone(),
             plan(&engine.state.plan_input()),
+            Arc::clone(&engine.ownership),
         );
         engine.scan = Some(scan);
         engine.reconcile();

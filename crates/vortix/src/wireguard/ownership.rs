@@ -23,6 +23,8 @@ const SCHEMA_VERSION: u8 = 1;
 const MAX_LEDGER_BYTES: u64 = 128 * 1024;
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_RUNTIME_DIR: &str = "/var/run/vortix-standard-tunnel-ownership";
+/// Routes, server pins and DNS resources the last run applied.
+const HOST_STATE_FILE: &str = "host-state.json";
 
 #[derive(Debug, Error)]
 pub enum OwnershipError {
@@ -290,9 +292,30 @@ impl TunnelOwnershipStore {
         Ok(())
     }
 
+    /// Record what the host carries, root-owned and cleared by a reboot.
+    pub fn save_host_state(&self, bytes: &[u8]) -> Result<(), OwnershipError> {
+        self.atomic_write_path(&self.root.join(HOST_STATE_FILE), bytes)
+    }
+
+    /// What the last run recorded, if the record is present and root-owned.
+    #[must_use]
+    pub fn load_host_state(&self) -> Option<Vec<u8>> {
+        self.ensure_root().ok()?;
+        self.read_private(&self.root.join(HOST_STATE_FILE)).ok()
+    }
+
     fn load(&self, profile_id: &ProfileId) -> Result<WireGuardOwnershipRecord, OwnershipError> {
         self.ensure_root()?;
-        let path = self.record_path(profile_id);
+        let bytes = self.read_private(&self.record_path(profile_id))?;
+        let record: WireGuardOwnershipRecord =
+            serde_json::from_slice(&bytes).map_err(|_| OwnershipError::Malformed)?;
+        if record.schema_version != SCHEMA_VERSION || record.profile_id != profile_id.as_str() {
+            return Err(OwnershipError::Stale);
+        }
+        Ok(record)
+    }
+
+    fn read_private(&self, path: &Path) -> Result<Vec<u8>, OwnershipError> {
         let mut options = OpenOptions::new();
         options.read(true);
         {
@@ -314,12 +337,7 @@ impl TunnelOwnershipStore {
         if bytes.len() as u64 > MAX_LEDGER_BYTES {
             return Err(OwnershipError::Capacity);
         }
-        let record: WireGuardOwnershipRecord =
-            serde_json::from_slice(&bytes).map_err(|_| OwnershipError::Malformed)?;
-        if record.schema_version != SCHEMA_VERSION || record.profile_id != profile_id.as_str() {
-            return Err(OwnershipError::Stale);
-        }
-        Ok(record)
+        Ok(bytes)
     }
 
     fn atomic_write_path(&self, final_path: &Path, bytes: &[u8]) -> Result<(), OwnershipError> {
@@ -549,6 +567,16 @@ mod tests {
         assert!(store
             .remove_after_confirmed_absence(&profile.id, &[])
             .unwrap());
+    }
+
+    #[test]
+    fn host_state_round_trips_in_the_private_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            TunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a").unwrap();
+        assert!(store.load_host_state().is_none());
+        store.save_host_state(b"{\"routes\":[]}").unwrap();
+        assert_eq!(store.load_host_state().unwrap(), b"{\"routes\":[]}");
     }
 
     #[test]

@@ -268,6 +268,14 @@ impl DnsPolicyCoordinator {
         self.invalidate_effective("persisted DNS state requires platform read-back");
     }
 
+    /// Re-adopt resources a root-owned record says an earlier run created, so
+    /// the next reconcile releases whichever the new policy does not want.
+    pub fn restore_owned(&mut self, owned: Vec<DnsOwnedResource>) {
+        if self.effective.owned.is_empty() {
+            self.effective.owned = owned;
+        }
+    }
+
     /// Force a read-only platform proof on the next unchanged reconcile.
     pub fn invalidate_verification(&mut self) {
         self.clear_verification();
@@ -779,5 +787,49 @@ mod tests {
             loaded.effective().status,
             crate::control::dns::DnsEffectiveStatus::Degraded
         );
+    }
+
+    /// A resolver left by a tunnel that died while no Vortix ran is released
+    /// only if its record survives the restart; the user-owned receipt's
+    /// claims are dropped at load, so the root-owned copy is restored.
+    #[test]
+    fn restored_ownership_reaches_the_adapter_for_release() {
+        struct Capture(std::cell::RefCell<Vec<DnsOwnedResource>>);
+        impl DnsPolicyAdapter for Capture {
+            fn capabilities(&self) -> DnsPlatformCapabilities {
+                DnsPlatformCapabilities {
+                    scoped_domains: true,
+                }
+            }
+            fn apply(
+                &self,
+                desired: &DnsPolicy,
+                _: Option<&DnsPolicy>,
+                previous: &DnsEffectiveState,
+            ) -> DnsEffectiveState {
+                self.0.borrow_mut().extend(previous.owned.iter().cloned());
+                DnsEffectiveState {
+                    requested_generation: desired.generation,
+                    applied_generation: Some(desired.generation),
+                    status: DnsEffectiveStatus::Released,
+                    ..DnsEffectiveState::default()
+                }
+            }
+            fn verify(&self, _: &DnsPolicy, _: &DnsEffectiveState) -> Result<(), Vec<String>> {
+                Ok(())
+            }
+        }
+        let stale = DnsOwnedResource {
+            generation: 4,
+            id: "macos:/etc/resolver/corp.example".into(),
+            profile_id: ProfileId::new("gone"),
+            interface: "utun9".into(),
+        };
+        let mut coordinator = DnsPolicyCoordinator::default();
+        coordinator.discard_persisted_authority();
+        coordinator.restore_owned(vec![stale.clone()]);
+        let adapter = Capture(std::cell::RefCell::new(Vec::new()));
+        coordinator.reconcile(&[], &adapter).unwrap();
+        assert_eq!(adapter.0.into_inner(), vec![stale]);
     }
 }

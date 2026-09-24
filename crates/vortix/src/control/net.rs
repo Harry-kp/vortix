@@ -1,11 +1,18 @@
 //! The one place that changes the host network: moves routes, DNS and the
 //! firewall from the last applied plan to the next one.
 
+use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::control::dns::{DnsEffectiveStatus, DnsPolicyCoordinator};
+use serde::{Deserialize, Serialize};
+
+use crate::cidr::Cidr;
+use crate::control::dns::{DnsEffectiveStatus, DnsOwnedResource, DnsPolicyCoordinator};
 use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::platform::DefaultRouteObservation;
+use crate::wireguard::ownership::TunnelOwnershipStore;
 
 use super::plan::{Firewall, NetworkPlan};
 
@@ -15,23 +22,78 @@ pub struct Net {
     /// Mode last saved with the firewall; `None` until the first apply.
     saved_mode: Option<KillSwitchMode>,
     dns: DnsPolicyCoordinator,
+    store: Arc<TunnelOwnershipStore>,
+}
+
+/// What an earlier run left on the host, kept root-owned so a tunnel that
+/// died while no Vortix ran is still cleaned up on the next start.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HostState {
+    routes: Vec<(Cidr, String)>,
+    host_routes: BTreeSet<IpAddr>,
+    dns: Vec<DnsOwnedResource>,
 }
 
 impl Net {
-    /// `applied` is what the host already carries, e.g. for adopted tunnels.
+    /// `applied` is what the host carries for adopted tunnels; whatever the
+    /// last run recorded beyond it is added so the first apply removes it.
     #[must_use]
-    pub fn new(config_dir: PathBuf, applied: NetworkPlan) -> Self {
+    pub fn new(
+        config_dir: PathBuf,
+        mut applied: NetworkPlan,
+        store: Arc<TunnelOwnershipStore>,
+    ) -> Self {
+        let mut dns = crate::control::dns::load_policy(&config_dir).unwrap_or_default();
+        let recorded = store
+            .load_host_state()
+            .and_then(|bytes| serde_json::from_slice::<HostState>(&bytes).ok())
+            .unwrap_or_default();
+        for (cidr, interface) in recorded.routes {
+            applied.routes.entry(cidr).or_insert(interface);
+        }
+        applied.host_routes.extend(recorded.host_routes);
+        dns.restore_owned(recorded.dns);
         Self {
-            dns: crate::control::dns::load_policy(&config_dir).unwrap_or_default(),
+            dns,
             config_dir,
             applied,
             saved_mode: None,
+            store,
+        }
+    }
+
+    fn record_host_state(&self) {
+        let state = HostState {
+            routes: self
+                .applied
+                .routes
+                .iter()
+                .map(|(cidr, interface)| (*cidr, interface.clone()))
+                .collect(),
+            host_routes: self.applied.host_routes.clone(),
+            dns: self.dns.effective().owned.clone(),
+        };
+        let saved = serde_json::to_vec(&state)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                self.store
+                    .save_host_state(&bytes)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = saved {
+            tracing::warn!(target: "vortix::net", %error, "could not record applied host state");
         }
     }
 
     /// Move the host to `target`. Idempotent: after a failure the next call
     /// retries whatever is still missing.
     pub fn apply(&mut self, target: &NetworkPlan, mode: KillSwitchMode) -> Result<(), String> {
+        let result = self.apply_all(target, mode);
+        self.record_host_state();
+        result
+    }
+
+    fn apply_all(&mut self, target: &NetworkPlan, mode: KillSwitchMode) -> Result<(), String> {
         let tightening = matches!(target.firewall, Firewall::Block(_));
         if tightening {
             self.apply_firewall(target, mode)?;
@@ -43,11 +105,6 @@ impl Net {
         }
         self.applied = target.clone();
         Self::verify_routes(target)
-    }
-
-    /// Put the host back as it was before Vortix touched it.
-    pub fn release(&mut self) -> Result<(), String> {
-        self.apply(&NetworkPlan::default(), KillSwitchMode::Off)
     }
 
     fn apply_routes(&mut self, target: &NetworkPlan) -> Result<(), String> {
