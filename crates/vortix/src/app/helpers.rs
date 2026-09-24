@@ -29,7 +29,7 @@ impl App {
     /// mean nothing to the reader.
     pub(crate) fn profile_display_name(
         &self,
-        profile_id: &crate::vortix_core::profile::ProfileId,
+        profile_id: &crate::core::profile::ProfileId,
     ) -> String {
         self.runtime
             .profiles
@@ -42,7 +42,7 @@ impl App {
     }
 
     pub fn legacy_state(&self) -> crate::vpn_runtime::ConnectionState {
-        use crate::vortix_core::engine::state::Connection;
+        use crate::core::engine::state::Connection;
         use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
 
         let snap = self
@@ -147,7 +147,7 @@ impl App {
     }
 
     pub(crate) fn has_active_connection(&self) -> bool {
-        use crate::vortix_core::engine::state::Connection;
+        use crate::core::engine::state::Connection;
         self.registry
             .snapshot_all()
             .iter()
@@ -182,7 +182,7 @@ impl App {
     /// `AwaitingUserInput`, and any other in-flight states.
     #[must_use]
     pub(crate) fn active_tunnel_count(&self) -> usize {
-        use crate::vortix_core::engine::state::Connection;
+        use crate::core::engine::state::Connection;
         self.registry
             .snapshot_all()
             .iter()
@@ -195,7 +195,7 @@ impl App {
     pub(crate) fn profile_id_for_name(
         &self,
         display_name: &str,
-    ) -> Option<crate::vortix_core::profile::ProfileId> {
+    ) -> Option<crate::core::profile::ProfileId> {
         self.runtime
             .profiles
             .iter()
@@ -210,7 +210,7 @@ impl App {
     /// tunnel.
     #[must_use]
     pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
-        use crate::vortix_core::engine::state::Connection;
+        use crate::core::engine::state::Connection;
         self.profile_id_for_name(profile_name)
             .and_then(|id| self.registry.snapshot(&id))
             .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected { .. }))
@@ -220,7 +220,7 @@ impl App {
     /// Used by the `c` cancel keybinding ().
     #[must_use]
     pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
-        use crate::vortix_core::engine::state::Connection;
+        use crate::core::engine::state::Connection;
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };

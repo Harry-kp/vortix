@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Instant, SystemTime};
 
-use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::engine::{classify_route_conflict, Conflict};
-use crate::vortix_core::ports::dns::DnsRequest;
-use crate::vortix_core::profile::{ProfileId, ProtocolKind};
-use crate::vortix_core::state::killswitch::KillSwitchMode;
+use crate::core::cidr::Cidr;
+use crate::core::engine::{classify_route_conflict, Conflict};
+use crate::core::ports::dns::DnsRequest;
+use crate::core::profile::{ProfileId, ProtocolKind};
+use crate::core::state::killswitch::KillSwitchMode;
 
 use super::plan::{LiveTunnel, PlanInput};
 

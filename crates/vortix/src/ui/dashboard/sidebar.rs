@@ -50,9 +50,9 @@
 //! the `fixed_cols` arithmetic above.
 
 use crate::app::App;
-use crate::vortix_core::engine::state::Connection;
-use crate::vortix_core::engine::{Role, TunnelSnapshot};
-use crate::vortix_core::profile::ProfileId;
+use crate::core::engine::state::Connection;
+use crate::core::engine::{Role, TunnelSnapshot};
+use crate::core::profile::ProfileId;
 use crate::{theme, utils};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
@@ -130,7 +130,7 @@ fn has_risk_annotation(snapshot: &TunnelSnapshot) -> bool {
     matches!(snapshot.role, Role::AddressableSuppressed { .. })
         || matches!(
             snapshot.health,
-            crate::vortix_core::engine::state::ConnectionHealth::Degraded { .. }
+            crate::core::engine::state::ConnectionHealth::Degraded { .. }
         )
 }
 
@@ -451,11 +451,11 @@ mod tests {
     //! Earlier smoke tests (empty-state, row rendering) remain.
     use super::*;
     use crate::app::App;
+    use crate::core::cidr::Cidr;
+    use crate::core::engine::registry::Role;
+    use crate::core::engine::state::ConnectionHealth;
+    use crate::core::profile::ProfileId;
     use crate::state::{Protocol, VpnProfile};
-    use crate::vortix_core::cidr::Cidr;
-    use crate::vortix_core::engine::registry::Role;
-    use crate::vortix_core::engine::state::ConnectionHealth;
-    use crate::vortix_core::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -464,7 +464,7 @@ mod tests {
 
     fn make_profile(name: &str) -> VpnProfile {
         VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(name),
+            id: crate::core::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: Protocol::WireGuard,
             location: String::new(),
@@ -750,7 +750,7 @@ mod tests {
 
     #[test]
     fn disconnected_with_failure_renders_x_glyph_error() {
-        use crate::vortix_core::engine::state::FailureReason;
+        use crate::core::engine::state::FailureReason;
         let snap = TunnelSnapshot {
             profile_id: ProfileId::new("vpn1"),
             state: Connection::Disconnected {

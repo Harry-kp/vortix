@@ -35,7 +35,7 @@ fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
     {
         add_profiles(app, &[name]);
     }
-    let profile_id = crate::vortix_core::profile::ProfileId::new(name);
+    let profile_id = crate::core::profile::ProfileId::new(name);
     let mut snapshot = (*app.control_snapshot).clone();
     snapshot
         .tunnels
@@ -48,7 +48,7 @@ fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
         since: std::time::SystemTime::UNIX_EPOCH,
         routes: Vec::new(),
         dns: Vec::new(),
-        details: crate::vortix_core::engine::state::DetailedConnectionInfo {
+        details: crate::core::engine::state::DetailedConnectionInfo {
             interface: "wg0".to_owned(),
             interface_authoritative: true,
             pid: Some(12_345),
@@ -117,7 +117,7 @@ fn set_connecting(app: &mut App, name: &str) {
 fn add_profiles(app: &mut App, names: &[&str]) {
     for name in names {
         app.runtime.profiles.push(VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(*name),
+            id: crate::core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -129,23 +129,23 @@ fn add_profiles(app: &mut App, names: &[&str]) {
 
 fn add_stored_profile(
     app: &mut App,
-    store: &crate::vortix_config::profile_store::FsProfileStore,
+    store: &crate::config::profile_store::FsProfileStore,
     directory: &std::path::Path,
     name: &str,
-) -> crate::vortix_core::profile::ProfileId {
+) -> crate::core::profile::ProfileId {
     static NEXT_TEST_PROFILE_ID: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(1);
     let sequence = NEXT_TEST_PROFILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let profile_id = crate::vortix_core::profile::ProfileId::parse(format!("{sequence:064x}"))
+    let profile_id = crate::core::profile::ProfileId::parse(format!("{sequence:064x}"))
         .expect("test profile ID must be valid");
     let config_path = directory.join(format!("{name}.conf"));
-    let profile = crate::vortix_core::profile::Profile::new(
+    let profile = crate::core::profile::Profile::new(
         profile_id.clone(),
         name,
-        crate::vortix_core::profile::ProtocolKind::WireGuard,
+        crate::core::profile::ProtocolKind::WireGuard,
         config_path.clone(),
     );
-    crate::vortix_config::profile_store::ProfileStore::insert(store, &profile, b"dummy").unwrap();
+    crate::config::profile_store::ProfileStore::insert(store, &profile, b"dummy").unwrap();
     app.runtime.profiles.push(VpnProfile {
         id: profile_id.clone(),
         name: name.to_string(),
@@ -162,7 +162,7 @@ fn add_stored_profile(
 fn takeover_overlay(to: &str) -> InputMode {
     InputMode::ConfirmDefaultRouteTakeover {
         from: "vpn-a".to_string(),
-        to_profile_id: crate::vortix_core::profile::ProfileId::new(to),
+        to_profile_id: crate::core::profile::ProfileId::new(to),
         to_name: to.to_string(),
         confirm_selected: true,
     }
@@ -242,7 +242,7 @@ fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::vortix_core::profile::ProfileId::new("mfa"),
+        profile_id: crate::core::profile::ProfileId::new("mfa"),
         profile_name: "mfa".to_string(),
         username: String::new().into(),
         username_cursor: 0,
@@ -280,7 +280,7 @@ fn test_auth_field_switching() {
 
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::vortix_core::profile::ProfileId::new("test"),
+        profile_id: crate::core::profile::ProfileId::new("test"),
         profile_name: "test".to_string(),
         username: String::new().into(),
         username_cursor: 0,
@@ -613,7 +613,7 @@ fn test_open_config_caches_content_and_close_clears() {
     let tmp = tempfile::Builder::new().suffix(".conf").tempfile().unwrap();
     std::fs::write(tmp.path(), "[Interface]\nAddress = 10.0.0.1/24").unwrap();
     app.runtime.profiles.push(VpnProfile {
-        id: crate::vortix_core::profile::ProfileId::new("test-vpn"),
+        id: crate::core::profile::ProfileId::new("test-vpn"),
         name: "test-vpn".to_string(),
         protocol: Protocol::WireGuard,
         config_path: tmp.path().to_path_buf(),
@@ -1054,15 +1054,15 @@ fn test_rename_updates_last_connected_profile() {
     let mut app = test_app();
     let dir = tempfile::tempdir().unwrap();
     let conf_path = dir.path().join("old-name.conf");
-    let stable_id = crate::vortix_core::profile::ProfileId::parse("22".repeat(32)).unwrap();
-    let stored = crate::vortix_core::profile::Profile::new(
+    let stable_id = crate::core::profile::ProfileId::parse("22".repeat(32)).unwrap();
+    let stored = crate::core::profile::Profile::new(
         stable_id.clone(),
         "old-name",
-        crate::vortix_core::profile::ProtocolKind::WireGuard,
+        crate::core::profile::ProtocolKind::WireGuard,
         conf_path.clone(),
     );
-    crate::vortix_config::profile_store::ProfileStore::insert(
-        &crate::vortix_config::profile_store::FsProfileStore::new(dir.path().to_path_buf()),
+    crate::config::profile_store::ProfileStore::insert(
+        &crate::config::profile_store::FsProfileStore::new(dir.path().to_path_buf()),
         &stored,
         b"dummy",
     )
@@ -1090,8 +1090,7 @@ fn test_rename_updates_last_connected_profile() {
 fn rename_dialog_keeps_its_profile_when_background_sorting_reorders_the_list() {
     let mut app = test_app();
     let directory = tempfile::tempdir().unwrap();
-    let store =
-        crate::vortix_config::profile_store::FsProfileStore::new(directory.path().to_path_buf());
+    let store = crate::config::profile_store::FsProfileStore::new(directory.path().to_path_buf());
     let target_id = add_stored_profile(&mut app, &store, directory.path(), "target");
     let other_id = add_stored_profile(&mut app, &store, directory.path(), "other");
     app.profile_list_state.select(Some(0));
@@ -1127,8 +1126,7 @@ fn rename_dialog_keeps_its_profile_when_background_sorting_reorders_the_list() {
 fn delete_dialog_keeps_its_profile_when_background_sorting_reorders_the_list() {
     let mut app = test_app();
     let directory = tempfile::tempdir().unwrap();
-    let store =
-        crate::vortix_config::profile_store::FsProfileStore::new(directory.path().to_path_buf());
+    let store = crate::config::profile_store::FsProfileStore::new(directory.path().to_path_buf());
     let target_id = add_stored_profile(&mut app, &store, directory.path(), "target-delete");
     let other_id = add_stored_profile(&mut app, &store, directory.path(), "other-delete");
     app.profile_list_state.select(Some(0));
@@ -1166,7 +1164,7 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
     let conf_path = dir.path().join("active-vpn.conf");
     std::fs::write(&conf_path, "dummy").unwrap();
     app.runtime.profiles.push(VpnProfile {
-        id: crate::vortix_core::profile::ProfileId::new("active-vpn"),
+        id: crate::core::profile::ProfileId::new("active-vpn"),
         name: "active-vpn".to_string(),
         protocol: Protocol::WireGuard,
         config_path: conf_path,
@@ -1555,10 +1553,10 @@ fn sidebar_d_on_inactive_row_never_disconnects_another_tunnel() {
     assert!(app.toast.is_none(), "inactive-row d must be a quiet no-op");
     assert!(matches!(
         app.registry
-            .snapshot(&crate::vortix_core::profile::ProfileId::new("active"))
+            .snapshot(&crate::core::profile::ProfileId::new("active"))
             .unwrap()
             .state,
-        crate::vortix_core::engine::state::Connection::Connected { .. }
+        crate::core::engine::state::Connection::Connected { .. }
     ));
 }
 
@@ -2069,7 +2067,7 @@ fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
 
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::vortix_core::profile::ProfileId::new("reveal-profile"),
+        profile_id: crate::core::profile::ProfileId::new("reveal-profile"),
         profile_name: "reveal".into(),
         username: "vortix".into(),
         username_cursor: 6,
@@ -2159,16 +2157,16 @@ fn test_auth_delete_profile_cleans_auth_file() {
         .unwrap();
     let profiles_dir = tmp.path().join(crate::constants::PROFILES_DIR_NAME);
     std::fs::create_dir(&profiles_dir).unwrap();
-    let stable_id = crate::vortix_core::profile::ProfileId::parse("11".repeat(32)).unwrap();
+    let stable_id = crate::core::profile::ProfileId::parse("11".repeat(32)).unwrap();
     let config_path = profiles_dir.join("del-vpn.ovpn");
-    let stored = crate::vortix_core::profile::Profile::new(
+    let stored = crate::core::profile::Profile::new(
         stable_id.clone(),
         "del-vpn",
-        crate::vortix_core::profile::ProtocolKind::OpenVpn,
+        crate::core::profile::ProtocolKind::OpenVpn,
         config_path.clone(),
     );
-    crate::vortix_config::profile_store::ProfileStore::insert(
-        &crate::vortix_config::profile_store::FsProfileStore::new(profiles_dir),
+    crate::config::profile_store::ProfileStore::insert(
+        &crate::config::profile_store::FsProfileStore::new(profiles_dir),
         &stored,
         b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
     )
@@ -2183,16 +2181,14 @@ fn test_auth_delete_profile_cleans_auth_file() {
     });
     app.runtime.config_dir = tmp.path().to_path_buf();
     let (uid, gid) = crate::config::config_owner(tmp.path()).unwrap();
-    let store =
-        crate::vortix_config::openvpn_credentials::FsOpenVpnCredentialStore::for_standard_owner(
-            tmp.path(),
-            uid,
-            gid,
-        );
-    let credentials = crate::vortix_config::openvpn_credentials::RememberedOpenVpnCredentials::new(
-        "user", "pass",
-    )
-    .unwrap();
+    let store = crate::config::openvpn_credentials::FsOpenVpnCredentialStore::for_standard_owner(
+        tmp.path(),
+        uid,
+        gid,
+    );
+    let credentials =
+        crate::config::openvpn_credentials::RememberedOpenVpnCredentials::new("user", "pass")
+            .unwrap();
     store.replace(&stable_id, &credentials).unwrap();
 
     app.confirm_delete_profile(&stable_id);
@@ -2204,8 +2200,8 @@ fn test_auth_delete_profile_cleans_auth_file() {
 #[test]
 fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
     use crate::app::{focused_tunnel_action, FocusedTunnelAction};
-    use crate::vortix_core::engine::state::{Connection, ConnectionHealth, PromptKind};
-    use crate::vortix_core::profile::ProfileId;
+    use crate::core::engine::state::{Connection, ConnectionHealth, PromptKind};
+    use crate::core::profile::ProfileId;
     use std::time::{Duration, SystemTime};
 
     let profile_id = ProfileId::new("focused");
@@ -2261,7 +2257,7 @@ fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
 
 #[test]
 fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
-    use crate::vortix_core::engine::Connection;
+    use crate::core::engine::Connection;
     use std::sync::mpsc;
 
     let mut app = test_app();
@@ -2272,7 +2268,7 @@ fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
         .try_recv()
         .expect("initial connection must refresh egress telemetry");
 
-    let profile_id = crate::vortix_core::profile::ProfileId::new("primary");
+    let profile_id = crate::core::profile::ProfileId::new("primary");
     let edit = |app: &App, change: &dyn Fn(&mut crate::control::Snapshot)| {
         let mut next = (*app.control_snapshot).clone();
         change(&mut next);

@@ -11,7 +11,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::vortix_process::{self, CommandSpec};
+use crate::process::{self, CommandSpec};
 
 /// Semantic version of an installed `openvpn` binary, as reported by
 /// `openvpn --version`. Used by `check_dependencies` to assert the
@@ -113,7 +113,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
     // xtask:allow-protocol-leak: dependency-version probe runs before any tunnel exists; pre-flight gate
-    let version_output = vortix_process::run_to_output(
+    let version_output = process::run_to_output(
         CommandSpec::oneshot("openvpn", vec!["--version".into()]).timeout(PROBE_TIMEOUT),
     );
     if let Ok(out) = version_output {
@@ -128,7 +128,7 @@ fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
     }
 
     // xtask:allow-protocol-leak: dependency-feature probe runs before any tunnel exists; pre-flight gate
-    let help_output = vortix_process::run_to_output(
+    let help_output = process::run_to_output(
         CommandSpec::oneshot("openvpn", vec!["--help".into()]).timeout(PROBE_TIMEOUT),
     );
     if let Ok(out) = help_output {

@@ -8,7 +8,7 @@
 //! retired the legacy
 //! `state::ConnectionState` enum. UI panels read active tunnel state
 //! from `crate::app::App::registry` (a
-//! `crate::vortix_core::engine::TunnelRegistry`); the legacy mirror that
+//! `crate::core::engine::TunnelRegistry`); the legacy mirror that
 //! the connect/disconnect flow still drives lives at
 //! `crate::vpn_runtime::ConnectionState` (not re-exported here).
 

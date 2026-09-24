@@ -7,7 +7,7 @@
 //! Privacy-by-design: only collects non-identifying data. Never touches IPs,
 //! server endpoints, profile names, credentials, DNS servers, or log contents.
 
-use crate::vortix_process::CommandSpec;
+use crate::process::CommandSpec;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::Path;
@@ -368,8 +368,7 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
 
     // wg-quick --version exits non-zero on some systems; try to get version anyway
     let owned_args: Vec<String> = version_args.iter().map(|s| (*s).to_string()).collect();
-    let version = match crate::vortix_process::run_to_output(CommandSpec::oneshot(name, owned_args))
-    {
+    let version = match crate::process::run_to_output(CommandSpec::oneshot(name, owned_args)) {
         Ok(output) => {
             let raw = if output.stdout.is_empty() {
                 String::from_utf8_lossy(&output.stderr).to_string()
@@ -589,7 +588,7 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
 
     // Diagnostic Journal — surface the JSONL session path
     // and the in-memory tail so triagers can replay locally.
-    if let Some(journal) = crate::vortix_core::journal::global_journal() {
+    if let Some(journal) = crate::core::journal::global_journal() {
         let _ = writeln!(body, "## Diagnostic Journal\n");
         let _ = writeln!(body, "```");
         if let Some(path) = &journal.session_path {
@@ -706,7 +705,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 /// Pipe `text` to a command's stdin.
 fn pipe_to_command(cmd: &str, text: &str) -> Option<()> {
-    let output = crate::vortix_process::run_to_output(
+    let output = crate::process::run_to_output(
         CommandSpec::oneshot(cmd, vec![]).stdin(text.as_bytes().to_vec()),
     )
     .ok()?;

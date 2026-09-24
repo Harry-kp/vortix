@@ -14,8 +14,8 @@ use vortix::cli::output::OutputMode;
 fn cli_import_single_file() {
     use vortix::cli::args::Commands;
     use vortix::cli::commands::handle_command;
-    use vortix::vortix_config::profile_store::FsProfileStore;
-    use vortix::vortix_config::ProfileStore as _;
+    use vortix::config::profile_store::FsProfileStore;
+    use vortix::config::ProfileStore as _;
 
     let dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();

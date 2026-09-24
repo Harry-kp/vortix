@@ -2,7 +2,7 @@
 //! type of `App::legacy_state()`.
 //!
 //! After plan P5d the canonical source of truth for active VPN state on
-//! the App side is the [`crate::vortix_core::engine::TunnelRegistry`] that
+//! the App side is the [`crate::core::engine::TunnelRegistry`] that
 //! lives on [`crate::app::App`]. The `connection_state` field on
 //! `VpnRuntime` is gone; every panel renderer reads `app.registry`
 //! snapshots directly.
@@ -20,13 +20,13 @@ use std::time::Instant;
 /// The canonical tunnel details. This module used to carry its own copy with
 /// the same field names and types, and a hand-written copy in `app/helpers.rs`
 /// moved values between the two.
-pub use crate::vortix_core::engine::state::DetailedConnectionInfo;
+pub use crate::core::engine::state::DetailedConnectionInfo;
 
 /// VPN connection state machine (legacy single-tunnel mirror).
 ///
 /// A follow-up will retire this in favour of the per-tunnel
-/// [`crate::vortix_core::engine::state::Connection`] FSM owned by
-/// [`crate::vortix_core::engine::TunnelRegistry`].
+/// [`crate::core::engine::state::Connection`] FSM owned by
+/// [`crate::core::engine::TunnelRegistry`].
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum ConnectionState {
     /// No active VPN connection.

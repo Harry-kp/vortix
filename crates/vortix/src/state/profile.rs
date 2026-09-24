@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::vortix_core::profile::ProfileId;
+use crate::core::profile::ProfileId;
 
 /// Supported VPN protocol types.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]

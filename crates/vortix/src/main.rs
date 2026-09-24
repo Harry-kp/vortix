@@ -10,7 +10,7 @@ fn main() -> Result<()> {
     // Private Standard-mode lifecycle actor. Handle this before error hooks,
     // configuration migration, argument parsing, or any user-facing startup
     // work: the custodian has exactly one child and only status/stop IPC.
-    if let Some(exit_code) = vortix::vortix_process::custodian::maybe_run_hidden_entrypoint() {
+    if let Some(exit_code) = vortix::process::custodian::maybe_run_hidden_entrypoint() {
         std::process::exit(exit_code);
     }
 
@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     // toggles so production startup is silent; `RUST_LOG=vortix::process=info`
     // surfaces every subprocess invocation as a structured event.
     init_tracing();
-    vortix::vortix_process::set_global_runner(vortix::vortix_process::CommandRunner::real());
+    vortix::process::set_global_runner(vortix::process::CommandRunner::real());
 
     // Platform aggregate. Detect the OS variants once at startup;
     // consumers reach for `crate::platform::current_platform()` instead of
@@ -160,36 +160,34 @@ fn main() -> Result<()> {
     // config.toml. Resolve this only after clap/env/sudo-user selection so an
     // old default-path settings file can never silently override
     // `--config-dir` or `VORTIX_CONFIG_DIR`.
-    let settings = match vortix::vortix_config::Settings::load_from_config_dir(&config_dir) {
+    let settings = match vortix::config::Settings::load_from_config_dir(&config_dir) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: failed to load settings ({e}); using defaults");
-            vortix::vortix_config::Settings::default()
+            vortix::config::Settings::default()
         }
     };
 
     // Journal — open the per-session JSONL writer using the runner's own
     // tokio runtime after the authoritative settings path is known.
-    let runtime_handle = vortix::vortix_process::global_runner()
+    let runtime_handle = vortix::process::global_runner()
         .as_real()
         .map(|r| r.runtime().handle().clone());
     if let Some(handle) = runtime_handle.clone() {
         let _guard = handle.enter();
-        match vortix::vortix_core::journal::Journal::open(
-            vortix::vortix_core::journal::JournalConfig {
-                disk: settings.journal.disk,
-                retention_days: settings.journal.retention_days,
-                retention_count: settings.journal.retention_count,
-                // The default resolves the XDG data dir from $HOME, which is
-                // /root under sudo, so session journals landed outside the
-                // user's home where they could neither find nor prune them.
-                // Keep them beside the logs, in the sudo-aware config dir.
-                journal_dir: Some(config_dir.join("sessions")),
-                ..Default::default()
-            },
-        ) {
+        match vortix::core::journal::Journal::open(vortix::core::journal::JournalConfig {
+            disk: settings.journal.disk,
+            retention_days: settings.journal.retention_days,
+            retention_count: settings.journal.retention_count,
+            // The default resolves the XDG data dir from $HOME, which is
+            // /root under sudo, so session journals landed outside the
+            // user's home where they could neither find nor prune them.
+            // Keep them beside the logs, in the sudo-aware config dir.
+            journal_dir: Some(config_dir.join("sessions")),
+            ..Default::default()
+        }) {
             Ok(journal) => {
-                vortix::vortix_core::journal::set_global_journal(journal);
+                vortix::core::journal::set_global_journal(journal);
             }
             Err(e) => {
                 eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
@@ -249,7 +247,7 @@ fn main() -> Result<()> {
     if std::env::var_os("VORTIX_SKIP_MIGRATION").is_some() {
         eprintln!("VORTIX_SKIP_MIGRATION set — skipping startup sidecar backfill.");
     } else {
-        match vortix::vortix_config::migrate_legacy_profiles(&profiles_dir) {
+        match vortix::config::migrate_legacy_profiles(&profiles_dir) {
             Ok(stats) => {
                 if stats.created > 0 {
                     eprintln!(
@@ -300,7 +298,7 @@ fn main() -> Result<()> {
                         cli::output::ExitCode::PermissionDenied,
                     )
                 } else if let Some(sidecar) =
-                    vortix::vortix_config::migration::unexplained_sidecar_cause(&e)
+                    vortix::config::migration::unexplained_sidecar_cause(&e)
                 {
                     // The blanket "restore the inventory" text told the user
                     // neither which file was the problem nor how to clear it,
@@ -367,10 +365,7 @@ fn main() -> Result<()> {
     tracked_pids.extend(vortix::core::managed_wireguard::tracked_wireguard_pids(
         &config_dir,
     ));
-    let orphans = vortix::vortix_process::filter_untracked(
-        vortix::vortix_process::scan_orphans(),
-        &tracked_pids,
-    );
+    let orphans = vortix::process::filter_untracked(vortix::process::scan_orphans(), &tracked_pids);
     if !orphans.is_empty() && vortix::utils::is_root() {
         eprintln!(
             "Warning: detected {} possible orphan VPN process(es) from a previous session:",
@@ -697,7 +692,7 @@ mod tests {
         ] {
             let filter = log_filter(value);
             assert!(
-                !filter.would_enable("vortix::vortix_process", &Level::ERROR),
+                !filter.would_enable("vortix::process", &Level::ERROR),
                 "RUST_LOG={value:?} must not enable anything, not even ERROR"
             );
             assert_eq!(filter.default_level(), None, "RUST_LOG={value:?}");
@@ -706,8 +701,8 @@ mod tests {
 
     #[test]
     fn a_trailing_comma_does_not_widen_the_filter() {
-        let filter = log_filter(Some("vortix::vortix_process=info,"));
-        assert!(filter.would_enable("vortix::vortix_process", &Level::INFO));
+        let filter = log_filter(Some("vortix::process=info,"));
+        assert!(filter.would_enable("vortix::process", &Level::INFO));
         assert!(!filter.would_enable("some::other::crate", &Level::ERROR));
     }
 

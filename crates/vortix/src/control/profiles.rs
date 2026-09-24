@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::cidr::Cidr;
+use crate::core::openvpn_routes::OpenVpnRedirectGateway;
+use crate::core::ports::tunnel::ParsedProfile as _;
+use crate::core::profile::{Profile, ProfileId, ProtocolKind, ResolvedEndpoint};
 use crate::state::{Protocol, VpnProfile};
-use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::openvpn::OpenVpnRedirectGateway;
-use crate::vortix_core::ports::tunnel::ParsedProfile as _;
-use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind, ResolvedEndpoint};
 
 use super::state::Spec;
 
@@ -129,8 +129,8 @@ fn parse(
     };
     let (protocol, dns) = match profile.protocol {
         Protocol::WireGuard => {
-            let parsed = crate::vortix_protocol_wireguard::parser::parse_wg_conf(body)
-                .map_err(|error| error.to_string())?;
+            let parsed =
+                crate::wireguard::parser::parse_wg_conf(body).map_err(|error| error.to_string())?;
             for peer in &parsed.peers {
                 routes.extend(
                     peer.allowed_ips
@@ -147,8 +147,8 @@ fn parse(
             (ProtocolKind::WireGuard, parsed.dns_request())
         }
         Protocol::OpenVPN => {
-            let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(body)
-                .map_err(|error| error.to_string())?;
+            let parsed =
+                crate::openvpn::parser::parse_ovpn_conf(body).map_err(|error| error.to_string())?;
             if parsed
                 .redirect_gateway
                 .as_ref()

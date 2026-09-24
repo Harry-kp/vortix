@@ -368,8 +368,8 @@ pub struct TempSessionLease {
 /// files, including when journal disk persistence is disabled.
 #[must_use]
 pub fn temp_session_id() -> String {
-    crate::vortix_core::journal::global_journal()
-        .and_then(crate::vortix_core::journal::Journal::session_id)
+    crate::core::journal::global_journal()
+        .and_then(crate::core::journal::Journal::session_id)
         .unwrap_or_else(|| format!("nojournal-{}", std::process::id()))
 }
 
@@ -545,8 +545,8 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
 
 /// Strip a profile name down to ASCII `[A-Za-z0-9_-]` for safe use in
 /// daemon names, filenames, and process-match patterns.
-pub use crate::vortix_core::profile::sanitize_profile_name;
-use crate::vortix_core::profile::unambiguous_legacy_artifact_key;
+pub use crate::core::profile::sanitize_profile_name;
+use crate::core::profile::unambiguous_legacy_artifact_key;
 
 pub(crate) fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
     if !key.is_empty()
@@ -565,7 +565,7 @@ pub(crate) fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
 
 /// Returns `(pid_path, log_path)` for an opaque profile artifact key.
 ///
-/// Production callers pass [`crate::vortix_core::profile::ProfileId::as_str`].
+/// Production callers pass [`crate::core::profile::ProfileId::as_str`].
 /// Display names are accepted only by explicit legacy compatibility helpers.
 ///
 /// # Errors
@@ -695,7 +695,7 @@ pub fn write_openvpn_scrv1_auth_file(
     password: &str,
     otp: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
+    use crate::core::secret_file::{write_secret_file, SecretFileError};
 
     let auth_path = get_openvpn_scrv1_auth_path(profile_name)?;
 
@@ -746,7 +746,7 @@ pub fn delete_openvpn_scrv1_auth_file(profile_name: &str) {
 #[must_use]
 pub fn read_openvpn_static_challenge_prompt(config_path: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(config_path).ok()?;
-    let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(&text).ok()?;
+    let parsed = crate::openvpn::parser::parse_ovpn_conf(&text).ok()?;
     parsed.static_challenge.map(|sc| sc.prompt)
 }
 
@@ -1146,7 +1146,7 @@ pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
 /// `/etc/resolv.conf`, so a simple `which resolvconf` is not enough.
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: resolvconf-shim probing is Linux-only DNS plumbing
 pub(crate) fn resolvconf_works() -> bool {
-    use crate::vortix_process::CommandSpec;
+    use crate::process::CommandSpec;
     use std::time::Duration;
     if !binary_exists("resolvconf") {
         return false;
@@ -1163,7 +1163,7 @@ pub(crate) fn resolvconf_works() -> bool {
     // timeout we return `false`, which routes the user to the existing
     // "resolvconf not available" error path — strictly better than a
     // wedged panel.
-    crate::vortix_process::run_to_output(
+    crate::process::run_to_output(
         CommandSpec::oneshot("resolvconf", vec!["--version".into()])
             .timeout(Duration::from_secs(10)),
     )
@@ -1182,12 +1182,12 @@ pub(crate) fn resolvconf_works() -> bool {
 /// UI thread.
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: resolvectl probing is Linux-only DNS plumbing
 pub(crate) fn resolvectl_works() -> bool {
-    use crate::vortix_process::CommandSpec;
+    use crate::process::CommandSpec;
     use std::time::Duration;
     if !binary_exists("resolvectl") {
         return false;
     }
-    crate::vortix_process::run_to_output(
+    crate::process::run_to_output(
         CommandSpec::oneshot("resolvectl", vec!["--version".into()])
             .timeout(Duration::from_secs(10)),
     )

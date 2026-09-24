@@ -93,9 +93,9 @@ pub(crate) struct PendingThemeChange {
 use std::collections::HashMap;
 
 use crate::constants;
+use crate::core::engine::TunnelRegistry;
 use crate::logger;
 use crate::message::Message;
-use crate::vortix_core::engine::TunnelRegistry;
 use crate::vpn_runtime::VpnRuntime;
 
 // Re-export state types for convenient access
@@ -138,7 +138,7 @@ pub struct App {
     /// Highest engine notice already shown.
     pub(crate) notices_seen: u64,
     /// Kept when every tunnel is gone, so reconnect means "the last one".
-    pub(crate) last_control_connected_profile: Option<crate::vortix_core::profile::ProfileId>,
+    pub(crate) last_control_connected_profile: Option<crate::core::profile::ProfileId>,
     /// Kill switch mode sent but not yet in a snapshot.
     pub(crate) pending_control_killswitch_mode: Option<crate::state::KillSwitchMode>,
 

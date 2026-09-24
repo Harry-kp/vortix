@@ -9,7 +9,7 @@ CI failed four times on a single PR because each push verified a different subse
 
 Common traps documented there (each cost one CI cycle):
 - `-p vortix --lib` skips test code; `clippy::pedantic` is workspace-wide so test code gets pedantic lints too
-- macOS host cannot validate Linux-cfg code paths (`vortix_platform_linux/*`, `daemon/server.rs` SO_PEERCRED block) and vice versa
+- macOS host cannot validate Linux-cfg code paths (`linux/*`, `daemon/server.rs` SO_PEERCRED block) and vice versa
 - `cargo clippy` does NOT run rustdoc lints — only `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps` exercises them
 - `cargo fmt` (without `--all`) skips workspace members on rustfmt diffs
 
@@ -17,11 +17,11 @@ Common traps documented there (each cost one CI cycle):
 
 ## Architectural boundaries are enforced by xtask, not just convention
 
-- `vortix_core/` must not import from `vortix_platform_*`, `vortix_protocol_*`, or the process layer
-- `vortix_platform_*` must not import from `vortix_protocol_*` and vice versa
-- Subprocess invocations of protocol binaries (`wg`, `wg-quick`, `openvpn`) belong in `vortix_protocol_*` only — anywhere else needs a `// xtask:allow-protocol-leak: <reason>` annotation
+- `cfg(target_os)` lives in `macos/`, `linux/` and `platform/` only (`check-platform-leak`)
+- Raw `Command::new` lives in `process/real.rs` only (`check-subprocess`)
+- `wg`/`wg-quick` belong in `wireguard/`, `openvpn` in `openvpn/` — anywhere else needs a `// xtask:allow-protocol-leak: <reason>` annotation (`check-protocol-leak`)
 
-The three `cargo xtask check-*-leak` commands enforce this in CI. If you're tempted to add an import that crosses a boundary, stop and ask whether the abstraction should move instead.
+Exceptions take a `// xtask:allow-*: <reason>` annotation. If you reach for one, ask whether the code should move instead.
 
 ## TUI density principle
 
@@ -67,7 +67,7 @@ state transition, with a test in `plan.rs`/`state.rs` — not into a caller.
 
 ## Kill switch semantics
 
-One vocabulary, used identically on every surface — CLI input verb, CLI output, TUI panels, JSON envelope, log lines. Rust enum variants (`Off` / `Auto` / `AlwaysOn`) stay idiomatic for the language but never leak into output. The bridge between the enum and every user-visible string is the helper set on `vortix_core::state::killswitch` — `KillSwitchMode::display_name` (display), `cli_verb` / `from_cli_verb` (input parsing), `one_liner`, `behavior_lines`, and `KillSwitchState::display_status`.
+One vocabulary, used identically on every surface — CLI input verb, CLI output, TUI panels, JSON envelope, log lines. Rust enum variants (`Off` / `Auto` / `AlwaysOn`) stay idiomatic for the language but never leak into output. The bridge between the enum and every user-visible string is the helper set on `core::state::killswitch` — `KillSwitchMode::display_name` (display), `cli_verb` / `from_cli_verb` (input parsing), `one_liner`, `behavior_lines`, and `KillSwitchState::display_status`.
 
 | Rust enum    | Slug (CLI verb + display) | What it does                                                                                                                                                                                                  |
 |--------------|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

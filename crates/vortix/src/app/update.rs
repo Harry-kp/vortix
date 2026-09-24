@@ -508,12 +508,13 @@ impl App {
                         return;
                     };
                     match control.clear_credentials(&profile_id, &name) {
-                        Ok(crate::vortix_config::openvpn_credentials::CredentialClearOutcome::NotFound) => self
-                            .show_toast(
-                                format!("No saved credentials for '{name}'"),
-                                ToastType::Info,
-                            ),
-                        Ok(crate::vortix_config::openvpn_credentials::CredentialClearOutcome::Cleared) => {
+                        Ok(
+                            crate::config::openvpn_credentials::CredentialClearOutcome::NotFound,
+                        ) => self.show_toast(
+                            format!("No saved credentials for '{name}'"),
+                            ToastType::Info,
+                        ),
+                        Ok(crate::config::openvpn_credentials::CredentialClearOutcome::Cleared) => {
                             self.log(&format!("AUTH: Cleared saved credentials for '{name}'"));
                             self.show_toast(
                                 format!("Credentials cleared for '{name}'"),
@@ -537,7 +538,7 @@ impl App {
     }
     fn handle_auth_submit(
         &mut self,
-        profile_id: crate::vortix_core::profile::ProfileId,
+        profile_id: crate::core::profile::ProfileId,
         username: crate::state::SecretText,
         password: crate::state::SecretText,
         otp: Option<crate::state::SecretText>,
@@ -671,14 +672,14 @@ impl App {
                     && !self.default_route_is_tunnel();
                 let no_tunnel_routes_v6 = is_connected
                     && !self.registry.snapshot_all().into_iter().any(|snap| {
-                        use crate::vortix_core::engine::{Connection, Role};
+                        use crate::core::engine::{Connection, Role};
                         match (snap.state, snap.role) {
                             (
                                 Connection::Connected { .. },
                                 Role::Primary { allowed_ips }
                                 | Role::Addressable { allowed_ips }
                                 | Role::AddressableSuppressed { allowed_ips },
-                            ) => crate::vortix_core::cidr::claims_default_route_v6(&allowed_ips),
+                            ) => crate::core::cidr::claims_default_route_v6(&allowed_ips),
                             _ => false,
                         }
                     });
@@ -768,8 +769,8 @@ impl App {
         let old_ip = self.runtime.public_ip.clone();
 
         if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
-            if let Some(journal) = crate::vortix_core::journal::global_journal() {
-                let _ = journal.append(crate::vortix_core::journal::JournalEvent::IpChanged {
+            if let Some(journal) = crate::core::journal::global_journal() {
+                let _ = journal.append(crate::core::journal::JournalEvent::IpChanged {
                     old: Some(old_ip.clone()),
                     new: ip.clone(),
                 });

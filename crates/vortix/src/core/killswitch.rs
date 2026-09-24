@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 
 // Re-export the canonical types so existing `crate::core::killswitch::*`
 // imports keep resolving.
-pub use crate::vortix_core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
+pub use crate::core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
 
 // Backwards-compat alias — the old name is `KillSwitchError`.
 pub type KillSwitchError = KillswitchError;
@@ -182,7 +182,7 @@ pub fn validate_policy(active: &[ActiveTunnelInfo]) -> Result<()> {
 /// Enable kill switch with a per-tunnel ruleset.
 ///
 /// Routes through the process-global `Platform` aggregate. The per-OS
-/// impl lives in `vortix_platform_{macos,linux,windows}` and synthesises
+/// impl lives in `macos`/`linux` and synthesises
 /// allow rules for every entry in `active` plus an RFC1918 base with
 /// secondary-declared CIDRs subtracted.
 ///
@@ -728,10 +728,10 @@ fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
             )
         })?;
     let (uid, gid) = crate::config::config_owner(parent).map_err(io::Error::other)?;
-    let directory = crate::vortix_config::owned_file::open_owned_directory(parent, false, uid, gid)
+    let directory = crate::config::owned_file::open_owned_directory(parent, false, uid, gid)
         .map_err(io::Error::other)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "config directory is missing"))?;
-    crate::vortix_config::owned_file::write_owned_atomic(&directory, name, contents, uid, gid)
+    crate::config::owned_file::write_owned_atomic(&directory, name, contents, uid, gid)
         .map_err(io::Error::other)
 }
 
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn policy_digest_covers_full_policy_but_not_iteration_order() {
-        use crate::vortix_core::cidr::Cidr;
+        use crate::core::cidr::Cidr;
         use std::net::IpAddr;
 
         let first = ActiveTunnelInfo {
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn local_verification_is_typed_bounded_and_policy_bound() {
-        use crate::vortix_core::cidr::Cidr;
+        use crate::core::cidr::Cidr;
         use std::net::IpAddr;
         let active = [ActiveTunnelInfo {
             interface: "wg0".to_string(),
@@ -1143,7 +1143,7 @@ mod tests {
 
     #[test]
     fn persisted_from_active_stringifies_addresses_and_cidrs() {
-        use crate::vortix_core::cidr::Cidr;
+        use crate::core::cidr::Cidr;
         use std::net::IpAddr;
         let active = vec![ActiveTunnelInfo {
             interface: "utun3".to_string(),

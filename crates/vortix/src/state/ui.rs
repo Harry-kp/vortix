@@ -1,8 +1,8 @@
 //! UI state types.
 
 use super::Protocol;
-use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::profile::ProfileId;
+use crate::core::cidr::Cidr;
+use crate::core::profile::ProfileId;
 use std::fmt;
 use std::ops::Deref;
 use std::time::{Duration, Instant};

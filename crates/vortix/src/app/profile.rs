@@ -3,10 +3,10 @@
 use std::path::Path;
 
 use super::{App, InputMode, Protocol, ToastType};
+use crate::config::profile_store::{FsProfileStore, ProfileStore};
 use crate::constants;
+use crate::core::profile::ProfileId;
 use crate::utils;
-use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
-use crate::vortix_core::profile::ProfileId;
 
 fn importable_profile_paths(dir_path: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut paths = std::fs::read_dir(dir_path)?
@@ -170,7 +170,7 @@ impl App {
             // started. Re-check the stable identity at the mutation point;
             // an index or display-name check can be invalidated by sorting or
             // another rename while the dialog is open.
-            use crate::vortix_core::engine::state::Connection;
+            use crate::core::engine::state::Connection;
             if self
                 .registry
                 .snapshot(&stable_id)

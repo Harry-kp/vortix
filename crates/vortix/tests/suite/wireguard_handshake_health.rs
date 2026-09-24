@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use vortix::vortix_core::ports::dns::DnsRequest;
-use vortix::vortix_core::ports::tunnel::{
+use vortix::core::ports::dns::DnsRequest;
+use vortix::core::ports::tunnel::{
     classify_peer_handshake_health, HandshakeAttempt, PeerHandshakeHealth, PeerTrafficExpectation,
     ProtocolStatus, TunnelHandle, TunnelKindTag, TunnelPeerStatus, TunnelStatus,
 };
-use vortix::vortix_core::profile::ProfileId;
-use vortix::vortix_protocol_wireguard::parser::parse_wg_conf;
-use vortix::vortix_protocol_wireguard::tunnel::{parse_wg_dump, select_health_probe};
+use vortix::core::profile::ProfileId;
+use vortix::wireguard::parser::parse_wg_conf;
+use vortix::wireguard::tunnel::{parse_wg_dump, select_health_probe};
 
 #[derive(Debug)]
 struct Detail;

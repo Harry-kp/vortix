@@ -8,26 +8,26 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::core::scanner::ActiveSession;
-use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
-use crate::state::Protocol;
-use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::ids::TunnelRevision;
-use crate::vortix_core::ids::{AuthorityEpoch, OperationId};
-use crate::vortix_core::openvpn::OpenVpnRouteEvidence;
-use crate::vortix_core::ports::dns::DnsRequest;
-use crate::vortix_core::ports::tunnel::{
+use crate::core::cidr::Cidr;
+use crate::core::ids::TunnelRevision;
+use crate::core::ids::{AuthorityEpoch, OperationId};
+use crate::core::openvpn_routes::OpenVpnRouteEvidence;
+use crate::core::ports::dns::DnsRequest;
+use crate::core::ports::tunnel::{
     TunnelCancellation, TunnelExecutionContext, TunnelHandle, TunnelKindTag,
 };
-use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
-use crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials;
+use crate::core::profile::{Profile, ProfileId, ProtocolKind};
+use crate::core::scanner::ActiveSession;
+use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
+use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
+use crate::state::Protocol;
 
-use crate::state::VpnProfile;
-use crate::vortix_core::ports::tunnel::{
+use crate::core::ports::tunnel::{
     ParseError, ParsedProfile, Tunnel, TunnelCapabilities, TunnelError, TunnelStatus,
 };
-use crate::vortix_protocol_openvpn::OvpnTunnel;
-use crate::vortix_protocol_wireguard::WgTunnel;
+use crate::openvpn::OvpnTunnel;
+use crate::state::VpnProfile;
+use crate::wireguard::WgTunnel;
 
 const EPOCH: AuthorityEpoch = AuthorityEpoch(1);
 
@@ -240,13 +240,9 @@ pub fn adopt(
                 .requested_runtime_evidence(profile)
                 .map_err(|error| error.to_string())?;
             let dns_request = match evidence.dns {
-                crate::vortix_protocol_openvpn::OvpnDnsEvidence::Observed(request)
-                | crate::vortix_protocol_openvpn::OvpnDnsEvidence::ExplicitlyEmpty(request) => {
-                    request
-                }
-                crate::vortix_protocol_openvpn::OvpnDnsEvidence::Unavailable {
-                    configured, ..
-                } => configured,
+                crate::openvpn::OvpnDnsEvidence::Observed(request)
+                | crate::openvpn::OvpnDnsEvidence::ExplicitlyEmpty(request) => request,
+                crate::openvpn::OvpnDnsEvidence::Unavailable { configured, .. } => configured,
             };
             let handle = TunnelHandle {
                 profile_id: profile.id.clone(),
@@ -341,14 +337,14 @@ fn route_claims(evidence: &OpenVpnRouteEvidence) -> BTreeSet<Cidr> {
 
 /// Runtime-selectable carrier over the closed protocol set.
 ///
-/// Mock variant uses `crate::vortix_core::ports::tunnel::mock::MockTunnel` so tests
+/// Mock variant uses `crate::core::ports::tunnel::mock::MockTunnel` so tests
 /// can substitute scripted behaviour without touching the real impls.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TunnelKind {
     WireGuard(WgTunnel),
     OpenVpn(OvpnTunnel),
-    Mock(crate::vortix_core::ports::tunnel::mock::MockTunnel),
+    Mock(crate::core::ports::tunnel::mock::MockTunnel),
 }
 
 impl TunnelKind {
@@ -362,7 +358,7 @@ impl TunnelKind {
     }
 
     #[must_use]
-    pub fn for_operation(self, operation_id: crate::vortix_core::ids::OperationId) -> Self {
+    pub fn for_operation(self, operation_id: crate::core::ids::OperationId) -> Self {
         match self {
             Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.for_operation(operation_id)),
             other => other,
@@ -381,7 +377,7 @@ impl TunnelKind {
     #[must_use]
     pub fn with_openvpn_static_challenge(
         self,
-        credentials: crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials,
+        credentials: crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials,
     ) -> Self {
         match self {
             Self::OpenVpn(tunnel) => {
@@ -454,7 +450,7 @@ impl TunnelKind {
 }
 
 pub(crate) struct StandardOpenVpnOwner {
-    custody: crate::vortix_process::CustodianHandshake,
+    custody: crate::process::CustodianHandshake,
     protocol_pid: u32,
 }
 
@@ -470,7 +466,7 @@ impl StandardOpenVpnOwner {
     }
 
     #[must_use]
-    pub(crate) fn identity(&self) -> crate::vortix_core::ports::process::ManagedProcessId {
+    pub(crate) fn identity(&self) -> crate::core::ports::process::ManagedProcessId {
         self.custody.identity.clone()
     }
 }
@@ -479,12 +475,12 @@ pub(crate) fn standard_openvpn_owner(
     profile_id: &ProfileId,
     session: &crate::core::scanner::ActiveSession,
 ) -> Result<Option<StandardOpenVpnOwner>, String> {
-    let Some(custody) = crate::vortix_process::custodian::load_handshake(profile_id)
+    let Some(custody) = crate::process::custodian::load_handshake(profile_id)
         .map_err(|error| format!("OpenVPN ownership receipt rejected: {error}"))?
     else {
         return Ok(None);
     };
-    let alive = crate::vortix_process::custodian::remote_status(&custody.identity)
+    let alive = crate::process::custodian::remote_status(&custody.identity)
         .map_err(|error| format!("OpenVPN custodian status failed: {error}"))?;
     if !alive {
         return Ok(None);
@@ -492,7 +488,7 @@ pub(crate) fn standard_openvpn_owner(
     let scanner_pid = session
         .pid
         .ok_or_else(|| "active OpenVPN target has no scanner process PID".to_string())?;
-    if !crate::vortix_process::custodian::contains_protocol_pid(&custody, scanner_pid)
+    if !crate::process::custodian::contains_protocol_pid(&custody, scanner_pid)
         .map_err(|error| format!("OpenVPN process-group ownership check failed: {error}"))?
     {
         return Err(
@@ -508,7 +504,7 @@ pub(crate) fn standard_openvpn_owner(
 // Implement the `Tunnel` trait by delegating to the inherent methods.
 // Plan 005's `Engine<T: Tunnel>` requires this so the binary can construct
 // `Engine<TunnelKind>` and drive the FSM with the existing dispatch.
-impl crate::vortix_core::ports::tunnel::Tunnel for TunnelKind {
+impl crate::core::ports::tunnel::Tunnel for TunnelKind {
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
         TunnelKind::up(self, profile)
     }

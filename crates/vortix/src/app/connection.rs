@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use super::{App, InputMode, ToastType};
 use crate::control::{Command, Level, Phase, Snapshot, TunnelView};
+use crate::core::engine::registry::{Role, TunnelSnapshot};
+use crate::core::engine::state::{Connection, ConnectionHealth, PromptKind};
+use crate::core::engine::Conflict;
+use crate::core::profile::ProfileId;
 use crate::utils;
-use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
-use crate::vortix_core::engine::state::{Connection, ConnectionHealth, PromptKind};
-use crate::vortix_core::engine::Conflict;
-use crate::vortix_core::profile::ProfileId;
 
 pub(super) const CONTROL_STARTING_MESSAGE: &str =
     "The VPN service is still starting. Try again in a moment.";

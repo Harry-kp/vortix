@@ -8,13 +8,13 @@ use crate::state::Protocol;
 use super::VpnRuntime;
 
 fn wireguard_health_from_session(
-    peers: &[crate::vortix_core::ports::tunnel::TunnelPeerStatus],
+    peers: &[crate::core::ports::tunnel::TunnelPeerStatus],
     activity: &mut std::collections::HashMap<String, crate::vpn_runtime::WireGuardPeerActivity>,
-    probe_receipts: &[crate::vortix_core::ports::tunnel::ProbeReceipt],
+    probe_receipts: &[crate::core::ports::tunnel::ProbeReceipt],
     stale_after: std::time::Duration,
-) -> crate::vortix_core::engine::state::ConnectionHealth {
-    use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
-    use crate::vortix_core::ports::tunnel::{
+) -> crate::core::engine::state::ConnectionHealth {
+    use crate::core::engine::state::{ConnectionHealth, DegradedReason};
+    use crate::core::ports::tunnel::{
         classify_peer_handshake_health, PeerHandshakeHealth, PeerTrafficExpectation,
     };
 
@@ -101,7 +101,7 @@ pub struct StatusSnapshot {
     pub connection_state: String,
     /// Typed health for a Vortix-issued connected generation. Scanner-only
     /// observations intentionally leave this absent.
-    pub health: Option<crate::vortix_core::engine::state::ConnectionHealth>,
+    pub health: Option<crate::core::engine::state::ConnectionHealth>,
     /// Exact successful attempt generation when durable managed evidence is
     /// available.
     pub generation: Option<u64>,
@@ -250,9 +250,9 @@ impl VpnRuntime {
                         &mut receipt,
                         current.clone(),
                     ) {
-                        if let Some(journal) = crate::vortix_core::journal::global_journal() {
+                        if let Some(journal) = crate::core::journal::global_journal() {
                             let _ = journal.append(
-                                crate::vortix_core::journal::JournalEvent::ConnectionHealthChanged {
+                                crate::core::journal::JournalEvent::ConnectionHealthChanged {
                                     profile_id: profile.id.clone(),
                                     old,
                                     new: current.clone(),

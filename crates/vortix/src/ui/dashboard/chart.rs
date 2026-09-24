@@ -1,6 +1,6 @@
 use crate::app::App;
+use crate::core::engine::state::Connection;
 use crate::ui::helpers;
-use crate::vortix_core::engine::state::Connection;
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},

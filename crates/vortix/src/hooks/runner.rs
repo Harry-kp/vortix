@@ -11,10 +11,10 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::config::hooks_config::{validate_hooks, HookConfigError, HookSpec};
+use crate::core::ports::process::{ProcessCredentials, ProcessError};
 use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
-use crate::vortix_config::hooks_config::{validate_hooks, HookConfigError, HookSpec};
-use crate::vortix_core::ports::process::{ProcessCredentials, ProcessError};
-use crate::vortix_process::{CommandRunner, CommandSpec};
+use crate::process::{CommandRunner, CommandSpec};
 
 const HOOK_QUEUE_CAPACITY: usize = 64;
 const HOOK_DIAGNOSTIC_CAPACITY: usize = 128;
@@ -477,8 +477,8 @@ async fn run_one(
     env.insert(
         "VORTIX_PROTOCOL".into(),
         match job.fact.protocol {
-            crate::vortix_core::profile::ProtocolKind::WireGuard => "wireguard",
-            crate::vortix_core::profile::ProtocolKind::OpenVpn => "openvpn",
+            crate::core::profile::ProtocolKind::WireGuard => "wireguard",
+            crate::core::profile::ProtocolKind::OpenVpn => "openvpn",
         }
         .into(),
     );
@@ -533,7 +533,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::vortix_core::profile::{ProfileId, ProtocolKind};
+    use crate::core::profile::{ProfileId, ProtocolKind};
 
     #[test]
     fn empty_configuration_starts_no_runner() {
@@ -588,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn hook_uses_only_allowlisted_environment_and_owner_credentials() {
-        let mock = crate::vortix_process::MockRunner::with_default_success();
+        let mock = crate::process::MockRunner::with_default_success();
         let (runner, mut diagnostics) = HookRunner::start(
             vec![HookSpec {
                 event: HookEvent::Connected,
@@ -642,7 +642,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bounded_shutdown_drains_jobs_already_accepted() {
-        let mock = crate::vortix_process::MockRunner::with_default_success();
+        let mock = crate::process::MockRunner::with_default_success();
         let (runner, _diagnostics) = HookRunner::start(
             vec![HookSpec {
                 event: HookEvent::Disconnected,
@@ -713,7 +713,7 @@ mod tests {
                 timeout_secs: 5,
             }],
             VerifiedHookOwner::from_ids(501, 20),
-            CommandRunner::Mock(crate::vortix_process::MockRunner::new()),
+            CommandRunner::Mock(crate::process::MockRunner::new()),
         )
         .unwrap()
         .unwrap();
@@ -738,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_failures_are_bounded_typed_metadata() {
-        use crate::vortix_process::mock::{ScriptedOutcome, SpecMatcher};
+        use crate::process::mock::{ScriptedOutcome, SpecMatcher};
 
         let cases = [
             (ScriptedOutcome::Timeout, HookFailure::Timeout),
@@ -756,7 +756,7 @@ mod tests {
             ),
         ];
         for (sequence, (outcome, expected)) in cases.into_iter().enumerate() {
-            let mock = crate::vortix_process::MockRunner::new();
+            let mock = crate::process::MockRunner::new();
             mock.expect(SpecMatcher::Any, outcome);
             let (runner, mut diagnostics) = HookRunner::start(
                 vec![HookSpec {

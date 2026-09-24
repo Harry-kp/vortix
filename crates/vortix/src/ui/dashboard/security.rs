@@ -1,7 +1,7 @@
 use crate::app::App;
+use crate::core::engine::registry::TunnelSnapshot;
+use crate::core::engine::state::Connection;
 use crate::state::{KillSwitchMode, KillSwitchState};
-use crate::vortix_core::engine::registry::TunnelSnapshot;
-use crate::vortix_core::engine::state::Connection;
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::Rect,
@@ -1364,14 +1364,14 @@ mod tests {
     //! registry test helpers).
     use super::*;
     use crate::app::App;
+    use crate::core::profile::ProfileId;
     use crate::state::KillSwitchMode;
-    use crate::vortix_core::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::Instant;
 
     fn insert_idle_tunnel(app: &mut App, name: &str) {
-        use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
+        use crate::core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
         app.registry.insert_for_test(TunnelSnapshot {
             profile_id: ProfileId::new(name),
             state: Connection::Disconnected { last_failure: None },

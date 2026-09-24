@@ -92,7 +92,7 @@ a first attempt at load average 57 produced a spurious 3x "improvement" in both 
 
 It would drop most of the 1.2 MB of unwind tables, and it is off the table: `catch_unwind` is
 load-bearing. A panic inside a tunnel operation (`tunnel.rs`,
-`vortix_protocol_wireguard/tunnel.rs`), a control-worker job (`vortix_core/control/worker.rs`),
+`wireguard/tunnel.rs`), a control-worker job (`core/control/worker.rs`),
 a lifecycle hook (`hooks/runner.rs`) or a background task (`background.rs`) is caught and turned
 into an error rather than killing a process that holds kill-switch state. Aborting there trades
 a firewall-safety guarantee for binary size.

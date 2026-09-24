@@ -3,9 +3,9 @@
 
 use std::path::PathBuf;
 
-use crate::vortix_core::ports::dns::{DnsEffectiveStatus, DnsPolicyCoordinator};
-use crate::vortix_core::ports::route_table::DefaultRouteObservation;
-use crate::vortix_core::state::killswitch::KillSwitchMode;
+use crate::core::ports::dns::{DnsEffectiveStatus, DnsPolicyCoordinator};
+use crate::core::ports::route_table::DefaultRouteObservation;
+use crate::core::state::killswitch::KillSwitchMode;
 
 use super::plan::{Firewall, NetworkPlan};
 
@@ -143,7 +143,7 @@ impl Net {
 
     fn routes_through(
         target: &NetworkPlan,
-        cidr: crate::vortix_core::cidr::Cidr,
+        cidr: crate::core::cidr::Cidr,
         interface: &str,
     ) -> bool {
         let Some(probe) = target.probe_address(cidr) else {

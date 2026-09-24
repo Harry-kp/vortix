@@ -13,12 +13,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::core::ids::AuthorityEpoch;
+use crate::core::ids::OperationId;
+use crate::core::ids::TunnelRevision;
+use crate::core::ports::tunnel::{HandshakeEvidence, ProbeReceipt, TunnelTeardownConfig};
+use crate::core::profile::{Profile, ProfileId, ProtocolKind};
 use crate::core::scanner::ActiveSession;
-use crate::vortix_core::ids::AuthorityEpoch;
-use crate::vortix_core::ids::OperationId;
-use crate::vortix_core::ids::TunnelRevision;
-use crate::vortix_core::ports::tunnel::{HandshakeEvidence, ProbeReceipt, TunnelTeardownConfig};
-use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 
 const SCHEMA_VERSION: u8 = 1;
 const MAX_LEDGER_BYTES: u64 = 128 * 1024;
@@ -403,7 +403,7 @@ fn profile_wg_quick_interface(profile: &Profile) -> Result<String, StandardOwner
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or(StandardOwnershipError::Stale)?;
-    crate::vortix_core::profile::validate_wireguard_interface_name(interface)
+    crate::core::profile::validate_wireguard_interface_name(interface)
         .map_err(|_| StandardOwnershipError::Stale)?;
     Ok(interface.to_owned())
 }
@@ -483,7 +483,7 @@ fn validate_owned_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vortix_core::ports::tunnel::TunnelPeerStatus;
+    use crate::core::ports::tunnel::TunnelPeerStatus;
     use std::time::SystemTime;
 
     fn uid() -> u32 {

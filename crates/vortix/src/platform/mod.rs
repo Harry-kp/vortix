@@ -1,20 +1,10 @@
-//! Platform abstraction layer — thin re-exports.
-//!
-//! Plan 003 moves capability-port traits and impls into `vortix-core::ports::*`
-//! and the `vortix-platform-{linux,macos}` crates. This module keeps the
-//! legacy trait/impl path aliases working until a later sweep swaps consumers
-//! over to the `Platform` aggregate.
+//! The process-wide `Platform` aggregate over the OS adapters.
 
 pub mod aggregate;
 #[cfg(target_os = "macos")]
 // xtask:allow-platform-cfg: the only remaining caller is the macOS DNS adapter
 pub(crate) mod fixed_root_command;
 pub(crate) mod route_probe;
-
-#[cfg(target_os = "linux")]
-pub mod linux;
-#[cfg(target_os = "macos")]
-pub mod macos;
 
 pub use aggregate::{
     DnsResolverKind, InterfaceKind, KillswitchKind, MockDns, MockInterface, MockKillswitch,
@@ -26,7 +16,7 @@ pub use aggregate::{
 //
 // Plan #003 originally threaded the Platform aggregate through every consumer.
 // We instead install a process-wide singleton, matching the runner's
-// `crate::vortix_process::global_runner()` pattern. `main.rs` initialises it once at
+// `crate::process::global_runner()` pattern. `main.rs` initialises it once at
 // startup; consumers reach for `current_platform()` instead of branching on
 // `cfg(target_os)`. The async engine refactor swaps this back to
 // explicit dependency injection.
@@ -77,7 +67,7 @@ pub(crate) fn wireguard_staging_dir() -> Option<&'static std::path::Path> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn process_group_has_live_members(group_id: u32) -> std::io::Result<Option<bool>> {
-    crate::vortix_platform_linux::process_identity::process_group_has_live_members(group_id)
+    crate::linux::process_identity::process_group_has_live_members(group_id)
 }
 
 #[cfg(target_os = "macos")]
@@ -98,11 +88,11 @@ pub use crate::constants::KILLSWITCH_EMERGENCY_MSG;
 
 // Capability ports now live in `vortix-core::ports::*`.
 // Keep the legacy trait names as aliases so existing call sites keep working.
-pub use crate::vortix_core::ports::dns::DnsResolver;
-pub use crate::vortix_core::ports::interface::Interface as InterfaceDetector;
-pub use crate::vortix_core::ports::killswitch::Killswitch as Firewall;
-pub use crate::vortix_core::ports::network_stats::NetworkStats as NetworkStatsProvider;
-pub use crate::vortix_core::ports::route_table::RouteTable;
+pub use crate::core::ports::dns::DnsResolver;
+pub use crate::core::ports::interface::Interface as InterfaceDetector;
+pub use crate::core::ports::killswitch::Killswitch as Firewall;
+pub use crate::core::ports::network_stats::NetworkStats as NetworkStatsProvider;
+pub use crate::core::ports::route_table::RouteTable;
 
 fn syscall_result(result: libc::c_int) -> std::io::Result<()> {
     if result == 0 {

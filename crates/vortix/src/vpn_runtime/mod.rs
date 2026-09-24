@@ -27,8 +27,8 @@ use crate::logger;
 use crate::message::Message;
 use crate::state::{KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile};
 
+use crate::core::profile::ProfileId;
 use crate::utils;
-use crate::vortix_core::profile::ProfileId;
 
 type DnsObservation = (ProfileId, String, bool);
 
@@ -130,8 +130,8 @@ pub struct VpnRuntime {
 
     /// Full desired/effective resolver policy owned by the global network
     /// policy path. Protocol adapters only populate `dns_requests`.
-    pub dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator,
-    dns_requests: HashMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
+    pub dns_policy: crate::core::ports::dns::DnsPolicyCoordinator,
+    dns_requests: HashMap<ProfileId, crate::core::ports::dns::DnsRequest>,
     persist_dns_policy: bool,
     /// Scanner-visible sessions for which this process has no protocol handle.
     pub dns_external_sessions: usize,
@@ -212,7 +212,7 @@ impl VpnRuntime {
 
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
-            dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
+            dns_policy: crate::core::ports::dns::DnsPolicyCoordinator::default(),
             dns_requests: HashMap::new(),
             persist_dns_policy: true,
             dns_external_sessions: 0,
@@ -318,7 +318,7 @@ impl VpnRuntime {
     pub fn remember_dns_request(
         &mut self,
         profile_name: &str,
-        request: crate::vortix_core::ports::dns::DnsRequest,
+        request: crate::core::ports::dns::DnsRequest,
     ) {
         if let Some(profile) = self
             .profiles
@@ -347,8 +347,8 @@ impl VpnRuntime {
     fn dns_intents(
         &self,
         observations: &[DnsObservation],
-    ) -> Vec<crate::vortix_core::ports::dns::DnsTunnelIntent> {
-        use crate::vortix_core::ports::dns::{DnsTunnelIntent, DnsTunnelRole};
+    ) -> Vec<crate::core::ports::dns::DnsTunnelIntent> {
+        use crate::core::ports::dns::{DnsTunnelIntent, DnsTunnelRole};
 
         observations
             .iter()
@@ -376,7 +376,7 @@ impl VpnRuntime {
     pub fn reconcile_dns_observations(
         &mut self,
         observations: &[DnsObservation],
-    ) -> crate::vortix_core::ports::dns::DnsEffectiveState {
+    ) -> crate::core::ports::dns::DnsEffectiveState {
         let intents = self.dns_intents(observations);
         let _lock = match crate::core::dns_policy::acquire_policy_lock(&self.config_dir) {
             Ok(lock) => lock,
@@ -404,16 +404,14 @@ impl VpnRuntime {
     }
     /// Headless CLI reconciliation uses the same scanner route truth as the
     /// kill-switch path; no CLI-local primary heuristic is retained.
-    pub fn reconcile_dns_from_scanner(
-        &mut self,
-    ) -> crate::vortix_core::ports::dns::DnsEffectiveState {
+    pub fn reconcile_dns_from_scanner(&mut self) -> crate::core::ports::dns::DnsEffectiveState {
         let scan = crate::core::scanner::gather_system_state(&self.profiles);
         let route_interface = match scan.default_route {
-            crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
-                interface,
-            ) => Some(interface),
-            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute => None,
-            crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed => {
+            crate::core::ports::route_table::DefaultRouteObservation::Interface(interface) => {
+                Some(interface)
+            }
+            crate::core::ports::route_table::DefaultRouteObservation::NoDefaultRoute => None,
+            crate::core::ports::route_table::DefaultRouteObservation::ProbeFailed => {
                 self.route_observation_fresh = false;
                 self.dns_policy.invalidate_effective(
                     "default-route probe failed; retaining prior DNS topology",
@@ -529,7 +527,7 @@ impl VpnRuntime {
     pub fn cleanup_vpn_resources(
         &self,
         profile_name: &str,
-    ) -> Result<(), crate::vortix_core::ports::tunnel::TunnelError> {
+    ) -> Result<(), crate::core::ports::tunnel::TunnelError> {
         let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) else {
             return Ok(());
         };
@@ -544,8 +542,8 @@ impl VpnRuntime {
         &self,
         profile_name: &str,
         tunnel: &mut crate::control::tunnels::TunnelKind,
-    ) -> Result<(), crate::vortix_core::ports::tunnel::TunnelError> {
-        use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+    ) -> Result<(), crate::core::ports::tunnel::TunnelError> {
+        use crate::core::ports::tunnel::{TunnelHandle, TunnelKindTag};
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
             let iface = match profile.protocol {
                 Protocol::WireGuard => profile
@@ -579,7 +577,7 @@ impl VpnRuntime {
                 probe_receipts: Vec::new(),
                 process_ownership: None,
                 teardown_config: matches!(profile.protocol, Protocol::WireGuard).then(|| {
-                    crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
+                    crate::core::ports::tunnel::TunnelTeardownConfig {
                         path: profile.config_path.clone(),
                         managed: false,
                         wg_quick_interface: profile
@@ -589,7 +587,7 @@ impl VpnRuntime {
                             .map(str::to_owned),
                     }
                 }),
-                dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+                dns_request: crate::core::ports::dns::DnsRequest::default(),
                 openvpn_routes: None,
             };
 
@@ -939,13 +937,13 @@ mod dns_gate_tests {
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
-    use crate::vortix_core::ports::tunnel::mock::{MockTunnel, ScriptedTunnelOutcome};
+    use crate::core::ports::tunnel::mock::{MockTunnel, ScriptedTunnelOutcome};
 
     #[test]
     fn cleanup_propagates_teardown_failure_instead_of_claiming_disconnect() {
         let mut runtime = VpnRuntime::new_test();
         runtime.profiles.push(crate::state::VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new("cleanup-failure"),
+            id: crate::core::profile::ProfileId::new("cleanup-failure"),
             name: "cleanup-failure".into(),
             protocol: Protocol::WireGuard,
             config_path: "/tmp/cleanup-failure.conf".into(),

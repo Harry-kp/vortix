@@ -20,7 +20,7 @@
 //! mode with `set_read_timeout`. Wiring `AsyncFd` would force a tokio
 //! runtime that nothing else here needs.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 

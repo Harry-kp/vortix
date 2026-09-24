@@ -2,8 +2,8 @@
 
 use std::process::Command;
 
-use vortix::vortix_config::profile_store::{FsProfileStore, ProfileStore};
-use vortix::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+use vortix::config::profile_store::{FsProfileStore, ProfileStore};
+use vortix::core::profile::{Profile, ProfileId, ProtocolKind};
 
 fn run_vortix(config_dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_vortix"))

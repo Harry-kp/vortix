@@ -4,7 +4,7 @@
 //! by scanning system interfaces and processes for `WireGuard` and `OpenVPN` sessions.
 
 use crate::app::{Protocol, VpnProfile};
-use crate::vortix_process::simple_output as cmd_output;
+use crate::process::simple_output as cmd_output;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -53,7 +53,7 @@ pub struct ActiveSession {
     pub latest_handshake: String,
     /// Typed `WireGuard` peer facts. Empty for `OpenVPN`. Display strings above
     /// are compatibility projections and never control authority.
-    pub wireguard_peers: Vec<crate::vortix_core::ports::tunnel::TunnelPeerStatus>,
+    pub wireguard_peers: Vec<crate::core::ports::tunnel::TunnelPeerStatus>,
 }
 
 impl Default for ActiveSession {
@@ -83,7 +83,7 @@ impl Default for ActiveSession {
 #[derive(Default, Debug)]
 pub struct ScannerResult {
     pub sessions: Vec<ActiveSession>,
-    pub default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation,
+    pub default_route: crate::core::ports::route_table::DefaultRouteObservation,
     /// `false` means at least one protocol-wide probe failed, so missing
     /// sessions are unknown rather than proof of absence.
     pub tunnel_observation_complete: bool,
@@ -135,7 +135,7 @@ fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
         .iter()
         .any(|profile| matches!(profile.protocol, Protocol::WireGuard))
     {
-        match crate::vortix_protocol_wireguard::WgTunnel::observe_all_interfaces() {
+        match crate::wireguard::WgTunnel::observe_all_interfaces() {
             Ok(statuses) => (statuses, true),
             // An absent `wg` is not an ambiguous observation. Vortix brings
             // WireGuard up through wg-quick, so without the userspace tools
@@ -311,10 +311,7 @@ fn get_all_openvpn_pids() -> Option<Vec<(PathBuf, u32)>> {
 /// - Linux: kernel interface lookup + typed `WireGuard` protocol observation
 fn check_wireguard_by_name(
     name: &str,
-    statuses: &std::collections::BTreeMap<
-        String,
-        crate::vortix_protocol_wireguard::tunnel::WgStatus,
-    >,
+    statuses: &std::collections::BTreeMap<String, crate::wireguard::tunnel::WgStatus>,
 ) -> Option<ActiveSession> {
     // Platform-dispatched interface check via the platform aggregate.
     let platform = crate::platform::current_platform();
@@ -490,16 +487,14 @@ fn check_openvpn_by_pid(
         let log_path = if canonical_log.exists() {
             canonical_log
         } else if let Some(legacy_key) =
-            crate::vortix_core::profile::unambiguous_legacy_artifact_key(display_name)
+            crate::core::profile::unambiguous_legacy_artifact_key(display_name)
         {
             run_dir.join(format!("{legacy_key}.log"))
         } else {
             canonical_log
         };
         if let Ok(log_text) = std::fs::read_to_string(&log_path) {
-            if let Some(iface) =
-                crate::vortix_protocol_openvpn::tunnel::parse_kernel_interface(&log_text)
-            {
+            if let Some(iface) = crate::openvpn::tunnel::parse_kernel_interface(&log_text) {
                 detected_iface = iface;
                 iface_authoritative = true;
             }
@@ -579,9 +574,7 @@ fn check_openvpn_by_pid(
                     if line.starts_with("inet ") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() >= 2
-                            && !crate::vortix_protocol_wireguard::WgTunnel::interface_exists(
-                                &current_iface,
-                            )
+                            && !crate::wireguard::WgTunnel::interface_exists(&current_iface)
                         {
                             session.internal_ip = parts[1].to_string();
                             session.mtu.clone_from(&iface_mtu);
@@ -614,9 +607,7 @@ fn check_openvpn_by_pid(
                         if found_tun {
                             // Check it's not a WireGuard interface through the
                             // protocol-owned typed observer.
-                            if crate::vortix_protocol_wireguard::WgTunnel::interface_exists(
-                                &current_iface,
-                            ) {
+                            if crate::wireguard::WgTunnel::interface_exists(&current_iface) {
                                 found_tun = false;
                                 continue;
                             }
@@ -854,7 +845,7 @@ mod tests {
         assert!(
             matches!(
                 result.default_route,
-                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed
+                crate::core::ports::route_table::DefaultRouteObservation::ProbeFailed
             ),
             "default ScannerResult must have no route interface"
         );
@@ -862,7 +853,7 @@ mod tests {
 
     #[test]
     fn managed_openvpn_config_matches_only_its_exact_stable_profile_id() {
-        use crate::vortix_core::profile::ProfileId;
+        use crate::core::profile::ProfileId;
 
         let id = "a".repeat(ProfileId::HEX_LEN);
         let source = "/profiles/corp.ovpn";

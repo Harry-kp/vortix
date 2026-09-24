@@ -14,9 +14,9 @@ use crate::cli::output::{
     err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError,
     ConnectionEntry, ConnectionHealthEntry, ExitCode, OutputMode,
 };
+use crate::config::profile_store::{FsProfileStore, ProfileStore};
 use crate::config::AppConfig;
 use crate::constants;
-use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
 use crate::vpn_runtime::VpnRuntime;
 
 fn lifecycle_progress_message(
@@ -213,14 +213,14 @@ pub fn handle_command(
 /// `vortix audit` — per-process socket snapshot.
 #[derive(Serialize)]
 struct AuditData {
-    sockets: Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>,
+    sockets: Vec<crate::core::ports::socket_audit::SocketSnapshot>,
 }
 
 fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i32 {
     let platform = crate::platform::current_platform();
     let mut snapshots = match platform.socket_audit.snapshot() {
         Ok(s) => s,
-        Err(crate::vortix_core::ports::socket_audit::SocketAuditError::Unsupported) => {
+        Err(crate::core::ports::socket_audit::SocketAuditError::Unsupported) => {
             print_error_and_exit(
                 mode,
                 "audit",
@@ -401,7 +401,7 @@ fn handle_up(
         if let Some(conflict) = detect_conflict_for_cli(&engine, &profile_name) {
             // Conflicts carry opaque profile IDs; the reader needs the name
             // they typed, so resolve through the catalog before formatting.
-            let named = |id: &crate::vortix_core::profile::ProfileId| {
+            let named = |id: &crate::core::profile::ProfileId| {
                 engine
                     .profiles
                     .iter()
@@ -409,14 +409,14 @@ fn handle_up(
                     .map_or_else(|| id.to_string(), |profile| profile.name.clone())
             };
             let (code, message) = match &conflict {
-                crate::vortix_core::engine::Conflict::DefaultRouteTakeover { current, new: _ } => (
+                crate::core::engine::Conflict::DefaultRouteTakeover { current, new: _ } => (
                     "state_conflict_default_route",
                     format!(
                         "Profile '{profile_name}' would take over the default route from '{}'",
                         named(current)
                     ),
                 ),
-                crate::vortix_core::engine::Conflict::RouteOverlap {
+                crate::core::engine::Conflict::RouteOverlap {
                     with,
                     overlapping_cidrs,
                 } => (
@@ -561,7 +561,7 @@ fn engine_failure_or_exit(mode: OutputMode, command: &str, message: String) -> !
 /// The CLI doesn't share an in-memory `TunnelRegistry` with the running
 /// session — active tunnels are discovered via
 /// `scanner::get_active_profiles`. We inspect each active session's parsed
-/// config and use the **shared** `vortix_core::cidr` and
+/// config and use the **shared** `core::cidr` and
 /// `claims_default_route_*` helpers (same logic the TUI's
 /// `TunnelRegistry::detect_conflict` uses) so the two surfaces refuse the
 /// same set of takeovers. The route-overlap branch is a CLI-only
@@ -600,10 +600,10 @@ fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::uti
 fn detect_conflict_for_cli(
     engine: &VpnRuntime,
     target_name: &str,
-) -> Option<crate::vortix_core::engine::Conflict> {
+) -> Option<crate::core::engine::Conflict> {
     let target_profile = engine.profiles.iter().find(|p| p.name == target_name)?;
     let specs = crate::control::profiles::load(&engine.config_dir, engine.profiles.clone());
-    let routes = |id: &crate::vortix_core::profile::ProfileId| {
+    let routes = |id: &crate::core::profile::ProfileId| {
         specs
             .get(id)
             .and_then(|entry| entry.spec.as_ref().ok())
@@ -623,7 +623,7 @@ fn detect_conflict_for_cli(
             continue;
         };
         let active_allowed = routes(&active_profile.id);
-        if let Some(conflict) = crate::vortix_core::engine::classify_route_conflict(
+        if let Some(conflict) = crate::core::engine::classify_route_conflict(
             &target_allowed,
             &active_allowed,
             &active_profile.id,
@@ -1169,7 +1169,7 @@ fn human_status_headline(snap: &crate::vpn_runtime::connection::StatusSnapshot) 
         "connected" => snap.health.as_ref().map_or_else(
             || format!("● Connected to {profile} ({protocol})"),
             |health| match health {
-                crate::vortix_core::engine::state::ConnectionHealth::Degraded { .. } => format!(
+                crate::core::engine::state::ConnectionHealth::Degraded { .. } => format!(
                     "⚠ Connected to {profile} ({protocol}) — {}",
                     connection_health_human(health)
                 ),
@@ -1186,9 +1186,9 @@ fn human_status_headline(snap: &crate::vpn_runtime::connection::StatusSnapshot) 
 }
 
 fn connection_health_entry(
-    health: &crate::vortix_core::engine::state::ConnectionHealth,
+    health: &crate::core::engine::state::ConnectionHealth,
 ) -> ConnectionHealthEntry {
-    use crate::vortix_core::engine::state::ConnectionHealth;
+    use crate::core::engine::state::ConnectionHealth;
     match health {
         ConnectionHealth::Unknown => ConnectionHealthEntry {
             status: "unknown".into(),
@@ -1205,8 +1205,8 @@ fn connection_health_entry(
     }
 }
 
-fn connection_health_human(health: &crate::vortix_core::engine::state::ConnectionHealth) -> String {
-    use crate::vortix_core::engine::state::ConnectionHealth;
+fn connection_health_human(health: &crate::core::engine::state::ConnectionHealth) -> String {
+    use crate::core::engine::state::ConnectionHealth;
     match health {
         ConnectionHealth::Unknown => "Unknown (measuring)".into(),
         ConnectionHealth::Healthy => "Healthy".into(),
@@ -1216,8 +1216,8 @@ fn connection_health_human(health: &crate::vortix_core::engine::state::Connectio
     }
 }
 
-fn degraded_reason_human(reason: &crate::vortix_core::engine::state::DegradedReason) -> String {
-    use crate::vortix_core::engine::state::DegradedReason;
+fn degraded_reason_human(reason: &crate::core::engine::state::DegradedReason) -> String {
+    use crate::core::engine::state::DegradedReason;
     match reason {
         DegradedReason::HandshakeStale {
             seconds_since_last_handshake,
@@ -1337,8 +1337,8 @@ mod handshake_status_tests {
 
     #[test]
     fn human_projection_preserves_typed_health_generation() {
-        let degraded = crate::vortix_core::engine::state::ConnectionHealth::Degraded {
-            reason: crate::vortix_core::engine::state::DegradedReason::WireGuardPeerStale {
+        let degraded = crate::core::engine::state::ConnectionHealth::Degraded {
+            reason: crate::core::engine::state::DegradedReason::WireGuardPeerStale {
                 peer_public_key: "peer-public-key".into(),
                 allowed_routes: vec!["10.0.0.0/24".into()],
                 seconds_since_last_handshake: 181,
@@ -1351,7 +1351,7 @@ mod handshake_status_tests {
         let projected = connection_health_entry(snap.health.as_ref().unwrap());
         assert_eq!(projected.status, "degraded");
         assert!(projected.reason.unwrap().contains("peer-pub"));
-        snap.health = Some(crate::vortix_core::engine::state::ConnectionHealth::Healthy);
+        snap.health = Some(crate::core::engine::state::ConnectionHealth::Healthy);
         assert_eq!(
             connection_health_entry(snap.health.as_ref().unwrap()).status,
             "healthy"
@@ -1617,7 +1617,7 @@ fn format_elapsed(secs: u64) -> String {
 fn build_profile_entry(
     profile: &crate::state::VpnProfile,
     active_names: &std::collections::HashSet<String>,
-    sidecar: Option<&crate::vortix_config::profile_store::ProfileSummary>,
+    sidecar: Option<&crate::config::profile_store::ProfileSummary>,
 ) -> ProfileEntry {
     ProfileEntry {
         name: profile.name.clone(),
@@ -1659,7 +1659,7 @@ mod list_tests {
 
     fn profile(name: &str) -> VpnProfile {
         VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(name),
+            id: crate::core::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -2247,7 +2247,7 @@ fn handle_rename(
     );
 
     if fresh_profile.protocol == crate::state::Protocol::WireGuard
-        && crate::vortix_core::profile::validate_wireguard_interface_name(trimmed).is_err()
+        && crate::core::profile::validate_wireguard_interface_name(trimmed).is_err()
     {
         print_error_and_exit(
             mode,
@@ -2266,12 +2266,12 @@ fn handle_rename(
         .rename(&profile_id, trimmed)
     {
         let (code, message, exit) = match error {
-            crate::vortix_config::profile_store::ProfileStoreError::NameCollision { .. } => (
+            crate::config::profile_store::ProfileStoreError::NameCollision { .. } => (
                 "already_exists",
                 format!("A profile named '{trimmed}' already exists"),
                 ExitCode::StateConflict,
             ),
-            crate::vortix_config::profile_store::ProfileStoreError::InvalidName(_) => (
+            crate::config::profile_store::ProfileStoreError::InvalidName(_) => (
                 "invalid_name",
                 format!("'{trimmed}' is not a usable profile name"),
                 ExitCode::GeneralError,
@@ -2572,7 +2572,7 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
     // Session-journal path. Folded into `vortix info` as part
     // of the v0.3.0 CLI surface cleanup — `vortix journal path` was
     // dropped in favour of surfacing the path here.
-    let journal_session = crate::vortix_core::journal::global_journal()
+    let journal_session = crate::core::journal::global_journal()
         .and_then(|j| j.session_path.as_ref().map(|p| p.display().to_string()));
 
     let data = InfoData {
@@ -2620,7 +2620,7 @@ fn handle_update(mode: OutputMode) {
         println!("Updating vortix...");
     }
 
-    let result = crate::vortix_process::run_to_output(crate::vortix_process::CommandSpec::oneshot(
+    let result = crate::process::run_to_output(crate::process::CommandSpec::oneshot(
         "cargo",
         vec!["install".into(), "vortix".into(), "--force".into()],
     ));

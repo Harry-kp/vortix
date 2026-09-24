@@ -4,9 +4,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, AuthField, FocusedPanel, InputMode, ToastType};
 use crate::constants;
+use crate::core::engine::state::Connection;
 use crate::message::{self, Message, ScrollMove, SelectionMove};
 use crate::state::help_max_scroll_for_terminal_height;
-use crate::vortix_core::engine::state::Connection;
 
 enum ConfirmAction {
     Confirmed,
@@ -536,7 +536,7 @@ impl crate::app::App {
     fn handle_input_auth(
         &mut self,
         key: KeyEvent,
-        profile_id: &crate::vortix_core::profile::ProfileId,
+        profile_id: &crate::core::profile::ProfileId,
         _profile_name: &str,
         username: &mut crate::state::SecretText,
         username_cursor: &mut usize,
@@ -955,7 +955,7 @@ impl crate::app::App {
     fn handle_rename_keys(
         &mut self,
         key: KeyEvent,
-        profile_id: &crate::vortix_core::profile::ProfileId,
+        profile_id: &crate::core::profile::ProfileId,
         new_name: &mut String,
         cursor: &mut usize,
     ) {

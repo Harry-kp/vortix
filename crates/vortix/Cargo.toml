@@ -85,7 +85,7 @@ sha2 = "0.11"
 zeroize = "1.8"
 # Plan 2026-06-02-001 U2 (#191): base64 envelope for OpenVPN SCRV1
 # static-challenge auth files. STANDARD alphabet only — see
-# `vortix_protocol_openvpn::tunnel` consumers and the plan's Key Tech
+# `openvpn::tunnel` consumers and the plan's Key Tech
 # Decisions for the URL_SAFE-vs-STANDARD reasoning.
 base64 = "0.23"
 # Plan 002 U10: raw socket for ICMP echo (replaces `ping` shell-out).

@@ -18,15 +18,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::state::VpnProfile;
-use crate::vortix_config::openvpn_credentials::{
+use crate::config::openvpn_credentials::{
     CredentialClearOutcome, FsOpenVpnCredentialStore, RememberedOpenVpnCredentials,
 };
-use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::engine::state::DetailedConnectionInfo;
-use crate::vortix_core::engine::{classify_route_conflict, Conflict};
-use crate::vortix_core::profile::ProfileId;
-use crate::vortix_core::state::killswitch::{KillSwitchMode, KillSwitchState};
+use crate::core::cidr::Cidr;
+use crate::core::engine::state::DetailedConnectionInfo;
+use crate::core::engine::{classify_route_conflict, Conflict};
+use crate::core::profile::ProfileId;
+use crate::core::state::killswitch::{KillSwitchMode, KillSwitchState};
+use crate::state::VpnProfile;
 
 pub use state::Phase;
 
@@ -207,13 +207,10 @@ impl Config {
     }
 
     #[must_use]
-    pub const fn connect_timeout(
-        &self,
-        protocol: crate::vortix_core::profile::ProtocolKind,
-    ) -> Duration {
+    pub const fn connect_timeout(&self, protocol: crate::core::profile::ProtocolKind) -> Duration {
         match protocol {
-            crate::vortix_core::profile::ProtocolKind::OpenVpn => self.openvpn_timeout,
-            crate::vortix_core::profile::ProtocolKind::WireGuard => self.wireguard_timeout,
+            crate::core::profile::ProtocolKind::OpenVpn => self.openvpn_timeout,
+            crate::core::profile::ProtocolKind::WireGuard => self.wireguard_timeout,
         }
     }
 }

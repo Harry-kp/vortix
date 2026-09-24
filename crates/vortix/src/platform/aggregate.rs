@@ -16,14 +16,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::vortix_core::ports::killswitch::{
-    ActiveTunnelInfo, KillswitchError, Result as KsResult,
-};
+use crate::core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result as KsResult};
 
 #[cfg(target_os = "linux")]
-use crate::vortix_platform_linux as platform_impl;
+use crate::linux as platform_impl;
 #[cfg(target_os = "macos")]
-use crate::vortix_platform_macos as platform_impl;
+use crate::macos as platform_impl;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Mock state shells
@@ -202,7 +200,7 @@ impl KillswitchKind {
     ///
     /// The mock variant may panic if its internal mutex is poisoned.
     pub fn enable_blocking_multi(&self, active: &[ActiveTunnelInfo]) -> KsResult<()> {
-        use crate::vortix_core::ports::killswitch::Killswitch;
+        use crate::core::ports::killswitch::Killswitch;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::PfFirewall::enable_blocking_multi(active),
@@ -222,7 +220,7 @@ impl KillswitchKind {
     ///
     /// The mock variant may panic if its internal mutex is poisoned.
     pub fn disable_blocking(&self) -> KsResult<()> {
-        use crate::vortix_core::ports::killswitch::Killswitch;
+        use crate::core::ports::killswitch::Killswitch;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::PfFirewall::disable_blocking(),
@@ -234,7 +232,7 @@ impl KillswitchKind {
 
     /// Read back an exact blocking policy without mutating it.
     pub fn verify_blocking(&self, active: &[ActiveTunnelInfo]) -> KsResult<()> {
-        use crate::vortix_core::ports::killswitch::Killswitch;
+        use crate::core::ports::killswitch::Killswitch;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::PfFirewall::verify_blocking(active),
@@ -246,7 +244,7 @@ impl KillswitchKind {
 
     /// Prove that Vortix-owned firewall state is absent without mutating it.
     pub fn verify_disabled(&self) -> KsResult<()> {
-        use crate::vortix_core::ports::killswitch::Killswitch;
+        use crate::core::ports::killswitch::Killswitch;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::PfFirewall::verify_disabled(),
@@ -272,7 +270,7 @@ impl DnsResolverKind {
     /// Get the current system DNS server.
     #[must_use]
     pub fn get_dns_server(&self) -> Option<String> {
-        use crate::vortix_core::ports::dns::DnsResolver;
+        use crate::core::ports::dns::DnsResolver;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacDns::get_dns_server(),
@@ -283,14 +281,14 @@ impl DnsResolverKind {
     }
 }
 
-impl crate::vortix_core::ports::dns::DnsPolicyAdapter for DnsResolverKind {
-    fn capabilities(&self) -> crate::vortix_core::ports::dns::DnsPlatformCapabilities {
+impl crate::core::ports::dns::DnsPolicyAdapter for DnsResolverKind {
+    fn capabilities(&self) -> crate::core::ports::dns::DnsPlatformCapabilities {
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacDns.capabilities(),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxDns.capabilities(),
-            Self::Mock(_) => crate::vortix_core::ports::dns::DnsPlatformCapabilities {
+            Self::Mock(_) => crate::core::ports::dns::DnsPlatformCapabilities {
                 scoped_domains: true,
             },
         }
@@ -298,10 +296,10 @@ impl crate::vortix_core::ports::dns::DnsPolicyAdapter for DnsResolverKind {
 
     fn apply(
         &self,
-        desired: &crate::vortix_core::ports::dns::DnsPolicy,
-        previous_desired: Option<&crate::vortix_core::ports::dns::DnsPolicy>,
-        previous_effective: &crate::vortix_core::ports::dns::DnsEffectiveState,
-    ) -> crate::vortix_core::ports::dns::DnsEffectiveState {
+        desired: &crate::core::ports::dns::DnsPolicy,
+        previous_desired: Option<&crate::core::ports::dns::DnsPolicy>,
+        previous_effective: &crate::core::ports::dns::DnsEffectiveState,
+    ) -> crate::core::ports::dns::DnsEffectiveState {
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => {
@@ -311,18 +309,18 @@ impl crate::vortix_core::ports::dns::DnsPolicyAdapter for DnsResolverKind {
             Self::Linux => {
                 platform_impl::LinuxDns.apply(desired, previous_desired, previous_effective)
             }
-            Self::Mock(_) => crate::vortix_core::ports::dns::DnsEffectiveState {
+            Self::Mock(_) => crate::core::ports::dns::DnsEffectiveState {
                 requested_generation: desired.generation,
                 applied_generation: Some(desired.generation),
                 status: if desired.assignments.iter().all(|assignment| {
                     matches!(
                         assignment.scope,
-                        crate::vortix_core::ports::dns::DnsScope::Suppressed
+                        crate::core::ports::dns::DnsScope::Suppressed
                     )
                 }) {
-                    crate::vortix_core::ports::dns::DnsEffectiveStatus::Released
+                    crate::core::ports::dns::DnsEffectiveStatus::Released
                 } else {
-                    crate::vortix_core::ports::dns::DnsEffectiveStatus::Applied
+                    crate::core::ports::dns::DnsEffectiveStatus::Applied
                 },
                 owned: desired
                     .assignments
@@ -330,17 +328,15 @@ impl crate::vortix_core::ports::dns::DnsPolicyAdapter for DnsResolverKind {
                     .filter(|assignment| {
                         !matches!(
                             assignment.scope,
-                            crate::vortix_core::ports::dns::DnsScope::Suppressed
+                            crate::core::ports::dns::DnsScope::Suppressed
                         )
                     })
-                    .map(
-                        |assignment| crate::vortix_core::ports::dns::DnsOwnedResource {
-                            generation: desired.generation,
-                            id: format!("mock:{}", assignment.interface),
-                            profile_id: assignment.profile_id.clone(),
-                            interface: assignment.interface.clone(),
-                        },
-                    )
+                    .map(|assignment| crate::core::ports::dns::DnsOwnedResource {
+                        generation: desired.generation,
+                        id: format!("mock:{}", assignment.interface),
+                        profile_id: assignment.profile_id.clone(),
+                        interface: assignment.interface.clone(),
+                    })
                     .collect(),
                 errors: Vec::new(),
             },
@@ -349,8 +345,8 @@ impl crate::vortix_core::ports::dns::DnsPolicyAdapter for DnsResolverKind {
 
     fn verify(
         &self,
-        desired: &crate::vortix_core::ports::dns::DnsPolicy,
-        effective: &crate::vortix_core::ports::dns::DnsEffectiveState,
+        desired: &crate::core::ports::dns::DnsPolicy,
+        effective: &crate::core::ports::dns::DnsEffectiveState,
     ) -> Result<(), Vec<String>> {
         match self {
             #[cfg(target_os = "macos")]
@@ -377,7 +373,7 @@ impl InterfaceKind {
     /// Resolve the real interface name for a `WireGuard` profile.
     #[must_use]
     pub fn resolve_wireguard_interface(&self, name: &str) -> Option<String> {
-        use crate::vortix_core::ports::interface::Interface;
+        use crate::core::ports::interface::Interface;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacInterface::resolve_wireguard_interface(name),
@@ -398,7 +394,7 @@ impl InterfaceKind {
     /// PID of the `WireGuard` user-space process managing the interface.
     #[must_use]
     pub fn get_wireguard_pid(&self, interface: &str) -> Option<u32> {
-        use crate::vortix_core::ports::interface::Interface;
+        use crate::core::ports::interface::Interface;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacInterface::get_wireguard_pid(interface),
@@ -411,7 +407,7 @@ impl InterfaceKind {
     /// `(ip, mtu)` for the interface.
     #[must_use]
     pub fn get_interface_info(&self, interface: &str) -> (String, String) {
-        use crate::vortix_core::ports::interface::Interface;
+        use crate::core::ports::interface::Interface;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacInterface::get_interface_info(interface),
@@ -437,7 +433,7 @@ impl NetworkStatsKind {
     /// Total bytes received and transmitted across all non-loopback interfaces.
     #[must_use]
     pub fn get_total_bytes(&self) -> (u64, u64) {
-        use crate::vortix_core::ports::network_stats::NetworkStats;
+        use crate::core::ports::network_stats::NetworkStats;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacNetworkStats::get_total_bytes(),
@@ -463,7 +459,7 @@ impl RouteTableKind {
     /// IP of the current default gateway, if any.
     #[must_use]
     pub fn default_gateway(&self) -> Option<String> {
-        use crate::vortix_core::ports::route_table::RouteTable;
+        use crate::core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacRouteTable::default_gateway(),
@@ -484,19 +480,19 @@ impl RouteTableKind {
     #[must_use]
     pub fn default_route_observation(
         &self,
-    ) -> crate::vortix_core::ports::route_table::DefaultRouteObservation {
-        use crate::vortix_core::ports::route_table::RouteTable;
+    ) -> crate::core::ports::route_table::DefaultRouteObservation {
+        use crate::core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacRouteTable::default_route_observation(),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxRouteTable::default_route_observation(),
             Self::Mock(m) if m.probe_failed => {
-                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed
+                crate::core::ports::route_table::DefaultRouteObservation::ProbeFailed
             }
             Self::Mock(m) => m.interface.clone().map_or(
-                crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-                crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface,
+                crate::core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
+                crate::core::ports::route_table::DefaultRouteObservation::Interface,
             ),
         }
     }
@@ -511,7 +507,7 @@ impl RouteTableKind {
 
     /// Bind `cidr` to `interface`.
     pub fn bind_route(&self, cidr: &str, interface: &str) -> Result<(), String> {
-        use crate::vortix_core::ports::route_table::RouteTable;
+        use crate::core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacRouteTable::bind_route(cidr, interface),
@@ -527,7 +523,7 @@ impl RouteTableKind {
         destination: std::net::IpAddr,
         gateway: &str,
     ) -> Result<(), String> {
-        use crate::vortix_core::ports::route_table::RouteTable;
+        use crate::core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacRouteTable::bind_host_route(destination, gateway),
@@ -539,7 +535,7 @@ impl RouteTableKind {
 
     /// Remove an interface-scoped route installed by Vortix.
     pub fn unbind_route(&self, cidr: &str, interface: &str) -> Result<(), String> {
-        use crate::vortix_core::ports::route_table::RouteTable;
+        use crate::core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacRouteTable::unbind_route(cidr, interface),
@@ -551,7 +547,7 @@ impl RouteTableKind {
 
     /// Remove a VPN-server escape route installed by Vortix.
     pub fn unbind_host_route(&self, destination: std::net::IpAddr) -> Result<(), String> {
-        use crate::vortix_core::ports::route_table::RouteTable;
+        use crate::core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacRouteTable::unbind_host_route(destination),
@@ -566,19 +562,19 @@ impl RouteTableKind {
     pub fn route_interface_for(
         &self,
         target: std::net::IpAddr,
-    ) -> crate::vortix_core::ports::route_table::DefaultRouteObservation {
-        use crate::vortix_core::ports::route_table::RouteTable;
+    ) -> crate::core::ports::route_table::DefaultRouteObservation {
+        use crate::core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::MacRouteTable::route_interface_for(target),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxRouteTable::route_interface_for(target),
             Self::Mock(m) if m.probe_failed => {
-                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed
+                crate::core::ports::route_table::DefaultRouteObservation::ProbeFailed
             }
             Self::Mock(m) => m.interface.clone().map_or(
-                crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-                crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface,
+                crate::core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
+                crate::core::ports::route_table::DefaultRouteObservation::Interface,
             ),
         }
     }
@@ -587,7 +583,7 @@ impl RouteTableKind {
 /// Scriptable mock for the `SocketAudit` port.
 #[derive(Debug, Default, Clone)]
 pub struct MockSocketAudit {
-    pub canned: Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>,
+    pub canned: Vec<crate::core::ports::socket_audit::SocketSnapshot>,
 }
 
 /// Static-dispatch carrier for the `SocketAudit` port.
@@ -606,13 +602,13 @@ impl SocketAuditKind {
     ///
     /// # Errors
     ///
-    /// See `crate::vortix_core::ports::socket_audit::SocketAuditError`.
+    /// See `crate::core::ports::socket_audit::SocketAuditError`.
     pub fn snapshot(
         &self,
-    ) -> crate::vortix_core::ports::socket_audit::SocketAuditResult<
-        Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>,
+    ) -> crate::core::ports::socket_audit::SocketAuditResult<
+        Vec<crate::core::ports::socket_audit::SocketSnapshot>,
     > {
-        use crate::vortix_core::ports::socket_audit::SocketAudit;
+        use crate::core::ports::socket_audit::SocketAudit;
         match self {
             #[cfg(target_os = "macos")]
             Self::Macos => platform_impl::LsofSocketAudit::snapshot(),

@@ -15,10 +15,10 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::core::engine::state::ConnectionHealth;
+use crate::core::ports::tunnel::{HandshakeEvidence, ProbeReceipt};
+use crate::core::profile::ProfileId;
 use crate::core::scanner::ActiveSession;
-use crate::vortix_core::engine::state::ConnectionHealth;
-use crate::vortix_core::ports::tunnel::{HandshakeEvidence, ProbeReceipt};
-use crate::vortix_core::profile::ProfileId;
 
 const DIRECTORY: &str = "managed-wireguard";
 const LOCK_FILE: &str = "managed-wireguard.lock";
@@ -385,7 +385,7 @@ fn receipt_path(config_dir: &Path, profile_id: &ProfileId) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vortix_core::ports::tunnel::TunnelPeerStatus;
+    use crate::core::ports::tunnel::TunnelPeerStatus;
     use std::time::Duration;
 
     fn evidence(generation: u64, at: SystemTime) -> HandshakeEvidence {

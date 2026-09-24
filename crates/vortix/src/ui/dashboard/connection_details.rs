@@ -1,9 +1,9 @@
 use crate::app::App;
+use crate::core::cidr::Cidr;
+use crate::core::engine::registry::{Role, TunnelSnapshot};
+use crate::core::engine::state::{Connection, DetailedConnectionInfo};
 use crate::state::{Protocol, QualityLevel};
 use crate::ui::helpers;
-use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
-use crate::vortix_core::engine::state::{Connection, DetailedConnectionInfo};
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::Rect,
@@ -343,9 +343,9 @@ fn render_connected(
         theme::current().yellow,
     ));
 
-    if let crate::vortix_core::engine::state::ConnectionHealth::Degraded {
+    if let crate::core::engine::state::ConnectionHealth::Degraded {
         reason:
-            crate::vortix_core::engine::state::DegradedReason::WireGuardPeerStale {
+            crate::core::engine::state::DegradedReason::WireGuardPeerStale {
                 allowed_routes,
                 seconds_since_last_handshake,
                 ..
@@ -673,10 +673,8 @@ fn format_cidr(c: &Cidr) -> String {
 }
 
 /// `AwaitingUserInput` call-to-action.
-fn awaiting_user_input_hint(
-    prompt_kind: &crate::vortix_core::engine::state::PromptKind,
-) -> Line<'static> {
-    use crate::vortix_core::engine::state::PromptKind;
+fn awaiting_user_input_hint(prompt_kind: &crate::core::engine::state::PromptKind) -> Line<'static> {
+    use crate::core::engine::state::PromptKind;
     let what = match prompt_kind {
         PromptKind::TwoFactorCode => "2FA code",
         PromptKind::Passphrase => "passphrase",
@@ -836,9 +834,9 @@ mod tests {
     //! unknown focused profiles surface the "no longer available" hint.
     use super::*;
     use crate::app::App;
+    use crate::core::engine::state::PromptKind;
+    use crate::core::profile::ProfileId;
     use crate::state::{Protocol, VpnProfile};
-    use crate::vortix_core::engine::state::PromptKind;
-    use crate::vortix_core::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -851,7 +849,7 @@ mod tests {
 
     fn make_profile(name: &str, config_path: PathBuf) -> VpnProfile {
         VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(name),
+            id: crate::core::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: Protocol::WireGuard,
             location: String::new(),
@@ -861,7 +859,7 @@ mod tests {
     }
 
     fn insert_connected(app: &mut App, name: &str, interface: &str, allowed_ips: Vec<Cidr>) {
-        use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
+        use crate::core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
         let profile_id = ProfileId::new(name);
         app.registry.insert_for_test(TunnelSnapshot {
             profile_id: profile_id.clone(),
@@ -869,7 +867,7 @@ mod tests {
                 profile_id,
                 since: SystemTime::UNIX_EPOCH,
                 health: ConnectionHealth::default(),
-                details: Box::new(crate::vortix_core::engine::DetailedConnectionInfo {
+                details: Box::new(crate::core::engine::DetailedConnectionInfo {
                     interface: interface.to_owned(),
                     interface_authoritative: true,
                     ..Default::default()
@@ -919,9 +917,9 @@ mod tests {
             });
             app.profile_list_state.select(Some(0));
             let profile_id = ProfileId::new("corp");
-            let tunnel = crate::vortix_core::engine::TunnelSnapshot {
+            let tunnel = crate::core::engine::TunnelSnapshot {
                 profile_id: profile_id.clone(),
-                state: crate::vortix_core::engine::Connection::Connecting {
+                state: crate::core::engine::Connection::Connecting {
                     profile_id: profile_id.clone(),
                     started_at: std::time::SystemTime::UNIX_EPOCH,
                     attempt: 1,
@@ -930,7 +928,7 @@ mod tests {
                 role: Role::Addressable {
                     allowed_ips: Vec::new(),
                 },
-                health: crate::vortix_core::engine::ConnectionHealth::Unknown,
+                health: crate::core::engine::ConnectionHealth::Unknown,
                 interface_name: None,
                 started_at: Some(std::time::SystemTime::UNIX_EPOCH),
             };

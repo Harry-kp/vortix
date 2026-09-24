@@ -16,7 +16,7 @@ pub use runner::{
 /// runtime.
 pub(crate) fn start(config_dir: &Path) -> Option<HookRunner> {
     let started = (|| {
-        let settings = crate::vortix_config::Settings::load_from_config_dir(config_dir)
+        let settings = crate::config::Settings::load_from_config_dir(config_dir)
             .map_err(|error| error.to_string())?;
         if settings.hooks.is_empty() {
             return Ok(None);
@@ -26,7 +26,7 @@ pub(crate) fn start(config_dir: &Path) -> Option<HookRunner> {
         HookRunner::start(
             settings.hooks,
             owner,
-            crate::vortix_process::global_runner().clone(),
+            crate::process::global_runner().clone(),
         )
         .map(|started| started.map(|(runner, _)| runner))
         .map_err(|error| error.to_string())

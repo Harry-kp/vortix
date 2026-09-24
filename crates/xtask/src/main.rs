@@ -9,12 +9,12 @@ type Task = fn() -> Result<(), Box<dyn std::error::Error>>;
 const TASKS: &[(&str, &str, Task)] = &[
     (
         "check-subprocess",
-        "Verify no raw `Command::new` outside `vortix-process`.",
+        "Verify no raw `Command::new` outside `process/real.rs`.",
         check_subprocess,
     ),
     (
         "check-platform-leak",
-        "Verify no `cfg(target_os)` outside `vortix-platform-*`.",
+        "Verify no `cfg(target_os)` outside `macos/`, `linux/`, `platform/`.",
         check_platform_leak,
     ),
     (
@@ -95,10 +95,10 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Scan the workspace for raw `Command::new` use outside `vortix-process`.
+/// Scan the workspace for raw `Command::new` use outside `process/real.rs`.
 ///
 /// Allowed:
-/// - `vortix-process/src/real.rs` (the one legitimate caller of `tokio::process::Command::new`)
+/// - `crates/vortix/src/process/real.rs` (the one legitimate caller of `tokio::process::Command::new`)
 /// - Lines annotated with `// xtask:allow-subprocess` (explicit opt-out)
 /// - Matches inside `xtask`'s own source (this file references the pattern in the
 ///   error message and the allowlist below — we don't lint ourselves).
@@ -139,7 +139,7 @@ fn check_subprocess() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         eprintln!(
-            "xtask check-subprocess: {} violation(s) — all subprocess invocations must flow through `vortix_process::CommandRunner`. Annotate exceptions with `// xtask:allow-subprocess: <reason>`.",
+            "xtask check-subprocess: {} violation(s) — all subprocess invocations must flow through `process::CommandRunner`. Annotate exceptions with `// xtask:allow-subprocess: <reason>`.",
             violations.len()
         );
         for v in &violations {
@@ -163,9 +163,7 @@ fn is_allowlisted_file(path: &Path, workspace_root: &Path) -> bool {
     let rel_str = rel.to_string_lossy();
 
     // Allow the runner impl itself.
-    if rel_str == "crates/vortix-process/src/real.rs"
-        || rel_str == "crates/vortix/src/vortix_process/real.rs"
-    {
+    if rel_str == "crates/vortix/src/process/real.rs" {
         return true;
     }
 
@@ -181,7 +179,7 @@ fn is_allowlisted_file(path: &Path, workspace_root: &Path) -> bool {
 /// boundaries.
 ///
 /// Allowlist:
-/// - `crates/vortix-platform-{macos,linux,windows}/**` — platform crates.
+/// - `crates/vortix/src/{macos,linux,platform}/**` — platform modules.
 /// - `crates/vortix/src/platform/**` — binary-side platform aggregate.
 /// - `crates/vortix/src/constants.rs` — OS-specific compile-time constants.
 /// - `crates/xtask/src/main.rs` — this lint references the pattern.
@@ -241,7 +239,7 @@ fn check_platform_leak() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         eprintln!(
-            "xtask check-platform-leak: {} violation(s) — `cfg(target_os = ...)` must live in `vortix-platform-*` or `vortix::platform::*`. Route OS-specific calls through `crate::platform::current_platform()`; for genuine compile-time gates, annotate with `// xtask:allow-platform-cfg: <reason>`.",
+            "xtask check-platform-leak: {} violation(s) — `cfg(target_os = ...)` must live in `macos`, `linux` or `platform`. Route OS-specific calls through `crate::platform::current_platform()`; for genuine compile-time gates, annotate with `// xtask:allow-platform-cfg: <reason>`.",
             violations.len()
         );
         for v in &violations {
@@ -255,8 +253,8 @@ fn is_platform_leak_allowlisted(path: &Path, workspace_root: &Path) -> bool {
     let rel = path.strip_prefix(workspace_root).unwrap_or(path);
     let rel_str = rel.to_string_lossy();
 
-    rel_str.starts_with("crates/vortix-platform-")
-        || rel_str.starts_with("crates/vortix/src/vortix_platform_")
+    rel_str.starts_with("crates/vortix/src/macos/")
+        || rel_str.starts_with("crates/vortix/src/linux/")
         || rel_str.starts_with("crates/vortix/src/platform/")
         || rel_str == "crates/vortix/src/lib.rs"
         || rel_str == "crates/vortix/src/constants.rs"
@@ -267,8 +265,8 @@ fn is_platform_leak_allowlisted(path: &Path, workspace_root: &Path) -> bool {
 /// `CommandSpec` invocations outside their protocol crates.
 ///
 /// Allowlist:
-/// - `crates/vortix-protocol-wireguard/**` may invoke `wg-quick` and `wg`.
-/// - `crates/vortix-protocol-openvpn/**` may invoke `openvpn`.
+/// - `crates/vortix/src/wireguard/**` may invoke `wg-quick` and `wg`.
+/// - `crates/vortix/src/openvpn/**` may invoke `openvpn`.
 /// - `crates/xtask/**` references the patterns in error strings.
 /// - Lines annotated `// xtask:allow-protocol-leak: <reason>` are accepted
 ///   (on the same line, the line above, or the line below — rustfmt may
@@ -293,13 +291,9 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
 
-        let allowed_names: &[&str] = if rel_str.starts_with("crates/vortix-protocol-wireguard/")
-            || rel_str.starts_with("crates/vortix/src/vortix_protocol_wireguard/")
-        {
+        let allowed_names: &[&str] = if rel_str.starts_with("crates/vortix/src/wireguard/") {
             &["openvpn"]
-        } else if rel_str.starts_with("crates/vortix-protocol-openvpn/")
-            || rel_str.starts_with("crates/vortix/src/vortix_protocol_openvpn/")
-        {
+        } else if rel_str.starts_with("crates/vortix/src/openvpn/") {
             &["wg", "wg-quick"]
         } else if rel_str.starts_with("crates/xtask/") {
             continue;

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::vortix_core::profile::{ProfileId, ProtocolKind};
+use crate::core::profile::{ProfileId, ProtocolKind};
 
 /// Lifecycle transitions available to global hook specifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

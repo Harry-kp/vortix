@@ -1,9 +1,9 @@
 use crate::app::App;
+use crate::core::engine::state::Connection;
+use crate::core::engine::TunnelSnapshot;
+use crate::core::profile::ProfileId;
 use crate::state::QualityLevel;
 use crate::ui::helpers;
-use crate::vortix_core::engine::state::Connection;
-use crate::vortix_core::engine::TunnelSnapshot;
-use crate::vortix_core::profile::ProfileId;
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::Rect,
@@ -227,7 +227,7 @@ fn format_uptime(elapsed: u64) -> String {
 fn connected_line(
     app: &App,
     primary_snap: &TunnelSnapshot,
-    details: &crate::vortix_core::engine::state::DetailedConnectionInfo,
+    details: &crate::core::engine::state::DetailedConnectionInfo,
     since: std::time::SystemTime,
     ks_indicator: Span<'static>,
     area_width: u16,
@@ -455,7 +455,7 @@ fn append_tunnels_strip(
     app: Option<&App>,
     mut line: Line<'static>,
     snapshots: &[TunnelSnapshot],
-    primary: Option<&crate::vortix_core::profile::ProfileId>,
+    primary: Option<&crate::core::profile::ProfileId>,
     area_width: u16,
 ) -> Line<'static> {
     // Order: primary first (if any), then remaining stable-sorted.
@@ -705,7 +705,7 @@ fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>
 ///
 /// The variant names `Off` / `Auto` / `AlwaysOn` are the stable
 /// CLI/JSON contract — never renamed. The labels here are the UI
-/// vocabulary; see `vortix_core::state::killswitch` module docs for
+/// vocabulary; see `core::state::killswitch` module docs for
 /// the mapping convention.
 fn get_killswitch_indicator(app: &App) -> Span<'static> {
     use crate::state::{KillSwitchMode, KillSwitchState};
@@ -764,9 +764,9 @@ mod tests {
     //! the rendering smoke covered here.
     use super::*;
     use crate::app::App;
-    use crate::vortix_core::engine::state::{Connection, ConnectionHealth, DetailedConnectionInfo};
-    use crate::vortix_core::engine::{Role, TunnelSnapshot};
-    use crate::vortix_core::profile::ProfileId;
+    use crate::core::engine::state::{Connection, ConnectionHealth, DetailedConnectionInfo};
+    use crate::core::engine::{Role, TunnelSnapshot};
+    use crate::core::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
@@ -832,18 +832,18 @@ mod tests {
             last_used: None,
         });
         let profile_id = ProfileId::new("corp");
-        let tunnel = crate::vortix_core::engine::TunnelSnapshot {
+        let tunnel = crate::core::engine::TunnelSnapshot {
             profile_id: profile_id.clone(),
-            state: crate::vortix_core::engine::Connection::Connecting {
+            state: crate::core::engine::Connection::Connecting {
                 profile_id: profile_id.clone(),
                 started_at: std::time::SystemTime::UNIX_EPOCH,
                 attempt: 1,
                 retry_budget_remaining: std::time::Duration::ZERO,
             },
-            role: crate::vortix_core::engine::Role::Addressable {
+            role: crate::core::engine::Role::Addressable {
                 allowed_ips: Vec::new(),
             },
-            health: crate::vortix_core::engine::ConnectionHealth::Unknown,
+            health: crate::core::engine::ConnectionHealth::Unknown,
             interface_name: None,
             started_at: Some(std::time::SystemTime::UNIX_EPOCH),
         };

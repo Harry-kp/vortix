@@ -1,6 +1,7 @@
 //! UI rendering module
 
 mod dashboard;
+mod footer;
 mod helpers;
 /// Overlays are reachable from the App layer because the open-config
 /// path pre-builds the cached `Vec<Line>` once (`CachedConfigView`)
@@ -9,7 +10,6 @@ pub(crate) mod overlays;
 /// Single source of truth for every sigil rendered in the TUI.
 /// Renderers + the `?` help overlay both read from `sigils::CATALOG`.
 pub(crate) mod sigils;
-mod widgets;
 
 use crate::app::App;
 use ratatui::Frame;

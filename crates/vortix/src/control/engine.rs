@@ -5,20 +5,18 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::config::openvpn_credentials::{FsOpenVpnCredentialStore, RememberedOpenVpnCredentials};
+use crate::core::engine::state::DetailedConnectionInfo;
+use crate::core::engine::Conflict;
+use crate::core::ports::route_table::DefaultRouteObservation;
+use crate::core::ports::tunnel::TunnelCancellation;
+use crate::core::profile::{ProfileId, ProtocolKind};
 use crate::core::scanner::{ActiveSession, ScannerResult};
+use crate::core::secret::Secret;
 use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
+use crate::core::state::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
-use crate::vortix_config::openvpn_credentials::{
-    FsOpenVpnCredentialStore, RememberedOpenVpnCredentials,
-};
-use crate::vortix_core::engine::state::DetailedConnectionInfo;
-use crate::vortix_core::engine::Conflict;
-use crate::vortix_core::ports::route_table::DefaultRouteObservation;
-use crate::vortix_core::ports::tunnel::TunnelCancellation;
-use crate::vortix_core::profile::{ProfileId, ProtocolKind};
-use crate::vortix_core::secret::Secret;
-use crate::vortix_core::state::killswitch::{KillSwitchMode, KillSwitchState};
-use crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials;
+use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 
 use super::net::Net;
 use super::plan::{plan, NetworkPlan};
@@ -1033,8 +1031,8 @@ impl Engine {
 
     fn notice(&mut self, level: Level, text: String) {
         tracing::info!(target: "vortix::engine", ?level, %text);
-        if let Some(journal) = crate::vortix_core::journal::global_journal() {
-            let _ = journal.append(crate::vortix_core::journal::JournalEvent::Notice {
+        if let Some(journal) = crate::core::journal::global_journal() {
+            let _ = journal.append(crate::core::journal::JournalEvent::Notice {
                 level: format!("{level:?}").to_ascii_lowercase(),
                 text: text.clone(),
             });

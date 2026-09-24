@@ -1,11 +1,9 @@
 use std::time::{Duration, Instant};
 
+use vortix::config::migrate_legacy_profiles;
+use vortix::config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError, Sidecar};
+use vortix::core::profile::{Profile, ProfileId, ProtocolKind};
 use vortix::state::{ProfilePresence, ProfilePresenceTracker};
-use vortix::vortix_config::migrate_legacy_profiles;
-use vortix::vortix_config::profile_store::{
-    FsProfileStore, ProfileStore, ProfileStoreError, Sidecar,
-};
-use vortix::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 
 fn id(byte: u8) -> ProfileId {
     ProfileId::parse(format!("{byte:02x}").repeat(32)).unwrap()

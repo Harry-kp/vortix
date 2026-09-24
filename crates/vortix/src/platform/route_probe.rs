@@ -3,7 +3,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::vortix_process::CommandSpec;
+use crate::process::CommandSpec;
 
 pub(crate) enum ProbeOutcome {
     BackedOff,
@@ -46,7 +46,7 @@ impl RouteProbe {
             }
         }
 
-        let result = crate::vortix_process::run_to_output(spec);
+        let result = crate::process::run_to_output(spec);
         let mut state = state.lock().expect("backoff state mutex poisoned");
         if let Ok(output) = result {
             state.consecutive_failures = 0;

@@ -50,7 +50,7 @@ fn test_app() -> App {
 fn add_wg_profiles(app: &mut App, names: &[&str]) {
     for name in names {
         app.runtime.profiles.push(VpnProfile {
-            id: vortix::vortix_core::profile::ProfileId::new(*name),
+            id: vortix::core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -65,7 +65,7 @@ fn set_connected(app: &mut App, name: &str) {
         add_wg_profiles(app, &[name]);
     }
     app.runtime.session_start = Some(Instant::now());
-    let details = vortix::vortix_core::engine::DetailedConnectionInfo {
+    let details = vortix::core::engine::DetailedConnectionInfo {
         interface: "wg0".to_string(),
         interface_authoritative: true,
         pid: Some(12345),
@@ -74,23 +74,19 @@ fn set_connected(app: &mut App, name: &str) {
     set_projection(
         app,
         name,
-        &vortix::vortix_core::engine::state::Connection::Connected {
-            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
+        &vortix::core::engine::state::Connection::Connected {
+            profile_id: vortix::core::profile::ProfileId::new(name),
             since: std::time::SystemTime::now(),
-            health: vortix::vortix_core::engine::state::ConnectionHealth::Healthy,
+            health: vortix::core::engine::state::ConnectionHealth::Healthy,
             details: Box::new(details),
         },
     );
 }
 
-fn set_projection(
-    app: &mut App,
-    name: &str,
-    state: &vortix::vortix_core::engine::state::Connection,
-) {
+fn set_projection(app: &mut App, name: &str, state: &vortix::core::engine::state::Connection) {
     use vortix::control::{Phase, TunnelView};
-    use vortix::vortix_core::engine::state::Connection;
-    use vortix::vortix_core::profile::ProfileId;
+    use vortix::core::engine::state::Connection;
+    use vortix::core::profile::ProfileId;
 
     let phase = match state {
         Connection::Connected { .. } => Phase::Up,
@@ -114,7 +110,7 @@ fn set_projection(
         since: std::time::SystemTime::now(),
         routes: Vec::new(),
         dns: Vec::new(),
-        details: vortix::vortix_core::engine::state::DetailedConnectionInfo {
+        details: vortix::core::engine::state::DetailedConnectionInfo {
             interface: "wg0".into(),
             ..Default::default()
         },
