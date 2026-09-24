@@ -20,13 +20,7 @@ const PROFILE_LOCK: &str = ".vortix-profile.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub(crate) fn is_profile_config_name(file_name: &str) -> bool {
-    !file_name.starts_with('.')
-        && matches!(
-            Path::new(file_name)
-                .extension()
-                .and_then(|extension| extension.to_str()),
-            Some("conf" | "ovpn")
-        )
+    !file_name.starts_with('.') && crate::profile::has_profile_extension(Path::new(file_name))
 }
 
 pub(crate) struct ProfileMutationLock(std::fs::File);
@@ -302,15 +296,7 @@ impl FsProfileStore {
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 == Some(profile.display_name.as_str());
-        if is_local_named_path
-            && matches!(
-                profile
-                    .config_path
-                    .extension()
-                    .and_then(|value| value.to_str()),
-                Some("conf" | "ovpn")
-            )
-        {
+        if is_local_named_path && crate::profile::has_profile_extension(&profile.config_path) {
             profile
                 .config_path
                 .file_name()
@@ -412,12 +398,7 @@ impl FsProfileStore {
             let safe_filename = config_path.components().count() == 1
                 && config_path.file_stem().and_then(|stem| stem.to_str())
                     == Some(sidecar.display_name.as_str())
-                && matches!(
-                    config_path
-                        .extension()
-                        .and_then(|extension| extension.to_str()),
-                    Some("conf" | "ovpn")
-                );
+                && crate::profile::has_profile_extension(config_path);
             if !safe_filename {
                 return Err(ProfileStoreError::MalformedSidecar {
                     path: path.to_path_buf(),
@@ -769,10 +750,7 @@ impl FsProfileStore {
                 continue;
             }
             let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                if matches!(
-                    path.extension().and_then(|extension| extension.to_str()),
-                    Some("conf" | "ovpn")
-                ) {
+                if crate::profile::has_profile_extension(&path) {
                     return Err(ProfileStoreError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("profile filename is not valid UTF-8: {}", path.display()),
@@ -1107,18 +1085,20 @@ fn validate_basename(file: &str) -> Result<(), ProfileStoreError> {
     Ok(())
 }
 
-fn validate_config_basename(file: &str, display_name: &str) -> Result<(), ProfileStoreError> {
-    validate_basename(file)?;
+/// `<display_name>.conf` or `.ovpn`, a plain name inside the profile directory.
+pub(crate) fn is_config_file_for(file: &str, display_name: &str) -> bool {
     let path = Path::new(file);
-    if path.file_stem().and_then(|value| value.to_str()) != Some(display_name)
-        || !matches!(
-            path.extension().and_then(|value| value.to_str()),
-            Some("conf" | "ovpn")
-        )
-    {
-        return Err(ProfileStoreError::InvalidName(file.to_string()));
+    validate_basename(file).is_ok()
+        && path.file_stem().and_then(|value| value.to_str()) == Some(display_name)
+        && crate::profile::has_profile_extension(path)
+}
+
+fn validate_config_basename(file: &str, display_name: &str) -> Result<(), ProfileStoreError> {
+    if is_config_file_for(file, display_name) {
+        Ok(())
+    } else {
+        Err(ProfileStoreError::InvalidName(file.to_string()))
     }
-    Ok(())
 }
 
 fn reject_symlink(path: &Path) -> Result<(), ProfileStoreError> {

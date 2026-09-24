@@ -1186,15 +1186,7 @@ fn validate_inventory_entry(entry: &InventoryEntry) -> std::io::Result<()> {
 }
 
 fn validate_config_name(file: &str, display_name: &str) -> std::io::Result<()> {
-    let path = Path::new(file);
-    if path.is_absolute()
-        || path.components().count() != 1
-        || path.file_stem().and_then(|value| value.to_str()) != Some(display_name)
-        || !matches!(
-            path.extension().and_then(|value| value.to_str()),
-            Some("conf" | "ovpn")
-        )
-    {
+    if !crate::config::profile_store::is_config_file_for(file, display_name) {
         return Err(invalid_data(format!(
             "unsafe inventory config filename {file}"
         )));

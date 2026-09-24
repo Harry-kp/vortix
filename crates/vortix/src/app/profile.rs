@@ -12,12 +12,7 @@ fn importable_profile_paths(dir_path: &Path) -> std::io::Result<Vec<std::path::P
     let mut paths = std::fs::read_dir(dir_path)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|ext| ext == "conf" || ext == "ovpn")
-        })
+        .filter(|path| path.is_file() && crate::profile::has_profile_extension(path))
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)

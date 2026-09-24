@@ -258,6 +258,15 @@ pub fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// A `.conf` or `.ovpn` file: the only extensions a profile can have.
+#[must_use]
+pub fn has_profile_extension(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(std::ffi::OsStr::to_str),
+        Some("conf" | "ovpn")
+    )
+}
+
 /// What a `.conf` file's syntax says it is: `WireGuard` sections, `OpenVPN`
 /// directives, or both (which nothing can connect, so it is refused).
 /// A file with neither reads as `WireGuard`; its parser then names what is

@@ -449,11 +449,7 @@ fn import_from_directory(
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|ext| ext == "conf" || ext == "ovpn")
-                {
+                if path.is_file() && crate::profile::has_profile_extension(&path) {
                     match import_profile_via_control(&path, config, config_dir) {
                         Ok(profile) => {
                             if matches!(mode, OutputMode::Human) {
