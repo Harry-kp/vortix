@@ -390,16 +390,9 @@ pub fn check_dependencies(
             {
                 missing.push("wireguard-tools".to_string());
             }
-            // On Linux, wg-quick uses `resolvconf` to set DNS when the
-            // config contains a DNS directive. Two escape hatches:
-            //   1. systemd-resolved + working `resolvectl` →
-            //      `WgTunnel::up` takes over per-link DNS via
-            //      `resolvectl` itself; no resolvconf shim needed.
-            //   2. A working `resolvconf` (openresolv on non-resolved
-            //      hosts; systemd-resolvconf shim on resolved hosts).
-            //
-            // Otherwise emit the missing-dep label with a hint at
-            // which shim the user actually needs.
+            // `DNS =` is stripped before wg-quick runs; Vortix applies it
+            // through `resolvectl`, else `resolvconf` (the same choice as
+            // `linux::dns`). A DNS profile with neither cannot be honoured.
             #[cfg(target_os = "linux")]
             // xtask:allow-platform-cfg: the gates below are Linux-only
             let parsed = std::fs::read_to_string(config_path)

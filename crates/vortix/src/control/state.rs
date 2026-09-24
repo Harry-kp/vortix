@@ -238,22 +238,28 @@ impl State {
         Some(attempt)
     }
 
-    /// Ask a tunnel to stop. Returns whether it was running.
+    /// Ask a tunnel to stop. Returns whether it was running. A stop also
+    /// cancels any pending restart: the latest request wins.
     pub fn stop(&mut self, profile_id: &ProfileId) -> bool {
-        match self.tunnels.get_mut(profile_id) {
-            Some(tunnel) if tunnel.phase != Phase::Stopping => {
-                tunnel.phase = Phase::Stopping;
-                true
-            }
-            _ => false,
+        let Some(tunnel) = self.tunnels.get_mut(profile_id) else {
+            return false;
+        };
+        tunnel.restart = false;
+        if tunnel.phase == Phase::Stopping {
+            return false;
         }
+        tunnel.phase = Phase::Stopping;
+        true
     }
 
-    /// Stop and start again.
+    /// Stop and start again. Returns false, and schedules nothing, when the
+    /// tunnel is absent or already stopping.
     pub fn restart(&mut self, profile_id: &ProfileId) -> bool {
         let stopped = self.stop(profile_id);
-        if let Some(tunnel) = self.tunnels.get_mut(profile_id) {
-            tunnel.restart = true;
+        if stopped {
+            if let Some(tunnel) = self.tunnels.get_mut(profile_id) {
+                tunnel.restart = true;
+            }
         }
         stopped
     }
@@ -263,6 +269,14 @@ impl State {
         self.tunnels
             .remove(profile_id)
             .filter(|tunnel| tunnel.restart)
+    }
+
+    /// Keep a restarted tunnel counted as dropped, so block-on-drop keeps
+    /// blocking until the restart actually comes up.
+    pub fn resume_recovery(&mut self, profile_id: &ProfileId) {
+        if let Some(tunnel) = self.tunnels.get_mut(profile_id) {
+            tunnel.recovering = Some(0);
+        }
     }
 
     /// A stop attempt failed; the tunnel is still carrying traffic.
@@ -489,6 +503,62 @@ mod tests {
         );
         state.came_up(&id("01"), "utun7".into(), [], [], None);
         assert!(!state.plan_input().dropped);
+    }
+
+    #[test]
+    fn a_disconnect_cancels_a_pending_reconnect() {
+        let mut state = State::default();
+        state
+            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .unwrap();
+        state.came_up(&id("01"), "utun4".into(), [], [], None);
+        assert!(state.restart(&id("01")));
+        assert!(!state.stop(&id("01")), "already stopping");
+        assert!(
+            state.stopped(&id("01")).is_none(),
+            "the disconnect must win over the earlier reconnect"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_while_stopping_schedules_nothing() {
+        let mut state = State::default();
+        state
+            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .unwrap();
+        state.came_up(&id("01"), "utun4".into(), [], [], None);
+        assert!(state.stop(&id("01")));
+        assert!(!state.restart(&id("01")));
+        assert!(state.stopped(&id("01")).is_none());
+    }
+
+    #[test]
+    fn a_restarted_dropped_tunnel_keeps_block_on_drop_blocking() {
+        let mut state = State {
+            kill_switch: KillSwitchMode::Auto,
+            ..State::default()
+        };
+        state
+            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .unwrap();
+        state.came_up(&id("01"), "utun4".into(), [], [], None);
+        state.lost(&id("01"), None);
+        assert!(state.restart(&id("01")));
+        let old = state.stopped(&id("01")).expect("restart requested");
+        assert!(old.recovering.is_some());
+        state
+            .begin(spec("01", "0.0.0.0/0"), 2, BTreeSet::new(), false)
+            .unwrap();
+        state.resume_recovery(&id("01"));
+        assert!(
+            state.plan_input().dropped,
+            "still blocking while it restarts"
+        );
+        assert!(
+            state.start_failed(&id("01"), None),
+            "a failed restart keeps waiting instead of forgetting the drop"
+        );
+        assert!(state.plan_input().dropped);
     }
 
     /// Every sequence of up to five events over three profiles keeps every

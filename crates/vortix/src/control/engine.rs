@@ -623,6 +623,9 @@ impl Engine {
                     .begin(spec, rank, BTreeSet::new(), matches!(need, Need::Prompt(_)))
                     .is_ok()
                 {
+                    if restart.as_ref().is_some_and(|old| old.recovering.is_some()) {
+                        self.state.resume_recovery(profile_id);
+                    }
                     match need {
                         Need::Ready {
                             credentials,
