@@ -46,6 +46,8 @@ pub(super) enum Event {
         result: ScannerResult,
         started: Instant,
     },
+    /// A dropped tunnel's teardown finished.
+    Drained { profile_id: ProfileId },
 }
 
 enum Wait {
@@ -217,6 +219,7 @@ impl Engine {
                 } => self.started(&profile_id, result, remember, used_saved),
                 Event::Stopped { profile_id, result } => self.stopped(&profile_id, result),
                 Event::Scanned { result, started } => self.scanned(result, started),
+                Event::Drained { profile_id } => self.drained(&profile_id),
             },
             Msg::Shutdown => {}
         }
@@ -574,17 +577,26 @@ impl Engine {
 
     fn lost(&mut self, profile_id: &ProfileId) {
         let name = self.name(profile_id);
-        if let Some(live) = self.live.remove(profile_id) {
+        let draining = if let Some(live) = self.live.remove(profile_id) {
             let settings = self.config.tunnels.clone();
             let ownership = Arc::clone(&self.ownership);
+            let tx = self.tx.clone();
+            let profile_id = profile_id.clone();
             std::thread::spawn(move || {
-                let _ = tunnels::stop(&settings, &ownership, live);
+                // Drained must arrive even if the stop panics, or the retry never runs.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tunnels::stop(&settings, &ownership, live)
+                }));
+                let _ = tx.send(Msg::Event(Box::new(Event::Drained { profile_id })));
             });
-        }
+            true
+        } else {
+            false
+        };
         self.up_at.remove(profile_id);
         let retry_at = (self.config.auto_reconnect && self.config.max_retries > 0)
             .then(|| Instant::now() + self.config.reconnect_delay);
-        self.state.lost(profile_id, retry_at);
+        self.state.lost(profile_id, retry_at, draining);
         self.notice(
             Level::Warning,
             if retry_at.is_some() {
@@ -612,9 +624,26 @@ impl Engine {
         if let Some(cancel) = self.cancel.get(profile_id) {
             // The start result arrives next and finishes the stop.
             cancel.cancel();
+        } else if self
+            .state
+            .get(profile_id)
+            .is_some_and(|tunnel| tunnel.draining)
+        {
+            // The dropped tunnel's teardown reports next and finishes the stop.
         } else if let Some(live) = self.live.remove(profile_id) {
             self.spawn_stop(profile_id, live);
         } else {
+            self.finish_stop(profile_id);
+        }
+    }
+
+    fn drained(&mut self, profile_id: &ProfileId) {
+        let stopping = self
+            .state
+            .get(profile_id)
+            .is_some_and(|tunnel| tunnel.phase == Phase::Stopping);
+        self.state.drained(profile_id);
+        if stopping {
             self.finish_stop(profile_id);
         }
     }
@@ -959,7 +988,9 @@ impl Engine {
         let mut wake = self.next_scan;
         for tunnel in self.state.tunnels() {
             if let Phase::Waiting { retry_at: Some(at) } = tunnel.phase {
-                wake = wake.min(at);
+                if !tunnel.draining {
+                    wake = wake.min(at);
+                }
             }
         }
         if self.apply_error.is_some() {
