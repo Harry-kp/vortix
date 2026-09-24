@@ -468,18 +468,44 @@ pub(crate) fn write_owned_atomic_with_hook(
     result
 }
 
-/// Who Vortix-written user state belongs to: the sudo user under sudo,
-/// otherwise the current user.
-pub(crate) fn invoking_owner() -> std::io::Result<(u32, u32)> {
-    Ok(match crate::config::sudo_ids()? {
-        Some(ids) if crate::platform::is_root() => ids,
-        _ => crate::platform::effective_user_group_ids(),
-    })
+/// Who Vortix-written user state under `dir` belongs to: the sudo user under
+/// sudo; as root with no sudo identity, the owner of `dir`'s nearest existing
+/// directory; otherwise the current user.
+pub(crate) fn invoking_owner(dir: &Path) -> std::io::Result<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let root = crate::platform::is_root();
+    let sudo = crate::config::sudo_ids()?;
+    let dir_owner = || {
+        dir.ancestors()
+            .find_map(|path| std::fs::symlink_metadata(path).ok())
+            .filter(std::fs::Metadata::is_dir)
+            .map(|metadata| (metadata.uid(), metadata.gid()))
+    };
+    let existing = (root && sudo.is_none()).then(dir_owner).flatten();
+    Ok(resolve_owner(
+        root,
+        sudo,
+        existing,
+        crate::platform::effective_user_group_ids(),
+    ))
+}
+
+fn resolve_owner(
+    root: bool,
+    sudo: Option<(u32, u32)>,
+    dir_owner: Option<(u32, u32)>,
+    effective: (u32, u32),
+) -> (u32, u32) {
+    match (root, sudo) {
+        (true, Some(ids)) => ids,
+        (true, None) => dir_owner.unwrap_or(effective),
+        (false, _) => effective,
+    }
 }
 
 /// Pin `dir` (creating the leaf if missing) for the invoking user.
 pub(crate) fn pin_user_dir(dir: &Path) -> std::io::Result<(OwnedDirectory, u32, u32)> {
-    let (uid, gid) = invoking_owner()?;
+    let (uid, gid) = invoking_owner(dir)?;
     let directory = open_owned_directory(dir, true, uid, gid)
         .map_err(std::io::Error::other)?
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
@@ -617,6 +643,24 @@ pub fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root shell with no sudo identity (a root login, `su -`, a systemd
+    /// unit) must write as the user who owns the config directory, or every
+    /// owner-checked profile write fails against that user's files.
+    #[test]
+    fn real_root_writes_as_the_directory_owner() {
+        let user = (501, 20);
+        assert_eq!(
+            resolve_owner(true, Some((502, 20)), Some(user), (0, 0)),
+            (502, 20)
+        );
+        assert_eq!(resolve_owner(true, None, Some(user), (0, 0)), user);
+        assert_eq!(resolve_owner(true, None, None, (0, 0)), (0, 0));
+        assert_eq!(
+            resolve_owner(false, Some((502, 20)), Some((0, 0)), user),
+            user
+        );
+    }
 
     /// An install predating the 0700 rule keeps the umask's mode forever
     /// unless startup repairs it. macOS gives 0755, Ubuntu 0775; both leave

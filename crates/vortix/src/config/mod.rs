@@ -776,7 +776,7 @@ pub fn lifecycle_lock_user_message(error: &std::io::Error) -> String {
 
 pub fn acquire_lifecycle_lock() -> std::io::Result<LifecycleLock> {
     let root = crate::config::get_config_dir()?;
-    acquire_lifecycle_lock_at(&root, crate::config::owned_file::invoking_owner()?.0)
+    acquire_lifecycle_lock_at(&root, crate::config::owned_file::invoking_owner(&root)?.0)
 }
 
 fn acquire_lifecycle_lock_at(
