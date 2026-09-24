@@ -113,6 +113,21 @@ impl App {
 
     pub fn apply_control_snapshot(&mut self, snapshot: Arc<Snapshot>) {
         self.sync_last_used(&snapshot);
+        let drops = snapshot
+            .tunnels
+            .iter()
+            .filter(|tunnel| {
+                matches!(tunnel.phase, Phase::Waiting { .. })
+                    && self
+                        .control_snapshot
+                        .tunnel(&tunnel.profile_id)
+                        .is_some_and(|old| old.phase == Phase::Up)
+            })
+            .count();
+        self.runtime.connection_drops = self
+            .runtime
+            .connection_drops
+            .saturating_add(u32::try_from(drops).unwrap_or(u32::MAX));
 
         let egress_changed = self.control_snapshot.primary != snapshot.primary
             || self

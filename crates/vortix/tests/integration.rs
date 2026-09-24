@@ -64,7 +64,6 @@ fn set_connected(app: &mut App, name: &str) {
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_wg_profiles(app, &[name]);
     }
-    app.runtime.session_start = Some(Instant::now());
     let details = vortix::core::engine::DetailedConnectionInfo {
         interface: "wg0".to_string(),
         interface_authoritative: true,

@@ -31,7 +31,6 @@ fn engine_new_headless_starts_disconnected() {
 fn engine_new_test_has_empty_profiles() {
     let engine = VpnRuntime::new_test();
     assert!(engine.profiles.is_empty());
-    assert!(engine.session_start.is_none());
     assert_eq!(engine.killswitch_mode, KillSwitchMode::Off);
     assert_eq!(engine.killswitch_state, KillSwitchState::Disabled);
 }

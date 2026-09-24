@@ -30,8 +30,6 @@ use crate::state::{KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, 
 use crate::core::profile::ProfileId;
 use crate::utils;
 
-type DnsObservation = (ProfileId, String, bool);
-
 /// Last accepted counter sample for one `WireGuard` peer. Cumulative byte
 /// totals are not activity by themselves: only a positive delta between two
 /// ordered observations advances `last_transfer_at`.
@@ -54,7 +52,6 @@ pub struct VpnRuntime {
     /// Debounced filesystem observation keyed by stable identity. It never
     /// allocates or rekeys a profile when an editor moves a config.
     pub profile_presence: HashMap<ProfileId, crate::state::ProfilePresenceTracker>,
-    pub session_start: Option<Instant>,
 
     // === Network Telemetry ===
     pub down_history: VecDeque<f64>,
@@ -128,16 +125,6 @@ pub struct VpnRuntime {
     pub killswitch_mode: KillSwitchMode,
     pub killswitch_state: KillSwitchState,
 
-    /// Full desired/effective resolver policy owned by the global network
-    /// policy path. Protocol adapters only populate `dns_requests`.
-    pub dns_policy: crate::core::ports::dns::DnsPolicyCoordinator,
-    dns_requests: HashMap<ProfileId, crate::core::ports::dns::DnsRequest>,
-    persist_dns_policy: bool,
-    /// Scanner-visible sessions for which this process has no protocol handle.
-    pub dns_external_sessions: usize,
-    /// False after a route probe failure; the prior registry primary is retained.
-    pub route_observation_fresh: bool,
-
     // === Async Communication ===
     pub(crate) telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
     pub telemetry_nudge: Option<mpsc::Sender<()>>,
@@ -174,7 +161,6 @@ impl VpnRuntime {
         Self {
             profiles: Vec::new(),
             profile_presence: HashMap::new(),
-            session_start: None,
 
             down_history: VecDeque::from(vec![0.0; history_size]),
             up_history: VecDeque::from(vec![0.0; history_size]),
@@ -212,11 +198,6 @@ impl VpnRuntime {
 
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
-            dns_policy: crate::core::ports::dns::DnsPolicyCoordinator::default(),
-            dns_requests: HashMap::new(),
-            persist_dns_policy: true,
-            dns_external_sessions: 0,
-            route_observation_fresh: false,
 
             telemetry_rx: None,
             telemetry_nudge: None,
@@ -246,12 +227,9 @@ impl VpnRuntime {
         }
     }
 
-    /// Adopt the kill-switch and DNS policy already on disk.
+    /// Adopt the kill-switch state already on disk.
     fn restore_persisted_state(&mut self) {
         self.recover_killswitch_truth();
-        if let Some(persisted) = crate::core::dns_policy::load(&self.config_dir) {
-            self.dns_policy = persisted;
-        }
     }
 
     /// Long-lived engine for the TUI: detects telemetry and runs background workers.
@@ -297,7 +275,6 @@ impl VpnRuntime {
             std::env::temp_dir().join("vortix_test"),
         );
         engine.is_root = false;
-        engine.persist_dns_policy = false;
         engine
     }
 
@@ -307,150 +284,6 @@ impl VpnRuntime {
         let (telem_rx, telem_nudge) = telemetry::spawn_telemetry_worker(telemetry_config);
         self.telemetry_rx = Some(telem_rx);
         self.telemetry_nudge = Some(telem_nudge);
-    }
-    /// Wake the telemetry worker so it refreshes IP/ISP/latency immediately.
-    pub fn refresh_telemetry(&self) {
-        if let Some(nudge) = &self.telemetry_nudge {
-            let _ = nudge.send(());
-        }
-    }
-
-    pub fn remember_dns_request(
-        &mut self,
-        profile_name: &str,
-        request: crate::core::ports::dns::DnsRequest,
-    ) {
-        if let Some(profile) = self
-            .profiles
-            .iter()
-            .find(|profile| profile.name == profile_name)
-        {
-            self.dns_requests.insert(profile.id.clone(), request);
-        }
-    }
-
-    pub fn forget_dns_request(&mut self, profile_name: &str) {
-        if let Some(profile) = self
-            .profiles
-            .iter()
-            .find(|profile| profile.name == profile_name)
-        {
-            self.dns_requests.remove(&profile.id);
-        }
-    }
-
-    #[must_use]
-    pub fn owns_dns_session(&self, profile_id: &ProfileId) -> bool {
-        self.dns_requests.contains_key(profile_id)
-    }
-
-    fn dns_intents(
-        &self,
-        observations: &[DnsObservation],
-    ) -> Vec<crate::core::ports::dns::DnsTunnelIntent> {
-        use crate::core::ports::dns::{DnsTunnelIntent, DnsTunnelRole};
-
-        observations
-            .iter()
-            .filter_map(|(profile_id, interface, is_primary)| {
-                // A scanner match or a persisted profile is not ownership.
-                // Only a live protocol-layer success in this process installs
-                // a request and authorizes platform DNS mutation.
-                let request = self.dns_requests.get(profile_id)?.clone();
-                Some(DnsTunnelIntent {
-                    profile_id: profile_id.clone(),
-                    interface: interface.clone(),
-                    role: if *is_primary {
-                        DnsTunnelRole::Primary
-                    } else {
-                        DnsTunnelRole::Secondary
-                    },
-                    request,
-                })
-            })
-            .collect()
-    }
-
-    /// Recompute one complete policy from kernel-derived roles. The tuple is
-    /// `(profile name, kernel interface, is primary)`.
-    pub fn reconcile_dns_observations(
-        &mut self,
-        observations: &[DnsObservation],
-    ) -> crate::core::ports::dns::DnsEffectiveState {
-        let intents = self.dns_intents(observations);
-        let _lock = match crate::core::dns_policy::acquire_policy_lock(&self.config_dir) {
-            Ok(lock) => lock,
-            Err(error) => {
-                self.dns_policy
-                    .invalidate_effective(format!("DNS policy lock failed: {error}"));
-                tracing::error!(target: "vortix::dns", error = %error, "DNS policy lock failed");
-                return self.dns_policy.effective().clone();
-            }
-        };
-        let adapter = &crate::platform::current_platform().dns;
-        let result = if self.persist_dns_policy {
-            let config_dir = self.config_dir.clone();
-            self.dns_policy
-                .reconcile_durable(&intents, adapter, |coordinator| {
-                    crate::core::dns_policy::save(&config_dir, coordinator)
-                })
-        } else {
-            self.dns_policy.reconcile(&intents, adapter)
-        };
-        if let Err(error) = result {
-            tracing::error!(target: "vortix::dns", error = %error, "DNS policy rejected");
-        }
-        self.dns_policy.effective().clone()
-    }
-    /// Headless CLI reconciliation uses the same scanner route truth as the
-    /// kill-switch path; no CLI-local primary heuristic is retained.
-    pub fn reconcile_dns_from_scanner(&mut self) -> crate::core::ports::dns::DnsEffectiveState {
-        let scan = crate::core::scanner::gather_system_state(&self.profiles);
-        let route_interface = match scan.default_route {
-            crate::core::ports::route_table::DefaultRouteObservation::Interface(interface) => {
-                Some(interface)
-            }
-            crate::core::ports::route_table::DefaultRouteObservation::NoDefaultRoute => None,
-            crate::core::ports::route_table::DefaultRouteObservation::ProbeFailed => {
-                self.route_observation_fresh = false;
-                self.dns_policy.invalidate_effective(
-                    "default-route probe failed; retaining prior DNS topology",
-                );
-                return self.dns_policy.effective().clone();
-            }
-        };
-        self.route_observation_fresh = true;
-        let external_sessions = scan
-            .sessions
-            .iter()
-            .filter(|session| {
-                self.profiles
-                    .iter()
-                    .find(|profile| profile.name == session.name)
-                    .is_none_or(|profile| !self.owns_dns_session(&profile.id))
-            })
-            .count();
-        let observations = scan
-            .sessions
-            .into_iter()
-            .filter_map(|session| {
-                let profile_id = self
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.name == session.name)?
-                    .id
-                    .clone();
-                let primary = route_interface.as_deref() == Some(session.interface.as_str());
-                Some((profile_id, session.interface, primary))
-            })
-            .collect::<Vec<_>>();
-        self.dns_external_sessions = external_sessions;
-        if external_sessions > 0 {
-            self.dns_policy
-                .invalidate_effective("external VPN session observed; DNS ownership is unknown");
-            return self.dns_policy.effective().clone();
-        }
-        self.reconcile_dns_observations(&observations)
     }
 
     /// Find a profile by name, returning its index.
@@ -519,172 +352,6 @@ impl VpnRuntime {
         }
 
         let _ = utils::save_profile_metadata(&metadata);
-    }
-
-    /// Kill any running VPN process and remove run files for a profile.
-    ///
-    /// dispatch routes through the `TunnelKind` aggregate.
-    pub fn cleanup_vpn_resources(
-        &self,
-        profile_name: &str,
-    ) -> Result<(), crate::core::ports::tunnel::TunnelError> {
-        let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) else {
-            return Ok(());
-        };
-        let config_dir =
-            utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        let mut tunnel =
-            crate::control::tunnels::tunnel_for(profile.protocol, &config_dir, "3", 30);
-        self.cleanup_vpn_resources_with(profile_name, &mut tunnel)
-    }
-
-    fn cleanup_vpn_resources_with(
-        &self,
-        profile_name: &str,
-        tunnel: &mut crate::control::tunnels::TunnelKind,
-    ) -> Result<(), crate::core::ports::tunnel::TunnelError> {
-        use crate::core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-        if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
-            let iface = match profile.protocol {
-                Protocol::WireGuard => profile
-                    .config_path
-                    .file_stem()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .unwrap_or("wg0")
-                    .to_string(),
-                Protocol::OpenVPN => {
-                    format!("openvpn-{}", utils::sanitize_profile_name(profile_name))
-                }
-            };
-            let pid = match profile.protocol {
-                Protocol::OpenVPN => {
-                    utils::read_openvpn_pid_compat(profile.id.as_str(), profile_name)
-                }
-                Protocol::WireGuard => None,
-            };
-            let handle = TunnelHandle {
-                profile_id: profile.id.clone(),
-                display_name: profile.name.clone(),
-                interface_name: iface,
-                pid,
-                started_at: std::time::SystemTime::now(),
-                kind: match profile.protocol {
-                    Protocol::WireGuard => TunnelKindTag::WireGuard,
-                    Protocol::OpenVPN => TunnelKindTag::OpenVpn,
-                },
-                generation: 0,
-                handshake: None,
-                probe_receipts: Vec::new(),
-                process_ownership: None,
-                teardown_config: matches!(profile.protocol, Protocol::WireGuard).then(|| {
-                    crate::core::ports::tunnel::TunnelTeardownConfig {
-                        path: profile.config_path.clone(),
-                        managed: false,
-                        wg_quick_interface: profile
-                            .config_path
-                            .file_stem()
-                            .and_then(std::ffi::OsStr::to_str)
-                            .map(str::to_owned),
-                    }
-                }),
-                dns_request: crate::core::ports::dns::DnsRequest::default(),
-                openvpn_routes: None,
-            };
-
-            tunnel.down(handle)?;
-
-            if matches!(profile.protocol, Protocol::OpenVPN) {
-                utils::cleanup_openvpn_run_files_compat(profile.id.as_str(), profile_name);
-            }
-        }
-        Ok(())
-    }
-
-    /// Build the legacy scanner-derived kill-switch projection.
-    ///
-    /// New application code uses the canonical control service and tunnel
-    /// registry. This method remains for source compatibility with v0.4.3.
-    #[deprecated(
-        since = "0.4.4",
-        note = "use the canonical control service and tunnel registry instead"
-    )]
-    #[must_use]
-    pub fn killswitch_view_from_scanner(
-        &self,
-    ) -> (bool, Vec<crate::core::killswitch::ActiveTunnelInfo>) {
-        let sessions = crate::core::scanner::get_active_profiles(&self.profiles);
-        let active_tunnels = sessions
-            .iter()
-            .map(|session| crate::core::killswitch::ActiveTunnelInfo {
-                interface: session.interface.clone(),
-                server_ips: session
-                    .endpoint
-                    .split(':')
-                    .next()
-                    .and_then(|host| host.parse().ok())
-                    .into_iter()
-                    .collect(),
-                declared_cidrs: Vec::new(),
-                is_primary: true,
-            })
-            .collect::<Vec<_>>();
-        (!active_tunnels.is_empty(), active_tunnels)
-    }
-
-    /// Apply the legacy direct kill-switch synchronization contract.
-    ///
-    /// New application code must submit a canonical control command. This
-    /// compatibility shim remains callable by v0.4.3 library consumers and
-    /// preserves fail-closed error reporting.
-    #[deprecated(
-        since = "0.4.4",
-        note = "submit kill-switch intent through the canonical control service instead"
-    )]
-    pub fn sync_killswitch(
-        &mut self,
-        is_connected: bool,
-        active_tunnels: &[crate::core::killswitch::ActiveTunnelInfo],
-    ) {
-        let prior = self.killswitch_state;
-        let mut requested = self.killswitch_mode.desired_state(prior, is_connected);
-        if requested.is_blocking() && !self.is_root {
-            requested = KillSwitchState::Armed;
-        }
-
-        let effect = if requested.is_blocking() {
-            crate::core::killswitch::enable_blocking_multi(active_tunnels)
-        } else if prior.is_blocking() {
-            crate::core::killswitch::disable_blocking()
-        } else {
-            Ok(())
-        };
-        self.killswitch_state = match effect {
-            Ok(()) => requested,
-            Err(error) => {
-                logger::log(
-                    logger::LogLevel::Warning,
-                    "SEC",
-                    format!("Kill-switch synchronization is degraded: {error}"),
-                );
-                KillSwitchState::Degraded
-            }
-        };
-
-        let verification = (self.killswitch_state == KillSwitchState::Blocking)
-            .then(|| crate::core::killswitch::local_verification(active_tunnels));
-        if let Err(error) = crate::core::killswitch::save_state_with_verification(
-            self.killswitch_mode,
-            self.killswitch_state,
-            crate::core::killswitch::persisted_from_active(active_tunnels),
-            verification,
-        ) {
-            self.killswitch_state = KillSwitchState::Degraded;
-            logger::log(
-                logger::LogLevel::Warning,
-                "SEC",
-                format!("Kill-switch state could not be persisted: {error}"),
-            );
-        }
     }
 
     /// Check if required binaries are available for a given protocol.
@@ -931,39 +598,6 @@ mod dns_gate_tests {
             wireguard_dns_missing_dep(inputs(true, true, true, true)),
             None
         );
-    }
-}
-
-#[cfg(test)]
-mod cleanup_tests {
-    use super::*;
-    use crate::core::ports::tunnel::mock::{MockTunnel, ScriptedTunnelOutcome};
-
-    #[test]
-    fn cleanup_propagates_teardown_failure_instead_of_claiming_disconnect() {
-        let mut runtime = VpnRuntime::new_test();
-        runtime.profiles.push(crate::state::VpnProfile {
-            id: crate::core::profile::ProfileId::new("cleanup-failure"),
-            name: "cleanup-failure".into(),
-            protocol: Protocol::WireGuard,
-            config_path: "/tmp/cleanup-failure.conf".into(),
-            location: "Test".into(),
-            last_used: None,
-        });
-        let mock = MockTunnel::new();
-        mock.script_down(ScriptedTunnelOutcome::Failure(
-            "injected teardown failure".into(),
-        ));
-        let calls = mock.invocations();
-        let mut tunnel = crate::control::tunnels::TunnelKind::Mock(mock);
-
-        let error = runtime
-            .cleanup_vpn_resources_with("cleanup-failure", &mut tunnel)
-            .expect_err("teardown failure must remain observable");
-
-        assert!(error.to_string().contains("injected teardown failure"));
-        assert_eq!(calls.lock().unwrap().len(), 1);
-        assert_eq!(calls.lock().unwrap()[0].method, "down");
     }
 }
 

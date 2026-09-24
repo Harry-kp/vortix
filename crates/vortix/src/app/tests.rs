@@ -2382,6 +2382,36 @@ fn a_control_snapshot_feeds_the_registry_default_route() {
 }
 
 #[test]
+fn an_unexpected_drop_counts_once() {
+    use crate::control::state::Phase;
+    use crate::control::{Snapshot, TunnelView};
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    let details = app.runtime.profiles[0].id.clone();
+    let view = |phase| TunnelView {
+        profile_id: details.clone(),
+        name: "corp".into(),
+        phase,
+        interface: Some("utun4".into()),
+        since: std::time::SystemTime::UNIX_EPOCH,
+        routes: Vec::new(),
+        dns: Vec::new(),
+        details: crate::core::engine::state::DetailedConnectionInfo::default(),
+    };
+    for phase in [
+        Phase::Up,
+        Phase::Waiting { retry_at: None },
+        Phase::Waiting { retry_at: None },
+    ] {
+        app.apply_control_snapshot(std::sync::Arc::new(Snapshot {
+            tunnels: vec![view(phase)],
+            ..Snapshot::default()
+        }));
+    }
+    assert_eq!(app.runtime.connection_drops, 1);
+}
+
+#[test]
 fn canonical_snapshot_updates_profile_last_connected_time() {
     let mut app = test_app();
     add_profiles(&mut app, &["corp"]);
