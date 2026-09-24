@@ -1,6 +1,5 @@
 //! UI state types.
 
-use super::Protocol;
 use crate::core::cidr::Cidr;
 use crate::core::profile::ProfileId;
 use std::fmt;
@@ -154,18 +153,6 @@ pub enum InputMode {
         path: String,
         /// Current cursor position in the path string.
         cursor: usize,
-    },
-    /// Dependency error dialog showing missing tools.
-    DependencyError {
-        /// Protocol that requires the missing dependencies.
-        protocol: Protocol,
-        /// List of missing tool names.
-        missing: Vec<String>,
-    },
-    /// Permission denied error dialog.
-    PermissionDenied {
-        /// Description of the action that was denied.
-        action: String,
     },
     /// Delete confirmation dialog.
     ConfirmDelete {

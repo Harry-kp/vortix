@@ -30,16 +30,6 @@ impl Secret {
         &self.0
     }
 
-    /// Transfer through an existing byte-oriented local client boundary.
-    /// The source allocation is cleared before this value is returned; the
-    /// receiver must immediately re-wrap the returned bytes in `Secret`.
-    #[must_use]
-    pub fn into_vec(mut self) -> Vec<u8> {
-        let bytes = self.0.to_vec();
-        self.clear();
-        bytes
-    }
-
     fn clear(&mut self) {
         self.0.zeroize();
     }

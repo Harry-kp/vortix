@@ -188,12 +188,6 @@ fn render_animated_panel(
 
 fn render_overlays(frame: &mut Frame, app: &mut App) {
     match &app.input_mode {
-        InputMode::DependencyError { protocol, missing } => {
-            super::overlays::dependency_alert::render(frame, *protocol, missing);
-        }
-        InputMode::PermissionDenied { action } => {
-            super::overlays::permission_denied::render(frame, action);
-        }
         InputMode::Import { path, cursor } => {
             super::overlays::import::render(frame, path, *cursor);
         }

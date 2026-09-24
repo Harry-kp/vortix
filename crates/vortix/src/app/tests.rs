@@ -337,8 +337,12 @@ fn each_telemetry_observation_carries_its_own_timestamp() {
     assert!(app.runtime.last_dns_check.is_none());
     assert!(app.runtime.last_ipv6_check.is_none());
 
-    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "1.2.3.4".to_string(),
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::core::telemetry::EgressIdentity {
+            public_ip: "1.2.3.4".to_string(),
+            isp: None,
+            location: None,
+        },
     )));
     assert!(app.runtime.last_egress_check.is_some());
     assert!(
@@ -389,8 +393,12 @@ fn a_remembered_real_address_is_promoted_only_by_a_live_observation() {
     app.runtime.real_ip_from_cache = true;
 
     // Nothing has proved the host is unprotected yet, so the flag stands.
-    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "203.0.113.5".to_string(),
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::core::telemetry::EgressIdentity {
+            public_ip: "203.0.113.5".to_string(),
+            isp: None,
+            location: None,
+        },
     )));
     assert!(
         app.runtime.real_ip_from_cache,
@@ -399,8 +407,12 @@ fn a_remembered_real_address_is_promoted_only_by_a_live_observation() {
 
     app.runtime.scanner_first_tick_done = true;
     app.runtime.last_kernel_session_count = 0;
-    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "203.0.113.5".to_string(),
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::core::telemetry::EgressIdentity {
+            public_ip: "203.0.113.5".to_string(),
+            isp: None,
+            location: None,
+        },
     )));
     assert!(
         !app.runtime.real_ip_from_cache,
@@ -414,8 +426,12 @@ fn test_last_security_check_updated_on_ip_telemetry() {
     let mut app = test_app();
     assert!(app.runtime.last_security_check.is_none());
 
-    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "1.2.3.4".to_string(),
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::core::telemetry::EgressIdentity {
+            public_ip: "1.2.3.4".to_string(),
+            isp: None,
+            location: None,
+        },
     )));
 
     assert!(app.runtime.last_security_check.is_some());
@@ -1188,8 +1204,12 @@ fn repeated_vpn_exit_ip_does_not_report_a_leak() {
     app.runtime.real_ip = Some("1.2.3.4".to_string());
     app.runtime.public_ip = "5.6.7.8".to_string();
 
-    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "5.6.7.8".to_string(),
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::core::telemetry::EgressIdentity {
+            public_ip: "5.6.7.8".to_string(),
+            isp: None,
+            location: None,
+        },
     )));
     assert!(
         !app.runtime.ip_unchanged_warned,
@@ -1205,8 +1225,12 @@ fn public_ip_matching_pre_vpn_ip_reports_a_leak() {
     app.runtime.real_ip = Some("1.2.3.4".to_string());
     app.runtime.public_ip = "5.6.7.8".to_string();
 
-    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "1.2.3.4".to_string(),
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::core::telemetry::EgressIdentity {
+            public_ip: "1.2.3.4".to_string(),
+            isp: None,
+            location: None,
+        },
     )));
     assert!(
         app.runtime.ip_unchanged_warned,
@@ -1804,8 +1828,12 @@ fn real_ip_not_cached_when_scanner_has_not_ticked_yet() {
     assert!(!app.runtime.scanner_first_tick_done);
     assert!(app.runtime.real_ip.is_none());
 
-    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "46.101.235.146".to_string(),
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::core::telemetry::EgressIdentity {
+            public_ip: "46.101.235.146".to_string(),
+            isp: None,
+            location: None,
+        },
     )));
 
     assert!(

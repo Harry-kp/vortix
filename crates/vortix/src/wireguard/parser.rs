@@ -74,7 +74,6 @@ pub struct WgParsedProfile {
     pub address: Option<String>,
     pub mtu: Option<u32>,
     pub peers: Vec<WgPeer>,
-    pub raw: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,7 +113,6 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
         });
     }
     let mut profile = WgParsedProfile {
-        raw: text.to_string(),
         ..Default::default()
     };
     let mut section = Section::None;

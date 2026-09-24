@@ -36,7 +36,7 @@ pub enum ScrollMove {
 /// Messages are the single source of truth for state mutations.
 /// They can originate from user input or programmatically.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Some variants are handled in match but not constructed externally
+
 pub enum Message {
     // === Navigation ===
     /// Focus next panel
@@ -125,8 +125,6 @@ pub enum Message {
     OpenImport,
 
     // === System ===
-    /// Log a message
-    Log(String),
     /// Copy IP to clipboard
     CopyIp,
     /// Clear activity logs

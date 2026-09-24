@@ -1,9 +1,6 @@
-use std::time::{Duration, Instant};
-
 use vortix::config::migrate_legacy_profiles;
 use vortix::config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError, Sidecar};
 use vortix::core::profile::{Profile, ProfileId, ProtocolKind};
-use vortix::state::{ProfilePresence, ProfilePresenceTracker};
 
 fn id(byte: u8) -> ProfileId {
     ProfileId::parse(format!("{byte:02x}").repeat(32)).unwrap()
@@ -68,19 +65,6 @@ fn duplicate_and_malformed_sidecars_fail_closed() {
         store.list(),
         Err(ProfileStoreError::MalformedSidecar { .. })
     ));
-}
-
-#[test]
-fn transient_external_rename_keeps_identity_and_stable_loss_is_missing() {
-    let start = Instant::now();
-    let mut tracker = ProfilePresenceTracker::new("corp.conf".into(), Duration::from_millis(250));
-    tracker.observe_missing(start);
-    tracker.observe_path(".corp.conf.swp".into());
-    assert!(matches!(tracker.state(), ProfilePresence::Present(_)));
-
-    tracker.observe_missing(start);
-    tracker.settle(start + Duration::from_millis(251));
-    assert_eq!(tracker.state(), &ProfilePresence::Missing);
 }
 
 #[test]

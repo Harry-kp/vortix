@@ -108,14 +108,9 @@ pub struct StatusSnapshot {
     pub profile: Option<String>,
     pub protocol: Option<String>,
     pub uptime_secs: Option<u64>,
-    pub public_ip: Option<String>,
     pub server: Option<String>,
     pub interface: Option<String>,
     pub internal_ip: Option<String>,
-    pub latency_ms: Option<u64>,
-    pub jitter_ms: Option<u64>,
-    pub packet_loss_pct: Option<f32>,
-    pub quality: Option<String>,
     pub download_bytes: Option<String>,
     pub upload_bytes: Option<String>,
     /// Kill switch mode — the typed enum. Call sites format it via
@@ -129,10 +124,6 @@ pub struct StatusSnapshot {
     /// [`crate::state::KillSwitchState::display_status`] (prose) and
     /// [`crate::state::KillSwitchState::cli_verb`] (slug).
     pub killswitch_state: crate::state::KillSwitchState,
-    pub dns_leak: Option<bool>,
-    pub encryption: Option<String>,
-    pub location: Option<String>,
-    pub isp: Option<String>,
 }
 
 impl VpnRuntime {
@@ -142,91 +133,74 @@ impl VpnRuntime {
     pub fn scan_status(&self) -> StatusSnapshot {
         let active = scanner::get_active_profiles(&self.profiles);
         let session = active.first();
-        let (
-            mut state,
-            profile,
-            protocol,
-            uptime,
-            server,
-            interface,
-            internal_ip,
-            dl,
-            ul,
-            encryption,
-        ) = if let Some(s) = session {
-            let proto = self
-                .profiles
-                .iter()
-                .find(|p| p.name == s.name)
-                .map(|p| p.protocol);
+        let (mut state, profile, protocol, uptime, server, interface, internal_ip, dl, ul) =
+            if let Some(s) = session {
+                let proto = self
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == s.name)
+                    .map(|p| p.protocol);
 
-            let enc = match proto {
-                Some(Protocol::WireGuard) => Some("ChaCha20-Poly1305".into()),
-                Some(Protocol::OpenVPN) => Some("AES-256-GCM".into()),
-                None => None,
-            };
-            // Direct scanner state is observation-only. Even a fresh or
-            // historically non-zero handshake timestamp cannot recreate
-            // the current attempt generation and ownership receipt.
-            let observed_state = if matches!(proto, Some(Protocol::WireGuard)) {
-                "handshaking"
+                // Direct scanner state is observation-only. Even a fresh or
+                // historically non-zero handshake timestamp cannot recreate
+                // the current attempt generation and ownership receipt.
+                let observed_state = if matches!(proto, Some(Protocol::WireGuard)) {
+                    "handshaking"
+                } else {
+                    "connected"
+                };
+
+                let uptime = s.started_at.and_then(|started| {
+                    std::time::SystemTime::now()
+                        .duration_since(started)
+                        .ok()
+                        .map(|d| d.as_secs())
+                });
+
+                (
+                    observed_state.to_string(),
+                    Some(s.name.clone()),
+                    proto.map(|p| format!("{p}")),
+                    uptime,
+                    if s.endpoint.is_empty() {
+                        None
+                    } else {
+                        Some(s.endpoint.clone())
+                    },
+                    if s.interface.is_empty() {
+                        None
+                    } else {
+                        Some(s.interface.clone())
+                    },
+                    if s.internal_ip.is_empty() {
+                        None
+                    } else {
+                        Some(s.internal_ip.clone())
+                    },
+                    if s.transfer_rx.is_empty() {
+                        None
+                    } else {
+                        Some(s.transfer_rx.clone())
+                    },
+                    if s.transfer_tx.is_empty() {
+                        None
+                    } else {
+                        Some(s.transfer_tx.clone())
+                    },
+                )
             } else {
-                "connected"
+                (
+                    "disconnected".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             };
-
-            let uptime = s.started_at.and_then(|started| {
-                std::time::SystemTime::now()
-                    .duration_since(started)
-                    .ok()
-                    .map(|d| d.as_secs())
-            });
-
-            (
-                observed_state.to_string(),
-                Some(s.name.clone()),
-                proto.map(|p| format!("{p}")),
-                uptime,
-                if s.endpoint.is_empty() {
-                    None
-                } else {
-                    Some(s.endpoint.clone())
-                },
-                if s.interface.is_empty() {
-                    None
-                } else {
-                    Some(s.interface.clone())
-                },
-                if s.internal_ip.is_empty() {
-                    None
-                } else {
-                    Some(s.internal_ip.clone())
-                },
-                if s.transfer_rx.is_empty() {
-                    None
-                } else {
-                    Some(s.transfer_rx.clone())
-                },
-                if s.transfer_tx.is_empty() {
-                    None
-                } else {
-                    Some(s.transfer_tx.clone())
-                },
-                enc,
-            )
-        } else {
-            (
-                "disconnected".to_string(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-        };
 
         let mut health = None;
         let mut generation = None;
@@ -274,22 +248,13 @@ impl VpnRuntime {
             profile,
             protocol,
             uptime_secs: uptime,
-            public_ip: None, // requires telemetry worker; populated by caller if needed
             server,
             interface,
             internal_ip,
-            latency_ms: None,
-            jitter_ms: None,
-            packet_loss_pct: None,
-            quality: None,
             download_bytes: dl,
             upload_bytes: ul,
             killswitch_mode: self.killswitch_mode,
             killswitch_state: self.killswitch_state,
-            dns_leak: None,
-            encryption,
-            location: None,
-            isp: None,
         }
     }
 }

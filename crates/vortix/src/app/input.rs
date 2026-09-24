@@ -211,11 +211,6 @@ impl App {
                     };
                 }
             }
-            InputMode::DependencyError { .. } | InputMode::PermissionDenied { .. } => {
-                if key.code == KeyCode::Esc {
-                    self.handle_message(Message::CloseOverlay);
-                }
-            }
             InputMode::Help {
                 mut scroll,
                 mut tab,

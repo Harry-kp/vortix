@@ -256,11 +256,6 @@ fn aggregate_rtts(
     })
 }
 
-// Silence dead-import warnings on TCP-only paths.
-#[cfg(test)]
-#[allow(unused_imports)]
-use std::io::{Read as _, Write as _};
-
 #[cfg(test)]
 mod tests {
     use super::*;

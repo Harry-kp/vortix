@@ -48,7 +48,6 @@ pub struct LogEntry {
     pub message: String,
 }
 
-#[allow(dead_code)]
 impl LogEntry {
     /// Format the log entry as a structured line:
     /// `[HH:MM:SS] [LEVEL] CATEGORY: message`
@@ -165,7 +164,6 @@ pub fn configure(log_level: &str, max_entries: usize) {
 }
 
 /// Set the minimum log level (for filtering).
-#[allow(dead_code)]
 pub fn set_min_level(level: LogLevel) {
     if let Ok(mut logger) = get_logger().lock() {
         logger.set_min_level(level);

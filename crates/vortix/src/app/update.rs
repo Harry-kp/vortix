@@ -289,7 +289,6 @@ impl App {
 
             // System
             Message::Quit => self.handle_quit(),
-            Message::Log(msg) => self.log(&msg),
             Message::Toast(msg, t_type) => self.show_toast(msg, t_type),
             Message::CopyIp => self.copy_ip_to_clipboard(),
             Message::ClearLogs => {
@@ -637,7 +636,6 @@ impl App {
     #[allow(clippy::too_many_lines)] // TEA-style dispatch — every arm is one telemetry variant; splitting would obscure the handler shape without simplifying it
     fn handle_telemetry(&mut self, update: TelemetryUpdate) {
         match update {
-            TelemetryUpdate::PublicIp(ip) => self.apply_public_ipv4(ip),
             TelemetryUpdate::EgressIdentity(identity) => {
                 self.apply_egress_identity(identity);
             }

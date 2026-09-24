@@ -201,7 +201,6 @@ fn profile_row(
     idx: usize,
     is_selected: bool,
     signal: &RowSignal,
-    profile_missing: bool,
     name_cell_width: usize,
 ) -> Row<'static> {
     // Status cell: badge taxonomy + optional `!` risk annotation.
@@ -215,18 +214,13 @@ fn profile_row(
             style
         };
         let mut spans = vec![Span::styled(glyph, badge_style)];
-        if signal.risk || profile_missing {
+        if signal.risk {
             spans.push(Span::styled(
                 "!",
                 Style::default().fg(row_fg(is_selected, theme::current().warning)),
             ));
         }
         Cell::from(Line::from(spans))
-    } else if profile_missing {
-        Cell::from(Span::styled(
-            "!",
-            Style::default().fg(row_fg(is_selected, theme::current().warning)),
-        ))
     } else if idx < 9 {
         Cell::from(Span::styled(
             format!("{}", idx + 1),
@@ -247,8 +241,6 @@ fn profile_row(
         Style::default()
             .fg(theme::current().row_selected_fg)
             .add_modifier(Modifier::BOLD)
-    } else if profile_missing {
-        Style::default().fg(theme::current().warning)
     } else if signal.is_primary {
         Style::default()
             .fg(signal.accent)
@@ -388,19 +380,11 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(idx, p)| {
             let signal = signal_for(&snapshots, primary.as_ref(), &p.id, p.protocol);
-            let profile_missing = app
-                .runtime
-                .profile_presence
-                .get(&p.id)
-                .is_some_and(|tracker| {
-                    matches!(tracker.state(), crate::state::ProfilePresence::Missing)
-                });
             profile_row(
                 p,
                 idx,
                 app.profile_list_state.selected() == Some(idx),
                 &signal,
-                profile_missing,
                 name_cell_width,
             )
         })

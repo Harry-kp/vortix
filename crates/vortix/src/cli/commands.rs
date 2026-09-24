@@ -1264,22 +1264,13 @@ mod handshake_status_tests {
             profile: Some("corp".into()),
             protocol: Some(protocol.into()),
             uptime_secs: None,
-            public_ip: None,
             server: None,
             interface: None,
             internal_ip: None,
-            latency_ms: None,
-            jitter_ms: None,
-            packet_loss_pct: None,
-            quality: None,
             download_bytes: None,
             upload_bytes: None,
             killswitch_mode: KillSwitchMode::Off,
             killswitch_state: KillSwitchState::Disabled,
-            dns_leak: None,
-            encryption: None,
-            location: None,
-            isp: None,
         }
     }
 

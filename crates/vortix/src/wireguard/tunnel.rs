@@ -158,19 +158,6 @@ impl WgTunnel {
             .as_ref()
             .is_some_and(|context| context.cancellation.is_cancelled())
     }
-
-    /// Parse requested DNS without applying platform state.
-    pub fn requested_dns(
-        &self,
-        profile: &Profile,
-    ) -> Result<crate::core::ports::dns::DnsRequest, TunnelError> {
-        let body = read_bounded_profile(&profile.config_path)?;
-        parse_wg_conf(&body)
-            .map(|parsed| parsed.dns_request())
-            .map_err(|error| {
-                TunnelError::Subprocess(format!("parse WireGuard DNS intent: {error}"))
-            })
-    }
 }
 
 fn read_bounded_profile(path: &Path) -> Result<String, TunnelError> {

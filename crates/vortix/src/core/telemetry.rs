@@ -57,8 +57,6 @@ impl From<&crate::config::AppConfig> for TelemetryConfig {
 /// Telemetry update messages sent from background workers to the main application.
 #[derive(Debug, Clone)]
 pub enum TelemetryUpdate {
-    /// Updated public IP address.
-    PublicIp(String),
     /// One coherent observation of the current public egress identity.
     /// Optional metadata is absent for IP-only fallback providers.
     EgressIdentity(EgressIdentity),

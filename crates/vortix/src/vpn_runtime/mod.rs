@@ -15,7 +15,7 @@ pub mod openvpn;
 
 pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -27,7 +27,6 @@ use crate::logger;
 use crate::message::Message;
 use crate::state::{KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile};
 
-use crate::core::profile::ProfileId;
 use crate::utils;
 
 /// Last accepted counter sample for one `WireGuard` peer. Cumulative byte
@@ -49,9 +48,6 @@ pub(crate) struct WireGuardPeerActivity {
 pub struct VpnRuntime {
     // === VPN State ===
     pub profiles: Vec<VpnProfile>,
-    /// Debounced filesystem observation keyed by stable identity. It never
-    /// allocates or rekeys a profile when an editor moves a config.
-    pub profile_presence: HashMap<ProfileId, crate::state::ProfilePresenceTracker>,
 
     // === Network Telemetry ===
     pub down_history: VecDeque<f64>,
@@ -160,7 +156,6 @@ impl VpnRuntime {
         let history_size = constants::NETWORK_HISTORY_SIZE;
         Self {
             profiles: Vec::new(),
-            profile_presence: HashMap::new(),
 
             down_history: VecDeque::from(vec![0.0; history_size]),
             up_history: VecDeque::from(vec![0.0; history_size]),

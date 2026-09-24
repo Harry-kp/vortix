@@ -428,12 +428,6 @@ mod message_routing {
     }
 
     #[test]
-    fn log_message_does_not_crash() {
-        let mut app = test_app();
-        app.handle_message(Message::Log("TEST: integration log".to_string()));
-    }
-
-    #[test]
     fn toast_message() {
         let mut app = test_app();
         app.handle_message(Message::Toast("Test toast".to_string(), ToastType::Info));
@@ -514,8 +508,12 @@ mod message_routing {
         use vortix::core::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
-        app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-            "1.2.3.4".to_string(),
+        app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+            vortix::core::telemetry::EgressIdentity {
+                public_ip: "1.2.3.4".to_string(),
+                isp: None,
+                location: None,
+            },
         )));
         assert_eq!(app.runtime.public_ip, "1.2.3.4");
     }

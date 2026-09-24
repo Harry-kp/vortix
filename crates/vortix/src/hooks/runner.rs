@@ -93,25 +93,6 @@ impl VerifiedHookOwner {
         })
     }
 
-    /// Prove that Background mode is already running as its enrolled owner.
-    pub fn for_background_mode() -> Result<Self, HookOwnerError> {
-        let (uid, gid) = crate::utils::effective_user_group_ids();
-        if uid == 0 || gid == 0 {
-            return Err(HookOwnerError::RootOwner);
-        }
-        let supplementary_groups = current_groups()?;
-        if supplementary_groups.contains(&0) {
-            return Err(HookOwnerError::RootOwner);
-        }
-        Ok(Self {
-            credentials: ProcessCredentials {
-                uid,
-                gid,
-                supplementary_groups,
-            },
-        })
-    }
-
     #[cfg(test)]
     fn from_ids(uid: u32, gid: u32) -> Self {
         Self {

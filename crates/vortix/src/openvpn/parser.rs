@@ -111,9 +111,6 @@ pub struct OvpnParsedProfile {
     pub dns_servers: Vec<IpAddr>,
     /// Suffixes requested with `dhcp-option DOMAIN` / `DOMAIN-SEARCH`.
     pub dns_search_domains: Vec<String>,
-    /// The raw config text — `openvpn` consumes the on-disk file, so this is
-    /// retained for introspection only.
-    pub raw: String,
 }
 
 impl OvpnParsedProfile {
@@ -134,7 +131,6 @@ impl OvpnParsedProfile {
 /// (key blocks, malformed directives) can add error variants.
 pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     let mut profile = OvpnParsedProfile {
-        raw: text.to_string(),
         ..Default::default()
     };
 
