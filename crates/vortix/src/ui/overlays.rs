@@ -863,10 +863,6 @@ pub mod help {
         "Reconnecting via …",
         "A connected tunnel dropped and vortix is automatically retrying. The 'via X' part names what its role was before the drop, so you know what to expect when it comes back.",
     ),
-    (
-        "n/a (awaiting input)",
-        "The tunnel is waiting for you to type something (2FA code, passphrase). Press Enter while focused on Connection Details to surface the prompt overlay.",
-    ),
 ];
 
     const ROLE_GLOSSARY_FOOTER: &str =
