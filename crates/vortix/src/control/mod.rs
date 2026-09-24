@@ -24,8 +24,8 @@ use crate::config::openvpn_credentials::{
 use crate::core::cidr::Cidr;
 use crate::core::engine::state::DetailedConnectionInfo;
 use crate::core::engine::{classify_route_conflict, Conflict};
+use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::core::profile::ProfileId;
-use crate::core::state::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::state::VpnProfile;
 
 pub use state::Phase;

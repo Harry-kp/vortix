@@ -3,9 +3,9 @@
 
 use std::path::PathBuf;
 
+use crate::core::killswitch::KillSwitchMode;
 use crate::core::ports::dns::{DnsEffectiveStatus, DnsPolicyCoordinator};
 use crate::core::ports::route_table::DefaultRouteObservation;
-use crate::core::state::killswitch::KillSwitchMode;
 
 use super::plan::{Firewall, NetworkPlan};
 

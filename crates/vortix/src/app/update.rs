@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{App, ConnectionState, FocusedPanel, InputMode, ToastType};
+use super::{App, FocusedPanel, InputMode, ToastType};
 use crate::constants;
 use crate::core::profile::ProtocolKind;
 use crate::core::telemetry::TelemetryUpdate;
@@ -142,26 +142,22 @@ impl App {
             Message::Disconnect => self.disconnect(),
             Message::Reconnect => self.reconnect(),
             Message::ConnectSelected => {
-                if let Some(idx) = self.profile_list_state.selected() {
-                    let target = self.runtime.profiles.get(idx).map(|p| p.name.clone());
-                    let legacy = self.legacy_state();
-                    match (&legacy, target) {
-                        (ConnectionState::Connected { profile, .. }, Some(name))
-                            if *profile == name =>
-                        {
-                            if let Some(profile_id) = self
-                                .runtime
-                                .profiles
-                                .get(idx)
-                                .map(|profile| profile.id.clone())
-                            {
-                                self.send(crate::control::Command::Reconnect(profile_id));
-                            }
-                        }
-                        (_, Some(_)) => {
-                            self.toggle_connection(idx);
-                        }
-                        _ => {}
+                if let Some((idx, profile_id)) = self
+                    .profile_list_state
+                    .selected()
+                    .and_then(|idx| Some((idx, self.runtime.profiles.get(idx)?.id.clone())))
+                {
+                    let connected = self.current_tunnel().is_some_and(|tunnel| {
+                        tunnel.profile_id == profile_id
+                            && matches!(
+                                tunnel.state,
+                                crate::core::engine::state::Connection::Connected { .. }
+                            )
+                    });
+                    if connected {
+                        self.send(crate::control::Command::Reconnect(profile_id));
+                    } else {
+                        self.toggle_connection(idx);
                     }
                 }
             }

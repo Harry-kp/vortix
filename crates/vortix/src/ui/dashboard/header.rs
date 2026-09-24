@@ -710,10 +710,10 @@ fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>
 ///
 /// The variant names `Off` / `Auto` / `AlwaysOn` are the stable
 /// CLI/JSON contract — never renamed. The labels here are the UI
-/// vocabulary; see `core::state::killswitch` module docs for
+/// vocabulary; see `core::killswitch` docs for
 /// the mapping convention.
 fn get_killswitch_indicator(app: &App) -> Span<'static> {
-    use crate::state::{KillSwitchMode, KillSwitchState};
+    use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 
     if let Some(mode) = app.pending_control_killswitch_mode {
         let label = match mode {
@@ -916,7 +916,8 @@ mod tests {
     #[test]
     fn pending_kill_switch_target_is_visible_in_the_header() {
         let mut app = App::new_test();
-        app.pending_control_killswitch_mode = Some(crate::state::KillSwitchMode::AlwaysOn);
+        app.pending_control_killswitch_mode =
+            Some(crate::core::killswitch::KillSwitchMode::AlwaysOn);
         assert_eq!(
             get_killswitch_indicator(&app).content.as_ref(),
             " KS:VPN-only… "
@@ -948,8 +949,8 @@ mod tests {
     fn kill_switch_indicator_reads_the_snapshot() {
         let mut app = App::new_test();
         let snapshot = std::sync::Arc::make_mut(&mut app.control_snapshot);
-        snapshot.kill_switch = crate::state::KillSwitchMode::AlwaysOn;
-        snapshot.kill_switch_state = crate::state::KillSwitchState::Degraded;
+        snapshot.kill_switch = crate::core::killswitch::KillSwitchMode::AlwaysOn;
+        snapshot.kill_switch_state = crate::core::killswitch::KillSwitchState::Degraded;
         assert_eq!(
             get_killswitch_indicator(&app).content.as_ref(),
             " KS:DEGRADED "

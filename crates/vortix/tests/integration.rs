@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use vortix::core::profile::ProtocolKind;
 
-use vortix::app::{App, ConnectionState, FocusedPanel, InputMode, Toast, ToastType, VpnProfile};
+use vortix::app::{App, FocusedPanel, InputMode, Toast, ToastType, VpnProfile};
 use vortix::message::{Message, ScrollMove, SelectionMove};
 
 static INIT: Once = Once::new();
@@ -500,7 +500,10 @@ mod message_routing {
         add_wg_profiles(&mut app, &["vpn-a"]);
 
         app.handle_message(Message::QuickConnect(99));
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+        assert!(app.current_tunnel().is_none_or(|t| matches!(
+            t.state,
+            vortix::core::engine::state::Connection::Disconnected { .. }
+        )));
     }
 
     #[test]

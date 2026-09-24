@@ -1149,14 +1149,17 @@ pub mod help {
                     return template.to_string();
                 }
                 template
-                    .replace("{off}", crate::state::KillSwitchMode::Off.display_name())
+                    .replace(
+                        "{off}",
+                        crate::core::killswitch::KillSwitchMode::Off.display_name(),
+                    )
                     .replace(
                         "{block_on_drop}",
-                        crate::state::KillSwitchMode::Auto.display_name(),
+                        crate::core::killswitch::KillSwitchMode::Auto.display_name(),
                     )
                     .replace(
                         "{vpn_only}",
-                        crate::state::KillSwitchMode::AlwaysOn.display_name(),
+                        crate::core::killswitch::KillSwitchMode::AlwaysOn.display_name(),
                     )
             },
         )
@@ -1346,9 +1349,9 @@ pub mod help {
                 .collect::<Vec<_>>()
                 .join("\n");
             for mode in [
-                crate::state::KillSwitchMode::Off,
-                crate::state::KillSwitchMode::Auto,
-                crate::state::KillSwitchMode::AlwaysOn,
+                crate::core::killswitch::KillSwitchMode::Off,
+                crate::core::killswitch::KillSwitchMode::Auto,
+                crate::core::killswitch::KillSwitchMode::AlwaysOn,
             ] {
                 assert!(rendered.contains(mode.display_name()));
             }

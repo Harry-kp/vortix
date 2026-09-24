@@ -1,26 +1,5 @@
-//! Domain state types for the Vortix application.
-//!
-//! This module contains UI-facing state types separated by domain:
-//! - `profile`: VPN profile configuration and protocol types
-//! - `ui`: UI-specific state like focus, input mode, and toasts
-//! - `killswitch`: Kill switch mode and state
-//!
-//! retired the legacy
-//! `state::ConnectionState` enum. UI panels read active tunnel state
-//! from `crate::app::App::registry` (a
-//! `crate::core::engine::TunnelRegistry`); the legacy mirror that
-//! the connect/disconnect flow still drives lives at
-//! `crate::vpn_runtime::ConnectionState` (not re-exported here).
+//! TUI state: profiles, focus, input modes, toasts.
 
-mod killswitch {
-    //! Kill switch state types — relocated to `vortix-core::state::killswitch`.
-    //!
-    //! This shim re-exports the canonical types so existing imports in the
-    //! binary crate keep working without a full sweep. A later sweep removes the
-    //! shim once consumers are updated.
-
-    pub use crate::core::state::killswitch::{KillSwitchMode, KillSwitchState};
-}
 mod profile {
     //! VPN profile and protocol types.
 
@@ -525,7 +504,6 @@ mod ui {
 }
 
 // Re-export all types for easy access
-pub use killswitch::{KillSwitchMode, KillSwitchState};
 pub use profile::VpnProfile;
 pub use ui::{
     help_max_scroll_for_terminal_height, AuthField, FlipState, FocusedPanel, HelpTab, InputMode,

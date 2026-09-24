@@ -10,9 +10,9 @@ use std::time::{Instant, SystemTime};
 
 use crate::core::cidr::Cidr;
 use crate::core::engine::{classify_route_conflict, Conflict};
+use crate::core::killswitch::KillSwitchMode;
 use crate::core::ports::dns::DnsRequest;
 use crate::core::profile::{ProfileId, ProtocolKind};
-use crate::core::state::killswitch::KillSwitchMode;
 
 use super::plan::{LiveTunnel, PlanInput};
 

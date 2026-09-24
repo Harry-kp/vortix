@@ -21,7 +21,6 @@ pub mod scanner;
 pub mod secret;
 pub mod secret_file;
 pub mod standard_tunnel_ownership;
-pub mod state;
 pub mod telemetry;
 pub mod telemetry_http;
 

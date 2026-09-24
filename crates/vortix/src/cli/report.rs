@@ -193,14 +193,16 @@ fn loaded_killswitch_summary(
         Ok(Some(persisted)) => {
             persisted_killswitch_summary(persisted.mode, persisted.recovered_state())
         }
-        Ok(None) => crate::state::KillSwitchMode::Off.display_name().to_string(),
+        Ok(None) => crate::core::killswitch::KillSwitchMode::Off
+            .display_name()
+            .to_string(),
         Err(error) => format!("Unknown — state could not be verified ({error})"),
     }
 }
 
 fn persisted_killswitch_summary(
-    mode: crate::state::KillSwitchMode,
-    state: crate::state::KillSwitchState,
+    mode: crate::core::killswitch::KillSwitchMode,
+    state: crate::core::killswitch::KillSwitchState,
 ) -> String {
     format!("{} ({})", mode.display_name(), state.display_status())
 }
@@ -745,15 +747,15 @@ mod tests {
     fn persisted_state_renders_mode_and_recovered_state() {
         assert_eq!(
             persisted_killswitch_summary(
-                crate::state::KillSwitchMode::AlwaysOn,
-                crate::state::KillSwitchState::Degraded,
+                crate::core::killswitch::KillSwitchMode::AlwaysOn,
+                crate::core::killswitch::KillSwitchState::Degraded,
             ),
             "VPN-only (Degraded)"
         );
         assert_eq!(
             persisted_killswitch_summary(
-                crate::state::KillSwitchMode::Auto,
-                crate::state::KillSwitchState::Armed,
+                crate::core::killswitch::KillSwitchMode::Auto,
+                crate::core::killswitch::KillSwitchState::Armed,
             ),
             "Block on drop (Watching)"
         );

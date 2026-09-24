@@ -12,19 +12,6 @@ use crate::logger::{self, LogLevel};
 use crate::utils;
 
 impl App {
-    /// Derive a legacy `ConnectionState` view from the registry primary.
-    ///
-    /// Post-P5d the App layer no longer carries a `connection_state`
-    /// field on `VpnRuntime`; this method computes the single-tunnel
-    /// view from `registry.primary()`. Falls back to the first
-    /// non-Disconnected entry when no primary is set (so Connecting
-    /// transitions surface before the FSM owns the default route).
-    ///
-    /// Used by code paths that still think in single-tunnel terms
-    /// (kill switch sync, profile delete safety, scanner dispatch).
-    /// All multi-tunnel-aware paths read `app.registry.snapshot_all`
-    /// directly.
-    #[must_use]
     /// Profile name for logs and dialogs. Profile ids are 64-char digests and
     /// mean nothing to the reader.
     pub(crate) fn profile_display_name(
@@ -41,12 +28,12 @@ impl App {
             )
     }
 
-    pub fn legacy_state(&self) -> crate::vpn_runtime::ConnectionState {
+    /// The tunnel the dashboard treats as current: the primary, else the
+    /// first one that is not disconnected.
+    #[must_use]
+    pub fn current_tunnel(&self) -> Option<crate::core::engine::TunnelSnapshot> {
         use crate::core::engine::state::Connection;
-        use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
-
-        let snap = self
-            .registry
+        self.registry
             .primary()
             .and_then(|pid| self.registry.snapshot(pid))
             .or_else(|| {
@@ -54,70 +41,9 @@ impl App {
                     .snapshot_all()
                     .into_iter()
                     .find(|s| !matches!(s.state, Connection::Disconnected { .. }))
-            });
-        let Some(snap) = snap else {
-            return ConnectionState::Disconnected;
-        };
-        let display_name = self.profile_display_name(&snap.profile_id);
-
-        let now = std::time::SystemTime::now();
-        let to_instant = |t: std::time::SystemTime| {
-            now.duration_since(t)
-                .ok()
-                .and_then(|d| Instant::now().checked_sub(d))
-                .unwrap_or_else(Instant::now)
-        };
-
-        match snap.state {
-            Connection::Disconnected { .. } => ConnectionState::Disconnected,
-            Connection::Connecting { started_at, .. }
-            | Connection::Reconnecting { started_at, .. } => ConnectionState::Connecting {
-                started: to_instant(started_at),
-                profile: display_name.clone(),
-            },
-            Connection::AwaitingUserInput { since, .. } => ConnectionState::Connecting {
-                started: to_instant(since),
-                profile: display_name.clone(),
-            },
-            Connection::Connected { since, details, .. } => {
-                let server_location = self
-                    .runtime
-                    .profiles
-                    .iter()
-                    .find(|p| p.id == snap.profile_id)
-                    .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
-                ConnectionState::Connected {
-                    since: to_instant(since),
-                    profile: display_name,
-                    server_location,
-                    latency_ms: 0,
-                    // The legacy view is a projection: ownership, teardown and
-                    // DNS intent stay with the canonical registry rather than
-                    // riding along here.
-                    details: Box::new(DetailedConnectionInfo {
-                        interface: details.interface.clone(),
-                        internal_ip: details.internal_ip.clone(),
-                        endpoint: details.endpoint.clone(),
-                        mtu: details.mtu.clone(),
-                        public_key: details.public_key.clone(),
-                        listen_port: details.listen_port.clone(),
-                        transfer_rx: details.transfer_rx.clone(),
-                        transfer_tx: details.transfer_tx.clone(),
-                        latest_handshake: details.latest_handshake.clone(),
-                        generation: details.generation,
-                        handshake: details.handshake.clone(),
-                        probe_receipts: details.probe_receipts.clone(),
-                        pid: details.pid,
-                        ..Default::default()
-                    }),
-                }
-            }
-            Connection::Disconnecting { started_at, .. } => ConnectionState::Disconnecting {
-                started: to_instant(started_at),
-                profile: display_name,
-            },
-        }
+            })
     }
+
     /// Whether the registry currently has at least one Connected tunnel.
     #[must_use]
     /// How long one telemetry observation may go unrefreshed before its

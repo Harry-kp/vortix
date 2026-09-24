@@ -80,10 +80,14 @@ fn u1_multi_tunnel_no_primary_projection_is_stable_and_sorted() {
         .collect();
     assert_eq!(names, ["alpha", "zeta"]);
     assert!(app.registry.primary().is_none());
-    let ConnectionState::Connected { profile, .. } = app.legacy_state() else {
-        panic!("legacy no-primary projection must choose the first active snapshot");
-    };
-    assert_eq!(profile, "alpha");
+    let current = app
+        .current_tunnel()
+        .expect("with no primary the first active tunnel is current");
+    assert!(matches!(
+        current.state,
+        crate::core::engine::state::Connection::Connected { .. }
+    ));
+    assert_eq!(app.profile_display_name(&current.profile_id), "alpha");
 }
 fn set_disconnecting(app: &mut App, name: &str) {
     set_phase(app, name, crate::control::Phase::Stopping);
@@ -104,7 +108,10 @@ fn set_disconnecting(app: &mut App, name: &str) {
 fn test_d_while_disconnected_is_noop() {
     let mut app = test_app();
     app.handle_message(Message::Disconnect);
-    assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+    assert!(app.current_tunnel().is_none_or(|t| matches!(
+        t.state,
+        crate::core::engine::state::Connection::Disconnected { .. }
+    )));
 }
 
 // ====================================================================
@@ -212,10 +219,12 @@ fn test_toggle_while_connecting_is_rejected() {
 
     app.toggle_connection(1);
 
-    assert!(matches!(
-        app.legacy_state(),
-        ConnectionState::Connecting { .. }
-    ));
+    assert!(app.current_tunnel().is_some_and(|t| matches!(
+        t.state,
+        crate::core::engine::state::Connection::Connecting { .. }
+            | crate::core::engine::state::Connection::Reconnecting { .. }
+            | crate::core::engine::state::Connection::AwaitingUserInput { .. }
+    )));
 }
 
 // ====================================================================
@@ -510,7 +519,10 @@ fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
     app.reconnect();
 
     assert!(
-        matches!(app.legacy_state(), ConnectionState::Disconnected),
+        app.current_tunnel().is_none_or(|t| matches!(
+            t.state,
+            crate::core::engine::state::Connection::Disconnected { .. }
+        )),
         "Should stay disconnected when no last_connected_profile"
     );
 }
@@ -1522,9 +1534,12 @@ fn u19_disconnect_profile_idempotent_for_inactive_row() {
     app.handle_message(Message::DisconnectProfile { idx: 1 });
 
     assert!(
-        matches!(app.legacy_state(), ConnectionState::Connected { .. }),
+        app.current_tunnel().is_some_and(|t| matches!(
+            t.state,
+            crate::core::engine::state::Connection::Connected { .. }
+        )),
         "DisconnectProfile on inactive row must leave Connected state intact, got {:?}",
-        app.legacy_state(),
+        app.current_tunnel().map(|t| t.state),
     );
 }
 
@@ -1711,10 +1726,10 @@ fn u19_confirm_disconnect_all_overlay_n_key_cancels() {
 
     assert!(matches!(app.input_mode, InputMode::Normal));
     // Connection state untouched.
-    assert!(matches!(
-        app.legacy_state(),
-        ConnectionState::Connected { .. }
-    ));
+    assert!(app.current_tunnel().is_some_and(|t| matches!(
+        t.state,
+        crate::core::engine::state::Connection::Connected { .. }
+    )));
 }
 
 /// `CachedConfigView::from_content` pre-counts lines and pre-highlights

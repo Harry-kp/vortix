@@ -103,11 +103,6 @@ pub use crate::state::{
     AuthField, FlipState, FocusedPanel, InputMode, ProfileSortOrder, Toast, ToastType, VpnProfile,
     DISMISS_DURATION,
 };
-// The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
-// lives on `crate::vpn_runtime` after the registry migration; re-export through `app::`
-// so the existing `app/connection.rs` / `app/update.rs` code paths that
-// drive the legacy mirror still resolve `app::ConnectionState`.
-pub use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
 
 /// Main application state container.
 ///
@@ -140,7 +135,7 @@ pub struct App {
     /// Kept when every tunnel is gone, so reconnect means "the last one".
     pub(crate) last_control_connected_profile: Option<crate::core::profile::ProfileId>,
     /// Kill switch mode sent but not yet in a snapshot.
-    pub(crate) pending_control_killswitch_mode: Option<crate::state::KillSwitchMode>,
+    pub(crate) pending_control_killswitch_mode: Option<crate::core::killswitch::KillSwitchMode>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,

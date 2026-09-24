@@ -1247,7 +1247,7 @@ fn short_peer(peer: &str) -> &str {
 #[cfg(test)]
 mod handshake_status_tests {
     use super::*;
-    use crate::state::{KillSwitchMode, KillSwitchState};
+    use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 
     fn snapshot(state: &str, protocol: &str) -> crate::vpn_runtime::connection::StatusSnapshot {
         crate::vpn_runtime::connection::StatusSnapshot {
@@ -2301,8 +2301,8 @@ struct KsData {
 
 /// Print the active mode, what it is doing right now, and the other choices.
 fn print_killswitch_status(
-    mode: crate::state::KillSwitchMode,
-    state: crate::state::KillSwitchState,
+    mode: crate::core::killswitch::KillSwitchMode,
+    state: crate::core::killswitch::KillSwitchState,
 ) {
     println!(
         "Kill Switch: {} — currently {}",
@@ -2312,7 +2312,7 @@ fn print_killswitch_status(
     // Degraded means this mode's rules are not in place. Printing the mode's
     // behaviour here read as a description of what is happening, so "no
     // internet at all" appeared over a working connection.
-    if state == crate::state::KillSwitchState::Degraded {
+    if state == crate::core::killswitch::KillSwitchState::Degraded {
         // Degraded is "this process cannot prove the rules are in place",
         // which is not the same as "they are not". Proof is bound to the
         // process that applied it, so a separate CLI invocation reaches
@@ -2335,9 +2335,9 @@ fn print_killswitch_status(
     println!();
     println!("Other modes:");
     for other in [
-        crate::state::KillSwitchMode::Off,
-        crate::state::KillSwitchMode::Auto,
-        crate::state::KillSwitchMode::AlwaysOn,
+        crate::core::killswitch::KillSwitchMode::Off,
+        crate::core::killswitch::KillSwitchMode::Auto,
+        crate::core::killswitch::KillSwitchMode::AlwaysOn,
     ] {
         if other == mode {
             continue;
@@ -2361,7 +2361,7 @@ fn handle_killswitch(
     let (mut mode, mut state) = crate::core::killswitch::persisted();
 
     if let Some(new_mode) = mode_arg {
-        let Some(ks_mode) = crate::state::KillSwitchMode::from_cli_verb(new_mode) else {
+        let Some(ks_mode) = crate::core::killswitch::KillSwitchMode::from_cli_verb(new_mode) else {
             print_error_and_exit(
                 output_mode,
                 "killswitch",
@@ -2376,7 +2376,7 @@ fn handle_killswitch(
             );
         };
 
-        if !engine.is_root && ks_mode != crate::state::KillSwitchMode::Off {
+        if !engine.is_root && ks_mode != crate::core::killswitch::KillSwitchMode::Off {
             print_error_and_exit(
                 output_mode,
                 "killswitch",
@@ -2719,8 +2719,11 @@ mod tests {
             std::fs::read_to_string(config.path().join(crate::constants::KILLSWITCH_STATE_FILE))
                 .unwrap();
         let state: crate::core::killswitch::PersistedState = serde_json::from_str(&saved).unwrap();
-        assert_eq!(state.mode, crate::state::KillSwitchMode::Off);
-        assert_eq!(state.state, crate::state::KillSwitchState::Disabled);
+        assert_eq!(state.mode, crate::core::killswitch::KillSwitchMode::Off);
+        assert_eq!(
+            state.state,
+            crate::core::killswitch::KillSwitchState::Disabled
+        );
         assert!(state.emergency_release_fence);
     }
 

@@ -8,13 +8,13 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::openvpn_credentials::{FsOpenVpnCredentialStore, RememberedOpenVpnCredentials};
 use crate::core::engine::state::DetailedConnectionInfo;
 use crate::core::engine::Conflict;
+use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::core::ports::route_table::DefaultRouteObservation;
 use crate::core::ports::tunnel::TunnelCancellation;
 use crate::core::profile::{ProfileId, ProtocolKind};
 use crate::core::scanner::{ActiveSession, ScannerResult};
 use crate::core::secret::Secret;
 use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
-use crate::core::state::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 

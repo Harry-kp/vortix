@@ -67,7 +67,7 @@ state transition, with a test in `plan.rs`/`state.rs` — not into a caller.
 
 ## Kill switch semantics
 
-One vocabulary, used identically on every surface — CLI input verb, CLI output, TUI panels, JSON envelope, log lines. Rust enum variants (`Off` / `Auto` / `AlwaysOn`) stay idiomatic for the language but never leak into output. The bridge between the enum and every user-visible string is the helper set on `core::state::killswitch` — `KillSwitchMode::display_name` (display), `cli_verb` / `from_cli_verb` (input parsing), `one_liner`, `behavior_lines`, and `KillSwitchState::display_status`.
+One vocabulary, used identically on every surface — CLI input verb, CLI output, TUI panels, JSON envelope, log lines. Rust enum variants (`Off` / `Auto` / `AlwaysOn`) stay idiomatic for the language but never leak into output. The bridge between the enum and every user-visible string is the helper set on `core::killswitch` — `KillSwitchMode::display_name` (display), `cli_verb` / `from_cli_verb` (input parsing), `one_liner`, `behavior_lines`, and `KillSwitchState::display_status`.
 
 | Rust enum    | Slug (CLI verb + display) | What it does                                                                                                                                                                                                  |
 |--------------|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

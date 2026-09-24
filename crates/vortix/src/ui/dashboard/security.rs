@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::core::engine::registry::TunnelSnapshot;
 use crate::core::engine::state::Connection;
-use crate::state::{KillSwitchMode, KillSwitchState};
+use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::Rect,
@@ -679,10 +679,10 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
             app.control_snapshot.kill_switch_state
         ),
         (
-            crate::state::KillSwitchMode::Auto,
-            crate::state::KillSwitchState::Blocking
-        ) | (_, crate::state::KillSwitchState::Degraded)
-            | (crate::state::KillSwitchMode::Off, _)
+            crate::core::killswitch::KillSwitchMode::Auto,
+            crate::core::killswitch::KillSwitchState::Blocking
+        ) | (_, crate::core::killswitch::KillSwitchState::Degraded)
+            | (crate::core::killswitch::KillSwitchMode::Off, _)
     );
     // Insecure cipher = effective wire plaintext. Demote to Partial so
     // the title doesn't claim full protection while crypto is broken.
@@ -1364,8 +1364,8 @@ mod tests {
     //! registry test helpers).
     use super::*;
     use crate::app::App;
+    use crate::core::killswitch::KillSwitchMode;
     use crate::core::profile::ProfileId;
-    use crate::state::KillSwitchMode;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::Instant;
@@ -2243,7 +2243,7 @@ mod tests {
         state.location = Some("Frankfurt am Main, DE".to_string());
         state.ip_status = IpStatus::Masked;
         state.killswitch_mode = KillSwitchMode::Off;
-        state.killswitch_state = crate::state::KillSwitchState::Disabled;
+        state.killswitch_state = crate::core::killswitch::KillSwitchState::Disabled;
 
         let lines = build_partial_audit(&state);
         let body: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
