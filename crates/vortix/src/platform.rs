@@ -2,8 +2,8 @@
 
 #[cfg(target_os = "linux")]
 pub use crate::linux::{
-    IptablesFirewall as Firewall, LinuxDns as Dns, LinuxInterface as Interface,
-    LinuxNetworkStats as NetworkStats, LinuxRouteTable as Routes, ProcSocketAudit as SocketAudit,
+    LinuxDns as Dns, LinuxInterface as Interface, LinuxNetworkStats as NetworkStats,
+    LinuxRouteTable as Routes, NftFirewall as Firewall, ProcSocketAudit as SocketAudit,
 };
 #[cfg(target_os = "macos")]
 pub use crate::macos::{

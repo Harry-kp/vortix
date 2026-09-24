@@ -12,13 +12,12 @@ pub mod firewall;
 pub mod interface;
 pub mod interface_list;
 pub mod network_stats;
-mod nft_policy;
 pub mod process_identity;
 pub mod route_table;
 pub mod socket_audit;
 
 pub use dns::LinuxDns;
-pub use firewall::IptablesFirewall;
+pub use firewall::NftFirewall;
 pub use interface::LinuxInterface;
 pub use network_stats::LinuxNetworkStats;
 pub use route_table::LinuxRouteTable;

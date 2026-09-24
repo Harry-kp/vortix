@@ -1,37 +1,14 @@
-//! Linux iptables/nftables firewall implementation for kill switch.
+//! Linux kill switch: one nftables `inet` table, replaced in a single
+//! transaction so IPv4 and IPv6 change together. iptables code remains only
+//! to clean up rules older releases installed.
 //!
-//! Uses nftables (nft) for engagement because one `inet` transaction covers
-//! IPv4 and IPv6 atomically. The legacy iptables backend is retained only for
-//! cleanup of state created by older releases; it cannot safely engage a
-//! dual-family policy because the two kernel transactions cannot be atomic.
-//!
-//! Legacy iptables cleanup owns one chain per address family and leaves host
-//! filter tables and policies untouched. The nftables backend owns one table
-//! and replaces it in a single nft transaction.
-//!
-//! Ruleset shape (per active tunnel set):
-//!   1. A Vortix-owned OUTPUT chain ending in DROP.
-//!   2. Loopback always allowed.
-//!   3. RFC1918 pass list, with secondaries' `declared_cidrs` subtracted
-//!      via `cidr_subtract`. Primaries (`is_primary == true`) do NOT
-//!      contribute to the remove list — their interface allow rule covers
-//!      their egress, and subtracting `0.0.0.0/0` would carve loopback.
-//!      See Q-DEF-9 / D-6.
-//!   4. DHCP allowed (`udp --sport 68 --dport 67`).
-//!   5. Per-tunnel: `-o <interface> -j ACCEPT` and one `-d <server-ip> -j
-//!      ACCEPT` per server IP — so the tunnel can reconnect after a
-//!      transport drop. IPv4 server IPs go into the v4 ruleset;
-//!      IPv6 server IPs route to a parallel `ip6tables-restore` invocation.
-//!
-//! An empty `active` slice yields rules 1-4 only — the base block-all
-//! posture with no per-tunnel egress.
+//! The output chain drops by default and accepts: loopback; the RFC1918
+//! ranges minus every secondary tunnel's routes (a primary's `0.0.0.0/0` is
+//! never subtracted, its interface rule covers it); DHCP; and per tunnel its
+//! interface plus each server address, so it can reconnect after a drop.
 
-use std::fmt::Write;
-use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::core::cidr::{rfc1918_ranges, Cidr};
-use crate::core::cidr_subtract::cidr_subtract;
 use crate::core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
 use crate::process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, error, info};
@@ -39,13 +16,13 @@ use tracing::{debug, error, info};
 const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
 const FIREWALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const FIREWALL_OUTPUT_LIMIT: usize = 1024 * 1024;
-use super::nft_policy::{self, BatchMode};
 use super::POLICY_COMMENT_PREFIX;
+use nft_policy::BatchMode;
 
 /// Linux nftables firewall implementation with legacy iptables cleanup.
-pub struct IptablesFirewall;
+pub struct NftFirewall;
 
-impl IptablesFirewall {
+impl NftFirewall {
     fn nft_command(args: Vec<String>) -> CommandSpec {
         let mut command = Self::firewall_command("nft", args);
         command.env.insert("LC_ALL".to_string(), "C".to_string());
@@ -68,123 +45,6 @@ impl IptablesFirewall {
     }
 
     // ─── iptables backend ───────────────────────────────────────────────
-
-    /// Synthesise the IPv4 `iptables-restore` ruleset for the given active
-    /// tunnel set. Pure function — no side effects, deterministic for
-    /// snapshot testing.
-    ///
-    /// Ruleset shape: see module-level docs. Empty `active` → rules 1-4
-    /// only (base block-all).
-    #[must_use]
-    pub fn generate_v4_ruleset(active: &[ActiveTunnelInfo]) -> String {
-        let mut rules = String::new();
-        writeln!(rules, "# Vortix Kill Switch Rules - Auto-generated").unwrap();
-        writeln!(rules, "# DO NOT EDIT - Will be overwritten").unwrap();
-        writeln!(rules, "*filter").unwrap();
-        writeln!(rules, ":{CHAIN_NAME} - [0:0]").unwrap();
-        writeln!(rules, "-F {CHAIN_NAME}").unwrap();
-
-        // Allow loopback.
-        writeln!(rules, "-A {CHAIN_NAME} -o lo -j ACCEPT").unwrap();
-
-        // RFC1918, with secondaries' declared CIDRs carved out. Primaries
-        // (0/0) are excluded from the remove list per Q-DEF-9 / D-6 — their
-        // interface allow rule covers egress, and subtracting the default
-        // route would strip loopback.
-        let secondary_cidrs: Vec<Cidr> = active
-            .iter()
-            .filter(|t| !t.is_primary)
-            .flat_map(|t| t.declared_cidrs.iter().copied())
-            .collect();
-        let rfc1918 = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
-        for c in &rfc1918 {
-            writeln!(rules, "-A {CHAIN_NAME} -d {c} -j ACCEPT").unwrap();
-        }
-
-        // DHCP — must precede the per-tunnel rules so a DHCP renew on the
-        // underlay isn't dropped.
-        writeln!(
-            rules,
-            "-A {CHAIN_NAME} -p udp --sport 68 --dport 67 -j ACCEPT"
-        )
-        .unwrap();
-
-        // Per-tunnel rules. Order preserved from caller — typically
-        // primary first, then secondaries by attach order.
-        for tunnel in active {
-            if !tunnel.is_endpoint_allowlist() {
-                writeln!(
-                    rules,
-                    "# Tunnel: {} (primary={})",
-                    tunnel.interface, tunnel.is_primary
-                )
-                .unwrap();
-                writeln!(rules, "-A {CHAIN_NAME} -o {} -j ACCEPT", tunnel.interface).unwrap();
-            }
-            for ip in &tunnel.server_ips {
-                if let IpAddr::V4(v4) = ip {
-                    writeln!(rules, "-A {CHAIN_NAME} -d {v4} -j ACCEPT").unwrap();
-                }
-            }
-        }
-
-        let digest = crate::core::killswitch::policy_digest(active);
-        writeln!(
-            rules,
-            "-A {CHAIN_NAME} -m comment --comment {POLICY_COMMENT_PREFIX}{digest} -j DROP"
-        )
-        .unwrap();
-
-        writeln!(rules, "COMMIT").unwrap();
-        rules
-    }
-
-    /// Synthesise the IPv6 `ip6tables-restore` ruleset. Same shape as v4
-    /// but without RFC1918 carve-out (RFC1918 is v4-only). Only IPv6
-    /// server IPs are emitted as owned-chain destination exceptions.
-    ///
-    #[must_use]
-    pub fn generate_v6_ruleset(active: &[ActiveTunnelInfo]) -> String {
-        let mut rules = String::new();
-        writeln!(rules, "# Vortix Kill Switch Rules (IPv6) - Auto-generated").unwrap();
-        writeln!(rules, "# DO NOT EDIT - Will be overwritten").unwrap();
-        writeln!(rules, "*filter").unwrap();
-        writeln!(rules, ":{CHAIN_NAME} - [0:0]").unwrap();
-        writeln!(rules, "-F {CHAIN_NAME}").unwrap();
-
-        // Loopback (v6 lo is the same interface name).
-        writeln!(rules, "-A {CHAIN_NAME} -o lo -j ACCEPT").unwrap();
-
-        // Every tunnel interface is allowed in both families. Endpoint
-        // family only selects the reconnect exception.
-        for tunnel in active {
-            let v6_ips: Vec<&IpAddr> = tunnel.server_ips.iter().filter(|ip| ip.is_ipv6()).collect();
-            if !tunnel.is_endpoint_allowlist() {
-                writeln!(
-                    rules,
-                    "# Tunnel: {} (primary={})",
-                    tunnel.interface, tunnel.is_primary
-                )
-                .unwrap();
-                writeln!(rules, "-A {CHAIN_NAME} -o {} -j ACCEPT", tunnel.interface).unwrap();
-            }
-            for ip in v6_ips {
-                if let IpAddr::V6(v6) = ip {
-                    writeln!(rules, "-A {CHAIN_NAME} -d {v6} -j ACCEPT").unwrap();
-                }
-            }
-        }
-
-        let digest = crate::core::killswitch::policy_digest(active);
-        writeln!(
-            rules,
-            "-A {CHAIN_NAME} -m comment --comment {POLICY_COMMENT_PREFIX}{digest} -j DROP"
-        )
-        .unwrap();
-
-        writeln!(rules, "COMMIT").unwrap();
-        rules
-    }
 
     /// Invoke `iptables-restore` with the given ruleset on stdin. The
     /// kernel performs an atomic ruleset replace — if the parse fails,
@@ -244,38 +104,6 @@ impl IptablesFirewall {
             )));
         }
         Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
-    }
-
-    #[cfg(test)]
-    fn output_jump_is_first(listing: &str) -> bool {
-        let expected = format!("-A OUTPUT -j {CHAIN_NAME}");
-        listing.lines().find(|line| line.starts_with("-A OUTPUT ")) == Some(expected.as_str())
-    }
-
-    #[cfg(test)]
-    fn canonical_owned_iptables_rules(rules: &str) -> Vec<String> {
-        rules
-            .lines()
-            .filter(|line| line.starts_with(&format!("-A {CHAIN_NAME} ")))
-            .map(|line| {
-                line.replace("--comment \"", "--comment ")
-                    .replace("\" -j", " -j")
-                    .replace("-p udp -m udp", "-p udp")
-                    .replace("/32 ", " ")
-                    .replace("/128 ", " ")
-            })
-            .collect()
-    }
-
-    #[cfg(test)]
-    fn snapshot_verifies_iptables(snapshot: &str, expected_ruleset: &str) -> bool {
-        let expected_jump = format!("-A OUTPUT -j {CHAIN_NAME}");
-        let jump_first = snapshot.lines().find(|line| line.starts_with("-A OUTPUT "))
-            == Some(expected_jump.as_str());
-        jump_first
-            && snapshot.contains(&format!(":{CHAIN_NAME} "))
-            && Self::canonical_owned_iptables_rules(snapshot)
-                == Self::canonical_owned_iptables_rules(expected_ruleset)
     }
 
     fn is_legacy_global_policy(snapshot: &str, ipv6: bool) -> bool {
@@ -545,7 +373,7 @@ impl IptablesFirewall {
     }
 }
 
-impl IptablesFirewall {
+impl NftFirewall {
     /// Engage the killswitch with one nftables `inet` transaction covering
     /// every tunnel in `active`. Both fresh enable and refresh with a changed
     /// active set go through this atomic dual-family path.
@@ -653,10 +481,258 @@ impl IptablesFirewall {
     }
 }
 
+mod nft_policy {
+    //! Pure rendering and exact read-back for the Vortix-owned nft table.
+
+    use std::fmt::Write as _;
+    use std::net::IpAddr;
+
+    use super::POLICY_COMMENT_PREFIX;
+    use crate::core::cidr::{rfc1918_ranges, Cidr};
+    use crate::core::cidr_subtract::cidr_subtract;
+    use crate::core::ports::killswitch::ActiveTunnelInfo;
+
+    pub(super) const MISSING_ERROR: &str = "No such file or directory";
+
+    #[derive(Clone, Copy)]
+    pub(super) enum BatchMode {
+        Create,
+        Replace,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum AcceptRule {
+        OutputInterface(String),
+        Destination(Cidr),
+        Dhcp,
+    }
+
+    pub(super) struct ExpectedPolicy {
+        ruleset: String,
+        accept_rules: Vec<AcceptRule>,
+        digest: String,
+    }
+
+    impl ExpectedPolicy {
+        pub(super) fn new(active: &[ActiveTunnelInfo], mode: BatchMode) -> Self {
+            let digest = crate::core::killswitch::policy_digest(active);
+            let ruleset = render(active, mode, &digest);
+            let accept_rules = parse_accept_rules(&ruleset)
+                .expect("the package-owned nft renderer emits canonical accept rules");
+            Self {
+                ruleset,
+                accept_rules,
+                digest,
+            }
+        }
+
+        pub(super) fn matches(&self, observed: &ObservedPolicy) -> bool {
+            observed.accept_rules.as_ref() == Some(&self.accept_rules)
+                && observed.policy_drop
+                && observed.terminal_digest.as_deref() == Some(self.digest.as_str())
+        }
+    }
+
+    pub(super) struct ObservedPolicy {
+        accept_rules: Option<Vec<AcceptRule>>,
+        policy_drop: bool,
+        terminal_digest: Option<String>,
+    }
+
+    impl ObservedPolicy {
+        pub(super) fn parse(snapshot: &str) -> Self {
+            let terminal_lines: Vec<&str> = snapshot
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.contains(POLICY_COMMENT_PREFIX))
+                .collect();
+            let terminal_digest = (terminal_lines.len() == 1
+                && terminal_lines[0].contains(" drop "))
+            .then(|| {
+                terminal_lines[0]
+                    .split_once(POLICY_COMMENT_PREFIX)
+                    .and_then(|(_, suffix)| suffix.split('"').next())
+                    .map(str::to_string)
+            })
+            .flatten();
+            Self {
+                accept_rules: parse_accept_rules(snapshot),
+                policy_drop: snapshot.contains("policy drop"),
+                terminal_digest,
+            }
+        }
+    }
+
+    pub(super) fn ruleset(active: &[ActiveTunnelInfo], mode: BatchMode) -> String {
+        ExpectedPolicy::new(active, mode).ruleset
+    }
+
+    pub(super) fn snapshot_matches(active: &[ActiveTunnelInfo], snapshot: &str) -> bool {
+        ExpectedPolicy::new(active, BatchMode::Create).matches(&ObservedPolicy::parse(snapshot))
+    }
+
+    fn render(active: &[ActiveTunnelInfo], mode: BatchMode, digest: &str) -> String {
+        let secondary_cidrs: Vec<Cidr> = active
+            .iter()
+            .filter(|tunnel| !tunnel.is_primary)
+            .flat_map(|tunnel| tunnel.declared_cidrs.iter().copied())
+            .collect();
+        let local_ranges = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
+
+        let mut ruleset = String::new();
+        if matches!(mode, BatchMode::Replace) {
+            writeln!(
+                ruleset,
+                "delete table inet {}",
+                crate::constants::NFT_TABLE_NAME
+            )
+            .unwrap();
+        }
+        write!(
+            ruleset,
+            r#"table inet {} {{
+  chain output {{
+    type filter hook output priority 0; policy drop;
+
+    oifname "lo" accept
+"#,
+            crate::constants::NFT_TABLE_NAME,
+        )
+        .unwrap();
+        for range in local_ranges {
+            writeln!(ruleset, "    ip daddr {range} accept").unwrap();
+        }
+        writeln!(ruleset, "    udp sport 68 udp dport 67 accept").unwrap();
+        for tunnel in active {
+            if !tunnel.is_endpoint_allowlist() {
+                writeln!(ruleset, "    oifname \"{}\" accept", tunnel.interface).unwrap();
+            }
+            for endpoint in &tunnel.server_ips {
+                match endpoint {
+                    IpAddr::V4(ip) => writeln!(ruleset, "    ip daddr {ip} accept").unwrap(),
+                    IpAddr::V6(ip) => writeln!(ruleset, "    ip6 daddr {ip} accept").unwrap(),
+                }
+            }
+        }
+        writeln!(
+            ruleset,
+            "    counter drop comment \"{POLICY_COMMENT_PREFIX}{digest}\""
+        )
+        .unwrap();
+        ruleset.push_str("  }\n}\n");
+        ruleset
+    }
+
+    fn host_cidr(address: IpAddr) -> Cidr {
+        let prefix_len = if address.is_ipv4() { 32 } else { 128 };
+        Cidr::new(address, prefix_len).expect("a host prefix is valid for its address family")
+    }
+
+    fn parse_accept_rule(line: &str) -> Option<AcceptRule> {
+        if line == "udp sport 68 udp dport 67 accept" {
+            return Some(AcceptRule::Dhcp);
+        }
+        if let Some(interface) = line
+            .strip_prefix("oifname \"")
+            .and_then(|rest| rest.strip_suffix("\" accept"))
+        {
+            if interface.is_empty() || interface.contains('"') {
+                return None;
+            }
+            return Some(AcceptRule::OutputInterface(interface.to_string()));
+        }
+
+        for (prefix, expect_v4) in [("ip daddr ", true), ("ip6 daddr ", false)] {
+            let Some(address) = line
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(" accept"))
+            else {
+                continue;
+            };
+            let destination = address
+                .parse::<Cidr>()
+                .ok()
+                .or_else(|| address.parse::<IpAddr>().ok().map(host_cidr))?;
+            if destination.is_v4() != expect_v4 {
+                return None;
+            }
+            return Some(AcceptRule::Destination(destination));
+        }
+        None
+    }
+
+    fn has_unquoted_accept_verdict(line: &str) -> bool {
+        const ACCEPT: &[u8] = b"accept";
+        let bytes = line.as_bytes();
+        let mut quoted = false;
+        let mut escaped = false;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            if byte == b'"' {
+                quoted = true;
+                continue;
+            }
+            let end = index + ACCEPT.len();
+            if end <= bytes.len()
+                && &bytes[index..end] == ACCEPT
+                && (index == 0 || bytes[index - 1].is_ascii_whitespace())
+                && (end == bytes.len() || bytes[end].is_ascii_whitespace())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn parse_accept_rules(ruleset: &str) -> Option<Vec<AcceptRule>> {
+        ruleset
+            .lines()
+            .map(str::trim)
+            .filter(|line| has_unquoted_accept_verdict(line))
+            .map(parse_accept_rule)
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn quoted_comment_does_not_create_an_accept_rule() {
+            assert_eq!(
+                parse_accept_rules("counter drop comment \"accept\""),
+                Some(vec![])
+            );
+        }
+
+        #[test]
+        fn bare_and_host_prefix_destinations_are_equivalent() {
+            assert_eq!(
+                parse_accept_rule("ip daddr 10.0.0.1/32 accept"),
+                parse_accept_rule("ip daddr 10.0.0.1 accept")
+            );
+            assert_eq!(
+                parse_accept_rule("ip6 daddr 2001:db8::1/128 accept"),
+                parse_accept_rule("ip6 daddr 2001:db8::1 accept")
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use crate::core::cidr::Cidr;
+    use std::net::IpAddr;
 
     fn cidr(s: &str) -> Cidr {
         s.parse().expect("valid cidr in test")
@@ -681,269 +757,104 @@ mod tests {
         }
     }
 
-    // ─── v4 ruleset generation ──────────────────────────────────────────
-
-    #[test]
-    fn empty_active_set_yields_base_blockall() {
-        let rules = IptablesFirewall::generate_v4_ruleset(&[]);
-        assert!(rules.contains("*filter"));
-        assert!(rules.contains(":VORTIX_KILLSWITCH - [0:0]"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -o lo -j ACCEPT"));
-        // Full RFC1918 base intact.
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
-        // DHCP present.
-        assert!(rules.contains("--sport 68 --dport 67"));
-        // No per-tunnel rules.
-        assert!(!rules.contains("# Tunnel:"));
-        assert!(rules.trim_end().ends_with("COMMIT"));
+    fn nft(active: &[ActiveTunnelInfo]) -> String {
+        nft_policy::ruleset(active, BatchMode::Create)
     }
 
     #[test]
-    fn single_primary_zero_slash_zero_keeps_full_rfc1918() {
-        // A primary tunnel declaring 0.0.0.0/0 must NOT subtract from
-        // RFC1918 — its interface allow covers egress, and subtracting
-        // the default route would carve loopback. See D-6.
-        let t = tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true);
-        let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg0 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
+    fn empty_active_set_blocks_all_but_loopback_lan_and_dhcp() {
+        let rules = nft(&[]);
+        assert!(rules.contains("policy drop;"));
+        assert!(rules.contains("oifname \"lo\" accept"));
+        assert!(rules.contains("ip daddr 10.0.0.0/8 accept"));
+        assert!(rules.contains("ip daddr 172.16.0.0/12 accept"));
+        assert!(rules.contains("ip daddr 192.168.0.0/16 accept"));
+        assert!(rules.contains("udp sport 68 udp dport 67 accept"));
+        assert!(!rules.contains("oifname \"wg"));
     }
 
     #[test]
-    fn single_secondary_ten_dot_carves_rfc1918() {
-        // A secondary claiming 10/8 should remove that block from the
-        // RFC1918 pass list. 172.16/12 + 192.168/16 remain.
-        let t = tunnel("wg1", &["5.6.7.8"], &["10.0.0.0/8"], false);
-        let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg1 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 5.6.7.8 -j ACCEPT"));
+    fn a_full_primary_does_not_carve_the_lan() {
+        // Subtracting the primary's 0/0 would remove the whole LAN allowance;
+        // its interface allow already covers its egress.
+        let rules = nft(&[tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true)]);
+        assert!(rules.contains("ip daddr 10.0.0.0/8 accept"));
+        assert!(rules.contains("ip daddr 172.16.0.0/12 accept"));
+        assert!(rules.contains("ip daddr 192.168.0.0/16 accept"));
+        assert!(rules.contains("oifname \"wg0\" accept"));
+        assert!(rules.contains("ip daddr 1.2.3.4 accept"));
     }
 
     #[test]
-    fn two_secondaries_disjoint_carve_correctly() {
-        // wg1 claims 10/8, wg2 claims 192.168/16. Result: only 172.16/12
-        // remains in the RFC1918 list.
-        let t1 = tunnel("wg1", &["1.1.1.1"], &["10.0.0.0/8"], false);
-        let t2 = tunnel("wg2", &["2.2.2.2"], &["192.168.0.0/16"], false);
-        let rules = IptablesFirewall::generate_v4_ruleset(&[t1, t2]);
-        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
-        // Both interfaces appear.
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg1 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg2 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 1.1.1.1 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 2.2.2.2 -j ACCEPT"));
+    fn secondary_routes_are_carved_from_the_lan_allowance() {
+        let one = nft(&[tunnel("wg1", &["5.6.7.8"], &["10.0.0.0/8"], false)]);
+        assert!(!one.contains("ip daddr 10.0.0.0/8 accept"));
+        assert!(one.contains("ip daddr 172.16.0.0/12 accept"));
+        assert!(one.contains("ip daddr 192.168.0.0/16 accept"));
+
+        let two = nft(&[
+            tunnel("wg1", &["1.1.1.1"], &["10.0.0.0/8"], false),
+            tunnel("wg2", &["2.2.2.2"], &["192.168.0.0/16"], false),
+        ]);
+        assert!(!two.contains("ip daddr 10.0.0.0/8 accept"));
+        assert!(two.contains("ip daddr 172.16.0.0/12 accept"));
+        assert!(!two.contains("ip daddr 192.168.0.0/16 accept"));
+        assert!(two.contains("oifname \"wg1\" accept"));
+        assert!(two.contains("oifname \"wg2\" accept"));
+
+        let overlapping = nft(&[
+            tunnel("wg3", &["1.1.1.1"], &["10.0.0.0/8"], false),
+            tunnel("wg4", &["2.2.2.2"], &["10.5.0.0/16"], false),
+        ]);
+        assert!(!overlapping.contains("ip daddr 10."));
+
+        let mixed = nft(&[
+            tunnel("wg0", &["9.9.9.9"], &["0.0.0.0/0"], true),
+            tunnel("wg1", &["8.8.8.8"], &["10.0.0.0/8"], false),
+        ]);
+        assert!(!mixed.contains("ip daddr 10.0.0.0/8 accept"));
+        assert!(mixed.contains("ip daddr 172.16.0.0/12 accept"));
     }
 
     #[test]
-    fn two_secondaries_overlapping_dont_double_subtract() {
-        // wg3 claims 10/8, wg4 claims 10.5/16 (a subset). Result is
-        // identical to subtracting just 10/8.
-        let t1 = tunnel("wg3", &["1.1.1.1"], &["10.0.0.0/8"], false);
-        let t2 = tunnel("wg4", &["2.2.2.2"], &["10.5.0.0/16"], false);
-        let rules = IptablesFirewall::generate_v4_ruleset(&[t1, t2]);
-        // No 10.* leftover anywhere in the RFC1918 ACCEPT lines.
-        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 10."));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
-    }
-
-    #[test]
-    fn primary_plus_secondary_only_secondary_carves() {
-        // Primary 0/0 + secondary 10/8 — only the secondary subtracts.
-        let prim = tunnel("wg0", &["9.9.9.9"], &["0.0.0.0/0"], true);
-        let sec = tunnel("wg1", &["8.8.8.8"], &["10.0.0.0/8"], false);
-        let rules = IptablesFirewall::generate_v4_ruleset(&[prim, sec]);
-        // 10/8 is gone.
-        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
-        // 172.16 and 192.168 intact.
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
-        // Both interfaces present.
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg0 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg1 -j ACCEPT"));
-    }
-
-    #[test]
-    fn tunnel_with_no_server_ips_still_gets_interface_rule() {
-        let t = tunnel("wg5", &[], &[], true);
-        let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg5 -j ACCEPT"));
-        // No spurious -d <ip> line for the empty server list — count
-        // occurrences of "wg5" — should appear exactly once on its own
-        // interface allow line plus once in the "# Tunnel:" comment.
-        let occurrences = rules.matches("wg5").count();
-        assert_eq!(
-            occurrences, 2,
-            "wg5 should appear exactly twice (comment + rule), got ruleset:\n{rules}"
-        );
-    }
-
-    #[test]
-    fn tunnel_with_multiple_server_ips_emits_one_pass_per_ip() {
-        let t = tunnel("wg6", &["1.2.3.4", "5.6.7.8"], &[], true);
-        let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
-        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 5.6.7.8 -j ACCEPT"));
+    fn every_endpoint_gets_one_rule_in_its_family() {
+        let rules = nft(&[
+            tunnel("wg5", &[], &[], true),
+            tunnel("wg6", &["1.2.3.4", "5.6.7.8", "2001:db8::1"], &[], false),
+        ]);
+        assert_eq!(rules.matches("wg5").count(), 1);
+        assert!(rules.contains("ip daddr 1.2.3.4 accept"));
+        assert!(rules.contains("ip daddr 5.6.7.8 accept"));
+        assert!(rules.contains("ip6 daddr 2001:db8::1 accept"));
     }
 
     #[test]
     fn endpoint_allowlist_emits_no_interface_rule() {
         let policy = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()]);
-        let v4 = IptablesFirewall::generate_v4_ruleset(std::slice::from_ref(&policy));
-        assert!(v4.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
-        assert!(!v4.contains("-A VORTIX_KILLSWITCH -o  -j ACCEPT"));
-        let nft = nft_policy::ruleset(&[policy], BatchMode::Create);
-        assert!(nft.contains("ip daddr 1.2.3.4 accept"));
-        assert!(!nft.contains("oifname \"\" accept"));
-    }
-
-    // ─── v6 ruleset generation ──────────────────────────────────────────
-
-    #[test]
-    fn no_v6_server_ips_still_yields_default_deny_v6_ruleset() {
-        // IPv6 must remain default-deny even when every tunnel endpoint is
-        // IPv4. Endpoint family controls reconnect exceptions, never whether
-        // the IPv6 policy exists.
-        let t = tunnel("wg0", &["1.2.3.4"], &[], true);
-        let with_tunnel = IptablesFirewall::generate_v6_ruleset(&[t]);
-        assert!(with_tunnel.contains(":VORTIX_KILLSWITCH - [0:0]"));
-        assert!(with_tunnel.contains("-A VORTIX_KILLSWITCH -o wg0 -j ACCEPT"));
-        assert!(with_tunnel.contains("-j DROP"));
-
-        let empty = IptablesFirewall::generate_v6_ruleset(&[]);
-        assert!(empty.contains("-A VORTIX_KILLSWITCH -o lo -j ACCEPT"));
-        assert!(empty.contains("-j DROP"));
-    }
-
-    #[test]
-    fn v6_server_ip_routes_to_ip6tables_ruleset() {
-        let t = ActiveTunnelInfo {
-            interface: "wg7".to_string(),
-            server_ips: vec!["2001:db8::1".parse().unwrap()],
-            declared_cidrs: vec![],
-            is_primary: true,
-        };
-        let v6 = IptablesFirewall::generate_v6_ruleset(&[t]);
-        assert!(v6.contains("*filter"));
-        assert!(v6.contains(":VORTIX_KILLSWITCH - [0:0]"));
-        assert!(v6.contains("-A VORTIX_KILLSWITCH -o lo -j ACCEPT"));
-        assert!(v6.contains("-A VORTIX_KILLSWITCH -o wg7 -j ACCEPT"));
-        assert!(v6.contains("-A VORTIX_KILLSWITCH -d 2001:db8::1 -j ACCEPT"));
-        assert!(v6.trim_end().ends_with("COMMIT"));
-    }
-
-    #[test]
-    fn mixed_v4_and_v6_server_ips_emit_both_rulesets() {
-        let t = ActiveTunnelInfo {
-            interface: "wg8".to_string(),
-            server_ips: vec![ip("1.2.3.4"), "2001:db8::1".parse().unwrap()],
-            declared_cidrs: vec![],
-            is_primary: true,
-        };
-        let v4 = IptablesFirewall::generate_v4_ruleset(std::slice::from_ref(&t));
-        let v6 = IptablesFirewall::generate_v6_ruleset(std::slice::from_ref(&t));
-        // v4 ruleset has the v4 server IP, not the v6 one.
-        assert!(v4.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
-        assert!(!v4.contains("2001:db8"));
-        // v6 ruleset has the v6 server IP, not the v4 one.
-        assert!(v6.contains("-A VORTIX_KILLSWITCH -d 2001:db8::1 -j ACCEPT"));
-        assert!(!v6.contains("1.2.3.4"));
-    }
-
-    #[test]
-    fn v6_ruleset_allows_every_tunnel_interface_but_only_v6_endpoints() {
-        let t9 = tunnel("wg9", &["1.2.3.4"], &[], true);
-        let t10 = ActiveTunnelInfo {
-            interface: "wg10".to_string(),
-            server_ips: vec!["2001:db8::1".parse().unwrap()],
-            declared_cidrs: vec![],
-            is_primary: false,
-        };
-        let v6 = IptablesFirewall::generate_v6_ruleset(&[t9, t10]);
-        assert!(v6.contains("-A VORTIX_KILLSWITCH -o wg9 -j ACCEPT"));
-        assert!(v6.contains("-A VORTIX_KILLSWITCH -o wg10 -j ACCEPT"));
-        assert!(v6.contains("-A VORTIX_KILLSWITCH -d 2001:db8::1 -j ACCEPT"));
-    }
-
-    #[test]
-    fn iptables_rulesets_only_replace_vortix_owned_chains() {
-        let tunnel = tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true);
-        for rules in [
-            IptablesFirewall::generate_v4_ruleset(std::slice::from_ref(&tunnel)),
-            IptablesFirewall::generate_v6_ruleset(std::slice::from_ref(&tunnel)),
-        ] {
-            assert!(rules.contains(":VORTIX_KILLSWITCH - [0:0]"));
-            assert!(rules.contains("-F VORTIX_KILLSWITCH"));
-            assert!(!rules.contains(":INPUT"));
-            assert!(!rules.contains(":FORWARD"));
-            assert!(!rules.contains(":OUTPUT"));
-            assert!(!rules.contains("-F OUTPUT"));
-        }
-    }
-
-    #[test]
-    fn iptables_readback_requires_first_jump_and_marker_bound_drop() {
-        let expected = "*filter\n:VORTIX_KILLSWITCH - [0:0]\n-A VORTIX_KILLSWITCH -o lo -j ACCEPT\n-A VORTIX_KILLSWITCH -m comment --comment vortix-policy:abc123 -j DROP\nCOMMIT\n";
-        let valid = "*filter\n:VORTIX_KILLSWITCH - [0:0]\n-A OUTPUT -j VORTIX_KILLSWITCH\n-A OUTPUT -d 203.0.113.1 -j ACCEPT\n-A VORTIX_KILLSWITCH -o lo -j ACCEPT\n-A VORTIX_KILLSWITCH -m comment --comment \"vortix-policy:abc123\" -j DROP\nCOMMIT\n";
-        assert!(IptablesFirewall::snapshot_verifies_iptables(
-            valid, expected
-        ));
-        assert!(IptablesFirewall::output_jump_is_first(
-            "-P OUTPUT ACCEPT\n-A OUTPUT -j VORTIX_KILLSWITCH\n-A OUTPUT -j ACCEPT\n"
-        ));
-
-        let bypass = valid.replace(
-            "-A OUTPUT -j VORTIX_KILLSWITCH\n",
-            "-A OUTPUT -j ACCEPT\n-A OUTPUT -j VORTIX_KILLSWITCH\n",
-        );
-        assert!(!IptablesFirewall::snapshot_verifies_iptables(
-            &bypass, expected
-        ));
-
-        let false_marker = valid.replace(
-            "--comment \"vortix-policy:abc123\" -j DROP",
-            "--comment \"vortix-policy:abc123\" -j ACCEPT",
-        );
-        assert!(!IptablesFirewall::snapshot_verifies_iptables(
-            &false_marker,
-            expected
-        ));
-        let missing_allow = valid.replace("-A VORTIX_KILLSWITCH -o lo -j ACCEPT\n", "");
-        assert!(!IptablesFirewall::snapshot_verifies_iptables(
-            &missing_allow,
-            expected
-        ));
+        let rules = nft(&[policy]);
+        assert!(rules.contains("ip daddr 1.2.3.4 accept"));
+        assert!(!rules.contains("oifname \"\" accept"));
     }
 
     #[test]
     fn legacy_global_policy_detection_is_strict() {
         let legacy_v4 = "*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT DROP [0:0]\n-A OUTPUT -o lo -j ACCEPT\n-A OUTPUT -p udp -m udp --sport 68 --dport 67 -j ACCEPT\nCOMMIT\n";
-        assert!(IptablesFirewall::is_legacy_global_policy(legacy_v4, false));
-        assert!(!IptablesFirewall::is_legacy_global_policy(
+        assert!(NftFirewall::is_legacy_global_policy(legacy_v4, false));
+        assert!(!NftFirewall::is_legacy_global_policy(
             &format!("{legacy_v4}-A INPUT -j ACCEPT\n"),
             false
         ));
-        assert!(!IptablesFirewall::is_legacy_global_policy(
+        assert!(!NftFirewall::is_legacy_global_policy(
             &legacy_v4.replace(":OUTPUT DROP", ":OUTPUT ACCEPT"),
             false
         ));
         let host_owned_drop = "*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT DROP [0:0]\n-A OUTPUT -d 203.0.113.10 -j ACCEPT\nCOMMIT\n";
-        assert!(!IptablesFirewall::is_legacy_global_policy(
+        assert!(!NftFirewall::is_legacy_global_policy(
             host_owned_drop,
             false
         ));
         assert_eq!(
-            IptablesFirewall::legacy_cleanup_ruleset(),
+            NftFirewall::legacy_cleanup_ruleset(),
             "*filter\n:OUTPUT ACCEPT [0:0]\n-F OUTPUT\nCOMMIT\n"
         );
     }
@@ -980,18 +891,18 @@ mod tests {
             &fresh.replace("counter drop comment", "counter accept comment")
         ));
         assert_eq!(
-            IptablesFirewall::nft_command(vec!["list".into()])
+            NftFirewall::nft_command(vec!["list".into()])
                 .env
                 .get("LC_ALL")
                 .map(String::as_str),
             Some("C")
         );
-        let command = IptablesFirewall::nft_command(vec!["list".into()]);
+        let command = NftFirewall::nft_command(vec!["list".into()]);
         assert_eq!(command.timeout, Some(FIREWALL_COMMAND_TIMEOUT));
         assert_eq!(command.output_limit, Some(FIREWALL_OUTPUT_LIMIT));
         assert!(command.terminate_process_group);
         assert_eq!(
-            IptablesFirewall::nft_command(vec![
+            NftFirewall::nft_command(vec![
                 "-n".into(),
                 "list".into(),
                 "table".into(),
@@ -1011,7 +922,7 @@ mod tests {
 
     #[test]
     fn legacy_firewall_commands_are_bounded_and_contain_descendants() {
-        let command = IptablesFirewall::firewall_command("iptables-save", Vec::new());
+        let command = NftFirewall::firewall_command("iptables-save", Vec::new());
         assert_eq!(command.timeout, Some(FIREWALL_COMMAND_TIMEOUT));
         assert_eq!(command.output_limit, Some(FIREWALL_OUTPUT_LIMIT));
         assert!(command.terminate_process_group);
@@ -1037,102 +948,32 @@ mod tests {
         ));
     }
 
-    // ─── snapshot tests pinning ruleset shape ───────────────────────────
-
     #[test]
-    fn snapshot_empty_active_set() {
-        let rules = IptablesFirewall::generate_v4_ruleset(&[]);
-        let digest = crate::core::killswitch::policy_digest(&[]);
-        let expected = format!(
-            "\
-# Vortix Kill Switch Rules - Auto-generated
-# DO NOT EDIT - Will be overwritten
-*filter
-:VORTIX_KILLSWITCH - [0:0]
--F VORTIX_KILLSWITCH
--A VORTIX_KILLSWITCH -o lo -j ACCEPT
--A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT
--A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT
--A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT
--A VORTIX_KILLSWITCH -p udp --sport 68 --dport 67 -j ACCEPT
--A VORTIX_KILLSWITCH -m comment --comment vortix-policy:{digest} -j DROP
-COMMIT
-"
-        );
-        assert_eq!(rules, expected);
-    }
-
-    #[test]
-    fn snapshot_single_primary() {
-        let t = ActiveTunnelInfo {
-            interface: "wg0".to_string(),
-            server_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
-            declared_cidrs: vec![cidr("0.0.0.0/0")],
-            is_primary: true,
-        };
-        let active = [t];
-        let rules = IptablesFirewall::generate_v4_ruleset(&active);
+    fn nft_snapshot_primary_plus_secondary() {
+        let active = [
+            tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true),
+            tunnel("wg1", &["5.6.7.8"], &["10.0.0.0/8"], false),
+        ];
         let digest = crate::core::killswitch::policy_digest(&active);
         let expected = format!(
-            "\
-# Vortix Kill Switch Rules - Auto-generated
-# DO NOT EDIT - Will be overwritten
-*filter
-:VORTIX_KILLSWITCH - [0:0]
--F VORTIX_KILLSWITCH
--A VORTIX_KILLSWITCH -o lo -j ACCEPT
--A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT
--A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT
--A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT
--A VORTIX_KILLSWITCH -p udp --sport 68 --dport 67 -j ACCEPT
-# Tunnel: wg0 (primary=true)
--A VORTIX_KILLSWITCH -o wg0 -j ACCEPT
--A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT
--A VORTIX_KILLSWITCH -m comment --comment vortix-policy:{digest} -j DROP
-COMMIT
-"
-        );
-        assert_eq!(rules, expected);
-    }
+            "table inet {table} {{
+  chain output {{
+    type filter hook output priority 0; policy drop;
 
-    #[test]
-    fn snapshot_primary_plus_secondary() {
-        let prim = ActiveTunnelInfo {
-            interface: "wg0".to_string(),
-            server_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
-            declared_cidrs: vec![cidr("0.0.0.0/0")],
-            is_primary: true,
-        };
-        let sec = ActiveTunnelInfo {
-            interface: "wg1".to_string(),
-            server_ips: vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))],
-            declared_cidrs: vec![cidr("10.0.0.0/8")],
-            is_primary: false,
-        };
-        let active = [prim, sec];
-        let rules = IptablesFirewall::generate_v4_ruleset(&active);
-        let digest = crate::core::killswitch::policy_digest(&active);
-        let expected = format!(
-            "\
-# Vortix Kill Switch Rules - Auto-generated
-# DO NOT EDIT - Will be overwritten
-*filter
-:VORTIX_KILLSWITCH - [0:0]
--F VORTIX_KILLSWITCH
--A VORTIX_KILLSWITCH -o lo -j ACCEPT
--A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT
--A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT
--A VORTIX_KILLSWITCH -p udp --sport 68 --dport 67 -j ACCEPT
-# Tunnel: wg0 (primary=true)
--A VORTIX_KILLSWITCH -o wg0 -j ACCEPT
--A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT
-# Tunnel: wg1 (primary=false)
--A VORTIX_KILLSWITCH -o wg1 -j ACCEPT
--A VORTIX_KILLSWITCH -d 5.6.7.8 -j ACCEPT
--A VORTIX_KILLSWITCH -m comment --comment vortix-policy:{digest} -j DROP
-COMMIT
-"
+    oifname \"lo\" accept
+    ip daddr 172.16.0.0/12 accept
+    ip daddr 192.168.0.0/16 accept
+    udp sport 68 udp dport 67 accept
+    oifname \"wg0\" accept
+    ip daddr 1.2.3.4 accept
+    oifname \"wg1\" accept
+    ip daddr 5.6.7.8 accept
+    counter drop comment \"{POLICY_COMMENT_PREFIX}{digest}\"
+  }}
+}}
+",
+            table = crate::constants::NFT_TABLE_NAME,
         );
-        assert_eq!(rules, expected);
+        assert_eq!(nft(&active), expected);
     }
 }
