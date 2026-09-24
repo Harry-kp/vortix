@@ -80,6 +80,12 @@ CLAUDE.md describes: `cargo build -p vortix`, run `./target/debug/vortix` in
 window 0, and confirm the fix in a captured frame plus host state from window 1.
 If `vxrun` is missing, skip the live check and say so in the PR.
 
+Repeat the same check on the Linux lab laptop (CLAUDE.md, "Live testing
+(Linux)"): push the branch or `scp` the changed files, build there, and run
+the same commands with `sudo -n env SUDO_UID=1000 SUDO_GID=1000
+SUDO_USER=harrykp`. Behaviour must match on both; a Linux-only difference is
+a bug, not a platform quirk.
+
 ## 6. Commit and open the PR
 
 ```bash

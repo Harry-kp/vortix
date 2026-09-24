@@ -124,7 +124,7 @@ summaries and overflow ladders fit the existing layout at 80×24 (see
 
 ## Live testing (macOS)
 
-Claude never runs `sudo`. The user keeps a tmux session `vxrun` with two root
+Claude never runs `sudo` on the Mac. The user keeps a tmux session `vxrun` with two root
 panes: window 0 for the TUI, window 1 for a root shell (both started with
 `sudo -s` and `export SUDO_UID=502 SUDO_GID=20 SUDO_USER=harshitchaudhary`).
 Drive them with `tmux send-keys -t vxrun:0 …` and read frames with
@@ -132,6 +132,18 @@ Drive them with `tmux send-keys -t vxrun:0 …` and read frames with
 create it. In the TUI: digits quick-connect a profile, `D` then `y`
 disconnects all, `K` cycles the kill switch, `q` quits. Verify host state from
 window 1 (`netstat -rn -f inet`, `scutil --dns`, `pfctl -a com.apple/vortix.killswitch -sr`).
+
+## Live testing (Linux)
+
+An Ubuntu lab laptop is on the LAN: `ssh -i ~/.ssh/vortix_lab_ed25519
+harrykp@192.168.1.97`, checkout at `~/vortix`, profiles already imported. It
+has passwordless sudo and the user allows using it **there** (never on the
+Mac). Sync with `git fetch origin <branch> && git checkout -B lab FETCH_HEAD`
+(or `scp` a changed file), build with `cargo build -p vortix`, and run as
+`sudo -n env SUDO_UID=1000 SUDO_GID=1000 SUDO_USER=harrykp ./target/debug/vortix …`.
+tmux session `vxlinux` has root windows 1 and 2 for the TUI. Check host state
+with `ip -4 route`, `resolvectl dns`, `nft list table inet vortix_killswitch`.
+Anything verified live on macOS should be verified here too.
 
 Profiles contain private keys and passwords: never print, copy or commit them.
 Credentials are typed by the user.
