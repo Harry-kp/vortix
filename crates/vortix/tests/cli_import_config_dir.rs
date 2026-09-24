@@ -38,7 +38,6 @@ fn cli_import_single_file() {
         config_dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
 
@@ -57,7 +56,6 @@ fn cli_import_single_file() {
         config_dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(rename, 0, "typed rename should preserve the CLI result");
@@ -72,7 +70,6 @@ fn cli_import_single_file() {
         config_dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(delete, 0, "typed delete should preserve the CLI result");

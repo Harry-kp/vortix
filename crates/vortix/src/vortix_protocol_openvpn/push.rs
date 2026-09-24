@@ -3,10 +3,10 @@ use thiserror::Error;
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use crate::vortix_core::privileged::{
+use crate::vortix_core::openvpn::{
     OpenVpnDefaultGateways, OpenVpnRedirectFlag, OpenVpnRedirectGateway, OpenVpnRoute,
     OpenVpnRouteDefaults, OpenVpnRouteEvidence, OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
-    MAX_RESOURCE_ITEMS,
+    MAX_ROUTES,
 };
 
 use super::parser::{
@@ -209,7 +209,7 @@ pub(crate) fn pushed_route_evidence(
             if seen_routes.insert(route.clone()) {
                 routes.push(route);
             }
-            if routes.len() > MAX_RESOURCE_ITEMS {
+            if routes.len() > MAX_ROUTES {
                 return Err(PushedRouteEvidenceError::CollectionLimit);
             }
         } else if directive.eq_ignore_ascii_case("redirect-gateway") {
@@ -369,7 +369,7 @@ mod tests {
         openvpn_route_evidence, pushed_route_evidence, selected_remote_address,
         PushReplySelectionError, PushedRouteEvidenceError, SelectedRemoteEvidenceError,
     };
-    use crate::vortix_core::privileged::{
+    use crate::vortix_core::openvpn::{
         OpenVpnDefaultGateway, OpenVpnRedirectFlag, OpenVpnRouteGateway,
     };
 

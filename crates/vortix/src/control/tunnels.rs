@@ -14,11 +14,11 @@ use crate::state::Protocol;
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::ids::TunnelRevision;
 use crate::vortix_core::ids::{AuthorityEpoch, OperationId};
+use crate::vortix_core::openvpn::OpenVpnRouteEvidence;
 use crate::vortix_core::ports::dns::DnsRequest;
 use crate::vortix_core::ports::tunnel::{
     TunnelCancellation, TunnelExecutionContext, TunnelHandle, TunnelKindTag,
 };
-use crate::vortix_core::privileged::OpenVpnRouteEvidence;
 use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 use crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 

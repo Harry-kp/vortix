@@ -197,9 +197,6 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
         InputMode::Import { path, cursor } => {
             super::overlays::import::render(frame, path, *cursor);
         }
-        InputMode::BackgroundSetup { state } => {
-            super::overlays::background_setup::render(frame, &app.background_mode, state);
-        }
         InputMode::ConfirmDelete {
             name,
             confirm_selected,

@@ -11,11 +11,9 @@
 mod control_scenarios;
 
 mod cli_profile_mutation;
-mod daemon_ipc;
 mod dns_policy;
 mod json_v2_envelope;
 mod openvpn_credential_store;
-mod privileged_contract;
 mod profile_identity;
 mod telemetry_behavior_parity;
 mod wireguard_handshake_health;

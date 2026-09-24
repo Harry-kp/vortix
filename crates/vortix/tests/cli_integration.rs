@@ -224,7 +224,6 @@ fn cli_list_empty_profiles() {
         dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(exit, 0);
@@ -243,7 +242,6 @@ fn cli_info_runs_without_error() {
         dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(exit, 0);
@@ -262,12 +260,10 @@ fn cli_status_disconnected() {
             watch: false,
             interval: 2,
             brief: true,
-            no_daemon: true,
         },
         dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(exit, 0);
@@ -286,7 +282,6 @@ fn cli_killswitch_show_mode() {
         dir.path(),
         "test",
         &config,
-        &vortix::vortix_config::Settings::default(),
         OutputMode::Quiet,
     );
     assert_eq!(exit, 0);
@@ -652,8 +647,6 @@ fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
             .unwrap_or_else(|error| panic!("{} failed to parse: {error}", scenario.id));
         let command = match parsed.command.as_ref() {
             None => "tui",
-            Some(Commands::Setup { .. }) => "setup",
-            Some(Commands::Background { .. }) => "background",
             Some(Commands::Up { .. }) => "up",
             Some(Commands::Down { .. }) => "down",
             Some(Commands::Reconnect { .. }) => "reconnect",
@@ -668,7 +661,6 @@ fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
             Some(Commands::Info) => "info",
             Some(Commands::Update) => "update",
             Some(Commands::Report) => "report",
-            Some(Commands::Daemon { .. }) => "daemon",
             Some(Commands::Audit { .. }) => "audit",
             Some(Commands::Completions { .. }) => "completions",
         };
@@ -690,87 +682,6 @@ fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
         assert_eq!(output, scenario.output, "{} output drift", scenario.id);
     }
 }
-
-#[test]
-fn prepared_background_json_uses_the_shared_mode_record() {
-    let view = vortix::background::BackgroundCommandView::prepared(vec![
-        "No privileged process was invoked".into(),
-    ]);
-    let value = serde_json::to_value(&view).unwrap();
-    assert_eq!(value["mode"]["state"], "standard_active");
-    assert_eq!(view.mode.state.display_name(), "Standard mode: Active");
-    assert_eq!(value["activation_available"], false);
-    assert!(!view.mode.may_claim_background_authority());
-}
-
-#[test]
-fn confirmed_prepared_background_mutations_have_nonzero_refusal_contract() {
-    for command in [
-        ["setup", "--yes"].as_slice(),
-        ["background", "recover", "--yes"].as_slice(),
-        ["background", "disable", "--yes"].as_slice(),
-    ] {
-        let config = tempfile::tempdir().unwrap();
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box CLI refusal contract
-            .arg("--config-dir")
-            .arg(config.path())
-            .arg("--json")
-            .args(command)
-            .env("VORTIX_SKIP_MIGRATION", "1")
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(4), "{command:?}");
-        let response: serde_json::Value =
-            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-                panic!(
-                    "{command:?} emitted invalid JSON ({error}): {}",
-                    String::from_utf8_lossy(&output.stdout)
-                )
-            });
-        assert_eq!(response["ok"], false, "{command:?}");
-        assert_eq!(
-            response["error"]["code"], "background_activation_unavailable",
-            "{command:?}"
-        );
-        let persisted_names = walk_file_names(config.path());
-        assert!(
-            persisted_names
-                .iter()
-                .all(|name| !name.contains("background") && !name.contains("bootstrap")),
-            "refusal persisted authority artifacts: {persisted_names:?}"
-        );
-
-        for (flag, expected_stderr) in [
-            (
-                None,
-                "error: Background mode is not available in this release",
-            ),
-            (
-                Some("--quiet"),
-                "error: Background mode is not available in this release",
-            ),
-        ] {
-            let config = tempfile::tempdir().unwrap();
-            let mut process = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")); // xtask:allow-subprocess: black-box CLI refusal contract
-            process.arg("--config-dir").arg(config.path());
-            if let Some(flag) = flag {
-                process.arg(flag);
-            }
-            let output = process
-                .args(command)
-                .env("VORTIX_SKIP_MIGRATION", "1")
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(4), "{command:?} {flag:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains(expected_stderr),
-                "unexpected stderr for {command:?} {flag:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
-}
-
 #[cfg(unix)]
 #[test]
 #[allow(
@@ -882,23 +793,4 @@ fn tui_without_administrator_access_fails_before_terminal_startup() {
     assert!(!stderr.contains("invalid invoking owner"));
     assert!(!stderr.contains("Backtrace"));
     assert!(!stderr.contains("Location:"));
-}
-
-fn walk_file_names(root: &std::path::Path) -> Vec<String> {
-    let mut pending = vec![root.to_path_buf()];
-    let mut names = Vec::new();
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                names.push(name.to_owned());
-            }
-        }
-    }
-    names
 }

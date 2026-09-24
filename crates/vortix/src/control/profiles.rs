@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{Protocol, VpnProfile};
 use crate::vortix_core::cidr::Cidr;
+use crate::vortix_core::openvpn::OpenVpnRedirectGateway;
 use crate::vortix_core::ports::tunnel::ParsedProfile as _;
-use crate::vortix_core::privileged::OpenVpnRedirectGateway;
 use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind, ResolvedEndpoint};
 
 use super::state::Spec;

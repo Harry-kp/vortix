@@ -50,17 +50,6 @@ pub enum Message {
     /// Toggle flip (front/back view) on current panel
     ToggleFlip,
 
-    // === Optional Background mode ===
-    OpenBackgroundSetup,
-    OpenBackgroundStatus,
-    OpenBackgroundRecover,
-    OpenBackgroundDisable,
-    OpenBackgroundDiagnostics,
-    BackgroundDiagnosticsLoaded(
-        Result<Box<crate::vortix_core::diagnostics::DiagnosticView>, String>,
-    ),
-    ConfirmBackgroundAction,
-
     // === Profile Management ===
     /// Move selection in profile list
     ProfileMove(SelectionMove),
@@ -92,28 +81,20 @@ pub enum Message {
     /// disconnect the current tunnel first, then connect the new one. Two
     /// tunnels cannot both hold the default route, so switch is the only
     /// way to proceed. Fired by the `[Y] Switch` choice on the overlay.
-    SwitchExclusiveAndConnect {
-        idx: usize,
-    },
+    SwitchExclusiveAndConnect { idx: usize },
     /// Confirm route-overlap . User
     /// accepted the AllowedIPs-overlap overlay; retry the connect with
     /// `force=true`.
-    ConfirmRouteOverlap {
-        idx: usize,
-    },
+    ConfirmRouteOverlap { idx: usize },
     /// disconnect one specific profile by
     /// index (the `d` keybinding on a Connected sidebar row). Distinct from
     /// the global `Disconnect` message which targets the legacy single-
     /// tunnel active profile.
-    DisconnectProfile {
-        idx: usize,
-    },
+    DisconnectProfile { idx: usize },
     /// Force-disconnect one exact profile when its teardown is already in
     /// progress. This is the profile-scoped counterpart to the legacy global
     /// `Disconnect` fallback.
-    ForceDisconnectProfile {
-        idx: usize,
-    },
+    ForceDisconnectProfile { idx: usize },
     /// open the "Disconnect all N tunnels?"
     /// confirmation dialog (the Shift+`D` keybinding when N>1). Fired from
     /// the sidebar; with N≤1 the input layer dispatches `DisconnectProfile`
@@ -127,9 +108,7 @@ pub enum Message {
     /// `c` keybinding on a Connecting row's Connection Details). FSM
     /// transitions Connecting → Disconnected and the sidebar row clears
     /// the badge.
-    CancelConnect {
-        idx: usize,
-    },
+    CancelConnect { idx: usize },
 
     // === Action Menu ===
     /// Open the action menu (Single actions)
@@ -413,14 +392,6 @@ mod tests {
         assert!(!actions
             .iter()
             .any(|a| { matches!(a.message, Message::ToggleTheme) }));
-        assert!(!actions.iter().any(|action| matches!(
-            action.message,
-            Message::OpenBackgroundSetup
-                | Message::OpenBackgroundStatus
-                | Message::OpenBackgroundRecover
-                | Message::OpenBackgroundDisable
-                | Message::OpenBackgroundDiagnostics
-        )));
     }
 
     #[test]

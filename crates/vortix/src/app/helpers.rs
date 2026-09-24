@@ -176,27 +176,6 @@ impl App {
         );
     }
 
-    /// Add a bounded group of messages while opening the persistent log once.
-    pub(crate) fn log_batch(&mut self, messages: &[String]) {
-        let mut persisted = Vec::with_capacity(messages.len());
-        for message in messages {
-            let (category, content, level) = classify_log_message(message);
-            logger::log(level, category, content);
-            let timestamp = utils::format_local_time();
-            let level_tag = level.prefix();
-            persisted.push(format!("{timestamp} [{level_tag}] {category}: {content}"));
-        }
-        if self.logs_auto_scroll {
-            self.logs_scroll = self.logs_max_scroll;
-        }
-        Self::append_to_log_file_batch(
-            &persisted,
-            &self.runtime.config_dir,
-            self.runtime.config.log_rotation_size,
-            self.runtime.config.log_retention_days,
-        );
-    }
-
     /// Count active tunnels for keybinding decisions (multi-tunnel
     /// work). "Active" means the FSM is not `Disconnected` — that
     /// includes `Connecting`, `Connected`, `Disconnecting`,

@@ -27,13 +27,11 @@ pub mod vortix_platform_macos;
 // Application modules
 pub mod app;
 pub(crate) mod authority_lock;
-pub mod background;
 pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod control;
 pub mod core;
-pub mod daemon;
 pub mod event;
 pub mod hooks;
 pub mod logger;

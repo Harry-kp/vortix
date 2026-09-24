@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 
-use crate::vortix_core::privileged::{
+use crate::vortix_core::openvpn::{
     OpenVpnDefaultGateway, OpenVpnDefaultGateways, OpenVpnRedirectFlag, OpenVpnRedirectGateway,
     OpenVpnRouteDefaults, OpenVpnRouteGateway,
 };

@@ -9,12 +9,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::cli::args::{BackgroundCommands, Commands};
+use crate::cli::args::Commands;
 use crate::cli::output::{
-    err_not_found, err_permission_denied, print_background_diagnostics,
-    print_background_unavailable, print_background_view, print_error_and_exit,
-    print_stream_error_and_exit, print_success, CliError, ConnectionEntry, ConnectionHealthEntry,
-    ExitCode, OutputMode,
+    err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError,
+    ConnectionEntry, ConnectionHealthEntry, ExitCode, OutputMode,
 };
 use crate::config::AppConfig;
 use crate::constants;
@@ -149,14 +147,9 @@ pub fn handle_command(
     config_dir: &Path,
     config_source: &str,
     config: &AppConfig,
-    settings: &crate::vortix_config::Settings,
     mode: OutputMode,
 ) -> i32 {
     match command {
-        Commands::Setup { boot, yes } => handle_background_setup(boot, *yes, config_dir, mode),
-        Commands::Background { command } => {
-            handle_background(command, config_dir, &settings.diagnostics, mode)
-        }
         Commands::Up {
             profile,
             timeout,
@@ -174,10 +167,7 @@ pub fn handle_command(
             watch,
             interval,
             brief,
-            no_daemon,
-        } => handle_status(
-            *watch, *interval, *brief, *no_daemon, config, config_dir, mode,
-        ),
+        } => handle_status(*watch, *interval, *brief, config, config_dir, mode),
         Commands::List {
             sort,
             reverse,
@@ -213,267 +203,10 @@ pub fn handle_command(
             0
         }
         Commands::Audit { pid, vpn_only } => handle_audit(*pid, *vpn_only, mode),
-        Commands::Daemon { socket } => {
-            handle_daemon(socket.clone(), mode, config_dir, &settings.diagnostics)
-        }
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
         }
-    }
-}
-
-fn handle_background_setup(
-    boot_profiles: &[String],
-    confirmed: bool,
-    config_dir: &Path,
-    mode: OutputMode,
-) -> i32 {
-    let profiles = (!boot_profiles.is_empty()).then(|| {
-        load_setup_profiles(config_dir).unwrap_or_else(|error| {
-            print_error_and_exit(
-                mode,
-                "setup",
-                CliError {
-                    code: "profile_catalog_unavailable",
-                    message: format!("Cannot inspect the authenticated profile catalog: {error}"),
-                    hint: Some(
-                        "Repair the profile catalog or wait for the other Vortix process, then retry; no boot intent was saved."
-                            .into(),
-                    ),
-                },
-                ExitCode::GeneralError,
-            )
-        })
-    });
-    for requested in boot_profiles {
-        let profile = profiles
-            .as_ref()
-            .and_then(|profiles| profiles.get(requested))
-            .unwrap_or_else(|| {
-                print_error_and_exit(mode, "setup", err_not_found(requested), ExitCode::NotFound)
-            });
-        let _ = profile;
-    }
-
-    let mut preview = vec![
-        "Would keep Vortix running in the background so the CLI and TUI stay in sync, dropped tunnels reconnect on their own, chosen profiles connect at boot, and firewall rules are re-checked continuously.".into(),
-        "Would run VPN commands through a small privileged helper installed once, so day-to-day use no longer needs sudo. Standard mode keeps asking for sudo instead.".into(),
-    ];
-    if !boot_profiles.is_empty() {
-        preview.push(format!(
-            "Boot-eligible profiles checked (intent not persisted): {}",
-            boot_profiles.join(", ")
-        ));
-    }
-    if confirmed {
-        return print_background_unavailable(mode, "setup").code();
-    }
-    preview.push(
-        crate::background::BackgroundWorkflow::Setup
-            .cancelled_preview()
-            .into(),
-    );
-    print_background_view(
-        mode,
-        "setup",
-        &crate::background::BackgroundCommandView::prepared(preview),
-    );
-    0
-}
-
-fn load_setup_profiles(
-    config_dir: &Path,
-) -> Result<
-    std::collections::BTreeMap<String, crate::state::VpnProfile>,
-    crate::vortix_config::profile_store::ProfileStoreError,
-> {
-    let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let store = FsProfileStore::new(profiles_dir.clone());
-    store.list().map(|summaries| {
-        summaries
-            .into_iter()
-            .map(|summary| {
-                let protocol = match summary.protocol {
-                    crate::vortix_core::profile::ProtocolKind::WireGuard => {
-                        crate::state::Protocol::WireGuard
-                    }
-                    crate::vortix_core::profile::ProtocolKind::OpenVpn => {
-                        crate::state::Protocol::OpenVPN
-                    }
-                };
-                let profile = crate::state::VpnProfile {
-                    id: summary.id,
-                    name: summary.display_name.clone(),
-                    protocol,
-                    location: "Unknown".into(),
-                    config_path: profiles_dir.join(summary.config_file),
-                    last_used: summary.last_used,
-                };
-                (summary.display_name, profile)
-            })
-            .collect()
-    })
-}
-
-fn handle_background(
-    command: &BackgroundCommands,
-    config_dir: &Path,
-    settings: &crate::vortix_config::DiagnosticsSettings,
-    mode: OutputMode,
-) -> i32 {
-    match command {
-        BackgroundCommands::Status => {
-            print_background_view(
-                mode,
-                "background status",
-                &crate::background::BackgroundCommandView::prepared(vec![
-                    crate::background::BackgroundWorkflow::Status
-                        .cancelled_preview()
-                        .into(),
-                ]),
-            );
-            0
-        }
-        BackgroundCommands::Recover { yes } => {
-            if *yes {
-                return print_background_unavailable(mode, "background recover").code();
-            }
-            print_background_view(
-                mode,
-                "background recover",
-                &crate::background::BackgroundCommandView::prepared(vec![
-                    crate::background::BackgroundWorkflow::Recover
-                        .cancelled_preview()
-                        .into(),
-                ]),
-            );
-            0
-        }
-        BackgroundCommands::Disable { yes } => {
-            if *yes {
-                return print_background_unavailable(mode, "background disable").code();
-            }
-            print_background_view(
-                mode,
-                "background disable",
-                &crate::background::BackgroundCommandView::prepared(vec![
-                    crate::background::BackgroundWorkflow::Disable
-                        .cancelled_preview()
-                        .into(),
-                ]),
-            );
-            0
-        }
-        BackgroundCommands::Diagnostics { follow } => {
-            handle_background_diagnostics(*follow, config_dir, settings, mode)
-        }
-    }
-}
-
-fn handle_background_diagnostics(
-    follow: bool,
-    config_dir: &Path,
-    settings: &crate::vortix_config::DiagnosticsSettings,
-    mode: OutputMode,
-) -> i32 {
-    let socket = crate::daemon::daemon_socket_path_override()
-        .unwrap_or_else(crate::daemon::default_socket_path);
-    if follow {
-        let mut subscription = crate::daemon::client::subscribe_diagnostics(&socket)
-            .unwrap_or_else(|error| background_diagnostics_error(mode, &error, true));
-        let mut last_sequence = newest_diagnostic_sequence(subscription.initial()).unwrap_or(0);
-        print_background_diagnostics(mode, subscription.initial(), true);
-        loop {
-            let view = match subscription.recv() {
-                Ok(view) => view,
-                Err(crate::daemon::client::ClientError::ResyncRequired { .. }) => {
-                    subscription = reconnect_diagnostics(&socket)
-                        .unwrap_or_else(|error| background_diagnostics_error(mode, &error, true));
-                    subscription.initial().clone()
-                }
-                Err(error) => background_diagnostics_error(mode, &error, true),
-            };
-            if let Some(delta) = diagnostic_delta(view, &mut last_sequence) {
-                print_background_diagnostics(mode, &delta, true);
-            }
-        }
-    }
-
-    let fallback = config_dir.join("control").join("diagnostics.json");
-    let view = crate::background::load_diagnostics(
-        &socket,
-        &fallback,
-        settings.fallback_snapshot,
-        crate::daemon::diagnostics::unix_millis(),
-    )
-    .unwrap_or_else(|error| background_diagnostics_error(mode, &error, false));
-    print_background_diagnostics(mode, &view, false);
-    0
-}
-
-fn reconnect_diagnostics(
-    socket: &Path,
-) -> Result<crate::daemon::client::DiagnosticSubscription, crate::daemon::client::ClientError> {
-    let mut last_error = None;
-    for attempt in 0..3 {
-        match crate::daemon::client::subscribe_diagnostics(socket) {
-            Ok(subscription) => return Ok(subscription),
-            Err(error) => last_error = Some(error),
-        }
-        std::thread::sleep(Duration::from_millis(50_u64 << attempt));
-    }
-    Err(last_error.expect("bounded reconnect always attempts at least once"))
-}
-
-fn newest_diagnostic_sequence(
-    view: &crate::vortix_core::diagnostics::DiagnosticView,
-) -> Option<u64> {
-    view.snapshot.records.last().map(|record| record.sequence)
-}
-
-fn diagnostic_delta(
-    mut view: crate::vortix_core::diagnostics::DiagnosticView,
-    last_sequence: &mut u64,
-) -> Option<crate::vortix_core::diagnostics::DiagnosticView> {
-    let newest = newest_diagnostic_sequence(&view)?;
-    if newest < *last_sequence {
-        *last_sequence = 0;
-    }
-    view.snapshot
-        .records
-        .retain(|record| record.sequence > *last_sequence);
-    *last_sequence = newest;
-    (!view.snapshot.records.is_empty()).then_some(view)
-}
-
-fn background_diagnostics_error(
-    mode: OutputMode,
-    error: &crate::daemon::client::ClientError,
-    stream: bool,
-) -> ! {
-    let cli_error = CliError {
-        code: "diagnostics_unavailable",
-        message: format!("Background diagnostics are unavailable: {error}"),
-        hint: Some(
-            "Run `vortix background status`; fallback diagnostics exist only after the passive service has published one."
-                .into(),
-        ),
-    };
-    if stream {
-        print_stream_error_and_exit(
-            mode,
-            "background diagnostics",
-            cli_error,
-            ExitCode::GeneralError,
-        )
-    } else {
-        print_error_and_exit(
-            mode,
-            "background diagnostics",
-            cli_error,
-            ExitCode::GeneralError,
-        )
     }
 }
 
@@ -565,109 +298,6 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
         }
         OutputMode::Quiet => 0,
     }
-}
-
-/// `vortix daemon` — run the bounded, read-only IPC candidate.
-fn handle_daemon(
-    socket_override: Option<std::path::PathBuf>,
-    mode: OutputMode,
-    config_directory: &Path,
-    settings: &crate::vortix_config::DiagnosticsSettings,
-) -> i32 {
-    let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
-
-    // Tokio-backed daemon socket binding must happen inside an active Tokio runtime.
-    // Binding before runtime creation panics with:
-    // "there is no reactor running, must be called from the context of a Tokio 1.x runtime".
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("vortix daemon: failed to build runtime: {e}");
-            return 1;
-        }
-    };
-
-    let server = match runtime
-        .block_on(async { crate::daemon::DaemonServer::bind(socket_path.clone()) })
-    {
-        Ok(s) => s,
-        Err(e) => {
-            print_error_and_exit(
-                mode,
-                "daemon",
-                CliError {
-                    code: "daemon_bind_failed",
-                    message: format!("Failed to bind daemon socket at {}: {e}", socket_path.display()),
-                    hint: Some(
-                        "Check parent directory exists and is writable. If a previous daemon left a stale socket, the bind path will be reused after the next start."
-                            .to_string(),
-                    ),
-                },
-                ExitCode::GeneralError,
-            );
-        }
-    };
-
-    eprintln!(
-        "vortix daemon: passive read-only candidate ready at {}. Set VORTIX_DAEMON_SOCKET to this path to use snapshot queries.",
-        server.socket_path().display()
-    );
-
-    let fallback_path = if settings.fallback_snapshot {
-        let diagnostic_directory = config_directory.join("control");
-        if let Err(error) =
-            crate::daemon::diagnostics::prepare_fallback_directory(&diagnostic_directory)
-        {
-            eprintln!("vortix daemon: failed to prepare diagnostics: {error}");
-            return 1;
-        }
-        Some(diagnostic_directory.join("diagnostics.json"))
-    } else {
-        None
-    };
-    let diagnostics = match crate::daemon::diagnostics::DiagnosticHub::start_with_stale_after(
-        fallback_path,
-        std::time::Duration::from_secs(settings.stale_after_secs.clamp(1, 86_400)),
-    ) {
-        Ok(diagnostics) => std::sync::Arc::new(diagnostics),
-        Err(error) => {
-            eprintln!("vortix daemon: failed to start diagnostics: {error}");
-            return 1;
-        }
-    };
-    // The candidate is deliberately passive: it polls scanner truth for
-    // queries/subscriptions but never constructs an engine, loads desired
-    // intent, acquires lifecycle authority, or exposes mutation capability.
-    // Its typed observation transitions feed the same bounded diagnostics
-    // provider served over IPC; raw scanner data never enters that provider.
-    let diagnostic_sink: std::sync::Arc<dyn crate::daemon::passive::PassiveDiagnosticSink> =
-        diagnostics.clone();
-    let provider = match crate::daemon::passive::ScannerQueryProvider::start_with_diagnostics(
-        crate::vpn::load_profiles(),
-        std::time::Duration::from_secs(1),
-        Some(diagnostic_sink),
-    ) {
-        Ok(provider) => std::sync::Arc::new(provider),
-        Err(error) => {
-            eprintln!("vortix daemon: failed to start passive observer: {error}");
-            return 1;
-        }
-    };
-    let server = server
-        .with_query_provider(provider)
-        .with_diagnostic_provider(diagnostics);
-
-    runtime.block_on(async {
-        if let Err(e) = server.run().await {
-            eprintln!("vortix daemon: accept loop terminated: {e}");
-        }
-    });
-
-    0
 }
 
 // ── Connection ──────────────────────────────────────────────────────────
@@ -1349,7 +979,6 @@ fn handle_status(
     watch: bool,
     interval: u64,
     brief: bool,
-    no_daemon: bool,
     config: &AppConfig,
     config_dir: &Path,
     mode: OutputMode,
@@ -1360,38 +989,8 @@ fn handle_status(
         return run_watch(interval, config, config_dir, mode);
     }
 
-    // Read-only ops route through the daemon ONLY when its socket
-    // exists and is connectable. Otherwise fall back to direct disk +
-    // scanner reads. The `--no-daemon` flag forces the
-    // bypass even when the daemon is up — useful for testing.
-    let daemon_socket = if no_daemon {
-        None
-    } else {
-        crate::daemon::daemon_socket_path_if_present()
-    };
-
     let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     let snap = engine.scan_status();
-    // The candidate is shadow-only: compare its passive observation with the
-    // local scanner but never let it override local control or status truth.
-    // Any error or rollout mismatch leaves user-visible output unchanged.
-    if let Some(socket) = daemon_socket {
-        if let Ok(crate::vortix_core::ipc::IpcResult::PassiveSnapshot { snapshot }) =
-            crate::daemon::client::request(&socket, crate::vortix_core::ipc::IpcOp::PassiveSnapshot)
-        {
-            if !passive_projection_matches(&snap, &snapshot) {
-                tracing::debug!(
-                    local_state = %snap.connection_state,
-                    local_profile = ?snap.profile,
-                    local_interface = ?snap.interface,
-                    remote_generation = snapshot.generation,
-                    remote_tunnels = snapshot.tunnels.len(),
-                    "passive daemon shadow projection differs from local scanner"
-                );
-            }
-        }
-    }
-
     let is_connected = snap.connection_state == "connected";
     let is_present = snap.connection_state != "disconnected";
 
@@ -1509,22 +1108,6 @@ fn handle_status(
         OutputMode::Quiet => {}
     }
     ExitCode::Success.code()
-}
-
-fn passive_projection_matches(
-    local: &crate::vpn_runtime::connection::StatusSnapshot,
-    remote: &crate::vortix_core::ipc::PassiveSnapshot,
-) -> bool {
-    if local.connection_state == "disconnected" {
-        return remote.tunnels.is_empty();
-    }
-    remote.tunnels.iter().any(|tunnel| {
-        local.profile.as_deref() == Some(tunnel.display_name.as_str())
-            && local
-                .interface
-                .as_deref()
-                .is_none_or(|name| name == tunnel.interface_name)
-    })
 }
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
@@ -1672,8 +1255,6 @@ fn short_peer(peer: &str) -> &str {
 mod handshake_status_tests {
     use super::*;
     use crate::state::{KillSwitchMode, KillSwitchState};
-    use crate::vortix_core::ipc::{PassiveSnapshot, PassiveTunnel};
-    use crate::vortix_core::profile::ProfileId;
 
     fn snapshot(state: &str, protocol: &str) -> crate::vpn_runtime::connection::StatusSnapshot {
         crate::vpn_runtime::connection::StatusSnapshot {
@@ -1775,28 +1356,6 @@ mod handshake_status_tests {
             connection_health_entry(snap.health.as_ref().unwrap()).status,
             "healthy"
         );
-    }
-
-    #[test]
-    fn passive_shadow_comparison_never_requires_authority() {
-        let tunnel = PassiveTunnel {
-            profile_id: ProfileId::new("corp"),
-            display_name: "corp".into(),
-            protocol: crate::vortix_core::profile::ProtocolKind::WireGuard,
-            interface_name: "wg0".into(),
-            observed_at_millis: 1,
-        };
-        let remote = PassiveSnapshot {
-            generation: 1,
-            observed_at_millis: 1,
-            tunnels: vec![tunnel],
-            authoritative: false,
-        };
-        let mut local = snapshot("connected", "WireGuard");
-        local.interface = Some("wg0".into());
-        assert!(passive_projection_matches(&local, &remote));
-        local.interface = Some("wg1".into());
-        assert!(!passive_projection_matches(&local, &remote));
     }
 
     #[test]
@@ -3254,76 +2813,5 @@ mod tests {
         assert_eq!(format_elapsed(120), "2 min ago");
         assert_eq!(format_elapsed(7200), "2 hours ago");
         assert_eq!(format_elapsed(172_800), "2 days ago");
-    }
-
-    #[test]
-    fn setup_catalog_preserves_identity_validation_errors() {
-        let config = tempfile::tempdir().unwrap();
-        let profiles = config.path().join(constants::PROFILES_DIR_NAME);
-        std::fs::create_dir_all(&profiles).unwrap();
-        std::fs::write(
-            profiles.join("orphan.conf"),
-            "[Interface]\nPrivateKey = x\n",
-        )
-        .unwrap();
-
-        let error = load_setup_profiles(config.path()).unwrap_err();
-        assert!(matches!(
-            error,
-            crate::vortix_config::profile_store::ProfileStoreError::MissingSidecar { .. }
-        ));
-    }
-
-    #[test]
-    fn diagnostic_follow_emits_only_new_records_and_resets_after_restart() {
-        use crate::vortix_core::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
-        use crate::vortix_core::diagnostics::{
-            DiagnosticCode, DiagnosticComponent, DiagnosticFields, DiagnosticRecord,
-            DiagnosticSeverity, DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus,
-            DiagnosticView,
-        };
-
-        let view = |sequences: &[u64]| DiagnosticView {
-            source: DiagnosticSource::AuthenticatedLive,
-            stale: false,
-            age_millis: 0,
-            snapshot: DiagnosticSnapshot {
-                schema_version: DIAGNOSTIC_SCHEMA_VERSION,
-                generation: *sequences.last().unwrap_or(&0),
-                generated_at_unix_millis: 1,
-                stale_after_millis: 30_000,
-                product_version: "test".into(),
-                status: DiagnosticStatus::default(),
-                records: sequences
-                    .iter()
-                    .map(|sequence| DiagnosticRecord {
-                        sequence: *sequence,
-                        age_millis: 0,
-                        component: DiagnosticComponent::Daemon,
-                        severity: DiagnosticSeverity::Info,
-                        code: DiagnosticCode::DaemonStarted,
-                        fields: DiagnosticFields::None,
-                    })
-                    .collect(),
-            },
-        };
-
-        let mut last = 2;
-        let delta = diagnostic_delta(view(&[1, 2, 3, 4]), &mut last).unwrap();
-        assert_eq!(
-            delta
-                .snapshot
-                .records
-                .iter()
-                .map(|record| record.sequence)
-                .collect::<Vec<_>>(),
-            vec![3, 4]
-        );
-        assert_eq!(last, 4);
-        assert!(diagnostic_delta(view(&[1, 2, 3, 4]), &mut last).is_none());
-
-        let restarted = diagnostic_delta(view(&[1]), &mut last).unwrap();
-        assert_eq!(restarted.snapshot.records[0].sequence, 1);
-        assert_eq!(last, 1);
     }
 }

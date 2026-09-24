@@ -412,7 +412,6 @@ fn main() -> Result<()> {
             &config_dir,
             config_dir_source,
             &app_config,
-            &settings,
             output_mode,
         );
         std::process::exit(exit_code);
@@ -420,12 +419,7 @@ fn main() -> Result<()> {
 
     // Run the TUI application
     let terminal = init_terminal()?;
-    let result = run_tui(
-        terminal,
-        app_config,
-        config_dir,
-        settings.diagnostics.fallback_snapshot,
-    );
+    let result = run_tui(terminal, app_config, config_dir);
     restore_terminal();
 
     result
@@ -509,7 +503,6 @@ fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     config: config::AppConfig,
     config_dir: std::path::PathBuf,
-    diagnostics_fallback: bool,
 ) -> Result<()> {
     terminal.draw(|frame| {
         use ratatui::layout::Alignment;
@@ -540,7 +533,6 @@ fn run_tui(
     })?;
     let tick_rate = config.tick_rate;
     let mut app = App::new(config, config_dir);
-    app.set_background_diagnostics_fallback(diagnostics_fallback);
     let control_config = app.runtime.config.clone();
     let control_dir = app.runtime.config_dir.clone();
     let control_profiles = app.runtime.profiles.clone();

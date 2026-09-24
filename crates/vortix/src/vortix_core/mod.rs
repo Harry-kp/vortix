@@ -9,13 +9,11 @@
 
 pub mod cidr;
 pub mod cidr_subtract;
-pub mod diagnostics;
 pub mod engine;
 pub mod ids;
-pub mod ipc;
 pub mod journal;
+pub mod openvpn;
 pub mod ports;
-pub mod privileged;
 pub mod profile;
 pub mod secret;
 pub mod secret_file;

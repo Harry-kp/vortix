@@ -79,20 +79,12 @@ There are **no aliases**. `vortix killswitch auto` and `vortix killswitch always
 
 The header bar uses short abbreviations of the same labels (`KS:Off` / `KS:Watch` / `KS:VPN-only` / `KS:DROPPED`) because of the 80-col budget. The display-name labels (`Off` / `Block on drop` / `VPN-only`) are the long-form rendering of the same three slugs — just title-cased for prose. Slug everywhere, prose only in the long-form Security Guard / `vortix killswitch` output.
 
-## Background mode was removed — the daemon is passive-only
+## Background mode and the daemon were removed
 
-Vortix runs as root directly. There is no helper, no enrolled daemon, no
-remote mutation. That path — a privilege-separated execution model behind an
-enrolled root helper — was built but never reachable from any shipped
-`main()`, and was removed. The full tree is preserved on the
-`archive/background-mode` branch if it is ever revived.
-
-What remains of `daemon/` is genuinely live and passive: `DaemonServer`
-binds an owner-only socket and serves scanner-derived snapshots and
-diagnostics subscriptions; the CLI's `status`/`list` route through
-`daemon/client.rs` when a socket is present. Mutation requests answer
-`CapabilityUnavailable`. Do not re-introduce a control-mutation path here
-without a product decision to ship Background mode.
+Vortix runs as root directly. There is no helper, no daemon socket, no
+`vortix setup`/`background`/`daemon` command. The privilege-separated tree is
+preserved on the `archive/background-mode` branch. Do not re-introduce it
+without a product decision.
 
 ## Planning artifacts
 

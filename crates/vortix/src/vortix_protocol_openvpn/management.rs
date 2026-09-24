@@ -8,7 +8,7 @@ use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::vortix_core::privileged::OpenVpnChallengeKind;
+use crate::vortix_core::openvpn::OpenVpnChallengeKind;
 
 const MAX_MANAGEMENT_EVENT_BYTES: usize = 4096;
 
@@ -193,7 +193,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use crate::vortix_core::privileged::OpenVpnChallengeKind;
+    use crate::vortix_core::openvpn::OpenVpnChallengeKind;
 
     use super::{authenticate, ManagementAuthError};
 

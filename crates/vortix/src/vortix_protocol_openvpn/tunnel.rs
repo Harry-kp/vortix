@@ -47,7 +47,7 @@ pub enum OvpnDnsEvidence {
 /// snapshot, so a renegotiation cannot mix evidence from different sessions.
 pub(crate) struct OvpnRuntimeEvidence {
     pub(crate) dns: OvpnDnsEvidence,
-    pub(crate) routes: crate::vortix_core::privileged::OpenVpnRouteEvidence,
+    pub(crate) routes: crate::vortix_core::openvpn::OpenVpnRouteEvidence,
 }
 
 /// Maximum wall-clock to wait for openvpn to create the unix
@@ -246,8 +246,8 @@ fn drive_mgmt_auth(
     answer: &[u8],
     timeout: Duration,
 ) -> Result<(), TunnelError> {
-    let challenge = (!answer.is_empty())
-        .then_some(crate::vortix_core::privileged::OpenVpnChallengeKind::Static);
+    let challenge =
+        (!answer.is_empty()).then_some(crate::vortix_core::openvpn::OpenVpnChallengeKind::Static);
     crate::vortix_protocol_openvpn::management::authenticate(
         stream, user, pass, answer, challenge, timeout,
     )
@@ -1809,7 +1809,7 @@ mod tests {
         assert!(redirect.ipv4());
         assert!(redirect
             .flags()
-            .contains(&crate::vortix_core::privileged::OpenVpnRedirectFlag::Def1));
+            .contains(&crate::vortix_core::openvpn::OpenVpnRedirectFlag::Def1));
     }
 
     #[test]
