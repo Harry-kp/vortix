@@ -4,6 +4,7 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
+| 0.4.x   | :white_check_mark: (current) |
 | 0.3.x   | :white_check_mark: |
 | 0.2.x   | :white_check_mark: |
 | 0.1.x   | :x:                |
@@ -40,38 +41,27 @@ Vortix handles sensitive VPN configurations. Key security measures:
 - OpenVPN credentials are stored in `~/.config/vortix/auth/<profile>.auth`
   with `600` permissions; reachable only by the owning user
 
-## Multi-tunnel trust assumptions (v0.4.0 phase)
+## Multi-tunnel trust assumptions (v0.4.0)
 
 > The multi-connection release lands the ability to run more than one
 > VPN tunnel concurrently. The sections below document the new trust
 > boundaries that come with it. These have not yet been reviewed by an outside party — surfaced here
 > so downstream audits know what to walk through.
 
-### OpenVPN `remote` IP allow-list trust assumption
+### `vpn-only` allow-list
 
-When the kill switch is in `vpn-only` mode, Vortix synthesizes its
-firewall ruleset by allow-listing every `remote <host> <port>`
-directive in every imported `.ovpn` profile. We do this because at
-ruleset-synthesis time we do not yet know which `remote` an OpenVPN
-process will eventually pick (OpenVPN selects at connect time, and
-the `remote-random` directive randomizes selection per-attempt).
+In `vpn-only` mode the firewall is default-drop and allows only the
+server IPs of live tunnels plus the endpoints of tunnels still
+starting. An imported profile's `remote` addresses are reachable only
+while that profile is starting or connected; nothing is allow-listed
+for profiles that are merely imported.
 
-**Concrete threat.** A `.ovpn` profile shipped with `remote 0.0.0.0`
-and `remote-random` (or, more realistically, a long list of
-attacker-controlled IPs) can rotate destinations across arbitrary
-internet endpoints. Every IP listed in any such profile is
-*permanently allow-listed* through the killswitch — including when
-no Vortix tunnel is up — providing an egress path for any traffic
-the attacker can route to those IPs. The killswitch's job is to be
-the last line of defense; this v1 posture makes that defense
-conditional on the user's profile-import trust.
+**Residual risk.** While a profile is starting, every endpoint it
+names is reachable, so a profile with many attacker-chosen `remote`
+lines opens egress to those IPs for the length of the connect.
 
-**Mitigation.** Only import `.ovpn` profiles from VPN providers you
-trust. Vortix v0.4.x relies on the user's profile-import flow as the
-trust gate (the sharper fix, OpenVPN management-socket integration that allow-lists only the
-*actually-connected* remote, is deferred to v2). If you ingest
-profiles from untrusted sources, audit the `remote` lines manually
-and avoid the `vpn-only` kill switch mode until v2 ships.
+**Mitigation.** Only import profiles from VPN providers you trust, and
+audit the `remote` lines of profiles from other sources.
 
 ### Credential-safe file handling via `write_secret_file`
 
@@ -82,7 +72,7 @@ implementation opened the path with `O_CREAT` and then called
 attacker could read the file at default-umask perms, or substitute a
 symlink to a target they wanted Vortix to clobber.
 
-**Mitigation (commit `cb25725`).** Credential writes go through
+**Mitigation.** Credential writes go through
 `write_secret_file` in `crates/vortix/src/config/secret.rs`, which:
 
 - Opens the parent directory with `O_DIRECTORY | O_NOFOLLOW` and

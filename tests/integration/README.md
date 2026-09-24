@@ -72,8 +72,8 @@ docker run --privileged --rm -v "$PWD:/workspace" -w /workspace vortix-integrati
 
 `.github/workflows/integration-tests.yml` runs the netns scripts on both
 `ubuntu-22.04` (iptables-nft compat image) and `fedora-41` (native nft), plus
-`release_smoke.sh` on `macos-latest`, for every PR and nightly. Failures
-block merge.
+`release_smoke.sh` on `macos-latest`, for every PR and nightly. A failure fails the PR check; merges refuse red
+checks.
 
 ## Notes on macOS
 

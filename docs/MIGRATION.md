@@ -86,7 +86,7 @@ Unset it to restore the implicit migration.
 ### Session event journal (default on, opt-out)
 
 v0.3.0 writes a JSON-lines event journal at
-`${XDG_DATA_HOME}/vortix/sessions/<ISO>-<pid>.jsonl` for every run.
+`~/.config/vortix/sessions/<ISO>-<pid>.jsonl` (the config dir's `sessions/`) for every run.
 Retention is 30 days / 30 files (whichever cap hits first). Each line
 is an `EngineEvent` record: connection state transitions, tunnel
 up/down, IP changes, telemetry samples, and so on.
@@ -94,7 +94,7 @@ up/down, IP changes, telemetry samples, and so on.
 Find the current session's path via `vortix info`:
 
 ```
-  Session journal: /Users/you/Library/Application Support/vortix/sessions/2026-...-66210.jsonl
+  Session journal: /Users/you/.config/vortix/sessions/2026-...-66210.jsonl
 ```
 
 Tail it with standard shell tools:
@@ -117,8 +117,7 @@ unaffected); only the on-disk JSONL file is suppressed.
 ### Layered settings (opt-in if you want overrides)
 
 A new `settings.toml` is read with figment-style layering: built-in
-defaults → `/etc/vortix/config.toml` (system) →
-`${XDG_CONFIG_HOME}/vortix/settings.toml` (user) → `VORTIX_*` env vars
+defaults → `<config_dir>/settings.toml` → `VORTIX_*` env vars
 (highest precedence). You don't need to create the file; the
 out-of-the-box defaults match v0.2.x behavior. To see what you've
 configured, read your own `settings.toml`.
@@ -132,14 +131,13 @@ records remain compatible. Vortix can resolve an unambiguous legacy name, while
 all new writes use the profile's stable ID. Profile rename therefore no
 longer changes which remembered username/password belongs to the profile.
 
-Standard mode now owns remembered credentials through the live control
-session. The TUI, CLI, and OpenVPN executor do not independently read or write
-credential paths. Only the reusable username/password pair may be remembered;
+One credential store owns remembered credentials; the TUI, CLI, and OpenVPN
+code do not independently read or write credential paths. Only the reusable username/password pair may be remembered;
 OTP and static- or remote-challenge answers remain memory-only.
 
 Older builds run through `sudo` could create the stable-ID `.auth` file as
-root even though the Vortix configuration belongs to the invoking user. A
-root-capable Standard session automatically transfers only that exact record
+root even though the Vortix configuration belongs to the invoking user. Running as
+root, Vortix automatically transfers only that exact record
 after proving it is a regular, single-link, mode-0600 file in the authenticated
 owner's directory. Symlinks, loose permissions, unexpected owners, ambiguous
 legacy names, malformed contents, and changed entries are left untouched and
@@ -153,9 +151,9 @@ succeeds but directory durability cannot be confirmed, the TUI says the change
 is visible but may need verification after restart. Auth Manager uses the same
 truthful distinction for edit and clear operations.
 
-Run the application normally after building it. Only the installed privileged
-boundary or an explicit manual compatibility test should run as root; avoid
-`sudo cargo` because it makes the Cargo target directory root-owned.
+Build without `sudo` and run the binary as root (`cargo build -p vortix &&
+sudo ./target/debug/vortix`); `sudo cargo` makes the Cargo target directory
+root-owned.
 
 ---
 
@@ -167,8 +165,8 @@ Everything here is additive. Pre-v0.3.0 commands are unchanged.
 |---|---|
 | `vortix info` | Output now includes a `Session journal:` line pointing at the current session's JSONL file |
 
-`vortix --json` envelopes now carry a top-level `schema_version: 1`
-field for forward-compatibility detection. Everything else is
+`vortix --json` envelopes now carry a top-level `schema_version`
+field (1 in v0.3.0, 2 since v0.4.0) for forward-compatibility detection. Everything else is
 internal architecture — engine FSM, layered settings, sidecar
 migration logic — none of which you interact with through new CLI
 verbs.
@@ -196,7 +194,7 @@ What rollback does to your data:
 - `.meta.toml` sidecars left behind are inert to v0.2.x — they're
   ignored, not parsed. Leave them in place or delete them; either
   works.
-- `sessions/*.jsonl` under `${XDG_DATA_HOME}/vortix/` are pure
+- `sessions/*.jsonl` under `~/.config/vortix/` are pure
   observability data; delete the directory if you want.
 - `settings.toml` is ignored by v0.2.x. Your old `config.toml` (if any)
   is untouched.
@@ -226,19 +224,11 @@ v0.3.x ("V1"), follow this procedure.
    npm install -g @harry-kp/vortix@0.3.1
    ```
 
-2. **Check whether V1 read-tolerance was backported.** If your
-   v0.3.x build received the read-tolerance backport (which makes V1
-   silently ignore the V2 killswitch state shape and re-arm fresh),
-   you are done — no manual cleanup is needed. The backport is
-   indicated by the presence of a `killswitch_state.compat = "v2-tolerant"`
-   marker line in `vortix --version` extended output.
-
-3. **Otherwise, remove the V2-only killswitch state file.** V2 persists
-   killswitch state in a new JSON shape that V1 cannot parse and will
-   refuse to load:
+2. **Remove the V2 killswitch state file.** V2 persists killswitch
+   state as JSON with `schema_version: 2`, which V1 cannot parse:
 
    ```sh
-   rm ~/.config/vortix/killswitch-state.json
+   rm ~/.config/vortix/killswitch.state
    ```
 
    Re-arm the killswitch on first run after downgrade:
@@ -247,20 +237,20 @@ v0.3.x ("V1"), follow this procedure.
    sudo vortix killswitch block-on-drop   # or "vpn-only", to taste
    ```
 
-4. **Profile configs are unchanged.** No migration is needed for your
+3. **Profile configs are unchanged.** No migration is needed for your
    `.conf` or `.ovpn` files. The `.meta.toml` sidecars introduced in
    v0.3.0 are V1-compatible and remain in place.
 
-5. **Journal JSONL is compatible.** V2 introduces new `EngineEvent`
-   variants (multi-tunnel state transitions, registry conflicts), but
+4. **Journal JSONL is compatible.** V2 introduces new `EngineEvent`
+   variants (multi-tunnel state transitions), but
    the enum is `#[non_exhaustive]`-additive on the wire — V1 readers
    skip unknown variants rather than erroring. You can keep your
-   `${XDG_DATA_HOME}/vortix/sessions/*.jsonl` files in place; they
+   `~/.config/vortix/sessions/*.jsonl` files in place; they
    stay readable by both V1 and V2 tooling.
 
 No data destructively rewritten by V2 — every change is
 read-then-write-new-file, so the worst-case rollback is "delete
-`killswitch-state.json` and re-arm."
+`killswitch.state` and re-arm."
 
 ---
 
@@ -299,7 +289,7 @@ Vortix's managed policy instead of a hook.
 
 ## Got stuck?
 
-Run `vortix bug-report` — v0.3.0 attaches the current session's
+Run `vortix report` — it attaches the current session's
 journal path and the last 10 event kinds, so the report carries the
 state you'd otherwise need to recreate by hand. Paste the output into
 a new issue.

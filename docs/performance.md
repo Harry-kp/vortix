@@ -26,7 +26,8 @@ sync by hand;** changing one without the other silently splits the install paths
 ## Where the binary goes
 
 Attribution from an unstripped `--release` build of `crates/vortix` on `aarch64-apple-darwin`,
-symbols mapped to crates by mangled prefix. Measured before the changes below:
+symbols mapped to crates by mangled prefix. Measured before the changes below, while color-eyre
+and the daemon-era helper binaries still shipped (historical):
 
 | Section | Bytes | Share |
 |---|---:|---:|
@@ -48,7 +49,7 @@ Top `__text` contributors:
 | `rustls` + `ring` + `webpki` | 214,376 | required — every telemetry endpoint is `https://` |
 | `tokio` | 207,424 | |
 | `regex-automata` + `regex-syntax` | 174,692 | **removed**, see below |
-| backtrace stack (`gimli`/`addr2line`/`backtrace`/`rustc-demangle`) | 131,404 | color-eyre's error reports |
+| backtrace stack (`gimli`/`addr2line`/`backtrace`/`rustc-demangle`) | 131,404 | color-eyre's error reports (color-eyre since removed) |
 
 The serde share is inherent to a JSON control protocol with ~280 typed messages, and the TLS
 share is required by the endpoints in `constants.rs`. Neither is a lever.
@@ -57,7 +58,7 @@ share is required by the endpoints in `constants.rs`. Neither is a lever.
 
 ### `opt-level = "z"` (was `3`)
 
-| opt-level | `vortix` | all three binaries |
+| opt-level | `vortix` | all three binaries (historical, before the daemon was removed) |
 |---|---:|---:|
 | `3` | 9,947,104 | 11,415,392 |
 | `2` | 9,633,344 | 11,085,120 |
@@ -109,7 +110,7 @@ re-initialised it will try to put `lto = "thin"` back, and that must be rejected
 | Change | Left the graph |
 |---|---|
 | `tracing-subscriber` without `env-filter` | `matchers`, `regex-automata`, `regex-syntax` |
-| `color-eyre` without `capture-spantrace` | `color-spantrace`, `tracing-error` |
+| `color-eyre` without `capture-spantrace` (color-eyre later removed) | `color-spantrace`, `tracing-error` |
 | `ratatui` with `default-features = false` | `ratatui-macros`, the unused Calendar widget |
 | `time` without `macros` | `time-macros` |
 | `clap` without `color` | `anstream`, `anstyle-parse`, `anstyle-query`, `anstyle-wincon`, `colorchoice`, `is_terminal_polyfill`, `once_cell_polyfill` |
@@ -138,7 +139,7 @@ trailing comma paints error output over the alternate screen.
 ## Test-target layout
 
 `crates/vortix/tests/` held 22 top-level `*.rs` files, so cargo built and linked 22 test binaries
-against the whole `vortix` rlib. Seventeen are now modules of one `tests/suite/main.rs`.
+against the whole `vortix` rlib. Seven are now modules of one `tests/suite/main.rs`.
 
 Five stay as their own targets:
 
@@ -202,7 +203,7 @@ different target has a different figure, which is why the check is opt-in via
 `VORTIX_SIZE_BUDGET_BYTES` rather than hardcoded.
 
 The script also pins the contracts that a size-driven profile change could plausibly break
-without failing a unit test: all three binaries reporting the same version, `--json` keeping
+without failing a unit test: the one binary reporting the workspace version, `--json` keeping
 stdout free of diagnostics, kill-switch verb parsing rejecting aliases, and an unprivileged
 launch exiting 2 with an actionable message instead of hanging.
 

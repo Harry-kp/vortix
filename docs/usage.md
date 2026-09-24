@@ -22,7 +22,7 @@ Press `?` at any time for the complete in-app reference. The most frequently use
 |---|---|
 | `1`–`9` | Quick-connect to profile N |
 | `d` | Disconnect or cancel the focused tunnel according to its phase (a stuck process is killed automatically) |
-| `D` | Disconnect every active tunnel |
+| `D` | With the sidebar focused: disconnect every active tunnel (asks `y`/`n` when 2+ are up). Elsewhere: disconnect |
 | `r` | Reconnect |
 | `i` | Import a profile, directory, or URL |
 | `K` | Cycle the kill-switch mode |
@@ -101,16 +101,15 @@ Use bypass flags only after reviewing the routes:
 sudo vortix up second-vpn --yes
 ```
 
-## Status and durable operations
+## Status
 
 ```bash
 vortix status
 vortix status --brief
 vortix status --watch
-vortix status --operation op-0000000000000001-0000000000000001
 ```
 
-If a blocking CLI command times out, its operation remains recorded for reconciliation. Query the operation ID reported by the command rather than immediately assuming the tunnel failed.
+If a blocking CLI command times out the connect carries on; check `vortix status`.
 
 ## Kill switch
 

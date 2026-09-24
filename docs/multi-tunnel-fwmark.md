@@ -47,7 +47,7 @@ affected row in the sidebar so you can spot the at-risk tunnel
 without having to focus each row in turn.
 
 The Connection Details panel links to this page via the warning
-line (see U17 of the multi-connection plan).
+line.
 
 ## How to fix it
 

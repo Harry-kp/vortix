@@ -1,6 +1,6 @@
 # CI integration tests
 #
-# Drives the vortix binary against real wg-quick + openvpn + nftables in
+# Drives the vortix binary against real wg-quick + nftables in
 # privileged Docker containers with `ip netns` namespaces. The kill switch
 # is nftables only. Matrix covers Ubuntu (iptables-nft compat image) +
 # Fedora (native nft) to catch distro differences.

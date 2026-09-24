@@ -7,8 +7,7 @@ Thanks for your interest in contributing! 🎉
 ```bash
 git clone https://github.com/Harry-kp/vortix.git
 cd vortix
-cargo build
-sudo cargo run
+cargo build -p vortix && sudo ./target/debug/vortix
 ```
 
 ## Ways to Contribute
@@ -17,7 +16,7 @@ sudo cargo run
 - 💡 **Suggest features** — Check the [roadmap](ROADMAP.md) first, then open an issue
 - 📖 **Improve docs** — README, code comments, examples
 - 🧪 **Add tests** — Unit tests, integration tests
-- 🍎 **Linux support** — Help port macOS-specific code
+- 🐧 **Linux support** — Test and fix Linux distro differences
 
 ## Linux Help Wanted
 
@@ -61,10 +60,10 @@ Vortix requires root for VPN operations. For testing:
 
 ```bash
 # Run unit tests (no root needed)
-cargo test
+cargo test -p vortix
 
-# Run with demo mode (masks sensitive data)
-sudo cargo run -- --demo
+# Run the debug build (never `sudo cargo`)
+cargo build -p vortix && sudo ./target/debug/vortix
 ```
 
 For Linux bug reports, include as much of the following as possible:

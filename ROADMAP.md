@@ -10,10 +10,10 @@ Vortix exists because managing VPN connections from the terminal should feel as 
 - **Split tunnels.** Profiles with narrow `AllowedIPs` / routes carry only their subnets.
 - **Kill switch** with three modes: `off`, `block-on-drop`, `vpn-only`. pf on macOS, nftables on Linux.
 - **Full CLI with JSON.** Every TUI action has a headless equivalent (`up`, `down`, `reconnect`, `status`, `list`, `import`, `killswitch`, `report`, ...). `--json` returns a versioned envelope for scripts and agents.
-- **Lifecycle hooks** (issue [#36](https://github.com/Harry-kp/vortix/issues/36)). Shell commands on connect/disconnect/failure, configured via `[[hooks]]` in `settings.toml`.
+- **Lifecycle hooks** (issue [#36](https://github.com/Harry-kp/vortix/issues/36)). An absolute executable with an argv list (never a shell) on connect/disconnect/failure, configured via `[[hooks]]` in `settings.toml`.
 - **Socket audit** (issues [#168](https://github.com/Harry-kp/vortix/issues/168), [#166](https://github.com/Harry-kp/vortix/issues/166)). `vortix audit` lists per-process sockets and whether they route through a tunnel.
-- **Session journal.** JSONL event log per run under `${XDG_DATA_HOME}/vortix/sessions/`.
-- **CI integration tests** (issue [#162](https://github.com/Harry-kp/vortix/issues/162)). Real `wg-quick`, `openvpn` and nftables in privileged containers across Linux distros.
+- **Session journal.** JSONL event log per run under `~/.config/vortix/sessions/`.
+- **CI integration tests** (issue [#162](https://github.com/Harry-kp/vortix/issues/162)). Real `wg-quick` and nftables in privileged containers across Linux distros.
 
 Vortix runs as root (`sudo vortix`). A privilege-separated daemon/helper design was built and then removed by product decision; it is archived on the `archive/background-mode` branch.
 
