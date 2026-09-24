@@ -977,11 +977,7 @@ fn read_json_line<R: BufRead, T: for<'de> Deserialize<'de>>(
 }
 
 fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::geteuid()
-    }
+    crate::platform::effective_user_group_ids().0
 }
 
 #[allow(unsafe_code)]

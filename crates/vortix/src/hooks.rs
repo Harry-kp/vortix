@@ -236,65 +236,22 @@ mod runner {
     }
 
     fn current_groups() -> Result<Vec<u32>, HookOwnerError> {
-        // SAFETY: the first call obtains the required length; the second writes
-        // into an allocated vector with that capacity.
-        #[allow(unsafe_code)]
-        unsafe {
-            let count = libc::getgroups(0, std::ptr::null_mut());
-            if count < 0 {
-                return Err(HookOwnerError::Groups {
-                    source: std::io::Error::last_os_error(),
-                });
-            }
-            let mut groups = vec![0; usize::try_from(count).unwrap_or(0)];
-            if count > 0 && libc::getgroups(count, groups.as_mut_ptr()) < 0 {
-                return Err(HookOwnerError::Groups {
-                    source: std::io::Error::last_os_error(),
-                });
-            }
-            Ok(groups)
-        }
+        crate::platform::current_groups().map_err(|source| HookOwnerError::Groups { source })
     }
 
     fn lookup_user(user: &str) -> Result<(u32, u32, Vec<u32>), HookOwnerError> {
         let user = std::ffi::CString::new(user).map_err(|_| HookOwnerError::UnknownUser)?;
-        let mut buffer_size = 16 * 1024;
-        loop {
-            let mut buffer = vec![0_u8; buffer_size];
-            // SAFETY: the record is initialized by getpwnam_r, which owns no
-            // storage beyond `buffer` and is safe against concurrent NSS lookups.
-            #[allow(unsafe_code)]
-            let (status, result, record) = unsafe {
-                let mut record = std::mem::zeroed::<libc::passwd>();
-                let mut result = std::ptr::null_mut();
-                let status = libc::getpwnam_r(
-                    user.as_ptr(),
-                    &raw mut record,
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    &raw mut result,
-                );
-                (status, result, record)
-            };
-            if status == libc::ERANGE && buffer_size < 1024 * 1024 {
-                buffer_size *= 2;
-                continue;
-            }
-            if status != 0 || result.is_null() {
-                return Err(HookOwnerError::UnknownUser);
-            }
-            let uid = record.pw_uid;
-            let gid = record.pw_gid;
-            let mut groups = crate::platform::supplementary_groups_for_user(
-                &user,
-                gid,
-                HOOK_MAX_SUPPLEMENTARY_GROUPS,
-            )
-            .ok_or(HookOwnerError::UnknownUser)?;
-            groups.sort_unstable();
-            groups.dedup();
-            return Ok((uid, gid, groups));
-        }
+        let (uid, gid, _) =
+            crate::platform::lookup_user(&user).ok_or(HookOwnerError::UnknownUser)?;
+        let mut groups = crate::platform::supplementary_groups_for_user(
+            &user,
+            gid,
+            HOOK_MAX_SUPPLEMENTARY_GROUPS,
+        )
+        .ok_or(HookOwnerError::UnknownUser)?;
+        groups.sort_unstable();
+        groups.dedup();
+        Ok((uid, gid, groups))
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

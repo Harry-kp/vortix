@@ -820,6 +820,55 @@ pub(crate) fn effective_user_group_ids() -> (u32, u32) {
     unsafe { (libc::geteuid(), libc::getegid()) }
 }
 
+/// This process's supplementary groups.
+#[allow(unsafe_code)]
+pub(crate) fn current_groups() -> std::io::Result<Vec<u32>> {
+    // SAFETY: the first call obtains the required length; the second writes
+    // into a vector of exactly that length.
+    unsafe {
+        let count = libc::getgroups(0, std::ptr::null_mut());
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut groups = vec![0; usize::try_from(count).unwrap_or(0)];
+        if count > 0 && libc::getgroups(count, groups.as_mut_ptr()) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(groups)
+    }
+}
+
+/// The OS user record for `name`: uid, primary gid and home directory.
+#[allow(unsafe_code)]
+pub(crate) fn lookup_user(name: &std::ffi::CStr) -> Option<(u32, u32, std::path::PathBuf)> {
+    let mut buffer_size = 16 * 1024;
+    loop {
+        let mut buffer = vec![0_u8; buffer_size];
+        // SAFETY: getpwnam_r writes only into `record` and `buffer`, and the
+        // home string is copied out before `buffer` drops.
+        unsafe {
+            let mut record = std::mem::zeroed::<libc::passwd>();
+            let mut result = std::ptr::null_mut();
+            let status = libc::getpwnam_r(
+                name.as_ptr(),
+                &raw mut record,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &raw mut result,
+            );
+            if status == libc::ERANGE && buffer_size < 1024 * 1024 {
+                buffer_size *= 2;
+                continue;
+            }
+            if status != 0 || result.is_null() || record.pw_dir.is_null() {
+                return None;
+            }
+            let home = std::ffi::CStr::from_ptr(record.pw_dir).to_str().ok()?;
+            return Some((record.pw_uid, record.pw_gid, home.into()));
+        }
+    }
+}
+
 /// Stable OS boot identity shared by persisted authority and verification.
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: boot identity reads an OS kernel primitive
 pub(crate) fn boot_identity() -> Option<String> {

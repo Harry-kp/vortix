@@ -597,26 +597,10 @@ fn drop_credentials(groups: &[u32], gid: u32, uid: u32) -> std::io::Result<()> {
 }
 
 fn current_groups() -> Result<Vec<u32>, ProcessError> {
-    // SAFETY: the first call obtains the required length; the second writes
-    // into an allocated vector of exactly that length.
-    #[allow(unsafe_code)]
-    unsafe {
-        let count = libc::getgroups(0, std::ptr::null_mut());
-        if count < 0 {
-            return Err(ProcessError::InvalidCredentials {
-                program: "process-owner".into(),
-                reason: std::io::Error::last_os_error().to_string(),
-            });
-        }
-        let mut groups = vec![0; usize::try_from(count).unwrap_or(0)];
-        if count > 0 && libc::getgroups(count, groups.as_mut_ptr()) < 0 {
-            return Err(ProcessError::InvalidCredentials {
-                program: "process-owner".into(),
-                reason: std::io::Error::last_os_error().to_string(),
-            });
-        }
-        Ok(groups)
-    }
+    crate::platform::current_groups().map_err(|error| ProcessError::InvalidCredentials {
+        program: "process-owner".into(),
+        reason: error.to_string(),
+    })
 }
 
 async fn terminate_child(child: &mut tokio::process::Child, process_group: bool) {

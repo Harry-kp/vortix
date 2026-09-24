@@ -300,27 +300,11 @@ fn default_config_dir() -> std::io::Result<PathBuf> {
 pub(crate) fn user_home() -> Option<PathBuf> {
     if crate::platform::is_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-            return home_dir_for_user(&sudo_user);
+            let name = std::ffi::CString::new(sudo_user).ok()?;
+            return crate::platform::lookup_user(&name).map(|(_, _, home)| home);
         }
     }
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
-}
-
-/// Looks up a user's home directory from `/etc/passwd` via `getpwnam`.
-#[allow(unsafe_code)]
-fn home_dir_for_user(username: &str) -> Option<PathBuf> {
-    use std::ffi::{CStr, CString};
-    let c_name = CString::new(username).ok()?;
-    // SAFETY: getpwnam returns a pointer to a static struct. We copy the
-    // home directory string immediately so the pointer is not held.
-    unsafe {
-        let pw = libc::getpwnam(c_name.as_ptr());
-        if pw.is_null() {
-            return None;
-        }
-        let home = CStr::from_ptr((*pw).pw_dir);
-        home.to_str().ok().map(PathBuf::from)
-    }
 }
 
 /// Loads `AppConfig` from `config.toml` in the given directory.

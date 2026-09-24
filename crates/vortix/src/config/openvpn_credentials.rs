@@ -387,7 +387,7 @@ impl FsOpenVpnCredentialStore {
             self.expected_gid,
             canonical_stable_id,
             self.root_adoption,
-            effective_owner(),
+            crate::platform::effective_user_group_ids(),
         )?;
         let identity = EntryIdentity::from_metadata(&metadata);
         let capacity =
@@ -716,10 +716,6 @@ fn map_file_error(error: FileError, operation: CredentialIoOperation) -> Credent
             source: std::io::Error::other("owner-bound filesystem operation failed"),
         },
     }
-}
-
-fn effective_owner() -> (u32, u32) {
-    crate::platform::effective_user_group_ids()
 }
 
 #[cfg(test)]
