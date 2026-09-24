@@ -804,7 +804,7 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
             CliError {
                 code: "invalid_name",
                 message: format!(
-                    "'{trimmed}' is not a usable profile name. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -."
+                    "'{trimmed}' is not a usable profile name. WireGuard names must be 1–15 characters using only letters, numbers, _, ., or -."
                 ),
                 hint: None,
             },

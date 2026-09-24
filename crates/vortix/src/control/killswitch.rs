@@ -477,18 +477,11 @@ pub(crate) fn policy_digest_bytes(active: &[ActiveTunnelInfo]) -> [u8; 32] {
 /// non-portable interface names.
 pub fn validate_policy(active: &[ActiveTunnelInfo]) -> Result<()> {
     for tunnel in active {
-        let interface = tunnel.interface.as_bytes();
         let endpoint_allowlist = tunnel.is_endpoint_allowlist()
             && !tunnel.server_ips.is_empty()
             && tunnel.declared_cidrs.is_empty()
             && !tunnel.is_primary;
-        if !endpoint_allowlist
-            && (interface.is_empty()
-                || interface.len() > 15
-                || !interface.iter().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.')
-                }))
-        {
+        if !endpoint_allowlist && !crate::profile::is_safe_interface_name(&tunnel.interface) {
             return Err(KillswitchError::InvalidPolicy(format!(
                 "unsafe interface name {:?}",
                 tunnel.interface

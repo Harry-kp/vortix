@@ -16,18 +16,24 @@ pub const MAX_WIREGUARD_INTERFACE_NAME_BYTES: usize = 15;
 /// Validate the one explicit `WireGuard` interface identity shared by profile
 /// storage, protocol execution, observation, and teardown.
 pub fn validate_wireguard_interface_name(name: &str) -> Result<(), String> {
-    let valid = !name.is_empty()
-        && name.len() <= MAX_WIREGUARD_INTERFACE_NAME_BYTES
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_=+.-".contains(&byte));
-    if valid {
+    if is_safe_interface_name(name) {
         Ok(())
     } else {
         Err(format!(
-            "WireGuard name must be 1–{MAX_WIREGUARD_INTERFACE_NAME_BYTES} characters using only letters, numbers, _, =, +, ., or -"
+            "WireGuard name must be 1–{MAX_WIREGUARD_INTERFACE_NAME_BYTES} characters using only letters, numbers, _, ., or -"
         ))
     }
+}
+
+/// An interface name that fits `IFNAMSIZ` and is safe to write into pf and
+/// nft rules unquoted: `[A-Za-z0-9_.-]`, 1–15 bytes.
+#[must_use]
+pub fn is_safe_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_WIREGUARD_INTERFACE_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
 }
 
 /// Strip a profile name down to ASCII `[A-Za-z0-9_-]` for safe use in
@@ -302,8 +308,8 @@ pub fn detect_conf_protocol(text: &str) -> Result<ProtocolKind, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_conf_protocol, hex, sanitize_profile_name, unambiguous_legacy_artifact_key,
-        ProfileId, ProtocolKind,
+        detect_conf_protocol, hex, is_safe_interface_name, sanitize_profile_name,
+        unambiguous_legacy_artifact_key, ProfileId, ProtocolKind,
     };
 
     #[test]
@@ -403,5 +409,15 @@ mod tests {
             Ok(ProtocolKind::WireGuard)
         );
         assert!(detect_conf_protocol(&format!("{wg}remote x 1\n")).is_err());
+    }
+
+    /// A `WireGuard` name is its Linux interface and lands unquoted in pf/nft
+    /// rules, so import and the kill switch must agree on one charset.
+    #[test]
+    fn interface_names_are_limited_to_firewall_safe_characters() {
+        assert!(is_safe_interface_name("wg-corp_1.a"));
+        for bad in ["", "a+b", "a=b", "a b", "sixteen-chars-xx"] {
+            assert!(!is_safe_interface_name(bad), "{bad}");
+        }
     }
 }
