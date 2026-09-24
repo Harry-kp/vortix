@@ -147,6 +147,8 @@ pub struct Snapshot {
     pub last_connected: BTreeMap<ProfileId, SystemTime>,
     /// Why the host network does not match the plan, while it does not.
     pub net_error: Option<String>,
+    /// Unexpected drops since the engine started.
+    pub drops: u32,
 }
 
 impl Snapshot {

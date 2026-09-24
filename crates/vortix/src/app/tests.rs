@@ -2385,17 +2385,40 @@ fn an_unexpected_drop_counts_once() {
         details: crate::tunnel::DetailedConnectionInfo::default(),
         health: crate::tunnel::ConnectionHealth::default(),
     };
-    for phase in [
-        Phase::Up,
-        Phase::Waiting { retry_at: None },
-        Phase::Waiting { retry_at: None },
-    ] {
+    // Up -> Waiting -> Starting all happened between two polls: the app
+    // never saw Waiting, so only the engine's count can report the drop.
+    for (phase, drops) in [(Phase::Up, 0), (Phase::Starting, 1), (Phase::Starting, 1)] {
         app.apply_control_snapshot(std::sync::Arc::new(Snapshot {
             tunnels: vec![view(phase)],
+            drops,
             ..Snapshot::default()
         }));
     }
     assert_eq!(app.runtime.connection_drops, 1);
+}
+
+/// A snapshot published before the engine handled an answer still lists
+/// the prompt; it must not reopen the dialog the user just closed.
+#[test]
+fn an_answered_prompt_does_not_reopen_from_a_stale_snapshot() {
+    use crate::control::{Prompt, Snapshot};
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    let snapshot = std::sync::Arc::new(Snapshot {
+        prompts: vec![Prompt {
+            id: 5,
+            profile_id: app.runtime.profiles[0].id.clone(),
+            name: "corp".into(),
+            otp_label: None,
+        }],
+        ..Snapshot::default()
+    });
+    app.apply_control_snapshot(std::sync::Arc::clone(&snapshot));
+    assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
+    app.answer_prompt(None);
+    app.input_mode = InputMode::Normal;
+    app.apply_control_snapshot(snapshot);
+    assert!(matches!(app.input_mode, InputMode::Normal));
 }
 
 #[test]

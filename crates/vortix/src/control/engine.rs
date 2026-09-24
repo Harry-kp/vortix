@@ -78,6 +78,7 @@ pub(super) struct Engine {
     outcomes: BTreeMap<u64, Outcome>,
     notices: VecDeque<Notice>,
     seq: u64,
+    drops: u32,
     net: Net,
     applied: Option<NetworkPlan>,
     apply_error: Option<String>,
@@ -155,6 +156,7 @@ impl Engine {
             outcomes: BTreeMap::new(),
             notices: VecDeque::new(),
             seq: 0,
+            drops: 0,
             applied: None,
             apply_error: None,
             applied_at: Instant::now(),
@@ -581,6 +583,7 @@ impl Engine {
     }
 
     fn lost(&mut self, profile_id: &ProfileId) {
+        self.drops = self.drops.saturating_add(1);
         let name = self.name(profile_id);
         let draining = if let Some(live) = self.live.remove(profile_id) {
             let settings = self.config.tunnels.clone();
@@ -977,6 +980,7 @@ impl Engine {
             external: self.external.clone(),
             last_connected: self.last_connected.clone(),
             net_error: self.apply_error.clone(),
+            drops: self.drops,
         };
         if next == self.published {
             return;
