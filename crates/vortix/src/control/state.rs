@@ -53,6 +53,8 @@ pub struct Tunnel {
     pub recovering: Option<u32>,
     /// Start again once stopped (a reconnect).
     pub restart: bool,
+    /// A dropped tunnel's teardown is still running; no retry until it ends.
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +139,7 @@ impl State {
                 replaces,
                 recovering: None,
                 restart: false,
+                draining: false,
             },
         );
         Ok(())
@@ -155,6 +158,7 @@ impl State {
                 replaces: BTreeSet::new(),
                 recovering: None,
                 restart: false,
+                draining: false,
             },
         );
     }
@@ -213,8 +217,9 @@ impl State {
         }
     }
 
-    /// The tunnel vanished without being asked to.
-    pub fn lost(&mut self, profile_id: &ProfileId, retry_at: Option<Instant>) {
+    /// The tunnel vanished without being asked to. `draining` when its
+    /// teardown is still running.
+    pub fn lost(&mut self, profile_id: &ProfileId, retry_at: Option<Instant>, draining: bool) {
         if let Some(tunnel) = self
             .tunnels
             .get_mut(profile_id)
@@ -223,6 +228,14 @@ impl State {
             tunnel.phase = Phase::Waiting { retry_at };
             tunnel.interface = None;
             tunnel.recovering = Some(0);
+            tunnel.draining = draining;
+        }
+    }
+
+    /// A dropped tunnel's teardown finished.
+    pub fn drained(&mut self, profile_id: &ProfileId) {
+        if let Some(tunnel) = self.tunnels.get_mut(profile_id) {
+            tunnel.draining = false;
         }
     }
 
@@ -231,7 +244,7 @@ impl State {
         let tunnel = self
             .tunnels
             .get_mut(profile_id)
-            .filter(|tunnel| matches!(tunnel.phase, Phase::Waiting { .. }))?;
+            .filter(|tunnel| matches!(tunnel.phase, Phase::Waiting { .. }) && !tunnel.draining)?;
         let attempt = tunnel.recovering.unwrap_or(0) + 1;
         tunnel.recovering = Some(attempt);
         tunnel.phase = Phase::Starting;
@@ -504,7 +517,7 @@ mod tests {
             .unwrap();
         state.came_up(&id("01"), "utun4".into(), [], [], None);
         assert!(!state.plan_input().dropped);
-        state.lost(&id("01"), Some(Instant::now()));
+        state.lost(&id("01"), Some(Instant::now()), false);
         assert!(state.plan_input().dropped);
         assert_eq!(state.retry(&id("01")), Some(1));
         assert!(
@@ -513,6 +526,22 @@ mod tests {
         );
         state.came_up(&id("01"), "utun7".into(), [], [], None);
         assert!(!state.plan_input().dropped);
+    }
+
+    /// The dropped tunnel's teardown removes that profile's interface and
+    /// ownership files; a retry that starts before it finishes gets its new
+    /// tunnel torn down by the old stop.
+    #[test]
+    fn a_reconnect_waits_for_the_dropped_tunnels_teardown() {
+        let mut state = State::default();
+        state
+            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .unwrap();
+        state.came_up(&id("01"), "wg0".into(), [], [], None);
+        state.lost(&id("01"), Some(Instant::now()), true);
+        assert!(state.retry(&id("01")).is_none(), "teardown still running");
+        state.drained(&id("01"));
+        assert_eq!(state.retry(&id("01")), Some(1));
     }
 
     #[test]
@@ -552,7 +581,7 @@ mod tests {
             .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
             .unwrap();
         state.came_up(&id("01"), "utun4".into(), [], [], None);
-        state.lost(&id("01"), None);
+        state.lost(&id("01"), None, false);
         assert!(state.restart(&id("01")));
         let old = state.stopped(&id("01")).expect("restart requested");
         assert!(old.recovering.is_some());
@@ -628,7 +657,7 @@ mod tests {
                                 state.stopped(&profile);
                             }
                         }
-                        _ => state.lost(&profile, None),
+                        _ => state.lost(&profile, None, false),
                     }
                     let input = state.plan_input();
                     assert_invariants(&input, &plan(&input));

@@ -222,15 +222,18 @@ impl TunnelOwnershipStore {
     }
 
     /// Remove only after a fresh scan proves the exact owned interface absent.
+    /// With `generation`, only that generation's record goes: a slow stop of
+    /// a dropped tunnel must not remove its reconnect's record.
     pub fn remove_after_confirmed_absence(
         &self,
         profile_id: &ProfileId,
         active: &[ActiveSession],
+        generation: Option<u64>,
     ) -> Result<bool, OwnershipError> {
         let record = match self.load(profile_id) {
             Ok(record) => record,
             Err(OwnershipError::Missing) => {
-                if active.is_empty() {
+                if active.is_empty() && generation.is_none() {
                     let _ = std::fs::remove_file(self.teardown_path(profile_id));
                 }
                 return Ok(false);
@@ -239,6 +242,7 @@ impl TunnelOwnershipStore {
         };
         if record.boot_scope != self.boot_scope
             || record.owner_uid != self.owner_uid
+            || generation.is_some_and(|generation| generation != record.tunnel_generation)
             || active
                 .iter()
                 .any(|session| session.details.interface == record.interface_name)
@@ -544,10 +548,41 @@ mod tests {
             AuthorityEpoch(3)
         );
         assert!(!store
-            .remove_after_confirmed_absence(&profile.id, std::slice::from_ref(&active))
+            .remove_after_confirmed_absence(&profile.id, std::slice::from_ref(&active), None)
             .unwrap());
         assert!(store
-            .remove_after_confirmed_absence(&profile.id, &[])
+            .remove_after_confirmed_absence(&profile.id, &[], None)
+            .unwrap());
+    }
+
+    /// A dropped tunnel's teardown can finish after its reconnect recorded a
+    /// newer generation; that record belongs to the live tunnel.
+    #[test]
+    fn stopping_an_older_generation_keeps_the_newer_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = profile(temp.path(), 'a');
+        let store =
+            TunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a").unwrap();
+        store
+            .issue_wireguard(
+                &profile,
+                TunnelRevision {
+                    authority_epoch: AuthorityEpoch(3),
+                    generation: 8,
+                },
+                serde_json::from_str("\"op-0000000000000003-0000000000000008\"").unwrap(),
+                "wg0",
+                &teardown_config(temp.path(), 'a'),
+                handshake(8),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(!store
+            .remove_after_confirmed_absence(&profile.id, &[], Some(7))
+            .unwrap());
+        assert!(store.load(&profile.id).is_ok());
+        assert!(store
+            .remove_after_confirmed_absence(&profile.id, &[], Some(8))
             .unwrap());
     }
 

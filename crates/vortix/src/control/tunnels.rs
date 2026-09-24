@@ -146,13 +146,15 @@ pub fn stop(
 ) -> Result<(), String> {
     let Live { mut kind, handle } = live;
     let profile_id = handle.profile_id.clone();
+    let generation = Some(handle.generation);
     let wireguard = handle.kind == TunnelKindTag::WireGuard;
     kind.down(&handle).map_err(|error| error.to_string())?;
     if wireguard {
-        let _ = ownership.remove_after_confirmed_absence(&profile_id, &[]);
+        let _ = ownership.remove_after_confirmed_absence(&profile_id, &[], generation);
         let _ = crate::wireguard::receipt::remove_after_confirmed_absence(
             &settings.config_dir,
             &profile_id,
+            generation,
         );
     }
     Ok(())
