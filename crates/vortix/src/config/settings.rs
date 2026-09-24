@@ -252,11 +252,6 @@ impl Settings {
     }
 }
 
-#[cfg(not(unix))]
-fn sudo_home(_user: &str) -> Option<PathBuf> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

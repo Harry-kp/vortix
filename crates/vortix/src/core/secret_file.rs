@@ -66,7 +66,6 @@ pub enum SecretFileError {
 ///
 /// Returns [`SecretFileError`] for invalid paths, symlinked parents,
 /// pre-existing targets, or any underlying syscall failure.
-#[cfg(unix)]
 pub fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), SecretFileError> {
     write_secret_file_tracked(path, contents).map(|_| ())
 }
@@ -77,7 +76,6 @@ pub fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), SecretFileE
 /// ordinary callers keep using [`write_secret_file`]. Any failure after the
 /// exclusive create removes the partial file if the directory entry still
 /// names that created inode.
-#[cfg(unix)]
 pub(crate) fn write_secret_file_tracked(
     path: &Path,
     contents: &[u8],
@@ -90,7 +88,6 @@ pub(crate) fn write_secret_file_tracked(
     })
 }
 
-#[cfg(unix)]
 fn write_secret_file_tracked_with(
     path: &Path,
     contents: &[u8],
@@ -226,7 +223,6 @@ fn write_secret_file_tracked_with(
     Ok(identity)
 }
 
-#[cfg(unix)]
 fn remove_created_file_if_same(
     parent: &std::fs::File,
     basename: &std::ffi::CStr,
@@ -277,27 +273,6 @@ fn remove_created_file_if_same(
         return Err(SecretFileError::Io(std::io::Error::last_os_error()));
     }
     Ok(())
-}
-
-/// Windows stub. A TOCTOU-safe equivalent on Windows needs a different
-/// primitive set; tracked for follow-up.
-#[cfg(not(unix))]
-pub fn write_secret_file(_path: &Path, _contents: &[u8]) -> Result<(), SecretFileError> {
-    Err(SecretFileError::Io(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "write_secret_file is not yet implemented on this platform",
-    )))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn write_secret_file_tracked(
-    _path: &Path,
-    _contents: &[u8],
-) -> Result<SecretFileIdentity, SecretFileError> {
-    Err(SecretFileError::Io(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "write_secret_file is not yet implemented on this platform",
-    )))
 }
 
 #[cfg(all(test, unix))]

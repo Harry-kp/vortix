@@ -1,9 +1,7 @@
 //! Crash-safe local persistence for DNS desired/effective generations.
 
-#[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -12,18 +10,15 @@ use crate::core::ports::dns::DnsPolicyCoordinator;
 
 const DNS_POLICY_STATE_FILE: &str = "dns-policy.state";
 const DNS_POLICY_SCHEMA: u8 = 2;
-#[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Serialize all DNS policy writers across CLI and TUI processes. This lock
 /// is intentionally distinct from the lifecycle lock so a CLI command that
 /// already owns lifecycle authority cannot self-deadlock.
-#[cfg(unix)]
 pub fn acquire_policy_lock(config_dir: &Path) -> std::io::Result<std::fs::File> {
     acquire_policy_lock_with_hook(config_dir, || {})
 }
 
-#[cfg(unix)]
 fn acquire_policy_lock_with_hook(
     config_dir: &Path,
     after_pin: impl FnOnce(),
@@ -47,16 +42,6 @@ fn acquire_policy_lock_with_hook(
     } else {
         Err(std::io::Error::last_os_error())
     }
-}
-
-#[cfg(not(unix))]
-pub fn acquire_policy_lock(config_dir: &Path) -> std::io::Result<std::fs::File> {
-    crate::utils::create_user_dir(config_dir)?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(config_dir.join("dns-policy.lock"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,7 +71,6 @@ pub fn save(config_dir: &Path, coordinator: &DnsPolicyCoordinator) -> std::io::R
     atomic_write_user_file(config_dir, &content)
 }
 
-#[cfg(unix)]
 fn atomic_write_user_file(config_dir: &Path, content: &[u8]) -> std::io::Result<()> {
     atomic_write_user_file_with_hook(config_dir, content, || {})
 }
@@ -94,7 +78,6 @@ fn atomic_write_user_file(config_dir: &Path, content: &[u8]) -> std::io::Result<
 /// Pin the destination directory before creating any file. Every subsequent
 /// operation is relative to that descriptor, so replacing any pathname with
 /// a symlink cannot redirect a privileged writer.
-#[cfg(unix)]
 fn atomic_write_user_file_with_hook(
     config_dir: &Path,
     content: &[u8],
@@ -117,20 +100,6 @@ fn atomic_write_user_file_with_hook(
     result
 }
 
-#[cfg(not(unix))]
-fn atomic_write_user_file(config_dir: &Path, content: &[u8]) -> std::io::Result<()> {
-    crate::utils::create_user_dir(config_dir)?;
-    let path = config_dir.join(DNS_POLICY_STATE_FILE);
-    let temp = config_dir.join(format!("{DNS_POLICY_STATE_FILE}.tmp"));
-    crate::utils::write_user_file(&temp, content)?;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .open(&temp)?
-        .sync_all()?;
-    std::fs::rename(temp, path)
-}
-
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn chown_open_file_to_real_user(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -160,7 +129,6 @@ fn chown_open_file_to_real_user(file: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
-#[cfg(unix)]
 fn create_private_temp(directory: &std::fs::File) -> std::io::Result<(String, std::fs::File)> {
     for _ in 0..128 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -186,7 +154,6 @@ fn create_private_temp(directory: &std::fs::File) -> std::io::Result<(String, st
     ))
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn open_pinned_config_dir(path: &Path) -> std::io::Result<std::fs::File> {
     use std::ffi::CString;
@@ -264,7 +231,6 @@ fn open_pinned_config_dir(path: &Path) -> std::io::Result<std::fs::File> {
 /// component remains unresolved and is opened with `O_NOFOLLOW`, so a
 /// symlink at the authority boundary is rejected rather than canonicalized
 /// into an attacker-selected directory.
-#[cfg(unix)]
 fn canonical_parent_with_leaf(path: &Path) -> std::io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -304,7 +270,6 @@ fn canonical_parent_with_leaf(path: &Path) -> std::io::Result<PathBuf> {
     Ok(canonical)
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn openat_file(
     directory: &std::fs::File,
@@ -336,7 +301,6 @@ fn openat_file(
     }
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn require_regular_file(file: &std::fs::File, label: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -356,7 +320,6 @@ fn require_regular_file(file: &std::fs::File, label: &str) -> std::io::Result<()
     }
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn renameat(directory: &std::fs::File, from: &str, to: &str) -> std::io::Result<()> {
     use std::ffi::CString;
@@ -379,7 +342,6 @@ fn renameat(directory: &std::fs::File, from: &str, to: &str) -> std::io::Result<
     }
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn unlinkat(directory: &std::fs::File, name: &str) -> std::io::Result<()> {
     use std::ffi::CString;
@@ -421,7 +383,6 @@ mod tests {
         waiter.join().unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn policy_lock_never_follows_a_precreated_symlink() {
         use std::os::unix::fs::symlink;
@@ -435,7 +396,6 @@ mod tests {
         assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_config_directory_is_rejected_for_save_and_lock() {
         use std::os::unix::fs::symlink;
@@ -457,7 +417,6 @@ mod tests {
         assert!(!victim.join("dns-policy.lock").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn pinned_directory_survives_path_swap_without_touching_victim() {
         use std::os::unix::fs::symlink;
@@ -482,7 +441,6 @@ mod tests {
         assert!(!victim.join(DNS_POLICY_STATE_FILE).exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn policy_lock_uses_pinned_directory_after_path_swap() {
         use std::os::unix::fs::symlink;
@@ -521,7 +479,6 @@ mod tests {
             .ends_with(".tmp")));
     }
 
-    #[cfg(unix)]
     #[test]
     fn attacker_symlink_at_legacy_temp_name_is_never_followed() {
         use std::os::unix::fs::symlink;

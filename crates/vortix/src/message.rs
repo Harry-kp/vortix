@@ -36,7 +36,6 @@ pub enum ScrollMove {
 /// Messages are the single source of truth for state mutations.
 /// They can originate from user input or programmatically.
 #[derive(Debug, Clone)]
-
 pub enum Message {
     // === Navigation ===
     /// Focus next panel

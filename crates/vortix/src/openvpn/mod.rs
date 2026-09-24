@@ -12,7 +12,6 @@ pub mod tunnel;
 pub(crate) mod management;
 pub(crate) mod push;
 
-pub use parser::OvpnParsedProfile;
 pub use tunnel::{OvpnDnsEvidence, OvpnTunnel};
 
 pub mod version {

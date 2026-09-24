@@ -8,5 +8,4 @@
 pub mod parser;
 pub mod tunnel;
 
-pub use parser::WgParsedProfile;
 pub use tunnel::WgTunnel;

@@ -8,7 +8,6 @@
 /// Uses the effective user ID from the OS instead of spawning an external command.
 /// This avoids silent failures if `id` is unavailable or fails.
 #[must_use]
-#[cfg(unix)]
 #[allow(unsafe_code)]
 pub fn is_root() -> bool {
     // SAFETY: geteuid() is a simple syscall that returns the effective user ID.
@@ -17,7 +16,6 @@ pub fn is_root() -> bool {
 }
 
 /// Effective process uid/gid without a subprocess lookup.
-#[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn effective_user_group_ids() -> (u32, u32) {
     // SAFETY: these libc calls return scalar process credentials.
@@ -64,15 +62,8 @@ pub(crate) fn boot_identity() -> Option<String> {
     }
 }
 
-/// Stable OS boot identity shared by persisted authority and verification.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))] // xtask:allow-platform-cfg: unsupported targets need an explicit non-authoritative boot identity
-pub(crate) fn boot_identity() -> Option<String> {
-    None
-}
-
 /// Milliseconds on the OS monotonic clock, stable across process restarts
 /// within one boot. Persisted deadlines must never use process-local time.
-#[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn boot_elapsed_millis() -> Option<u64> {
     let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
@@ -90,21 +81,6 @@ pub(crate) fn boot_elapsed_millis() -> Option<u64> {
             .saturating_mul(1_000)
             .saturating_add(nanos / 1_000_000),
     )
-}
-
-#[cfg(not(unix))]
-pub(crate) fn boot_elapsed_millis() -> Option<u64> {
-    None
-}
-
-/// Check if the current process is running as root (UID 0)
-///
-/// On non-Unix platforms, this always returns `false` because there is no
-/// portable concept of a root user.
-#[must_use]
-#[cfg(not(unix))]
-pub fn is_root() -> bool {
-    false
 }
 
 /// Create a directory (and parents) owned by, and private to, the real user.
@@ -141,7 +117,6 @@ pub fn create_user_dir(path: &std::path::Path) -> std::io::Result<()> {
 /// not fatal: the durable-state checks reject a directory that is still
 /// unsafe, with a message that names it.
 pub fn make_private(path: &std::path::Path) {
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         let Ok(metadata) = std::fs::metadata(path) else {
@@ -164,8 +139,6 @@ pub fn make_private(path: &std::path::Path) {
             );
         }
     }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 /// `create_dir_all` with 0700 on every directory it creates.
@@ -178,23 +151,12 @@ pub fn make_private(path: &std::path::Path) {
 /// # Errors
 ///
 /// Returns an error if directory creation fails.
-#[cfg(unix)]
 pub fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(path)
-}
-
-/// Non-Unix fallback: no mode bits to set.
-///
-/// # Errors
-///
-/// Returns an error if directory creation fails.
-#[cfg(not(unix))]
-pub fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)
 }
 
 /// Write a file owned by the real user.
@@ -239,20 +201,6 @@ pub fn format_bytes_speed(bytes: u64) -> String {
     }
 }
 
-/// Returns the application configuration directory path.
-///
-/// Reads from the process-wide config dir set at startup via
-/// [`crate::config::set_config_dir`], ensuring `--config-dir` is respected
-/// everywhere. Falls back to default resolution if not yet set (e.g. tests).
-///
-/// # Errors
-///
-/// Returns an error if the home directory cannot be determined or
-/// if directory creation fails.
-pub fn get_app_config_dir() -> std::io::Result<std::path::PathBuf> {
-    crate::config::get_config_dir()
-}
-
 /// Returns the VPN profiles directory path.
 ///
 /// Creates the directory at `~/.config/vortix/profiles` if it doesn't exist.
@@ -261,7 +209,7 @@ pub fn get_app_config_dir() -> std::io::Result<std::path::PathBuf> {
 ///
 /// Returns an error if directory creation fails.
 pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
-    let root = get_app_config_dir()?;
+    let root = crate::config::get_config_dir()?;
     let path = root.join(crate::constants::PROFILES_DIR_NAME);
 
     // Unconditional: `create_user_dir` is idempotent, and running it on an
@@ -289,11 +237,10 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
 ///
 /// Returns an error if the config directory cannot be resolved or if the
 /// per-session subdirectory cannot be created at the required mode.
-#[cfg(unix)]
 pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
 
-    let root = get_app_config_dir()?;
+    let root = crate::config::get_config_dir()?;
     let tmp_root = root.join(crate::constants::TMP_CONFIG_DIR);
 
     // Create `tmp/` and the per-session subdir at 0o700 explicitly.
@@ -327,7 +274,6 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
 /// including crashes and [`std::process::exit`]. Keeping this value alive is
 /// what distinguishes a concurrently running Vortix session from a crash
 /// orphan; a different journal session ID alone is not proof of death.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct TempSessionLease {
     _file: std::fs::File,
@@ -349,7 +295,6 @@ pub fn temp_session_id() -> String {
 /// Returns an I/O error when the private directory or its no-follow lease
 /// file cannot be created, or when another process already holds the same
 /// session identity.
-#[cfg(unix)]
 pub fn acquire_temp_session_lease(
     config_dir: &std::path::Path,
     session_id: &str,
@@ -388,7 +333,6 @@ pub fn acquire_temp_session_lease(
     Ok(TempSessionLease { _file: file })
 }
 
-#[cfg(unix)]
 fn legacy_temp_session_process_is_live(session_id: &str) -> bool {
     let Some(pid) = session_id
         .rsplit_once('-')
@@ -410,7 +354,6 @@ fn legacy_temp_session_process_is_live(session_id: &str) -> bool {
 /// upgrade window their PID suffix remains a conservative liveness fallback.
 /// Unknown or inaccessible entries are retained rather than risking deletion
 /// of a live tunnel's teardown capability.
-#[cfg(unix)]
 pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::io::AsRawFd as _;
@@ -484,7 +427,6 @@ pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_i
 ///
 /// These directories hold rendered tunnel configuration. Discarding the error
 /// let them accumulate with no trace of why.
-#[cfg(unix)]
 fn remove_swept_session(path: &std::path::Path) {
     if let Err(error) = std::fs::remove_dir_all(path) {
         tracing::warn!(
@@ -494,22 +436,6 @@ fn remove_swept_session(path: &std::path::Path) {
             "could not remove an orphaned tunnel scratch directory"
         );
     }
-}
-
-/// Non-Unix fallback: no `chmod`, just `create_dir_all` via `create_user_dir`.
-///
-/// # Errors
-///
-/// Returns an error if the config directory cannot be resolved or directory
-/// creation fails.
-#[cfg(not(unix))]
-pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBuf> {
-    let root = get_app_config_dir()?;
-    let session_dir = root.join(crate::constants::TMP_CONFIG_DIR).join(session_id);
-    if !session_dir.exists() {
-        create_user_dir(&session_dir)?;
-    }
-    Ok(session_dir)
 }
 
 /// Strip a profile name down to ASCII `[A-Za-z0-9_-]` for safe use in
@@ -544,7 +470,7 @@ pub fn get_openvpn_run_paths(
     profile_key: &str,
 ) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
     validate_openvpn_artifact_key(profile_key)?;
-    let root = get_app_config_dir()?;
+    let root = crate::config::get_config_dir()?;
     let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
 
     if !run_dir.exists() {
@@ -562,7 +488,7 @@ pub fn get_openvpn_run_paths(
 /// parsing), so it's cheap enough for the startup orphan scan.
 #[must_use]
 pub fn tracked_openvpn_pids() -> Vec<u32> {
-    let Ok(root) = get_app_config_dir() else {
+    let Ok(root) = crate::config::get_config_dir() else {
         return Vec::new();
     };
     let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
@@ -597,20 +523,6 @@ pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &
     }
 }
 
-/// Non-Unix fallback: same 3-line bundle, no chmod.
-#[cfg(not(unix))]
-pub fn write_openvpn_scrv1_auth_file(
-    profile_name: &str,
-    username: &str,
-    password: &str,
-    otp: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    let auth_path = get_openvpn_scrv1_auth_path(profile_name)?;
-    let body = format!("{username}\n{password}\n{otp}\n");
-    write_user_file(&auth_path, body)?;
-    Ok(auth_path)
-}
-
 /// Read a .ovpn config and return the `static-challenge` prompt text if the
 /// directive is present.
 ///
@@ -642,7 +554,7 @@ pub fn read_openvpn_static_challenge_prompt(config_path: &std::path::Path) -> Op
 /// not block app startup. Each deletion is logged at warn level with
 /// the file name (NOT the file contents).
 pub fn scrub_stale_scrv1_auth_files() {
-    let Ok(root) = get_app_config_dir() else {
+    let Ok(root) = crate::config::get_config_dir() else {
         return;
     };
     let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
@@ -738,7 +650,6 @@ pub fn format_system_time_local(time: std::time::SystemTime) -> String {
     format_system_time_inner(time).unwrap_or_else(|| "00:00:00".to_string())
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
     let secs = time
@@ -762,16 +673,6 @@ fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
         "{:02}:{:02}:{:02}",
         tm.tm_hour, tm.tm_min, tm.tm_sec
     ))
-}
-
-#[cfg(not(unix))]
-fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
-    // Non-Unix fallback via the `time` crate (no subprocess shell-out).
-    use time::format_description::well_known::iso8601;
-    let odt = time::OffsetDateTime::from(time);
-    let format = time::format_description::parse("[hour]:[minute]:[second]").ok()?;
-    let _ = iso8601;
-    odt.format(&format).ok()
 }
 
 /// Formats a `SystemTime` into a compact relative time string (e.g., 1s, 2m, 3h, 4d).
@@ -874,7 +775,6 @@ pub(crate) fn binary_exists(name: &str) -> bool {
         if !candidate.is_file() {
             continue;
         }
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = candidate.metadata() {
@@ -882,10 +782,6 @@ pub(crate) fn binary_exists(name: &str) -> bool {
                     return true;
                 }
             }
-        }
-        #[cfg(not(unix))]
-        {
-            return true;
         }
     }
     false
@@ -915,16 +811,11 @@ pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
         if !metadata.is_file() {
             continue;
         }
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if metadata.permissions().mode() & 0o111 != 0 {
                 return Some(candidate);
             }
-        }
-        #[cfg(not(unix))]
-        {
-            return Some(candidate);
         }
     }
     None
@@ -946,8 +837,7 @@ pub(crate) fn resolvconf_works() -> bool {
     // Test with `--version` which works with both openresolv and systemd-resolvconf.
     // `resolvconf -l` (list) is not supported by systemd-resolvconf's shim.
     //
-    // The 10s cap mirrors the openvpn version-probe defense in
-    // `vpn_runtime/openvpn.rs`: this probe is called from
+    // The 10s cap mirrors the OpenVPN version probe: this probe is called from
     // `check_dependencies` on the UI thread during a connect press,
     // so a hung subprocess (broken DNS plumbing, locked /etc/resolv.conf,
     // an openresolv shim stuck on a syscall) would freeze the TUI until
@@ -1077,18 +967,10 @@ pub(crate) fn host_ipv6_disabled() -> bool {
 /// without locking (a placeholder — vortix tunnels are unsupported on
 /// Windows, so there is no lifecycle to serialize there yet).
 /// Process-lifetime guard for the legacy and installed writer locks.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct LifecycleLock {
     _legacy: std::fs::File,
     _installed: Option<std::fs::File>,
-}
-
-/// Process-lifetime guard for the legacy writer lock.
-#[cfg(not(unix))]
-#[derive(Debug)]
-pub struct LifecycleLock {
-    _legacy: std::fs::File,
 }
 
 /// Turn a lifecycle-lock failure into concise, actionable user-facing copy.
@@ -1108,14 +990,12 @@ pub fn lifecycle_lock_user_message(error: &std::io::Error) -> String {
     format!("Vortix could not open its session lock: {error}")
 }
 
-#[cfg(unix)]
 pub fn acquire_lifecycle_lock() -> std::io::Result<LifecycleLock> {
-    let root = get_app_config_dir()?;
+    let root = crate::config::get_config_dir()?;
     let owner_uid = invoking_owner_uid()?;
     acquire_lifecycle_lock_at(&root, owner_uid, crate::authority_lock::acquire_installed)
 }
 
-#[cfg(unix)]
 fn acquire_lifecycle_lock_at(
     root: &std::path::Path,
     owner_uid: u32,
@@ -1138,14 +1018,12 @@ fn acquire_lifecycle_lock_at(
     })
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code, reason = "geteuid returns the scalar effective uid")]
 fn invoking_owner_uid() -> std::io::Result<u32> {
     let effective_uid = unsafe { libc::geteuid() };
     invoking_owner_uid_from(effective_uid, std::env::var_os("SUDO_UID").as_deref())
 }
 
-#[cfg(unix)]
 fn invoking_owner_uid_from(
     effective_uid: u32,
     sudo_uid: Option<&std::ffi::OsStr>,
@@ -1169,7 +1047,6 @@ fn invoking_owner_uid_from(
         })
 }
 
-#[cfg(unix)]
 fn acquire_nonblocking_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd as _;
 
@@ -1195,17 +1072,6 @@ fn acquire_nonblocking_lock(path: &std::path::Path) -> std::io::Result<std::fs::
         return Err(std::io::Error::last_os_error());
     }
     Ok(file)
-}
-
-#[cfg(not(unix))]
-pub fn acquire_lifecycle_lock() -> std::io::Result<LifecycleLock> {
-    let root = get_app_config_dir()?;
-    let legacy = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(root.join("lifecycle.lock"))?;
-    Ok(LifecycleLock { _legacy: legacy })
 }
 
 /// Check whether a `WireGuard` config declares an IPv6 entry on an
@@ -1241,7 +1107,6 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
-    #[cfg(unix)]
     #[test]
     fn lifecycle_selector_holds_legacy_and_installed_locks_together() {
         use std::os::unix::fs::MetadataExt as _;
@@ -1269,7 +1134,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn lifecycle_selector_uses_legacy_only_when_package_marker_is_absent() {
         use std::os::unix::fs::MetadataExt as _;
@@ -1286,7 +1150,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn lifecycle_selector_never_falls_back_after_installed_lock_error() {
         use std::os::unix::fs::MetadataExt as _;
@@ -1307,7 +1170,6 @@ mod tests {
         assert!(acquire_nonblocking_lock(&directory.path().join("lifecycle.lock")).is_ok());
     }
 
-    #[cfg(unix)]
     #[test]
     fn lifecycle_selector_rejects_a_config_directory_owned_by_another_uid() {
         use std::os::unix::fs::MetadataExt as _;
@@ -1323,7 +1185,6 @@ mod tests {
         assert!(!directory.path().join("lifecycle.lock").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn invoking_owner_identity_is_independent_of_the_config_path() {
         assert_eq!(invoking_owner_uid_from(501, None).unwrap(), 501);
@@ -1356,13 +1217,10 @@ mod tests {
         // support (macOS, Ubuntu, Fedora). On Windows the test simply
         // asserts the function doesn't panic — non-Unix runners don't
         // have a guaranteed binary at a known PATH location.
-        #[cfg(unix)]
         assert!(
             binary_exists("sh"),
             "binary_exists should locate `sh` on Unix-like PATH"
         );
-        #[cfg(not(unix))]
-        let _ = binary_exists("sh");
     }
 
     #[test]
@@ -1386,7 +1244,6 @@ mod tests {
 
     #[test]
     fn find_binary_path_returns_existing_path_for_known_unix_binary() {
-        #[cfg(unix)]
         {
             let path =
                 find_binary_path("sh").expect("`sh` should be locatable on every Unix CI runner");
@@ -1828,7 +1685,6 @@ mod tests {
 
     // --- get_tmp_config_dir ---
 
-    #[cfg(unix)]
     #[test]
     fn test_get_tmp_config_dir_creates_session_subdir_at_0700() {
         use std::os::unix::fs::PermissionsExt;
@@ -1852,7 +1708,6 @@ mod tests {
         assert_eq!(root_perms.mode() & 0o777, 0o700);
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_get_tmp_config_dir_is_idempotent() {
         let _tmp = set_temp_config_dir();
@@ -1866,7 +1721,6 @@ mod tests {
     /// An install predating the 0700 rule keeps the umask's mode forever
     /// unless startup repairs it. macOS gives 0755, Ubuntu 0775; both leave
     /// VPN private keys readable by every other account on the machine.
-    #[cfg(unix)]
     #[test]
     fn an_existing_world_readable_directory_is_repaired() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1899,7 +1753,6 @@ mod tests {
 
     /// Narrowing only. A directory with no owner-execute bit must not gain
     /// one just because the repair ran.
-    #[cfg(unix)]
     #[test]
     fn make_private_never_widens_owner_access() {
         use std::os::unix::fs::PermissionsExt as _;

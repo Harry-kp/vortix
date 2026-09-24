@@ -398,12 +398,6 @@ pub(crate) fn process_group_has_live_members(_group_id: u32) -> std::io::Result<
     Ok(None)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-compile_error!("Vortix currently only supports macOS and Linux");
-
-// Re-export platform constants from the centralized constants module for convenience.
-pub use crate::constants::KILLSWITCH_EMERGENCY_MSG;
-
 fn syscall_result(result: libc::c_int) -> std::io::Result<()> {
     if result == 0 {
         Ok(())
@@ -513,12 +507,6 @@ pub fn firewall_inspect_hint() -> &'static str {
 #[must_use]
 pub fn firewall_inspect_hint() -> &'static str {
     "sudo nft list table inet vortix_killswitch"
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-#[must_use]
-pub fn firewall_inspect_hint() -> &'static str {
-    "(no firewall inspection command on this platform)"
 }
 
 /// Platform-appropriate install hint for a package.
@@ -694,7 +682,7 @@ pub fn check_dependencies(
                     OvpnVersionProbe::HelpFallbackOk => {}
                     OvpnVersionProbe::Unparseable => {
                         tracing::warn!(
-                            target: "vortix::vpn_runtime",
+                            target: "vortix::platform",
                             "openvpn version could not be determined; \
                              multi-tunnel DNS scoping may not work if the \
                              installed binary is older than 2.4"
@@ -912,6 +900,3 @@ mod ipv6_gate_tests {
         );
     }
 }
-
-#[cfg(test)]
-mod external_interface_tests {}

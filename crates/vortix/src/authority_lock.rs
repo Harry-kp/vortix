@@ -13,20 +13,13 @@
     reason = "descriptor-relative no-follow opens and flock require libc"
 )]
 
-#[cfg(unix)]
 use std::ffi::{CStr, CString};
-#[cfg(unix)]
 use std::fs::File;
-#[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
-#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
-#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
 const AUTHORITY_LOCK_MODE: u32 = 0o400;
 
 /// Where a packaged install puts its root-owned lock. Absent on any OS
@@ -38,12 +31,9 @@ const AUTHORITY_LOCK_PATH: Option<&str> = Some("/var/lib/vortix-public/authority
 // xtask:allow-platform-cfg: package layout is selected by the build target
 const AUTHORITY_LOCK_PATH: Option<&str> =
     Some("/Library/Application Support/Vortix/Public/authority.lock");
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const AUTHORITY_LOCK_PATH: Option<&str> = None;
 
 const AUTHORITY_LOCK_DIR_MODE: u32 = 0o755;
 
-#[cfg(unix)]
 struct AuthorityLockStore {
     path: PathBuf,
     expected_parent_owner_uid: u32,
@@ -51,7 +41,6 @@ struct AuthorityLockStore {
     expected_parent_mode: u32,
 }
 
-#[cfg(unix)]
 impl AuthorityLockStore {
     fn installed(path: &str, owner_uid: u32) -> Self {
         Self {
@@ -159,7 +148,6 @@ impl AuthorityLockStore {
     }
 }
 
-#[cfg(unix)]
 fn openat_read(directory: &File, name: &CStr) -> std::io::Result<File> {
     let fd = unsafe {
         libc::openat(
@@ -175,7 +163,6 @@ fn openat_read(directory: &File, name: &CStr) -> std::io::Result<File> {
     }
 }
 
-#[cfg(unix)]
 fn unsafe_path() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
@@ -183,17 +170,11 @@ fn unsafe_path() -> std::io::Error {
     )
 }
 
-#[cfg(unix)]
 pub(crate) fn acquire_installed(owner_uid: u32) -> std::io::Result<Option<File>> {
     let Some(path) = AUTHORITY_LOCK_PATH else {
         return Ok(None);
     };
     AuthorityLockStore::installed(path, owner_uid).acquire()
-}
-
-#[cfg(not(unix))]
-pub(crate) fn acquire_installed(_owner_uid: u32) -> std::io::Result<Option<std::fs::File>> {
-    Ok(None)
 }
 
 #[cfg(all(test, unix))]

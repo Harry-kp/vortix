@@ -579,8 +579,7 @@ pub fn validate_policy(active: &[ActiveTunnelInfo]) -> Result<()> {
 
 /// Enable kill switch with a per-tunnel ruleset.
 ///
-/// Routes through the process-global `Platform` aggregate. The per-OS
-/// impl lives in `macos`/`linux` and synthesises
+/// The per-OS impl in `macos`/`linux` synthesises
 /// allow rules for every entry in `active` plus an RFC1918 base with
 /// secondary-declared CIDRs subtracted.
 ///
@@ -612,7 +611,7 @@ pub fn verify_disabled() -> Result<()> {
 
 /// Get the state file path.
 fn get_state_path() -> Option<PathBuf> {
-    utils::get_app_config_dir()
+    crate::config::get_config_dir()
         .ok()
         .map(|dir| dir.join(constants::KILLSWITCH_STATE_FILE))
 }
@@ -848,7 +847,7 @@ fn filter_phantom_tunnels(state: &mut PersistedState, live: &[String]) {
 /// invalid, or a newer schema cannot be interpreted safely.
 pub fn load_state_checked() -> std::result::Result<Option<PersistedState>, PersistedStateLoadError>
 {
-    let path = utils::get_app_config_dir()
+    let path = crate::config::get_config_dir()
         .map_err(PersistedStateLoadError::ConfigDirectory)?
         .join(constants::KILLSWITCH_STATE_FILE);
     let content = match fs::read_to_string(&path) {

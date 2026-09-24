@@ -944,7 +944,6 @@ impl OvpnTunnel {
         // spawn would orphan it (--writepid last-write-wins clobbers the
         // record `down` uses for teardown). Dead-pid files fall through to
         // the stale cleanup below.
-        #[cfg(unix)]
         if let Ok(content) = std::fs::read_to_string(&pid_path) {
             if let Some(existing_pid) = content
                 .trim()

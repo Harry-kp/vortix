@@ -165,10 +165,10 @@ fn main() -> Result<()> {
 
     // Journal — open the per-session JSONL writer using the runner's own
     // tokio runtime after the authoritative settings path is known.
-    let runtime_handle = vortix::process::global_runner()
+    if let Some(handle) = vortix::process::global_runner()
         .as_real()
-        .map(|r| r.runtime().handle().clone());
-    if let Some(handle) = runtime_handle.clone() {
+        .map(|r| r.runtime().handle().clone())
+    {
         let _guard = handle.enter();
         match vortix::core::journal::Journal::open(vortix::core::journal::JournalConfig {
             disk: settings.journal.disk,
@@ -189,7 +189,6 @@ fn main() -> Result<()> {
             }
         }
     }
-    let _ = runtime_handle;
 
     // Clear any SCRV1 envelopes left on
     // disk by a previous crash mid-connect. Runs once at startup before

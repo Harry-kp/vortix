@@ -240,7 +240,6 @@ fn save(config_dir: &Path, receipt: &ManagedWireGuardReceipt) -> std::io::Result
     let bytes = serde_json::to_vec(receipt).map_err(std::io::Error::other)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
@@ -259,14 +258,8 @@ fn save(config_dir: &Path, receipt: &ManagedWireGuardReceipt) -> std::io::Result
     result
 }
 
-#[cfg(unix)]
 fn sync_directory(directory: &Path) -> std::io::Result<()> {
     File::open(directory)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
@@ -274,7 +267,6 @@ fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
     let path = config_dir.join(LOCK_FILE);
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options
@@ -283,7 +275,6 @@ fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
     }
     let file = options.open(path)?;
     chown_open_file_to_real_user(&file)?;
-    #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
         // SAFETY: `file` owns a valid descriptor for the duration of the lock.
@@ -296,7 +287,6 @@ fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-#[cfg(unix)]
 fn chown_open_file_to_real_user(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
@@ -319,11 +309,6 @@ fn chown_open_file_to_real_user(file: &File) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
-}
-
-#[cfg(not(unix))]
-fn chown_open_file_to_real_user(_file: &File) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn receipt_path(config_dir: &Path, profile_id: &ProfileId) -> PathBuf {

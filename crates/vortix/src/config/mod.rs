@@ -240,7 +240,6 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
         // showed it: umask 022 happens to produce an acceptable 0755. The
         // directory holds credentials and control state, so 0700 is what it
         // should have been regardless of the inherited umask.
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
@@ -306,7 +305,6 @@ fn real_user_home() -> Option<PathBuf> {
 }
 
 /// Looks up a user's home directory from `/etc/passwd` via `getpwnam`.
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn home_dir_for_user(username: &str) -> Option<PathBuf> {
     use std::ffi::{CStr, CString};
@@ -321,11 +319,6 @@ fn home_dir_for_user(username: &str) -> Option<PathBuf> {
         let home = CStr::from_ptr((*pw).pw_dir);
         home.to_str().ok().map(PathBuf::from)
     }
-}
-
-#[cfg(not(unix))]
-fn home_dir_for_user(_username: &str) -> Option<PathBuf> {
-    None
 }
 
 /// Loads `AppConfig` from `config.toml` in the given directory.
@@ -391,7 +384,6 @@ pub(crate) fn persist_theme_choice(
         ));
     }
 
-    #[cfg(unix)]
     {
         classify_theme_write(crate::config::owned_file::write_owned_atomic_with_hook(
             &directory,
@@ -402,20 +394,8 @@ pub(crate) fn persist_theme_choice(
             |_, _| Ok(()),
         ))
     }
-
-    #[cfg(not(unix))]
-    crate::config::owned_file::write_owned_atomic(
-        &directory,
-        CONFIG_FILE,
-        body.as_bytes(),
-        owner.0,
-        owner.1,
-    )
-    .map(|()| ThemePersistOutcome::Durable)
-    .map_err(|error| format!("could not save config.toml: {error}"))
 }
 
-#[cfg(unix)]
 fn classify_theme_write(
     result: Result<(), crate::config::owned_file::AtomicWriteError>,
 ) -> Result<ThemePersistOutcome, String> {
@@ -434,7 +414,6 @@ fn classify_theme_write(
 
 /// Resolve the principal that owns user configuration, including when the
 /// process was launched through `sudo`.
-#[cfg(unix)]
 pub(crate) fn config_owner(config_dir: &Path) -> Result<(u32, u32), String> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -459,11 +438,6 @@ pub(crate) fn config_owner(config_dir: &Path) -> Result<(u32, u32), String> {
     (metadata.uid() == uid)
         .then_some((uid, gid))
         .ok_or_else(|| "sudo owner does not own configuration".into())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn config_owner(_config_dir: &Path) -> Result<(u32, u32), String> {
-    Err("Standard-mode canonical control is unsupported on this platform".into())
 }
 
 /// Load the effective application configuration.
@@ -729,7 +703,6 @@ pub fn fix_ownership(path: &Path) {
 }
 
 /// Recursively chowns a path to `SUDO_UID`:`SUDO_GID`.
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn chown_to_real_user(path: &Path) -> std::io::Result<()> {
     let uid: u32 = std::env::var("SUDO_UID")
@@ -744,7 +717,6 @@ fn chown_to_real_user(path: &Path) -> std::io::Result<()> {
     chown_recursive(path, uid, gid)
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn chown_recursive(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -765,11 +737,6 @@ fn chown_recursive(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         }
     }
 
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn chown_to_real_user(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -970,7 +937,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn persist_theme_refuses_a_symlinked_config() {
         use std::os::unix::fs::symlink;
@@ -1034,7 +1000,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), source);
     }
 
-    #[cfg(unix)]
     #[test]
     fn published_theme_is_kept_when_directory_sync_is_uncertain() {
         let outcome = classify_theme_write(Err(
@@ -1050,7 +1015,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn persist_theme_refuses_writable_or_multiply_linked_config() {
         use std::os::unix::fs::PermissionsExt as _;

@@ -223,20 +223,10 @@ fn outcome_to_output(outcome: CommandOutcome) -> std::process::Output {
     )
 }
 
-#[cfg(unix)]
 fn make_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> std::process::Output {
     use std::os::unix::process::ExitStatusExt;
     std::process::Output {
         status: std::process::ExitStatus::from_raw(code << 8),
-        stdout,
-        stderr,
-    }
-}
-
-#[cfg(not(unix))]
-fn make_output(_code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> std::process::Output {
-    std::process::Output {
-        status: std::process::ExitStatus::default(),
         stdout,
         stderr,
     }

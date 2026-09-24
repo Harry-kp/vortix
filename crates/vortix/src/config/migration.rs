@@ -543,7 +543,6 @@ fn legacy_archive_entry(
     legacy_archive_entry_from_file(&file, file_name)
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn open_legacy_sidecar(path: &Path) -> std::io::Result<std::fs::File> {
     use std::ffi::CString;
@@ -574,11 +573,6 @@ fn open_legacy_sidecar(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-#[cfg(not(unix))]
-fn open_legacy_sidecar(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
-}
-
 fn legacy_archive_entry_from_file(
     file: &std::fs::File,
     file_name: String,
@@ -601,7 +595,6 @@ fn read_legacy_sidecar_bytes(
             "legacy sidecar is not a safe regular file: {file_name}"
         )));
     }
-    #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         if metadata.nlink() != 1 {
@@ -654,7 +647,6 @@ fn archive_legacy_sidecars(
     archive_legacy_sidecars_platform(profiles_dir, entries)
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn archive_legacy_sidecars_platform(
     profiles_dir: &Path,
@@ -760,7 +752,6 @@ fn archive_legacy_sidecars_platform(
     Ok(())
 }
 
-#[cfg(unix)]
 fn require_same_file(
     left: &std::fs::File,
     right: &std::fs::File,
@@ -779,7 +770,6 @@ fn require_same_file(
     Ok(())
 }
 
-#[cfg(unix)]
 fn require_link_count(
     file: &std::fs::File,
     expected: u64,
@@ -796,7 +786,6 @@ fn require_link_count(
     Ok(())
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn verify_open_directory_name(
     parent: &std::fs::File,
@@ -829,7 +818,6 @@ fn verify_open_directory_name(
     Ok(())
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn openat_verified_regular(
     directory: &std::fs::File,
@@ -857,7 +845,6 @@ fn openat_verified_regular(
     Ok(Some(file))
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn chown_open_file_to_invoking_user(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -876,40 +863,6 @@ fn chown_open_file_to_invoking_user(file: &std::fs::File) -> std::io::Result<()>
         .map_err(|error| invalid_data(format!("invalid SUDO_GID: {error}")))?;
     if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
         return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn archive_legacy_sidecars_platform(
-    profiles_dir: &Path,
-    entries: &[LegacySidecarArchiveEntry],
-) -> std::io::Result<()> {
-    let archive = profiles_dir.join(LEGACY_SIDECAR_ARCHIVE_DIR);
-    std::fs::create_dir(&archive).or_else(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    })?;
-    for entry in entries {
-        validate_legacy_archive_entry(entry)?;
-        let source = profiles_dir.join(&entry.file_name);
-        let destination = archive.join(&entry.file_name);
-        if source.exists() {
-            verify_archive_file(&std::fs::File::open(&source)?, entry)?;
-            match std::fs::hard_link(&source, &destination) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    verify_archive_file(&std::fs::File::open(&destination)?, entry)?;
-                }
-                Err(error) => return Err(error),
-            }
-            std::fs::remove_file(source)?;
-        } else {
-            verify_archive_file(&std::fs::File::open(destination)?, entry)?;
-        }
     }
     Ok(())
 }
@@ -1105,7 +1058,6 @@ fn legacy_v1_profile_id(config_path: &Path, display_name: &str) -> std::io::Resu
             config_path.display()
         )));
     }
-    #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         if metadata.nlink() != 1 {
@@ -1171,7 +1123,6 @@ fn validate_pending_archive(
     Ok(())
 }
 
-#[cfg(unix)]
 fn verified_path_if_present(
     path: &Path,
     expected: &LegacySidecarArchiveEntry,
@@ -1179,27 +1130,6 @@ fn verified_path_if_present(
     match open_legacy_sidecar(path) {
         Ok(file) => {
             verify_archive_file(&file, expected)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(not(unix))]
-fn verified_path_if_present(
-    path: &Path,
-    expected: &LegacySidecarArchiveEntry,
-) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            Err(invalid_data(format!(
-                "legacy sidecar is not a safe regular file: {}",
-                path.display()
-            )))
-        }
-        Ok(_) => {
-            verify_archive_file(&std::fs::File::open(path)?, expected)?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1886,7 +1816,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn hardlinked_legacy_sidecar_is_rejected_before_inventory_write() {
         let tmp = tempfile::tempdir().unwrap();

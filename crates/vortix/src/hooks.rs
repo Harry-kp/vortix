@@ -653,7 +653,6 @@ mod runner {
             }
         }
 
-        #[cfg(unix)]
         #[test]
         fn standard_owner_rejects_symlinked_configuration() {
             use std::os::unix::fs::symlink;

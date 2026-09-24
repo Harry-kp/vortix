@@ -2433,7 +2433,7 @@ pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
             CliError {
                 code: "persistence_failed",
                 message: format!("Could not durably save kill switch mode off: {error}"),
-                hint: Some(crate::platform::KILLSWITCH_EMERGENCY_MSG.to_string()),
+                hint: Some(crate::constants::KILLSWITCH_EMERGENCY_MSG.to_string()),
             },
             ExitCode::GeneralError,
         )
@@ -2481,7 +2481,7 @@ fn emergency_release_failed(mode: OutputMode, message: String) -> ! {
         CliError {
             code: "release_failed",
             message,
-            hint: Some(crate::platform::KILLSWITCH_EMERGENCY_MSG.to_string()),
+            hint: Some(crate::constants::KILLSWITCH_EMERGENCY_MSG.to_string()),
         },
         ExitCode::GeneralError,
     )

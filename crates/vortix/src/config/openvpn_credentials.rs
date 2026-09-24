@@ -346,7 +346,6 @@ impl FsOpenVpnCredentialStore {
         Ok(directory)
     }
 
-    #[cfg(unix)]
     #[allow(unsafe_code)]
     fn open_entry(
         &self,
@@ -438,17 +437,6 @@ impl FsOpenVpnCredentialStore {
         }))
     }
 
-    #[cfg(not(unix))]
-    fn open_entry(
-        &self,
-        _directory: &OwnedDirectory,
-        _key: &str,
-        _canonical_stable_id: bool,
-    ) -> Result<Option<OpenedCredential>, CredentialStoreError> {
-        Err(CredentialStoreError::Unsupported)
-    }
-
-    #[cfg(unix)]
     #[allow(unsafe_code)]
     fn clear_entry(
         &self,
@@ -481,16 +469,6 @@ impl FsOpenVpnCredentialStore {
         }
         Ok(true)
     }
-
-    #[cfg(not(unix))]
-    fn clear_entry(
-        &self,
-        _directory: &OwnedDirectory,
-        _key: &str,
-        _canonical_stable_id: bool,
-    ) -> Result<bool, CredentialStoreError> {
-        Err(CredentialStoreError::Unsupported)
-    }
 }
 
 struct OpenedCredential {
@@ -507,7 +485,6 @@ struct EntryIdentity {
     ctime_nanoseconds: i64,
 }
 
-#[cfg(unix)]
 impl EntryIdentity {
     fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
@@ -517,19 +494,6 @@ impl EntryIdentity {
             length: metadata.len(),
             ctime_seconds: metadata.ctime(),
             ctime_nanoseconds: metadata.ctime_nsec(),
-        }
-    }
-}
-
-#[cfg(not(unix))]
-impl EntryIdentity {
-    fn from_metadata(_metadata: &std::fs::Metadata) -> Self {
-        Self {
-            device: 0,
-            inode: 0,
-            length: 0,
-            ctime_seconds: 0,
-            ctime_nanoseconds: 0,
         }
     }
 }
@@ -544,7 +508,6 @@ struct EntryFacts {
     len: u64,
 }
 
-#[cfg(unix)]
 impl EntryFacts {
     fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
@@ -619,7 +582,6 @@ fn legacy_artifact_key(display_name: &str) -> Option<&str> {
     ProfileId::parse(key.to_owned()).is_err().then_some(key)
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn normalize_private_directory(
     directory: &OwnedDirectory,
@@ -667,14 +629,6 @@ fn normalize_private_directory(
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn normalize_private_directory(
-    _directory: &OwnedDirectory,
-    _expected_uid: u32,
-) -> Result<(), CredentialStoreError> {
-    Ok(())
-}
-
 fn validate_field(value: &str) -> Result<(), CredentialStoreError> {
     if value.is_empty()
         || value
@@ -705,7 +659,6 @@ fn validate_artifact_key(key: &str) -> Result<(), CredentialStoreError> {
         .map_err(|_| CredentialStoreError::UnsafeArtifact(CredentialArtifactIssue::ChangedEntry))
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn adopt_descriptor(file: &std::fs::File, uid: u32, gid: u32) -> Result<(), CredentialStoreError> {
     use std::os::fd::AsRawFd as _;
@@ -735,7 +688,6 @@ fn adopt_descriptor(file: &std::fs::File, uid: u32, gid: u32) -> Result<(), Cred
     Ok(())
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn entry_matches(
     directory: &OwnedDirectory,
@@ -768,15 +720,6 @@ fn entry_matches(
     Ok(expected == Some(actual))
 }
 
-#[cfg(not(unix))]
-fn entry_matches(
-    _directory: &OwnedDirectory,
-    _name: &str,
-    _expected: Option<EntryIdentity>,
-) -> Result<bool, FileError> {
-    Err(FileError::UnsafeFile)
-}
-
 fn map_file_error(error: FileError, operation: CredentialIoOperation) -> CredentialStoreError {
     match error {
         FileError::UnsafeFile => {
@@ -791,14 +734,8 @@ fn map_file_error(error: FileError, operation: CredentialIoOperation) -> Credent
     }
 }
 
-#[cfg(unix)]
 fn effective_owner() -> (u32, u32) {
     crate::utils::effective_user_group_ids()
-}
-
-#[cfg(not(unix))]
-const fn effective_owner() -> (u32, u32) {
-    (u32::MAX, u32::MAX)
 }
 
 #[cfg(test)]
@@ -961,7 +898,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlink_hardlink_malformed_and_oversized_records_remain_untouched() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
@@ -1024,7 +960,6 @@ mod tests {
         assert_eq!(std::fs::metadata(&large).unwrap().len(), MAX_AUTH_BYTES + 1);
     }
 
-    #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
     fn fifo_entry_is_rejected_without_blocking() {
@@ -1058,7 +993,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn stable_id_shaped_display_name_never_enters_legacy_namespace() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1081,7 +1015,6 @@ mod tests {
         assert_eq!(retained.username(), "first-user");
     }
 
-    #[cfg(unix)]
     #[test]
     fn existing_auth_directory_is_normalized_to_private_mode() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1102,7 +1035,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn failed_replacement_keeps_the_previous_complete_record() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1131,7 +1063,6 @@ mod tests {
         assert_eq!(loaded.password(), "old-pass");
     }
 
-    #[cfg(unix)]
     #[test]
     fn every_atomic_stage_has_a_truthful_failure_outcome() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1198,7 +1129,6 @@ mod tests {
         assert_no_atomic_temporary(&temp);
     }
 
-    #[cfg(unix)]
     fn assert_no_atomic_temporary(temp: &tempfile::TempDir) {
         let auth = temp.path().join(OPENVPN_AUTH_DIR);
         assert!(std::fs::read_dir(auth).unwrap().all(|entry| {
@@ -1210,7 +1140,6 @@ mod tests {
         }));
     }
 
-    #[cfg(unix)]
     #[test]
     fn changed_destination_is_not_overwritten_after_validation() {
         use std::os::unix::fs::PermissionsExt as _;

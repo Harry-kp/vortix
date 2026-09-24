@@ -496,9 +496,6 @@ pub mod dns {
         Persistence(String),
     }
 }
-pub mod interface {
-    //! `Interface` port — VPN interface detection.
-}
 pub mod killswitch {
     //! `Killswitch` port — kill-switch firewall control.
     //!
@@ -584,9 +581,6 @@ pub mod killswitch {
             self.interface.is_empty()
         }
     }
-}
-pub mod network_stats {
-    //! `NetworkStats` port — per-host byte counters.
 }
 pub mod process {
     //! `CommandRunner` port — the typed seam through which every subprocess flows.
@@ -1053,12 +1047,7 @@ pub mod socket_audit {
     }
 }
 pub mod tunnel {
-    //! `Tunnel` port — the per-protocol adapter the engine drives.
-    //!
-    //! Each protocol (`WireGuard`, `OpenVPN`, future `IKEv2`) implements this
-    //! trait in its own crate. The engine never branches on protocol after
-    //! construction — it routes once via `profile.protocol → TunnelKind` (the
-    //! aggregate carrier defined in the binary) and dispatches statically.
+    //! Types shared by the protocol adapters: handles, status, errors.
     //!
 
     use std::collections::{BTreeMap, BTreeSet};

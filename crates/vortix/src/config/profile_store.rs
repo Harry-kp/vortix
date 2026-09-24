@@ -34,7 +34,6 @@ pub(crate) struct ProfileMutationLock(std::fs::File);
 
 impl Drop for ProfileMutationLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
         {
             use std::os::fd::AsRawFd as _;
             // SAFETY: `flock` only consumes the valid descriptor owned by
@@ -57,7 +56,6 @@ pub(crate) fn acquire_profile_lock(
     reject_symlink(&path)?;
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
@@ -66,7 +64,6 @@ pub(crate) fn acquire_profile_lock(
     // Same reason as `write_atomic`: a lock created under `sudo` must not
     // lock out the unprivileged CLI that runs next.
     crate::config::fix_ownership(&path);
-    #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
         // SAFETY: the descriptor remains owned by the returned guard for the
@@ -1163,7 +1160,6 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     ));
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
@@ -1188,14 +1184,8 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
 struct FileSync;
 
 impl FileSync {
-    #[cfg(unix)]
     fn sync(path: &Path) -> std::io::Result<()> {
         std::fs::File::open(path)?.sync_all()
-    }
-
-    #[cfg(not(unix))]
-    fn sync(_path: &Path) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -1653,7 +1643,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_profile_root_is_rejected_before_creation() {
         use std::os::unix::fs::symlink;
@@ -1667,7 +1656,6 @@ mod tests {
         assert!(!outside.join("profiles").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn lock_contention_returns_typed_busy_error() {
         let tmp = tempfile::tempdir().unwrap();

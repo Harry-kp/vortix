@@ -364,7 +364,6 @@ fn kill_guardian_group() -> ! {
     }
 }
 
-#[cfg(unix)]
 pub(super) fn process_group_has_live_members(group_id: u32) -> Result<bool, ProcessError> {
     match probe_process_group(group_id)? {
         ProcessGroupProbe::Absent => return Ok(false),
@@ -379,7 +378,6 @@ pub(super) fn process_group_has_live_members(group_id: u32) -> Result<bool, Proc
     Ok(true)
 }
 
-#[cfg(unix)]
 pub(super) fn process_is_nonleader_group_member(
     process_id: u32,
     group_id: u32,
@@ -412,7 +410,6 @@ pub(super) fn process_is_nonleader_group_member(
     }
 }
 
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessGroupProbe {
     Absent,
@@ -420,7 +417,6 @@ enum ProcessGroupProbe {
     PermissionDenied,
 }
 
-#[cfg(unix)]
 fn probe_process_group(group_id: u32) -> Result<ProcessGroupProbe, ProcessError> {
     let pid = i32::try_from(group_id).map_err(|_| ProcessError::IoError {
         program: "managed-child".into(),
@@ -442,7 +438,6 @@ fn probe_process_group(group_id: u32) -> Result<ProcessGroupProbe, ProcessError>
     }
 }
 
-#[cfg(unix)]
 fn signal_process_group(child: Option<&OwnedProcess>, signal: i32) -> Result<(), ProcessError> {
     let Some(child) = child else { return Ok(()) };
     let pid = i32::try_from(child.guardian.id()).map_err(|_| ProcessError::IoError {
@@ -461,17 +456,6 @@ fn signal_process_group(child: Option<&OwnedProcess>, signal: i32) -> Result<(),
             source: std::io::Error::last_os_error(),
         })
     }
-}
-
-#[cfg(not(unix))]
-fn signal_process_group(_child: Option<&OwnedProcess>, _signal: i32) -> Result<(), ProcessError> {
-    Err(ProcessError::IoError {
-        program: "managed-child".into(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "managed process groups are not implemented on this platform",
-        ),
-    })
 }
 
 impl Default for RealRunner {
@@ -572,7 +556,6 @@ impl RealRunner {
 
 fn configure_owner_process(command: &mut Command, spec: &CommandSpec) {
     command.kill_on_drop(spec.terminate_process_group);
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
 
@@ -595,7 +578,6 @@ fn configure_owner_process(command: &mut Command, spec: &CommandSpec) {
     }
 }
 
-#[cfg(unix)]
 fn drop_credentials(groups: &[u32], gid: u32, uid: u32) -> std::io::Result<()> {
     // SAFETY: pointers remain valid for the duration of each syscall and all
     // values were prepared before fork. Ordering prevents reacquiring privilege.
@@ -612,7 +594,6 @@ fn drop_credentials(groups: &[u32], gid: u32, uid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn current_groups() -> Result<Vec<u32>, ProcessError> {
     // SAFETY: the first call obtains the required length; the second writes
     // into an allocated vector of exactly that length.
@@ -637,7 +618,6 @@ fn current_groups() -> Result<Vec<u32>, ProcessError> {
 }
 
 async fn terminate_child(child: &mut tokio::process::Child, process_group: bool) {
-    #[cfg(unix)]
     if process_group {
         if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
             // SAFETY: the child was placed in a fresh group whose id is its pid.
@@ -649,15 +629,11 @@ async fn terminate_child(child: &mut tokio::process::Child, process_group: bool)
     } else {
         let _ = child.start_kill();
     }
-    #[cfg(not(unix))]
-    let _ = child.start_kill();
     let _ = child.wait().await;
 }
 
-#[cfg(unix)]
 struct ProcessGroupGuard(Option<i32>);
 
-#[cfg(unix)]
 impl ProcessGroupGuard {
     fn new(child: &tokio::process::Child, enabled: bool) -> Self {
         Self(
@@ -680,7 +656,6 @@ impl ProcessGroupGuard {
     }
 }
 
-#[cfg(unix)]
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         self.contain_descendants();
@@ -736,7 +711,6 @@ impl RealRunner {
                 }
             }
         })?;
-        #[cfg(unix)]
         let mut process_group = ProcessGroupGuard::new(&child, spec.terminate_process_group);
 
         // Optionally write stdin.
@@ -782,7 +756,6 @@ impl RealRunner {
                     source,
                 })?
             };
-            #[cfg(unix)]
             process_group.contain_descendants();
             let (stdout, stdout_overflow) = stdout_task
                 .await
@@ -839,7 +812,6 @@ impl RealRunner {
                         source: e,
                     })?
             };
-            #[cfg(unix)]
             process_group.contain_descendants();
             (output.status, output.stdout, output.stderr)
         };
@@ -870,15 +842,9 @@ impl RealRunner {
     }
 }
 
-#[cfg(unix)]
 fn signal_from_status(status: std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
     status.signal()
-}
-
-#[cfg(not(unix))]
-fn signal_from_status(_status: std::process::ExitStatus) -> Option<i32> {
-    None
 }
 
 fn redact_args(args: &[String], redact_indices: &[usize]) -> Vec<String> {

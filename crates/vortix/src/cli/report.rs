@@ -268,7 +268,6 @@ fn get_os_info() -> String {
 /// Replaces the shell-out to `uname` in `get_os_info`. Pure libc; no
 /// PATH dependency; ~10× faster than spawning a subprocess.
 ///
-#[cfg(unix)] // xtask:allow-platform-cfg: utsname is a Unix concept
 fn uname_release() -> Option<String> {
     // SAFETY: `libc::uname` writes a `utsname` struct's worth of bytes
     // into the pointer we provide. We pass a zero-initialised stack
@@ -698,9 +697,6 @@ fn copy_to_clipboard(text: &str) -> bool {
             .or_else(|| pipe_to_command("xsel", text))
             .or_else(|| pipe_to_command("wl-copy", text))
     };
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let result: Option<()> = None;
 
     result.is_some()
 }

@@ -23,8 +23,3 @@ pub mod secret_file;
 pub mod standard_tunnel_ownership;
 pub mod telemetry;
 pub mod telemetry_http;
-
-pub use cidr::{claims_default_route_v6, Cidr};
-pub use cidr_subtract::cidr_subtract;
-pub use scanner::{get_active_profiles, ActiveSession};
-pub use telemetry::{spawn_telemetry_worker, TelemetryUpdate};

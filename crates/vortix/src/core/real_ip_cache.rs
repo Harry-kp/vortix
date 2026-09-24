@@ -101,7 +101,6 @@ fn save_to(config_dir: &Path, file: &str, ip: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    #[cfg(unix)]
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -115,10 +114,6 @@ fn save_to(config_dir: &Path, file: &str, ip: &str) {
             let _ = f.write_all(content.as_bytes());
             let _ = f.flush();
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::write(&path, content);
     }
 }
 
@@ -246,7 +241,6 @@ mod tests {
         assert!(load(&dir).is_none(), "empty saves must be no-ops");
     }
 
-    #[cfg(unix)]
     #[test]
     fn save_sets_mode_0600_on_unix() {
         use std::os::unix::fs::PermissionsExt as _;

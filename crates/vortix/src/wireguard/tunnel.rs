@@ -348,7 +348,6 @@ fn write_managed_config_in_wireguard_dir(
         .file_name()
         .ok_or_else(|| TunnelError::Subprocess("WireGuard config has no basename".into()))?;
 
-    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
         std::fs::DirBuilder::new()
@@ -404,14 +403,11 @@ fn create_lifecycle_dir(session_root: &Path) -> Result<PathBuf, TunnelError> {
     for _ in 0..16 {
         let sequence = NEXT_LIFECYCLE.fetch_add(1, Ordering::Relaxed);
         let path = session_root.join(format!("wg-{}-{sequence}", std::process::id()));
-        #[cfg(unix)]
         let result = {
             use std::os::unix::fs::DirBuilderExt;
             let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700).create(&path)
         };
-        #[cfg(not(unix))]
-        let result = std::fs::create_dir(&path);
 
         match result {
             Ok(()) => return Ok(path),
@@ -1907,7 +1903,6 @@ mod tests {
     /// Per-test isolation: build a fresh session-style subdir at mode `0o700`
     /// under a tempdir. Avoids touching the process-global `config_dir`
     /// (`OnceLock` → first-write-wins → races across tests when set in each).
-    #[cfg(unix)]
     fn fresh_session_dir() -> (tempfile::TempDir, std::path::PathBuf) {
         use std::os::unix::fs::DirBuilderExt;
 
@@ -1924,18 +1919,6 @@ mod tests {
         (root, session)
     }
 
-    #[cfg(not(unix))]
-    fn fresh_session_dir() -> (tempfile::TempDir, std::path::PathBuf) {
-        let root = tempfile::Builder::new()
-            .prefix("vortix_wg_tunnel_test_")
-            .tempdir()
-            .unwrap();
-        let session = root.path().join("tmp").join("sid-test");
-        std::fs::create_dir_all(&session).unwrap();
-        (root, session)
-    }
-
-    #[cfg(unix)]
     #[test]
     fn fresh_session_dir_is_0700() {
         // Sanity-check the test fixture mirrors the production permission
@@ -1983,7 +1966,6 @@ mod tests {
         assert!(std::fs::read_dir(&session).unwrap().next().is_none());
     }
 
-    #[cfg(unix)]
     #[test]
     fn managed_temp_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;

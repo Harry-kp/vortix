@@ -477,7 +477,7 @@ fn check_openvpn_by_pid(
     // scanner sees a live openvpn process, and instead of guessing the
     // iface via lsof (which fails on macOS for modern openvpn's utun
     // socket), we read the log vortix's own protocol layer wrote.
-    if let Ok(config_dir) = crate::utils::get_app_config_dir() {
+    if let Ok(config_dir) = crate::config::get_config_dir() {
         let run_dir = config_dir.join(crate::constants::OPENVPN_RUN_DIR);
         let canonical_log = run_dir.join(format!("{profile_id}.log"));
         let log_path = if canonical_log.exists() {

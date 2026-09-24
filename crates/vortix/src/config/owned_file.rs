@@ -4,13 +4,8 @@ use std::path::Path;
 
 use thiserror::Error;
 
-#[cfg(unix)]
 pub(crate) type OwnedDirectory = std::fs::File;
 
-#[cfg(not(unix))]
-pub(crate) type OwnedDirectory = PathBuf;
-
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicWriteStage {
     Create,
@@ -22,14 +17,12 @@ pub(crate) enum AtomicWriteStage {
     DirectorySync,
 }
 
-#[cfg(unix)]
 #[derive(Debug)]
 pub(crate) enum AtomicWriteError {
     NotPublished(FileError),
     PublishedButDirectoryUnsynced(FileError),
 }
 
-#[cfg(unix)]
 impl AtomicWriteError {
     pub(crate) fn into_file_error(self) -> FileError {
         match self {
@@ -38,21 +31,18 @@ impl AtomicWriteError {
     }
 }
 
-#[cfg(unix)]
 impl From<FileError> for AtomicWriteError {
     fn from(error: FileError) -> Self {
         Self::NotPublished(error)
     }
 }
 
-#[cfg(unix)]
 impl From<std::io::Error> for AtomicWriteError {
     fn from(error: std::io::Error) -> Self {
         Self::NotPublished(FileError::Io(error))
     }
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 #[allow(clippy::similar_names)]
 pub(crate) fn open_owned_directory(
@@ -119,7 +109,6 @@ pub(crate) fn open_owned_directory(
     Ok(Some(directory))
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 #[allow(clippy::similar_names)]
 pub(crate) fn open_owned_directory_at(
@@ -194,7 +183,6 @@ pub(crate) fn open_owned_directory_at(
     Ok(Some(directory))
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn open_absolute_directory(path: &Path) -> Result<std::fs::File, FileError> {
     use std::ffi::CString;
@@ -231,7 +219,6 @@ fn open_absolute_directory(path: &Path) -> Result<std::fs::File, FileError> {
     Ok(directory)
 }
 
-#[cfg(unix)]
 fn validate_directory_descriptor(
     directory: &std::fs::File,
     expected_uid: u32,
@@ -248,12 +235,10 @@ fn validate_directory_descriptor(
     Ok(())
 }
 
-#[cfg(unix)]
 fn is_unsafe_path_error(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(code) if code == libc::ELOOP || code == libc::ENOTDIR)
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn prepare_created_descriptor(
     descriptor: &std::fs::File,
@@ -288,7 +273,6 @@ fn prepare_created_descriptor(
     }
     Ok(())
 }
-#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct EntryReadPolicy {
     max_bytes: u64,
@@ -296,7 +280,6 @@ struct EntryReadPolicy {
     require_single_link: bool,
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 fn read_owned_entry_with_policy(
     directory: &OwnedDirectory,
@@ -355,7 +338,6 @@ fn read_owned_entry_with_policy(
 /// Unlike canonical private state, ordinary user configuration may be
 /// world-readable for compatibility, but it must never be writable by a
 /// different principal.
-#[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn read_owned_user_entry(
     directory: &OwnedDirectory,
@@ -375,7 +357,6 @@ pub(crate) fn read_owned_user_entry(
     )
 }
 
-#[cfg(unix)]
 pub(crate) fn write_owned_atomic(
     directory: &OwnedDirectory,
     name: &str,
@@ -387,7 +368,6 @@ pub(crate) fn write_owned_atomic(
         .map_err(AtomicWriteError::into_file_error)
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn write_owned_atomic_with_hook(
     directory: &OwnedDirectory,
@@ -480,63 +460,6 @@ pub(crate) fn write_owned_atomic_with_hook(
         let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_name_c.as_ptr(), 0) };
     }
     result
-}
-
-#[cfg(not(unix))]
-pub(crate) fn open_owned_directory(
-    path: &Path,
-    create: bool,
-    _expected_uid: u32,
-    _expected_gid: u32,
-) -> Result<Option<OwnedDirectory>, FileError> {
-    if !path.exists() {
-        if !create {
-            return Ok(None);
-        }
-        std::fs::create_dir_all(path)?;
-    }
-    path.is_dir()
-        .then(|| path.to_path_buf())
-        .map(Some)
-        .ok_or(FileError::UnsafeFile)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn open_owned_directory_at(
-    parent: &OwnedDirectory,
-    name: &str,
-    create: bool,
-    expected_uid: u32,
-    expected_gid: u32,
-) -> Result<Option<OwnedDirectory>, FileError> {
-    open_owned_directory(&parent.join(name), create, expected_uid, expected_gid)
-}
-#[cfg(not(unix))]
-pub(crate) fn read_owned_user_entry(
-    directory: &OwnedDirectory,
-    name: &str,
-    _expected_uid: u32,
-    max_bytes: u64,
-) -> Result<Option<Vec<u8>>, FileError> {
-    let path = directory.join(name);
-    match std::fs::read(path) {
-        Ok(bytes) if bytes.len() as u64 <= max_bytes => Ok(Some(bytes)),
-        Ok(_) => Err(FileError::Capacity),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn write_owned_atomic(
-    directory: &OwnedDirectory,
-    name: &str,
-    body: &[u8],
-    _uid: u32,
-    _gid: u32,
-) -> Result<(), FileError> {
-    crate::config::profile_store::write_atomic(&directory.join(name), body)?;
-    Ok(())
 }
 
 #[derive(Debug, Error)]

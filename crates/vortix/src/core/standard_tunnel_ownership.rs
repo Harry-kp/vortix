@@ -270,20 +270,16 @@ impl StandardTunnelOwnershipStore {
             }
             Err(error) => return Err(error.into()),
         };
-        #[cfg(unix)]
         if created {
             std::fs::set_permissions(
                 &self.root,
                 <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
             )?;
         }
-        #[cfg(not(unix))]
-        let _ = created;
         let metadata = std::fs::symlink_metadata(&self.root)?;
         if !metadata.is_dir() {
             return Err(StandardOwnershipError::UnsafePath);
         }
-        #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
             if metadata.uid() != self.expected_runtime_uid
@@ -303,7 +299,6 @@ impl StandardTunnelOwnershipStore {
         let path = self.record_path(profile_id);
         let mut options = OpenOptions::new();
         options.read(true);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
@@ -346,7 +341,6 @@ impl StandardTunnelOwnershipStore {
             .join(format!(".{leaf}.{}.tmp", std::process::id()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options
@@ -424,7 +418,6 @@ fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, Standa
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err(StandardOwnershipError::UnsafePath);
     }
-    #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o077 != 0 {
@@ -433,7 +426,6 @@ fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, Standa
     }
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
@@ -468,15 +460,12 @@ fn validate_owned_file(
     if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(StandardOwnershipError::UnsafePath);
     }
-    #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o077 != 0 {
             return Err(StandardOwnershipError::UnsafePath);
         }
     }
-    #[cfg(not(unix))]
-    let _ = expected_uid;
     Ok(())
 }
 
@@ -516,7 +505,6 @@ mod tests {
         // because that basename is `wg-quick`'s stable interface identity.
         let path = root.join(format!("{byte}.conf"));
         std::fs::write(&path, "[Interface]\nPrivateKey = lifecycle-copy\n").unwrap();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -683,7 +671,6 @@ mod tests {
         )
         .unwrap();
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let record = store.record_path(&first.id);
@@ -716,7 +703,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn unsafe_directory_mode_and_symlink_record_are_rejected() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
