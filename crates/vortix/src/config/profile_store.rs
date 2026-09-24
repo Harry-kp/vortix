@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1141,40 +1140,14 @@ fn reject_symlink_io(path: &Path) -> std::io::Result<()> {
 /// sidecars are 0600, but a group-writable directory still allows renaming or
 /// replacing them.
 pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
-    })?;
-    reject_symlink_io(parent)?;
-    reject_symlink_io(path)?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = path.with_extension(format!(
-        "{}.{}.{}.tmp",
-        path.extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("file"),
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-    ));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    file.write_all(body)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    // The TUI requires root, so these 0600 files are born root-owned under
-    // `sudo vortix` and every later unprivileged CLI call then fails to read
-    // them. Hand them to the invoking user, same contract as the config dir.
-    // No-op when not root, and when invoked as direct root there is no user
-    // to hand them to.
-    crate::config::fix_ownership(path);
-    sync_dir(parent)
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a file path");
+    let parent = path.parent().ok_or_else(invalid)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(invalid)?;
+    crate::utils::create_user_dir(parent)?;
+    crate::config::owned_file::write_user_file_atomic(parent, name, body)
 }
 
 fn sync_dir(path: &Path) -> std::io::Result<()> {

@@ -1,16 +1,15 @@
 //! Crash-safe local persistence for DNS desired/effective generations.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::owned_file;
 use crate::core::ports::dns::DnsPolicyCoordinator;
 
 const DNS_POLICY_STATE_FILE: &str = "dns-policy.state";
+const DNS_POLICY_LOCK_FILE: &str = "dns-policy.lock";
 const DNS_POLICY_SCHEMA: u8 = 2;
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Serialize all DNS policy writers across CLI and TUI processes. This lock
 /// is intentionally distinct from the lifecycle lock so a CLI command that
@@ -25,16 +24,10 @@ fn acquire_policy_lock_with_hook(
 ) -> std::io::Result<std::fs::File> {
     use std::os::fd::AsRawFd as _;
 
-    let directory = open_pinned_config_dir(config_dir)?;
+    let (directory, uid, gid) = owned_file::pin_user_dir(config_dir)?;
     after_pin();
-    let file = openat_file(
-        &directory,
-        "dns-policy.lock",
-        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        0o600,
-    )?;
-    require_regular_file(&file, "DNS policy lock")?;
-    crate::config::chown_to_invoking_user(&file)?;
+    let file = owned_file::open_owned_lock(&directory, DNS_POLICY_LOCK_FILE, uid, gid)
+        .map_err(std::io::Error::other)?;
     #[allow(unsafe_code)]
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc == 0 {
@@ -75,256 +68,15 @@ fn atomic_write_user_file(config_dir: &Path, content: &[u8]) -> std::io::Result<
     atomic_write_user_file_with_hook(config_dir, content, || {})
 }
 
-/// Pin the destination directory before creating any file. Every subsequent
-/// operation is relative to that descriptor, so replacing any pathname with
-/// a symlink cannot redirect a privileged writer.
 fn atomic_write_user_file_with_hook(
     config_dir: &Path,
     content: &[u8],
     after_pin: impl FnOnce(),
 ) -> std::io::Result<()> {
-    let directory = open_pinned_config_dir(config_dir)?;
+    let (directory, uid, gid) = owned_file::pin_user_dir(config_dir)?;
     after_pin();
-    let (temp_name, mut file) = create_private_temp(&directory)?;
-    let result = (|| {
-        file.write_all(content)?;
-        file.sync_all()?;
-        crate::config::chown_to_invoking_user(&file)?;
-        renameat(&directory, &temp_name, DNS_POLICY_STATE_FILE)?;
-        directory.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = unlinkat(&directory, &temp_name);
-    }
-    result
-}
-
-fn create_private_temp(directory: &std::fs::File) -> std::io::Result<(String, std::fs::File)> {
-    for _ in 0..128 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = format!(
-            ".{DNS_POLICY_STATE_FILE}.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        );
-        match openat_file(
-            directory,
-            &name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        ) {
-            Ok(file) => return Ok((name, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a private DNS state temp file",
-    ))
-}
-
-#[allow(unsafe_code)]
-fn open_pinned_config_dir(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let path = canonical_parent_with_leaf(path)?;
-    let root_path = CString::new("/").expect("static path");
-    let fd = unsafe {
-        libc::open(
-            root_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut directory = unsafe { std::fs::File::from_raw_fd(fd) };
-
-    for component in path.components() {
-        use std::path::Component;
-        let Component::Normal(component) = component else {
-            if matches!(component, Component::RootDir | Component::CurDir) {
-                continue;
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "DNS config directory must not contain parent components",
-            ));
-        };
-        let name = CString::new(component.as_bytes()).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "DNS config directory contains a NUL byte",
-            )
-        })?;
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let mut child_fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        let mut created = false;
-        if child_fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
-            let mkdir_result =
-                unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
-            if mkdir_result == 0 {
-                created = true;
-            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-                return Err(std::io::Error::last_os_error());
-            }
-            child_fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        }
-        if child_fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let child = unsafe { std::fs::File::from_raw_fd(child_fd) };
-        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(child.as_raw_fd(), metadata.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let metadata = unsafe { metadata.assume_init() };
-        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                "DNS config path component is not a directory",
-            ));
-        }
-        if created {
-            crate::config::chown_to_invoking_user(&child)?;
-            directory.sync_all()?;
-        }
-        directory = child;
-    }
-    Ok(directory)
-}
-
-/// Resolve only the already-existing parent ancestry. The final config-dir
-/// component remains unresolved and is opened with `O_NOFOLLOW`, so a
-/// symlink at the authority boundary is rejected rather than canonicalized
-/// into an attacker-selected directory.
-fn canonical_parent_with_leaf(path: &Path) -> std::io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let Some(leaf) = absolute.file_name().map(ToOwned::to_owned) else {
-        return absolute.canonicalize();
-    };
-    let mut ancestor = absolute.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "DNS config directory has no parent",
-        )
-    })?;
-    let mut missing = Vec::new();
-    while !ancestor.exists() {
-        let component = ancestor.file_name().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "DNS config directory has no existing ancestor",
-            )
-        })?;
-        missing.push(component.to_os_string());
-        ancestor = ancestor.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "DNS config directory has no existing ancestor",
-            )
-        })?;
-    }
-    let mut canonical = ancestor.canonicalize()?;
-    for component in missing.into_iter().rev() {
-        canonical.push(component);
-    }
-    canonical.push(leaf);
-    Ok(canonical)
-}
-
-#[allow(unsafe_code)]
-fn openat_file(
-    directory: &std::fs::File,
-    name: &str,
-    flags: libc::c_int,
-    mode: libc::mode_t,
-) -> std::io::Result<std::fs::File> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
-    let name = CString::new(name).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "file name contains a NUL byte",
-        )
-    })?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            flags,
-            libc::c_uint::from(mode),
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-    }
-}
-
-#[allow(unsafe_code)]
-fn require_regular_file(file: &std::fs::File, label: &str) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{label} is not a regular file"),
-        ))
-    }
-}
-
-#[allow(unsafe_code)]
-fn renameat(directory: &std::fs::File, from: &str, to: &str) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd as _;
-
-    let from = CString::new(from).expect("generated temp name has no NUL");
-    let to = CString::new(to).expect("static state name has no NUL");
-    let result = unsafe {
-        libc::renameat(
-            directory.as_raw_fd(),
-            from.as_ptr(),
-            directory.as_raw_fd(),
-            to.as_ptr(),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[allow(unsafe_code)]
-fn unlinkat(directory: &std::fs::File, name: &str) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd as _;
-
-    let name = CString::new(name).expect("generated temp name has no NUL");
-    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    owned_file::write_owned_atomic(&directory, DNS_POLICY_STATE_FILE, content, uid, gid)
+        .map_err(std::io::Error::other)
 }
 
 #[cfg(test)]

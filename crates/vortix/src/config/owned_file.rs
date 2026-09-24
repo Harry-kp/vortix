@@ -462,6 +462,69 @@ pub(crate) fn write_owned_atomic_with_hook(
     result
 }
 
+/// Who Vortix-written user state belongs to: the sudo user under sudo,
+/// otherwise the current user.
+pub(crate) fn invoking_owner() -> std::io::Result<(u32, u32)> {
+    Ok(match crate::config::sudo_ids()? {
+        Some(ids) if crate::utils::is_root() => ids,
+        _ => crate::utils::effective_user_group_ids(),
+    })
+}
+
+/// Pin `dir` (creating the leaf if missing) for the invoking user.
+pub(crate) fn pin_user_dir(dir: &Path) -> std::io::Result<(OwnedDirectory, u32, u32)> {
+    let (uid, gid) = invoking_owner()?;
+    let directory = open_owned_directory(dir, true, uid, gid)
+        .map_err(std::io::Error::other)?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    Ok((directory, uid, gid))
+}
+
+/// Atomically replace `dir/name` with `body`, owned by the invoking user,
+/// without following links anywhere in the write.
+pub(crate) fn write_user_file_atomic(dir: &Path, name: &str, body: &[u8]) -> std::io::Result<()> {
+    let (directory, uid, gid) = pin_user_dir(dir)?;
+    write_owned_atomic(&directory, name, body, uid, gid).map_err(std::io::Error::other)
+}
+
+/// Open (creating if needed) a lock file inside a pinned directory without
+/// following links, and give it to `uid:gid` with mode 0600.
+#[allow(unsafe_code)]
+pub(crate) fn open_owned_lock(
+    directory: &OwnedDirectory,
+    name: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<std::fs::File, FileError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = CString::new(name).map_err(|_| FileError::UnsafeFile)?;
+    // O_NONBLOCK: a FIFO planted at the name must not hang the open.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(if is_unsafe_path_error(&error) {
+            FileError::UnsafeFile
+        } else {
+            error.into()
+        });
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(FileError::UnsafeFile);
+    }
+    prepare_created_descriptor(&file, uid, gid, 0o600)?;
+    Ok(file)
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum FileError {
     #[error("private state exceeds its fixed capacity")]

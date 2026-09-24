@@ -6,9 +6,8 @@
 //! kernel absence observation.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +22,6 @@ const LOCK_FILE: &str = "managed-wireguard.lock";
 const SCHEMA_VERSION: u8 = 1;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_TRACKED_RECEIPTS: usize = 512;
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// A successful, generation-bound `WireGuard` connect issued by Vortix.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -225,39 +223,10 @@ pub fn remove_after_confirmed_absence(
 
 fn save(config_dir: &Path, receipt: &ManagedWireGuardReceipt) -> std::io::Result<()> {
     let directory = config_dir.join(DIRECTORY);
-    if std::fs::symlink_metadata(&directory).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "managed WireGuard state directory must not be a symlink",
-        ));
-    }
     crate::utils::create_user_dir(&directory)?;
-    let path = receipt_path(config_dir, &ProfileId::new(&receipt.profile_id));
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp = directory.join(format!(".receipt-{}-{sequence}.tmp", std::process::id()));
+    let key = ProfileId::new(&receipt.profile_id).digest_key(16);
     let bytes = serde_json::to_vec(receipt).map_err(std::io::Error::other)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp)?;
-    let result = (|| {
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        crate::config::chown_to_invoking_user(&file)?;
-        std::fs::rename(&temp, &path)?;
-        sync_directory(&directory)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp);
-    }
-    result
-}
-
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    File::open(directory)?.sync_all()
+    crate::config::owned_file::write_user_file_atomic(&directory, &format!("{key}.json"), &bytes)
 }
 
 fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
