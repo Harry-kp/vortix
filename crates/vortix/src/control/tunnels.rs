@@ -56,7 +56,7 @@ impl Live {
         self.handle
             .openvpn_routes
             .as_ref()
-            .and_then(OpenVpnRouteEvidence::selected_remote)
+            .and_then(OpenVpnRouteEvidence::pinned_server)
     }
 
     /// DNS the tunnel negotiated. `WireGuard` DNS comes from its profile.

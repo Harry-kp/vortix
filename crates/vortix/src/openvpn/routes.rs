@@ -351,4 +351,48 @@ impl OpenVpnRouteEvidence {
     pub const fn selected_remote(&self) -> Option<IpAddr> {
         self.selected_remote
     }
+
+    /// The server address to pin to the physical gateway. None under
+    /// `redirect-gateway local`: the server is on the local subnet.
+    #[must_use]
+    pub fn pinned_server(&self) -> Option<IpAddr> {
+        let local = [
+            self.configured.redirect_gateway(),
+            self.pushed.redirect_gateway(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|redirect| redirect.flags().contains(&OpenVpnRedirectFlag::Local));
+        self.selected_remote.filter(|_| !local)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence(flags: Vec<OpenVpnRedirectFlag>) -> OpenVpnRouteEvidence {
+        let redirect = OpenVpnRedirectGateway::new(flags).unwrap();
+        OpenVpnRouteEvidence::new(
+            OpenVpnRouteSetEvidence::new(Vec::new(), Some(redirect)).unwrap(),
+            OpenVpnRouteSetEvidence::new(Vec::new(), None).unwrap(),
+        )
+        .unwrap()
+        .with_selected_remote(Some("192.168.1.50".parse().unwrap()))
+        .unwrap()
+    }
+
+    /// `redirect-gateway local` says the server shares the local subnet, so
+    /// pinning it via the router would be wrong; `OpenVPN` adds no server route.
+    #[test]
+    fn a_local_server_is_not_pinned_to_the_gateway() {
+        assert_eq!(
+            evidence(vec![OpenVpnRedirectFlag::Def1]).pinned_server(),
+            Some("192.168.1.50".parse().unwrap())
+        );
+        assert_eq!(
+            evidence(vec![OpenVpnRedirectFlag::Def1, OpenVpnRedirectFlag::Local]).pinned_server(),
+            None
+        );
+    }
 }
