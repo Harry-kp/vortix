@@ -208,19 +208,12 @@ pub fn update_health(
 }
 
 /// Remove after the caller has already established exact profile absence.
-/// With `generation`, a newer generation's receipt is left in place.
 pub fn remove_after_confirmed_absence(
     config_dir: &Path,
     profile_id: &ProfileId,
-    generation: Option<u64>,
 ) -> std::io::Result<bool> {
     let _lock = acquire_lock(config_dir)?;
     let path = receipt_path(config_dir, profile_id);
-    if generation.is_some_and(|generation| {
-        load_receipt_path(&path).is_some_and(|receipt| receipt.generation != generation)
-    }) {
-        return Ok(false);
-    }
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -470,25 +463,5 @@ mod tests {
         });
         assert_eq!(tracked, vec![9999]);
         assert_eq!(*resolved.borrow(), vec!["utun4"]);
-    }
-
-    #[test]
-    fn stopping_an_older_generation_keeps_the_newer_receipt() {
-        let dir = tempfile::tempdir().unwrap();
-        let profile = ProfileId::new("stable-profile");
-        let at = SystemTime::now();
-        issue(
-            dir.path(),
-            &profile,
-            "wg0".into(),
-            8,
-            evidence(8, at),
-            Vec::new(),
-        )
-        .unwrap();
-        assert!(!remove_after_confirmed_absence(dir.path(), &profile, Some(7)).unwrap());
-        assert!(load(dir.path(), &profile).is_some());
-        assert!(remove_after_confirmed_absence(dir.path(), &profile, Some(8)).unwrap());
-        assert!(load(dir.path(), &profile).is_none());
     }
 }
