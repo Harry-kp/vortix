@@ -421,7 +421,6 @@ mod mode {
 
 use crate::constants;
 use crate::logger::{self, LogLevel};
-use crate::utils;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
@@ -470,7 +469,7 @@ impl FirewallVerification {
         self.policy_digest == expected_policy_digest
             && self.fresh_until_unix_ms > now_unix_ms
             && self.executor_epoch == local_executor_epoch()
-            && utils::boot_identity().is_some_and(|boot_id| self.boot_id == boot_id)
+            && crate::platform::boot_identity().is_some_and(|boot_id| self.boot_id == boot_id)
     }
 }
 

@@ -53,7 +53,7 @@ use crate::app::registry::{Role, TunnelSnapshot};
 use crate::app::App;
 use crate::profile::ProfileId;
 use crate::tunnel::Connection;
-use crate::{theme, utils};
+use crate::ui::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     style::{Color, Modifier, Style},
@@ -273,7 +273,7 @@ fn profile_row(
     };
 
     let time_str = if let Some(last_used) = profile.last_used {
-        let relative = utils::format_relative_time(last_used);
+        let relative = crate::ui::helpers::format_relative_time(last_used);
         if !relative.ends_with("ago") && !relative.is_empty() {
             format!("{relative} ago")
         } else {
@@ -555,18 +555,18 @@ mod tests {
     #[test]
     fn selected_row_uses_one_contrasting_foreground_in_every_fixed_theme() {
         for choice in [
-            crate::theme::ThemeChoice::Synthwave,
-            crate::theme::ThemeChoice::CatppuccinMocha,
-            crate::theme::ThemeChoice::Dracula,
-            crate::theme::ThemeChoice::Nord,
-            crate::theme::ThemeChoice::GruvboxDark,
-            crate::theme::ThemeChoice::TokyoNight,
+            crate::ui::theme::ThemeChoice::Synthwave,
+            crate::ui::theme::ThemeChoice::CatppuccinMocha,
+            crate::ui::theme::ThemeChoice::Dracula,
+            crate::ui::theme::ThemeChoice::Nord,
+            crate::ui::theme::ThemeChoice::GruvboxDark,
+            crate::ui::theme::ThemeChoice::TokyoNight,
         ] {
             let mut app = App::new_test();
             app.runtime.profiles = vec![make_profile("selected")];
             app.profile_list_state.select(Some(0));
             let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("terminal");
-            crate::theme::with_choice(choice, || {
+            crate::ui::theme::with_choice(choice, || {
                 terminal
                     .draw(|frame| render(frame, &mut app, Rect::new(0, 0, 60, 6)))
                     .expect("draw");

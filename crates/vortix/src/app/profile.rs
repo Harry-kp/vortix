@@ -7,7 +7,6 @@ use crate::config::profile_store::FsProfileStore;
 use crate::constants;
 use crate::profile::ProfileId;
 use crate::profile::ProtocolKind;
-use crate::utils;
 
 fn importable_profile_paths(dir_path: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut paths = std::fs::read_dir(dir_path)?
@@ -120,7 +119,7 @@ impl App {
         // crash-safe delete transaction. The App only clears transient run
         // artifacts in this detached compatibility path.
         if matches!(protocol, ProtocolKind::OpenVpn) {
-            utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &profile_name);
+            crate::openvpn::cleanup_openvpn_run_files_compat(profile_id.as_str(), &profile_name);
         }
 
         // Adjust selection

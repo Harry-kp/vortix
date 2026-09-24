@@ -91,7 +91,7 @@ fn prompt_masked_otp(prompt: &str, expires_at_millis: u64) -> std::io::Result<St
 
     let mut otp = String::new();
     loop {
-        if crate::utils::boot_elapsed_millis().is_some_and(|now| now >= expires_at_millis) {
+        if crate::platform::boot_elapsed_millis().is_some_and(|now| now >= expires_at_millis) {
             println!();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -343,7 +343,7 @@ fn handle_up(
         }
     };
 
-    if !crate::utils::is_root() {
+    if !crate::platform::is_root() {
         print_error_and_exit(
             mode,
             "up",
@@ -489,7 +489,7 @@ fn run_engine_command(
 ) -> Result<std::sync::Arc<crate::control::Snapshot>, String> {
     let control = crate::control::Control::start(config, config_dir, profiles)?;
     let ticket = control.send(command);
-    let expires = crate::utils::boot_elapsed_millis()
+    let expires = crate::platform::boot_elapsed_millis()
         .unwrap_or_default()
         .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
     control.wait(ticket, timeout, |prompt| {
@@ -557,8 +557,8 @@ fn engine_failure_or_exit(mode: OutputMode, command: &str, message: String) -> !
 /// Acquire the cross-process lifecycle lock or exit with a structured
 /// error. Proceeding without the lock would reintroduce the concurrent
 /// `up`/`down` interleaving the lock exists to prevent.
-fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::utils::LifecycleLock {
-    match crate::utils::acquire_lifecycle_lock() {
+fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::config::LifecycleLock {
+    match crate::config::acquire_lifecycle_lock() {
         Ok(file) => file,
         Err(error) => {
             let busy = error.kind() == std::io::ErrorKind::WouldBlock;
@@ -571,7 +571,7 @@ fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::uti
                     } else {
                         "lock_failed"
                     },
-                    message: crate::utils::lifecycle_lock_user_message(&error),
+                    message: crate::config::lifecycle_lock_user_message(&error),
                     hint: (!busy).then(|| "Check ownership of the Vortix config directory.".into()),
                 },
                 if busy {
@@ -680,7 +680,7 @@ fn handle_down(
         return 0;
     }
 
-    if !crate::utils::is_root() {
+    if !crate::platform::is_root() {
         print_error_and_exit(
             mode,
             "down",
@@ -801,7 +801,7 @@ fn handle_reconnect(
         }
     };
 
-    if !crate::utils::is_root() {
+    if !crate::platform::is_root() {
         print_error_and_exit(
             mode,
             "reconnect",
@@ -2059,7 +2059,7 @@ fn handle_delete(profile_name: &str, yes: bool, config_dir: &Path, mode: OutputM
         );
     }
     if fresh_profile.protocol == crate::profile::ProtocolKind::OpenVpn {
-        crate::utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &fresh_name);
+        crate::openvpn::cleanup_openvpn_run_files_compat(profile_id.as_str(), &fresh_name);
     }
 
     let data = DeleteData {
@@ -2299,7 +2299,8 @@ fn handle_killswitch(
             );
         };
 
-        if !crate::utils::is_root() && ks_mode != crate::control::killswitch::KillSwitchMode::Off {
+        if !crate::platform::is_root() && ks_mode != crate::control::killswitch::KillSwitchMode::Off
+        {
             print_error_and_exit(
                 output_mode,
                 "killswitch",
@@ -2367,7 +2368,7 @@ struct ReleaseData {
 /// reporting success.
 #[must_use]
 pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
-    if !crate::utils::is_root() {
+    if !crate::platform::is_root() {
         print_error_and_exit(
             mode,
             "release-killswitch",
@@ -2492,7 +2493,7 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
         profile_count: total,
         wireguard_count: wg_count,
         openvpn_count: ovpn_count,
-        is_root: crate::utils::is_root(),
+        is_root: crate::platform::is_root(),
         journal_session: journal_session.clone(),
     };
 

@@ -9,7 +9,6 @@ use crate::app::registry::{Role, TunnelSnapshot};
 use crate::control::{Command, Level, Phase, Snapshot, TunnelView};
 use crate::profile::ProfileId;
 use crate::tunnel::{Connection, PromptKind};
-use crate::utils;
 
 pub(super) const CONTROL_STARTING_MESSAGE: &str =
     "The VPN service is still starting. Try again in a moment.";
@@ -358,11 +357,11 @@ impl App {
     /// Check for system-wide dependencies at startup and warn the user.
     pub(crate) fn check_system_dependencies(&mut self) {
         let mut missing: Vec<&str> = Vec::new();
-        if !utils::binary_exists("openvpn") {
+        if !crate::platform::binary_exists("openvpn") {
             missing.push("openvpn");
         }
         // wg / wg-quick both ship in wireguard-tools.
-        if !utils::binary_exists("wg-quick") || !utils::binary_exists("wg") {
+        if !crate::platform::binary_exists("wg-quick") || !crate::platform::binary_exists("wg") {
             missing.push("wireguard-tools");
         }
         if missing.is_empty() {

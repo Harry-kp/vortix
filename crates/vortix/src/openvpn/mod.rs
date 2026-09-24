@@ -300,3 +300,135 @@ pub mod version {
         }
     }
 }
+
+pub(crate) fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OpenVPN artifact key contains unsafe characters",
+        ))
+    }
+}
+
+/// Returns `(pid_path, log_path)` for an opaque profile artifact key.
+///
+/// Production callers pass [`crate::profile::ProfileId::as_str`].
+/// Display names are accepted only by explicit legacy compatibility helpers.
+///
+/// # Errors
+///
+/// Returns an error if directory creation fails.
+pub fn get_openvpn_run_paths(
+    profile_key: &str,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    validate_openvpn_artifact_key(profile_key)?;
+    let root = crate::config::get_config_dir()?;
+    let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
+
+    if !run_dir.exists() {
+        crate::config::owned_file::create_user_dir(&run_dir)?;
+    }
+
+    let pid_path = run_dir.join(format!("{profile_key}.pid"));
+    let log_path = run_dir.join(format!("{profile_key}.log"));
+
+    Ok((pid_path, log_path))
+}
+
+/// PIDs recorded in `<config_dir>/run/*.pid` — the `OpenVPN` daemons a
+/// vortix session is tracking. Reads only the run dir (no profile
+/// parsing), so it's cheap enough for the startup orphan scan.
+#[must_use]
+pub fn tracked_openvpn_pids() -> Vec<u32> {
+    let Ok(root) = crate::config::get_config_dir() else {
+        return Vec::new();
+    };
+    let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "pid"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|content| content.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// Cleans up `OpenVPN` runtime files (pid, log) for a given profile.
+pub fn cleanup_openvpn_run_files(profile_key: &str) {
+    if let Ok((pid_path, log_path)) = get_openvpn_run_paths(profile_key) {
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&log_path);
+    }
+}
+
+/// Remove canonical ID-keyed run files and, when collision-free, legacy
+/// name-keyed files. Ambiguous sanitized legacy names are deliberately left
+/// for manual cleanup rather than risking another profile's active daemon.
+pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &str) {
+    cleanup_openvpn_run_files(profile_id);
+    if let Some(legacy_key) = crate::profile::unambiguous_legacy_artifact_key(legacy_display_name) {
+        if legacy_key != profile_id {
+            cleanup_openvpn_run_files(legacy_key);
+        }
+    }
+}
+
+/// Scan the `OpenVPN` auth directory and delete any leftover transient
+/// `<safe>.scrv1.auth` credentials bundle.
+///
+/// The bundle is a 3-line `user\npass\notp\n` file the submit handler
+/// writes for the protocol layer to consume at the start of a
+/// static-challenge connect. The protocol layer deletes the file
+/// immediately on read; if it's still on disk at vortix startup,
+/// something crashed mid-connect and the file is now an orphaned
+/// plaintext OTP that should never persist. The OTP would also be
+/// stale (TOTP expires in 30s), so the only correct cleanup is
+/// deletion — the user re-enters credentials on the next connect.
+///
+/// Silently skips files it can't read or delete — the scrubber must
+/// not block app startup. Each deletion is logged at warn level with
+/// the file name (NOT the file contents).
+pub fn scrub_stale_scrv1_auth_files() {
+    let Ok(root) = crate::config::get_config_dir() else {
+        return;
+    };
+    let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
+    let Ok(entries) = std::fs::read_dir(&auth_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.to_ascii_lowercase().ends_with(".scrv1.auth") {
+            tracing::warn!(
+                file = %name,
+                "AUTH: stale credentials bundle — clearing"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_no_op_when_auth_dir_missing() {
+        // Set a temp config dir with no `auth/` subdir created. The scrub
+        // must not panic or error.
+        let _tmp = crate::config::set_temp_config_dir();
+        scrub_stale_scrv1_auth_files();
+        // No assertion needed — the test passes by not panicking.
+    }
+}

@@ -97,10 +97,10 @@ fn main() -> Result<()> {
     // its writer lock at the first safe point after resolving the authoritative
     // config directory, before migration, journals, or other shared-state work.
     let _tui_lifecycle_lock = if args.command.is_none() {
-        Some(match vortix::utils::acquire_lifecycle_lock() {
+        Some(match vortix::config::acquire_lifecycle_lock() {
             Ok(lock) => lock,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                eprintln!("{}", vortix::utils::lifecycle_lock_user_message(&error));
+                eprintln!("{}", vortix::config::lifecycle_lock_user_message(&error));
                 std::process::exit(cli::output::ExitCode::StateConflict.code());
             }
             Err(error) => {
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
                 // cleanly; this one returned an eyre error, so a lock the
                 // user simply could not open came with a source location and
                 // backtrace hints attached.
-                eprintln!("{}", vortix::utils::lifecycle_lock_user_message(&error));
+                eprintln!("{}", vortix::config::lifecycle_lock_user_message(&error));
                 let exit = if error.kind() == std::io::ErrorKind::PermissionDenied {
                     cli::output::ExitCode::PermissionDenied
                 } else {
@@ -127,7 +127,7 @@ fn main() -> Result<()> {
     // root-ownership error. The lifecycle-lock check deliberately wins when
     // another Vortix session is already active; read-only CLI commands remain
     // available without administrator access.
-    if args.command.is_none() && !vortix::utils::is_root() {
+    if args.command.is_none() && !vortix::platform::is_root() {
         eprintln!("Vortix needs administrator access to manage VPN connections.");
         eprintln!("Try again with: sudo vortix");
         std::process::exit(cli::output::ExitCode::PermissionDenied.code());
@@ -194,23 +194,25 @@ fn main() -> Result<()> {
     // disk by a previous crash mid-connect. Runs once at startup before
     // the CLI/TUI fork so both paths see a clean auth dir. Cheap O(N)
     // scan; failures are swallowed.
-    vortix::utils::scrub_stale_scrv1_auth_files();
+    vortix::openvpn::scrub_stale_scrv1_auth_files();
 
     // Hold a process-lifetime scratch lease before sweeping. Concurrent CLI
     // and TUI processes intentionally have different journal session IDs;
     // only an acquirable lease proves that another session crashed.
-    let temp_session_id = vortix::utils::temp_session_id();
-    let _temp_session_lease =
-        match vortix::utils::acquire_temp_session_lease(&config_dir, &temp_session_id) {
-            Ok(lease) => {
-                vortix::utils::sweep_orphan_temp_configs(&config_dir, &temp_session_id);
-                Some(lease)
-            }
-            Err(error) => {
-                eprintln!("warning: failed to lease temporary tunnel state ({error})");
-                None
-            }
-        };
+    let temp_session_id = vortix::wireguard::tunnel::temp_session_id();
+    let _temp_session_lease = match vortix::wireguard::tunnel::acquire_temp_session_lease(
+        &config_dir,
+        &temp_session_id,
+    ) {
+        Ok(lease) => {
+            vortix::wireguard::tunnel::sweep_orphan_temp_configs(&config_dir, &temp_session_id);
+            Some(lease)
+        }
+        Err(error) => {
+            eprintln!("warning: failed to lease temporary tunnel state ({error})");
+            None
+        }
+    };
 
     // backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
@@ -355,12 +357,12 @@ fn main() -> Result<()> {
     // reported every live managed tunnel as a possible orphan. Absence of
     // evidence is not evidence of an orphan, so only scan where the
     // evidence is readable.
-    let mut tracked_pids = vortix::utils::tracked_openvpn_pids();
+    let mut tracked_pids = vortix::openvpn::tracked_openvpn_pids();
     tracked_pids.extend(vortix::wireguard::receipt::tracked_wireguard_pids(
         &config_dir,
     ));
     let orphans = vortix::process::filter_untracked(vortix::process::scan_orphans(), &tracked_pids);
-    if !orphans.is_empty() && vortix::utils::is_root() {
+    if !orphans.is_empty() && vortix::platform::is_root() {
         eprintln!(
             "Warning: detected {} possible orphan VPN process(es) from a previous session:",
             orphans.len()
@@ -657,7 +659,7 @@ fn log_filter(directives: Option<&str>) -> tracing_subscriber::filter::Targets {
 }
 
 fn init_terminal() -> Result<ratatui::DefaultTerminal> {
-    vortix::theme::configure_for_terminal();
+    vortix::ui::theme::configure_for_terminal();
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     terminal.clear()?;

@@ -416,7 +416,7 @@ impl MacDnsPolicy {
         let resolver_dir = canonical_test_resolver_dir(resolver_dir);
         Self {
             resolver_dir,
-            expected_owner_uid: crate::utils::effective_user_group_ids().0,
+            expected_owner_uid: crate::platform::effective_user_group_ids().0,
             dynamic_store: MacDynamicStore::memory(),
             fail_readback_at: None,
         }
@@ -427,7 +427,7 @@ impl MacDnsPolicy {
         let resolver_dir = canonical_test_resolver_dir(resolver_dir);
         Self {
             resolver_dir,
-            expected_owner_uid: crate::utils::effective_user_group_ids().0,
+            expected_owner_uid: crate::platform::effective_user_group_ids().0,
             dynamic_store: MacDynamicStore::memory(),
             fail_readback_at: Some(write_number),
         }

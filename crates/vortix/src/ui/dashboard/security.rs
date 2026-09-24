@@ -2,7 +2,7 @@ use crate::app::registry::TunnelSnapshot;
 use crate::app::App;
 use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::tunnel::Connection;
-use crate::{constants, theme};
+use crate::{constants, ui::theme};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},

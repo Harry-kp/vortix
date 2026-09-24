@@ -6,8 +6,8 @@ pub mod action_menu {
     //! Provides a lazydocker-style popup menu triggered by 'x'.
 
     use crate::message::ActionMenuItem;
-    use crate::theme;
     use crate::ui::helpers::centered_rect_fixed;
+    use crate::ui::theme;
     use ratatui::{
         style::{Modifier, Style},
         text::{Line, Span},
@@ -90,7 +90,7 @@ pub mod action_menu {
 }
 pub mod auth {
     use crate::app::AuthField;
-    use crate::{constants, theme};
+    use crate::{constants, ui::theme};
     use ratatui::{
         layout::{Alignment, Constraint, Layout},
         style::{Modifier, Style},
@@ -350,8 +350,8 @@ pub mod config_viewer {
     //! Config file viewer overlay
 
     use crate::app::App;
-    use crate::theme;
     use crate::ui::helpers::centered_rect;
+    use crate::ui::theme;
     use ratatui::{
         layout::{Constraint, Layout, Rect},
         style::{Modifier, Style},
@@ -596,7 +596,7 @@ pub mod config_viewer {
 pub mod confirm_dialog {
     //! Reusable confirmation dialog overlay.
 
-    use crate::theme;
+    use crate::ui::theme;
     use ratatui::{
         layout::Rect,
         style::{Color, Modifier, Style},
@@ -720,8 +720,8 @@ pub mod help {
     //!   Guard explains the semantics.
 
     use crate::app::{state, state::HelpTab};
-    use crate::theme;
     use crate::ui::sigils::{Sigil, SigilCategory, CATALOG};
+    use crate::ui::theme;
     use ratatui::{
         layout::{Constraint, Direction, Layout, Rect},
         style::{Modifier, Style},
@@ -1361,7 +1361,7 @@ pub mod help {
     }
 }
 pub mod import {
-    use crate::{constants, theme};
+    use crate::{constants, ui::theme};
     use ratatui::{
         layout::Alignment,
         style::Style,
@@ -1565,7 +1565,7 @@ pub mod import {
     }
 }
 pub mod rename {
-    use crate::theme;
+    use crate::ui::theme;
     use ratatui::{
         layout::Rect,
         style::{Modifier, Style},
@@ -1629,7 +1629,7 @@ pub mod rename {
 }
 pub mod search {
     use crate::app::App;
-    use crate::theme;
+    use crate::ui::theme;
     use ratatui::{
         layout::Rect,
         style::{Modifier, Style},
@@ -1754,7 +1754,7 @@ pub mod toast {
 
             crate::ui::helpers::clear_area(frame, toast_area);
 
-            let t = crate::theme::current();
+            let t = crate::ui::theme::current();
             let (title, bg_color, border_color) = match toast.toast_type {
                 crate::app::state::ToastType::Info => (" INFO ", t.toast_info, t.toast_info),
                 crate::app::state::ToastType::Success => {

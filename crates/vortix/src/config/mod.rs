@@ -79,7 +79,7 @@ pub fn get_config_dir() -> std::io::Result<PathBuf> {
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     /// Built-in TUI color palette; `"terminal"` inherits terminal colors.
-    pub theme: crate::theme::ThemeChoice,
+    pub theme: crate::ui::theme::ThemeChoice,
     /// UI refresh rate in milliseconds.
     pub tick_rate: u64,
     /// Telemetry polling interval in seconds.
@@ -140,7 +140,7 @@ impl Default for AppConfig {
         use crate::constants;
 
         Self {
-            theme: crate::theme::ThemeChoice::default(),
+            theme: crate::ui::theme::ThemeChoice::default(),
             tick_rate: constants::DEFAULT_TICK_RATE,
             telemetry_poll_rate: constants::DEFAULT_TELEMETRY_POLL_RATE,
             api_timeout: constants::DEFAULT_API_TIMEOUT,
@@ -249,7 +249,7 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
         // When running under sudo the directory is created as root.
         // Chown newly-created dirs (e.g. ~/.config and ~/.config/vortix)
         // to the real user so normal-user sessions can read/write.
-        if crate::utils::is_root() {
+        if crate::platform::is_root() {
             // Chown each new directory from the config dir up to (but not
             // including) the first ancestor that already existed.
             let mut dir = Some(path.as_path());
@@ -265,7 +265,7 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
 
     // An install created before Vortix set 0700 keeps the umask's mode
     // forever, so the repair runs on every startup, not only at creation.
-    crate::utils::make_private(&path);
+    crate::config::owned_file::make_private(&path);
 
     // Canonicalize to resolve symlinks and ".." components
     std::fs::canonicalize(&path)
@@ -298,7 +298,7 @@ fn default_config_dir() -> std::io::Result<PathBuf> {
 /// checks `SUDO_USER` and looks up that user's actual home directory from
 /// `/etc/passwd` so config files land in the invoking user's home.
 pub(crate) fn user_home() -> Option<PathBuf> {
-    if crate::utils::is_root() {
+    if crate::platform::is_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
             return home_dir_for_user(&sudo_user);
         }
@@ -349,7 +349,7 @@ pub fn load_config(config_dir: &Path) -> Result<AppConfig, String> {
 /// keys, comments, and ordering.
 pub(crate) fn persist_theme_choice(
     config_dir: &Path,
-    choice: crate::theme::ThemeChoice,
+    choice: crate::ui::theme::ThemeChoice,
 ) -> Result<ThemePersistOutcome, String> {
     use std::str::FromStr as _;
 
@@ -423,7 +423,7 @@ pub(crate) fn config_owner(config_dir: &Path) -> Result<(u32, u32), String> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("configuration path is not a real directory".into());
     }
-    let effective = crate::utils::effective_user_group_ids();
+    let effective = crate::platform::effective_user_group_ids();
     if effective.0 != 0 {
         return (metadata.uid() == effective.0)
             .then_some(effective)
@@ -511,7 +511,7 @@ const MIGRATION_DONE_MARKER: &str = ".migration-done";
 #[must_use]
 pub fn check_migration(new_dir: &Path) -> Option<PathBuf> {
     // Only relevant when running under sudo
-    if !crate::utils::is_root() {
+    if !crate::platform::is_root() {
         return None;
     }
     if std::env::var("SUDO_USER").is_err() {
@@ -677,7 +677,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// - chown call itself failed (`EPERM`, broken filesystem, etc.): real
 ///   failure the operator may want to know about — `tracing::warn!`.
 pub fn fix_ownership(path: &Path) {
-    if !crate::utils::is_root() {
+    if !crate::platform::is_root() {
         return;
     }
     if let Err(e) = chown_to_real_user(path) {
@@ -721,7 +721,7 @@ pub(crate) fn sudo_ids() -> std::io::Result<Option<(u32, u32)>> {
 #[allow(unsafe_code)]
 pub(crate) fn chown_to_invoking_user(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
-    if !crate::utils::is_root() {
+    if !crate::platform::is_root() {
         return Ok(());
     }
     let Some((uid, gid)) = sudo_ids()? else {
@@ -766,6 +766,92 @@ fn chown_recursive(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Process-lifetime writer lock. The kernel releases it on every exit path,
+/// including `std::process::exit`; it fails with `WouldBlock` while another
+/// Vortix process holds it.
+#[derive(Debug)]
+pub struct LifecycleLock {
+    _file: std::fs::File,
+}
+
+/// Turn a lifecycle-lock failure into concise, actionable user-facing copy.
+#[must_use]
+pub fn lifecycle_lock_user_message(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return "Another Vortix process is managing VPN state. Close the running Vortix session or wait for its command to finish, then try again."
+            .to_string();
+    }
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        return format!(
+            "Vortix cannot open its session lock: {error}\n  hint: The lock file is owned by another user. Run: sudo chown -R $(id -u):$(id -g) \"${{XDG_CONFIG_HOME:-$HOME/.config}}/vortix\""
+        );
+    }
+    format!("Vortix could not open its session lock: {error}")
+}
+
+pub fn acquire_lifecycle_lock() -> std::io::Result<LifecycleLock> {
+    let root = crate::config::get_config_dir()?;
+    acquire_lifecycle_lock_at(&root, crate::config::owned_file::invoking_owner()?.0)
+}
+
+fn acquire_lifecycle_lock_at(
+    root: &std::path::Path,
+    owner_uid: u32,
+) -> std::io::Result<LifecycleLock> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.uid() != owner_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the Vortix config directory is not owned by the invoking user",
+        ));
+    }
+    Ok(LifecycleLock {
+        _file: acquire_nonblocking_lock(&root.join("lifecycle.lock"))?,
+    })
+}
+
+fn acquire_nonblocking_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+
+    // The dashboard needs root, so this lock is created root-owned by the
+    // first `sudo vortix`. It then needs write access to be re-locked, and an
+    // unprivileged run could never open it again — every later launch failed
+    // on EACCES with no way back. Same contract as `create_user_dir` and
+    // `write_user_file` above; a no-op when not root.
+    crate::config::fix_ownership(path);
+
+    // SAFETY: flock is a thin syscall wrapper over a valid owned fd; no
+    // buffers, no aliasing. Same invariant analysis as libc::kill in the
+    // OpenVPN teardown path.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// Point the global config dir at a fresh temp dir for one test. Hold the
+/// guard for the test's lifetime: the config dir is process-wide.
+#[cfg(test)]
+pub(crate) fn set_temp_config_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    set_config_dir(dir.path().to_path_buf());
+    (dir, guard)
 }
 
 #[cfg(test)]
@@ -912,16 +998,16 @@ mod tests {
             .tempdir()
             .unwrap();
         for (value, expected) in [
-            ("synthwave", crate::theme::ThemeChoice::Synthwave),
-            ("terminal", crate::theme::ThemeChoice::Terminal),
+            ("synthwave", crate::ui::theme::ThemeChoice::Synthwave),
+            ("terminal", crate::ui::theme::ThemeChoice::Terminal),
             (
                 "catppuccin-mocha",
-                crate::theme::ThemeChoice::CatppuccinMocha,
+                crate::ui::theme::ThemeChoice::CatppuccinMocha,
             ),
-            ("dracula", crate::theme::ThemeChoice::Dracula),
-            ("nord", crate::theme::ThemeChoice::Nord),
-            ("gruvbox-dark", crate::theme::ThemeChoice::GruvboxDark),
-            ("tokyo-night", crate::theme::ThemeChoice::TokyoNight),
+            ("dracula", crate::ui::theme::ThemeChoice::Dracula),
+            ("nord", crate::ui::theme::ThemeChoice::Nord),
+            ("gruvbox-dark", crate::ui::theme::ThemeChoice::GruvboxDark),
+            ("tokyo-night", crate::ui::theme::ThemeChoice::TokyoNight),
         ] {
             std::fs::write(
                 dir.path().join("config.toml"),
@@ -942,7 +1028,7 @@ mod tests {
             "# keep this comment\ntick_rate = 500\ntheme = \"synthwave\"\n",
         )
         .unwrap();
-        persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap();
+        persist_theme_choice(dir.path(), crate::ui::theme::ThemeChoice::Terminal).unwrap();
 
         let saved = std::fs::read_to_string(&config_path).unwrap();
         assert!(saved.contains("# keep this comment"));
@@ -950,14 +1036,14 @@ mod tests {
         assert!(saved.contains("theme = \"terminal\""));
         assert_eq!(
             load_config(dir.path()).unwrap().theme,
-            crate::theme::ThemeChoice::Terminal
+            crate::ui::theme::ThemeChoice::Terminal
         );
     }
 
     #[test]
     fn persist_theme_creates_a_minimal_config() {
         let dir = tempfile::tempdir().unwrap();
-        persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap();
+        persist_theme_choice(dir.path(), crate::ui::theme::ThemeChoice::Terminal).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap(),
@@ -974,7 +1060,7 @@ mod tests {
         std::fs::write(outside.path(), "theme = \"synthwave\"\n").unwrap();
         symlink(outside.path(), dir.path().join(CONFIG_FILE)).unwrap();
         let error =
-            persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap_err();
+            persist_theme_choice(dir.path(), crate::ui::theme::ThemeChoice::Terminal).unwrap_err();
 
         assert!(error.contains("safely read"));
         assert_eq!(
@@ -991,7 +1077,7 @@ mod tests {
         std::fs::write(&config_path, malformed).unwrap();
 
         let error =
-            persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap_err();
+            persist_theme_choice(dir.path(), crate::ui::theme::ThemeChoice::Terminal).unwrap_err();
 
         assert!(error.contains("invalid"));
         assert_eq!(std::fs::read(&config_path).unwrap(), malformed);
@@ -1005,7 +1091,7 @@ mod tests {
         std::fs::write(&config_path, invalid_utf8).unwrap();
 
         let error =
-            persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap_err();
+            persist_theme_choice(dir.path(), crate::ui::theme::ThemeChoice::Terminal).unwrap_err();
 
         assert!(error.contains("UTF-8"));
         assert_eq!(std::fs::read(&config_path).unwrap(), invalid_utf8);
@@ -1022,7 +1108,7 @@ mod tests {
         std::fs::write(&config_path, &source).unwrap();
 
         let error =
-            persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap_err();
+            persist_theme_choice(dir.path(), crate::ui::theme::ThemeChoice::Terminal).unwrap_err();
 
         assert!(error.contains("would exceed"));
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), source);
@@ -1052,7 +1138,7 @@ mod tests {
         std::fs::write(&writable, "theme = \"synthwave\"\n").unwrap();
         std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o664)).unwrap();
         assert!(
-            persist_theme_choice(writable_dir.path(), crate::theme::ThemeChoice::Terminal)
+            persist_theme_choice(writable_dir.path(), crate::ui::theme::ThemeChoice::Terminal)
                 .unwrap_err()
                 .contains("safely read")
         );
@@ -1062,7 +1148,7 @@ mod tests {
         std::fs::write(&linked, "theme = \"synthwave\"\n").unwrap();
         std::fs::hard_link(&linked, linked_dir.path().join("config.backup")).unwrap();
         assert!(
-            persist_theme_choice(linked_dir.path(), crate::theme::ThemeChoice::Terminal)
+            persist_theme_choice(linked_dir.path(), crate::ui::theme::ThemeChoice::Terminal)
                 .unwrap_err()
                 .contains("safely read")
         );
@@ -1290,6 +1376,8 @@ ip_api_fallbacks = ["https://fallback1.example.com"]
 
 #[cfg(all(test, unix))]
 mod private_config_dir_tests {
+    use super::*;
+
     /// The config directory must be 0700 no matter what the umask allows.
     ///
     /// `create_dir_all` applies the caller's umask, so Ubuntu's default 002
@@ -1315,5 +1403,49 @@ mod private_config_dir_tests {
             mode, 0o700,
             "a group- or world-accessible config dir is refused by the durable-state checks"
         );
+    }
+
+    #[test]
+    fn busy_lifecycle_lock_has_a_plain_user_message() {
+        let error = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+
+        let message = lifecycle_lock_user_message(&error);
+
+        assert_eq!(
+            message,
+            "Another Vortix process is managing VPN state. Close the running Vortix session or wait for its command to finish, then try again."
+        );
+        assert!(!message.contains("Resource temporarily unavailable"));
+    }
+
+    #[test]
+    fn lifecycle_lock_excludes_a_second_holder() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let owner_uid = directory.path().metadata().unwrap().uid();
+        let _guard = acquire_lifecycle_lock_at(directory.path(), owner_uid).unwrap();
+
+        assert_eq!(
+            acquire_nonblocking_lock(&directory.path().join("lifecycle.lock"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn lifecycle_selector_rejects_a_config_directory_owned_by_another_uid() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let different_uid = directory.path().metadata().unwrap().uid().wrapping_add(1);
+        let result = acquire_lifecycle_lock_at(directory.path(), different_uid);
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!directory.path().join("lifecycle.lock").exists());
     }
 }

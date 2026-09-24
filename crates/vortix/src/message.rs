@@ -176,9 +176,9 @@ pub enum Message {
     /// Completion of the background theme-persistence transaction.
     ThemePersisted {
         /// Theme active before the user requested the switch.
-        previous: crate::theme::ThemeChoice,
+        previous: crate::ui::theme::ThemeChoice,
         /// Theme painted optimistically while the config write runs.
-        selected: crate::theme::ThemeChoice,
+        selected: crate::ui::theme::ThemeChoice,
         /// Durable config-write result.
         result: Result<crate::config::ThemePersistOutcome, String>,
     },

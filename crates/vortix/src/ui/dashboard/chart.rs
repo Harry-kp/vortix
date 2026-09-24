@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::tunnel::Connection;
 use crate::ui::helpers;
-use crate::{constants, theme, utils};
+use crate::{constants, ui::theme};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::Style,
@@ -25,7 +25,10 @@ fn stats_line<'a>(app: &App, session_rx: &'a str, session_tx: &'a str) -> Line<'
     Line::from(vec![
         Span::styled(" ▲ UP: ", Style::default().fg(theme::current().success)),
         Span::styled(
-            format!("{:<10}", utils::format_bytes_speed(app.runtime.current_up)),
+            format!(
+                "{:<10}",
+                crate::ui::helpers::format_bytes_speed(app.runtime.current_up)
+            ),
             Style::default().fg(theme::current().text_primary),
         ),
         Span::styled(
@@ -39,7 +42,7 @@ fn stats_line<'a>(app: &App, session_rx: &'a str, session_tx: &'a str) -> Line<'
         Span::styled(
             format!(
                 "{:<10}",
-                utils::format_bytes_speed(app.runtime.current_down)
+                crate::ui::helpers::format_bytes_speed(app.runtime.current_down)
             ),
             Style::default().fg(theme::current().text_primary),
         ),
@@ -81,7 +84,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let max_up = app.runtime.up_history.iter().copied().fold(0.0, f64::max);
     let peak = (max_down.max(max_up) * 1.2).max(500_000.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let scale = crate::utils::format_bytes_speed(peak as u64);
+    let scale = crate::ui::helpers::format_bytes_speed(peak as u64);
     let peak_label = format!(" Peak: {scale} ");
 
     let block = Block::default()
@@ -174,8 +177,8 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let current_down_str = utils::format_bytes_speed(app.runtime.current_down);
-    let current_up_str = utils::format_bytes_speed(app.runtime.current_up);
+    let current_down_str = crate::ui::helpers::format_bytes_speed(app.runtime.current_down);
+    let current_up_str = crate::ui::helpers::format_bytes_speed(app.runtime.current_up);
 
     let text = vec![
         Line::from(""),

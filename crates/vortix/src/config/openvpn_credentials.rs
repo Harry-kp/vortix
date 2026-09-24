@@ -655,7 +655,7 @@ fn decode_credentials(body: &[u8]) -> Result<RememberedOpenVpnCredentials, Crede
 }
 
 fn validate_artifact_key(key: &str) -> Result<(), CredentialStoreError> {
-    crate::utils::validate_openvpn_artifact_key(key)
+    crate::openvpn::validate_openvpn_artifact_key(key)
         .map_err(|_| CredentialStoreError::UnsafeArtifact(CredentialArtifactIssue::ChangedEntry))
 }
 
@@ -735,7 +735,7 @@ fn map_file_error(error: FileError, operation: CredentialIoOperation) -> Credent
 }
 
 fn effective_owner() -> (u32, u32) {
-    crate::utils::effective_user_group_ids()
+    crate::platform::effective_user_group_ids()
 }
 
 #[cfg(test)]
@@ -904,7 +904,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let (uid, gid) = crate::platform::effective_user_group_ids();
         let store = FsOpenVpnCredentialStore::for_owner(temp.path(), uid, gid);
         let auth = temp.path().join(OPENVPN_AUTH_DIR);
         std::fs::create_dir(&auth).unwrap();
@@ -969,7 +969,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let (uid, gid) = crate::platform::effective_user_group_ids();
         let store = FsOpenVpnCredentialStore::for_owner(temp.path(), uid, gid);
         let auth = temp.path().join(OPENVPN_AUTH_DIR);
         std::fs::create_dir(&auth).unwrap();
@@ -999,7 +999,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let (uid, gid) = crate::platform::effective_user_group_ids();
         let store = FsOpenVpnCredentialStore::for_owner(temp.path(), uid, gid);
         let first = ProfileId::parse("6".repeat(ProfileId::HEX_LEN)).unwrap();
         let second = ProfileId::parse("7".repeat(ProfileId::HEX_LEN)).unwrap();
@@ -1024,7 +1024,7 @@ mod tests {
         let auth = temp.path().join(OPENVPN_AUTH_DIR);
         std::fs::create_dir(&auth).unwrap();
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let (uid, gid) = crate::platform::effective_user_group_ids();
         let store = FsOpenVpnCredentialStore::for_owner(temp.path(), uid, gid);
         let profile = ProfileId::parse("8".repeat(ProfileId::HEX_LEN)).unwrap();
 
@@ -1041,7 +1041,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let (uid, gid) = crate::platform::effective_user_group_ids();
         let store = FsOpenVpnCredentialStore::for_owner(temp.path(), uid, gid);
         let profile = ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap();
         let old = RememberedOpenVpnCredentials::new("old-user", "old-pass").unwrap();
@@ -1069,7 +1069,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let (uid, gid) = crate::platform::effective_user_group_ids();
         let store = FsOpenVpnCredentialStore::for_owner(temp.path(), uid, gid);
         let old = RememberedOpenVpnCredentials::new("old-user", "old-pass").unwrap();
         let new = RememberedOpenVpnCredentials::new("new-user", "new-pass").unwrap();
@@ -1146,7 +1146,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let (uid, gid) = crate::platform::effective_user_group_ids();
         let store = FsOpenVpnCredentialStore::for_owner(temp.path(), uid, gid);
         let profile = ProfileId::parse("b".repeat(ProfileId::HEX_LEN)).unwrap();
         let old = RememberedOpenVpnCredentials::new("old-user", "old-pass").unwrap();

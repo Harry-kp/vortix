@@ -147,7 +147,7 @@ mod runner {
             if metadata.file_type().is_symlink() {
                 return Err(HookOwnerError::SymlinkConfig);
             }
-            let (process_user, process_group) = crate::utils::effective_user_group_ids();
+            let (process_user, process_group) = crate::platform::effective_user_group_ids();
             if process_user != 0 {
                 if process_group == 0 {
                     return Err(HookOwnerError::RootOwner);
@@ -637,13 +637,13 @@ mod runner {
         fn standard_owner_requires_non_root_or_sudo_provenance() {
             let temp = tempfile::tempdir().unwrap();
             let result = VerifiedHookOwner::for_standard_mode(temp.path());
-            if crate::utils::is_root() {
+            if crate::platform::is_root() {
                 assert!(result.is_err());
             } else {
                 let owner = result.unwrap();
                 assert_eq!(
                     owner.credentials.uid,
-                    crate::utils::effective_user_group_ids().0
+                    crate::platform::effective_user_group_ids().0
                 );
             }
         }

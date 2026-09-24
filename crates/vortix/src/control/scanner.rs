@@ -92,7 +92,7 @@ fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
             // failed observation made the control service report an error on
             // every poll, which buried the one startup warning that named the
             // package to install.
-            Err(_) if !crate::utils::binary_exists("wg") => {
+            Err(_) if !crate::platform::binary_exists("wg") => {
                 (std::collections::BTreeMap::new(), true)
             }
             // A `wg` that exists and failed leaves tunnel state genuinely

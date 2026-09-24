@@ -4,7 +4,7 @@ use crate::app::App;
 use crate::profile::ProfileId;
 use crate::tunnel::Connection;
 use crate::ui::helpers;
-use crate::{constants, theme};
+use crate::{constants, ui::theme};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},

@@ -1741,8 +1741,10 @@ fn cached_config_view_precomputes_total_lines_and_highlighted_vec() {
     use crate::app::CachedConfigView;
 
     let content = "[Interface]\nAddress = 10.0.0.2/24\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 0.0.0.0/0\n";
-    let view =
-        CachedConfigView::from_content(content.to_string(), crate::theme::ThemeChoice::Synthwave);
+    let view = CachedConfigView::from_content(
+        content.to_string(),
+        crate::ui::theme::ThemeChoice::Synthwave,
+    );
 
     assert_eq!(view.total_lines, 7, "total_lines must be pre-computed");
     assert_eq!(
@@ -1770,7 +1772,7 @@ fn get_config_max_scroll_reads_from_cache() {
     app.terminal_size = (120, 40);
     app.cached_config = Some(CachedConfigView::from_content(
         content,
-        crate::theme::ThemeChoice::Synthwave,
+        crate::ui::theme::ThemeChoice::Synthwave,
     ));
 
     let max = app.get_config_max_scroll();
@@ -1875,10 +1877,10 @@ fn theme_toggle_persists_restyles_cached_content_and_reports_success() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = test_app();
     app.runtime.config_dir = temp.path().to_path_buf();
-    app.runtime.config.theme = crate::theme::ThemeChoice::Synthwave;
+    app.runtime.config.theme = crate::ui::theme::ThemeChoice::Synthwave;
     app.cached_config = Some(CachedConfigView::from_content(
         "[Interface]\nAddress = 10.0.0.2/24\n".to_string(),
-        crate::theme::ThemeChoice::Synthwave,
+        crate::ui::theme::ThemeChoice::Synthwave,
     ));
 
     app.handle_key(key_char('p'));
@@ -1887,7 +1889,7 @@ fn theme_toggle_persists_restyles_cached_content_and_reports_success() {
     // command worker so it cannot stall input or rendering.
     assert_eq!(
         app.runtime.config.theme,
-        crate::theme::ThemeChoice::Terminal
+        crate::ui::theme::ThemeChoice::Terminal
     );
     assert!(!app.show_bulk_menu);
     assert!(app.pending_theme_change.is_some());
@@ -1899,13 +1901,13 @@ fn theme_toggle_persists_restyles_cached_content_and_reports_success() {
     assert!(app.pending_theme_change.is_none());
     assert_eq!(
         crate::config::load_config(temp.path()).unwrap().theme,
-        crate::theme::ThemeChoice::Terminal
+        crate::ui::theme::ThemeChoice::Terminal
     );
     assert_eq!(
         app.cached_config.as_ref().unwrap().highlighted_lines[0].spans[0]
             .style
             .fg,
-        Some(crate::theme::TERMINAL.yellow)
+        Some(crate::ui::theme::TERMINAL.yellow)
     );
     let toast = app.toast.as_ref().unwrap();
     assert_eq!(toast.toast_type, ToastType::Success);
@@ -1917,13 +1919,13 @@ fn theme_toggle_failure_keeps_the_current_theme() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = test_app();
     app.runtime.config_dir = temp.path().join("missing");
-    app.runtime.config.theme = crate::theme::ThemeChoice::Synthwave;
+    app.runtime.config.theme = crate::ui::theme::ThemeChoice::Synthwave;
 
     app.handle_message(Message::ToggleTheme);
 
     assert_eq!(
         app.runtime.config.theme,
-        crate::theme::ThemeChoice::Terminal
+        crate::ui::theme::ThemeChoice::Terminal
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while app.pending_theme_change.is_some() && std::time::Instant::now() < deadline {
@@ -1933,7 +1935,7 @@ fn theme_toggle_failure_keeps_the_current_theme() {
     assert!(app.pending_theme_change.is_none());
     assert_eq!(
         app.runtime.config.theme,
-        crate::theme::ThemeChoice::Synthwave
+        crate::ui::theme::ThemeChoice::Synthwave
     );
     assert_eq!(app.toast.as_ref().unwrap().toast_type, ToastType::Error);
 }
@@ -1943,7 +1945,7 @@ fn second_theme_toggle_waits_for_the_pending_save() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = test_app();
     app.runtime.config_dir = temp.path().to_path_buf();
-    app.runtime.config.theme = crate::theme::ThemeChoice::Synthwave;
+    app.runtime.config.theme = crate::ui::theme::ThemeChoice::Synthwave;
 
     app.handle_message(Message::ToggleTheme);
     let pending = app.pending_theme_change;
@@ -1951,7 +1953,7 @@ fn second_theme_toggle_waits_for_the_pending_save() {
 
     assert_eq!(
         app.runtime.config.theme,
-        crate::theme::ThemeChoice::Terminal
+        crate::ui::theme::ThemeChoice::Terminal
     );
     assert_eq!(app.pending_theme_change, pending);
     assert_eq!(app.toast.as_ref().unwrap().toast_type, ToastType::Info);
@@ -1972,7 +1974,7 @@ fn quit_waits_for_in_flight_theme_persistence() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = test_app();
     app.runtime.config_dir = temp.path().to_path_buf();
-    app.runtime.config.theme = crate::theme::ThemeChoice::Synthwave;
+    app.runtime.config.theme = crate::ui::theme::ThemeChoice::Synthwave;
 
     app.handle_message(Message::ToggleTheme);
     app.handle_message(Message::Quit);
@@ -1986,7 +1988,7 @@ fn quit_waits_for_in_flight_theme_persistence() {
     assert!(app.should_quit);
     assert_eq!(
         crate::config::load_config(temp.path()).unwrap().theme,
-        crate::theme::ThemeChoice::Terminal
+        crate::ui::theme::ThemeChoice::Terminal
     );
 }
 

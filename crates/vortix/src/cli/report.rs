@@ -173,7 +173,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
         terminal: std::env::var("TERM").unwrap_or_else(|_| "unknown".to_string()),
         terminal_size,
         shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string()),
-        is_root: crate::utils::is_root(),
+        is_root: crate::platform::is_root(),
         tools: collect_tool_statuses(),
         config_dir: redact_home_prefix(&config_dir.display().to_string()),
         config_source: config_source.to_string(),
@@ -365,7 +365,7 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
     // `which` itself is not preinstalled on every distro (e.g. Fedora
     // minimal), and our own diagnostic surface shouldn't false-fail
     // because of a missing diagnostic tool.
-    let path = crate::utils::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
+    let path = crate::platform::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
 
     // wg-quick --version exits non-zero on some systems; try to get version anyway
     let owned_args: Vec<String> = version_args.iter().map(|s| (*s).to_string()).collect();
@@ -392,7 +392,7 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
 #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: helper only used by the macOS pfctl branch above
 fn check_tool_exists(name: &'static str) -> ToolStatus {
     // same PATH-walking as `check_tool` — see comment above.
-    let path = crate::utils::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
+    let path = crate::platform::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
     ToolStatus {
         name,
         path,

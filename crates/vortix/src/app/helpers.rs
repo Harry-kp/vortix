@@ -9,7 +9,6 @@ use time::OffsetDateTime;
 use super::{App, FocusedPanel, Toast, ToastType};
 use crate::constants;
 use crate::logger::{self, LogLevel};
-use crate::utils;
 
 impl App {
     /// Profile name for logs and dialogs. Profile ids are 64-char digests and
@@ -89,7 +88,7 @@ impl App {
         }
 
         // Auto-save to log file
-        let timestamp = utils::format_local_time();
+        let timestamp = crate::ui::helpers::format_local_time();
         let level_tag = level.prefix();
         Self::append_to_log_file_batch(
             &[format!("{timestamp} [{level_tag}] {category}: {content}")],
@@ -348,7 +347,7 @@ impl App {
         let log_dir = config_dir.join(constants::LOGS_DIR_NAME);
 
         // Create log directory if needed
-        if crate::utils::create_user_dir(&log_dir).is_err() {
+        if crate::config::owned_file::create_user_dir(&log_dir).is_err() {
             return;
         }
 

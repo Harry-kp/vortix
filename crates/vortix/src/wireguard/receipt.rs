@@ -223,14 +223,14 @@ pub fn remove_after_confirmed_absence(
 
 fn save(config_dir: &Path, receipt: &ManagedWireGuardReceipt) -> std::io::Result<()> {
     let directory = config_dir.join(DIRECTORY);
-    crate::utils::create_user_dir(&directory)?;
+    crate::config::owned_file::create_user_dir(&directory)?;
     let key = ProfileId::new(&receipt.profile_id).digest_key(16);
     let bytes = serde_json::to_vec(receipt).map_err(std::io::Error::other)?;
     crate::config::owned_file::write_user_file_atomic(&directory, &format!("{key}.json"), &bytes)
 }
 
 fn acquire_lock(config_dir: &Path) -> std::io::Result<File> {
-    crate::utils::create_user_dir(config_dir)?;
+    crate::config::owned_file::create_user_dir(config_dir)?;
     let path = config_dir.join(LOCK_FILE);
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);

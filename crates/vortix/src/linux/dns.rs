@@ -122,9 +122,9 @@ enum LinuxDnsBackend {
 }
 
 fn selected_backend() -> LinuxDnsBackend {
-    if crate::utils::use_resolvectl_path() {
+    if crate::linux::dns::use_resolvectl_path() {
         LinuxDnsBackend::Resolved
-    } else if crate::utils::resolvconf_works() {
+    } else if crate::linux::dns::resolvconf_works() {
         LinuxDnsBackend::Resolvconf
     } else {
         LinuxDnsBackend::Unavailable
@@ -1217,6 +1217,104 @@ fn interface_exists(interface: &str) -> bool {
     #[allow(unsafe_code)]
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
     index != 0
+}
+
+/// Check whether `resolvconf` is installed and functional.
+///
+/// Returns `true` only when the `resolvconf` binary exists **and** can
+/// operate on the current system.  `openresolv` will fail with a
+/// "signature mismatch" error when `systemd-resolved` manages
+/// `/etc/resolv.conf`, so a simple `which resolvconf` is not enough.
+pub(crate) fn resolvconf_works() -> bool {
+    use crate::process::CommandSpec;
+    use std::time::Duration;
+    if !crate::platform::binary_exists("resolvconf") {
+        return false;
+    }
+    // Test with `--version` which works with both openresolv and systemd-resolvconf.
+    // `resolvconf -l` (list) is not supported by systemd-resolvconf's shim.
+    //
+    // The 10s cap mirrors the OpenVPN version probe: this probe is called from
+    // `check_dependencies` on the UI thread during a connect press,
+    // so a hung subprocess (broken DNS plumbing, locked /etc/resolv.conf,
+    // an openresolv shim stuck on a syscall) would freeze the TUI until
+    // the user kills it. 10s is generous for any healthy probe; on
+    // timeout we return `false`, which routes the user to the existing
+    // "resolvconf not available" error path — strictly better than a
+    // wedged panel.
+    crate::process::run_to_output(
+        CommandSpec::oneshot("resolvconf", vec!["--version".into()])
+            .timeout(Duration::from_secs(10)),
+    )
+    .is_ok_and(|o| o.status.success())
+}
+
+/// Check whether `resolvectl` is installed and functional.
+///
+/// Returns `true` only when the `resolvectl` binary exists **and** a
+/// `--version` probe succeeds. `resolvectl` ships with systemd itself, so
+/// presence on PATH plus a working probe is a sufficient signal that the
+/// resolved per-link DNS API is callable.
+///
+/// The 10s cap mirrors the [`resolvconf_works`] probe shape — a hung
+/// resolved/DBus would otherwise wedge the connect-success path on the
+/// UI thread.
+pub(crate) fn resolvectl_works() -> bool {
+    use crate::process::CommandSpec;
+    use std::time::Duration;
+    if !crate::platform::binary_exists("resolvectl") {
+        return false;
+    }
+    crate::process::run_to_output(
+        CommandSpec::oneshot("resolvectl", vec!["--version".into()])
+            .timeout(Duration::from_secs(10)),
+    )
+    .is_ok_and(|o| o.status.success())
+}
+
+/// Should the resolvectl-based DNS path be used on this Linux host?
+///
+/// True when systemd-resolved is detected ([`is_systemd_resolved`]) AND
+/// `resolvectl` works ([`resolvectl_works`]). False otherwise — callers
+/// fall back to the legacy resolvconf path (the existing `wg-quick`
+/// behaviour) when this returns false.
+///
+/// All callers (dep-check, `WgTunnel::up`) MUST go through this single
+/// accessor so a subtle drift between two predicates can't make
+/// `check_dependencies` say "OK, no resolvconf needed" while the tunnel
+/// path then takes the resolvconf branch.
+pub(crate) fn use_resolvectl_path() -> bool {
+    is_systemd_resolved() && resolvectl_works()
+}
+
+/// Detect whether `systemd-resolved` is managing DNS on this system.
+///
+/// Checks if `/etc/resolv.conf` is a symlink pointing into a
+/// `systemd`-owned path (e.g. `/run/systemd/resolve/`).
+pub(crate) fn is_systemd_resolved() -> bool {
+    match std::fs::read_link("/etc/resolv.conf") {
+        Ok(target) => {
+            let s = target.to_string_lossy();
+            s.contains("systemd") || s.contains("resolvconf/run")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Detect whether the kernel has IPv6 disabled.
+///
+/// True when `/proc/sys/net/ipv6` is absent (booted with
+/// `ipv6.disable=1`) or either the `all` or `default` `disable_ipv6`
+/// sysctl reads `1`. `default` matters because `wg-quick` creates a
+/// fresh interface, which inherits the `default` setting.
+pub(crate) fn host_ipv6_disabled() -> bool {
+    if !std::path::Path::new("/proc/sys/net/ipv6").exists() {
+        return true;
+    }
+    ["all", "default"].iter().any(|scope| {
+        std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{scope}/disable_ipv6"))
+            .is_ok_and(|v| v.trim() == "1")
+    })
 }
 
 #[cfg(test)]

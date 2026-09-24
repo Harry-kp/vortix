@@ -805,7 +805,7 @@ fn resolve_standard_openvpn_binary() -> Result<PathBuf, TunnelError> {
     // installation as root-trusted input (including Homebrew). Canonicalizing
     // the existing PATH result prevents a second lookup inside the privileged
     // child.
-    let candidate = crate::utils::find_binary_path("openvpn").ok_or_else(|| {
+    let candidate = crate::platform::find_binary_path("openvpn").ok_or_else(|| {
         TunnelError::Subprocess("OpenVPN executable was not found on PATH".into())
     })?;
     candidate.canonicalize().map_err(|error| {

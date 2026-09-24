@@ -5,7 +5,6 @@
 #![allow(clippy::missing_errors_doc, clippy::implicit_hasher)]
 
 pub mod app;
-pub(crate) mod authority_lock;
 pub mod cidr;
 pub mod cli;
 pub mod config;
@@ -29,9 +28,7 @@ pub mod platform;
 pub mod process;
 pub mod profile;
 pub mod telemetry;
-pub mod theme;
 pub mod tunnel;
 pub mod ui;
-pub mod utils;
 #[doc(hidden)]
 pub mod wireguard;

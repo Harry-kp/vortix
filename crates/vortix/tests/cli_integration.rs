@@ -311,7 +311,7 @@ fn cli_release_killswitch_accepts_canonical_command_and_compatibility_alias() {
 #[cfg(unix)]
 #[test]
 fn emergency_release_reaches_root_gate_before_normal_startup() {
-    if vortix::utils::is_root() {
+    if vortix::platform::is_root() {
         // Non-root CI exercises the proof that emergency dispatch precedes
         // normal startup. Root environments would proceed to real firewall
         // mutation, which this test must never attempt.
@@ -765,7 +765,7 @@ fn second_tui_reports_an_actionable_already_running_message() {
 #[cfg(unix)]
 #[test]
 fn tui_without_administrator_access_fails_before_terminal_startup() {
-    if vortix::utils::is_root() {
+    if vortix::platform::is_root() {
         // The production contract is exercised by non-root macOS and Linux CI
         // runners. A root-only test environment cannot reproduce this entry
         // condition without changing process credentials.

@@ -386,7 +386,8 @@ pub fn check_dependencies(
             // Both `wg` and `wg-quick` ship in the wireguard-tools
             // package on every supported distro — report them under
             // a single label so the install hint isn't duplicated.
-            if !crate::utils::binary_exists("wg-quick") || !crate::utils::binary_exists("wg") {
+            if !crate::platform::binary_exists("wg-quick") || !crate::platform::binary_exists("wg")
+            {
                 missing.push("wireguard-tools".to_string());
             }
             // On Linux, wg-quick uses `resolvconf` to set DNS when the
@@ -410,9 +411,9 @@ pub fn check_dependencies(
                 has_dns_directive: parsed
                     .as_ref()
                     .is_some_and(crate::wireguard::parser::WgParsedProfile::has_dns),
-                resolvectl_path_available: crate::utils::use_resolvectl_path(),
-                resolvconf_works: crate::utils::resolvconf_works(),
-                is_systemd_resolved: crate::utils::is_systemd_resolved(),
+                resolvectl_path_available: crate::linux::dns::use_resolvectl_path(),
+                resolvconf_works: crate::linux::dns::resolvconf_works(),
+                is_systemd_resolved: crate::linux::dns::is_systemd_resolved(),
             }) {
                 missing.push(label);
             }
@@ -422,7 +423,7 @@ pub fn check_dependencies(
                 parsed
                     .as_ref()
                     .is_some_and(crate::wireguard::parser::WgParsedProfile::has_ipv6_address),
-                crate::utils::host_ipv6_disabled,
+                crate::linux::dns::host_ipv6_disabled,
             ) {
                 missing.push(label);
             }
@@ -430,7 +431,7 @@ pub fn check_dependencies(
             let _ = config_path; // suppress unused warning on non-Linux
         }
         crate::profile::ProtocolKind::OpenVpn => {
-            if crate::utils::binary_exists("openvpn") {
+            if crate::platform::binary_exists("openvpn") {
                 // Assert OpenVPN ≥ 2.4 so `--pull-filter` (multi-tunnel
                 // DNS scoping) is available. Older builds silently
                 // ignore the flag and leak pushed DNS into the primary
@@ -771,6 +772,104 @@ pub enum SocketAuditError {
 /// Result alias for socket-audit operations.
 pub type SocketAuditResult<T> = std::result::Result<T, SocketAuditError>;
 
+/// Check if the current process is running as root (UID 0)
+///
+/// Uses the effective user ID from the OS instead of spawning an external command.
+/// This avoids silent failures if `id` is unavailable or fails.
+#[must_use]
+#[allow(unsafe_code)]
+pub fn is_root() -> bool {
+    // SAFETY: geteuid() is a simple syscall that returns the effective user ID.
+    // It has no side effects and always succeeds.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Effective process uid/gid without a subprocess lookup.
+#[allow(unsafe_code)]
+pub(crate) fn effective_user_group_ids() -> (u32, u32) {
+    // SAFETY: these libc calls return scalar process credentials.
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
+/// Stable OS boot identity shared by persisted authority and verification.
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: boot identity reads an OS kernel primitive
+pub(crate) fn boot_identity() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Stable OS boot identity shared by persisted authority and verification.
+#[cfg(target_os = "macos")]
+// xtask:allow-platform-cfg: boot identity reads an OS kernel primitive
+#[allow(unsafe_code)]
+pub(crate) fn boot_identity() -> Option<String> {
+    let mut boot_time = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    // SAFETY: `kern.boottime` writes one timeval into the correctly sized,
+    // aligned output buffer; no input buffer is supplied.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&raw mut boot_time).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result == 0 {
+        Some(format!(
+            "macos-boot:{}:{}",
+            boot_time.tv_sec, boot_time.tv_usec
+        ))
+    } else {
+        None
+    }
+}
+
+/// Milliseconds on the OS monotonic clock, stable across process restarts
+/// within one boot. Persisted deadlines must never use process-local time.
+#[allow(unsafe_code)]
+pub(crate) fn boot_elapsed_millis() -> Option<u64> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes the supplied timespec when it
+    // returns zero. CLOCK_MONOTONIC is process-independent and non-adjustable.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful syscall above initialized the complete value.
+    let time = unsafe { time.assume_init() };
+    let seconds = u64::try_from(time.tv_sec).ok()?;
+    let nanos = u64::try_from(time.tv_nsec).ok()?;
+    Some(
+        seconds
+            .saturating_mul(1_000)
+            .saturating_add(nanos / 1_000_000),
+    )
+}
+
+/// First executable named `name` on `$PATH`. Walks `PATH` itself rather
+/// than running `which`, which minimal distros (Fedora containers) lack.
+pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// Whether an executable named `name` is on `$PATH`.
+pub(crate) fn binary_exists(name: &str) -> bool {
+    find_binary_path(name).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,5 +922,57 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         // Listening sockets serialize remote as null
         assert!(json.contains("\"remote\":null"));
+    }
+
+    #[test]
+    fn find_binary_path_returns_existing_path_for_known_unix_binary() {
+        {
+            let path =
+                find_binary_path("sh").expect("`sh` should be locatable on every Unix CI runner");
+            assert!(path.is_file(), "returned path must exist on disk: {path:?}");
+            assert!(
+                path.ends_with("sh"),
+                "returned path's filename should be `sh`: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_binary_path_returns_none_for_known_absent_binary() {
+        assert!(find_binary_path("vortix-nonexistent-xyz123").is_none());
+    }
+
+    #[test]
+    fn find_binary_path_and_binary_exists_agree() {
+        // Invariant: `binary_exists(x)` must equal `find_binary_path(x).is_some()`
+        // for every input. The two functions share PATH-walking logic; they
+        // should never disagree.
+        for name in ["sh", "vortix-nonexistent-xyz123", "cat", "another-fake"] {
+            assert_eq!(
+                binary_exists(name),
+                find_binary_path(name).is_some(),
+                "binary_exists and find_binary_path disagree on `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_exists_finds_a_known_present_unix_binary() {
+        // `sh` is part of POSIX and present on every Unix CI runner we
+        // support (macOS, Ubuntu, Fedora). On Windows the test simply
+        // asserts the function doesn't panic — non-Unix runners don't
+        // have a guaranteed binary at a known PATH location.
+        assert!(
+            binary_exists("sh"),
+            "binary_exists should locate `sh` on Unix-like PATH"
+        );
+    }
+
+    #[test]
+    fn binary_exists_returns_false_for_known_absent_binary() {
+        // Pick a name that almost certainly won't exist on any runner.
+        // If this ever flakes, the runner has a binary called
+        // `vortix-nonexistent-xyz123` and we have bigger problems.
+        assert!(!binary_exists("vortix-nonexistent-xyz123"));
     }
 }

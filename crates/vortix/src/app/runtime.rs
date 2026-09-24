@@ -13,8 +13,6 @@ use crate::message::Message;
 use crate::profile::ProtocolKind;
 use crate::telemetry::{self, TelemetryUpdate};
 
-use crate::utils;
-
 /// Telemetry, profiles and worker channels behind the TUI.
 #[allow(clippy::struct_excessive_bools)]
 pub struct VpnRuntime {
@@ -155,7 +153,7 @@ impl VpnRuntime {
 
             config,
             config_dir,
-            is_root: utils::is_root(),
+            is_root: crate::platform::is_root(),
 
             connection_drops: 0,
             sort_order: ProfileSortOrder::default(),

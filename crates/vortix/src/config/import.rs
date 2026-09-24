@@ -145,7 +145,6 @@ mod tests {
 use crate::constants;
 use crate::logger::{self, LogLevel};
 use crate::process::CommandSpec;
-use crate::utils;
 
 /// Downloads a VPN profile from a given URL and saves it to the profiles directory.
 ///
@@ -174,7 +173,7 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
 
     // Create target path in temp directory
     let profiles_dir = std::env::temp_dir();
-    let target_path = utils::get_unique_path(&profiles_dir, &filename);
+    let target_path = crate::config::profiles::get_unique_path(&profiles_dir, &filename);
 
     // Use curl to download directly to file
     // -f: Fail silently on HTTP errors (returns exit code)

@@ -180,19 +180,19 @@ fn push_hint_spans<'a>(
         if need_sep {
             spans.push(Span::styled(
                 " │ ",
-                Style::default().fg(crate::theme::current().separator),
+                Style::default().fg(crate::ui::theme::current().separator),
             ));
         }
         spans.push(Span::styled(
             *key,
             Style::default()
-                .fg(crate::theme::current().key_hint)
+                .fg(crate::ui::theme::current().key_hint)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             *action,
-            Style::default().fg(crate::theme::current().key_hint_desc),
+            Style::default().fg(crate::ui::theme::current().key_hint_desc),
         ));
 
         used += item_width;
@@ -228,7 +228,7 @@ fn render_hints(
         hint_spans.push(Span::styled(
             indicator,
             Style::default()
-                .fg(crate::theme::current().key_hint)
+                .fg(crate::ui::theme::current().key_hint)
                 .add_modifier(Modifier::BOLD),
         ));
     } else {
@@ -280,7 +280,7 @@ fn render_hints(
             crate::constants::APP_NAME,
             crate::constants::APP_VERSION
         ),
-        Style::default().fg(crate::theme::current().nord_polar_night_4),
+        Style::default().fg(crate::ui::theme::current().nord_polar_night_4),
     )]);
     frame.render_widget(
         Paragraph::new(branding).alignment(ratatui::layout::Alignment::Right),

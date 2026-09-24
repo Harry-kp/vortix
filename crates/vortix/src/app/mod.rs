@@ -71,8 +71,8 @@ impl CachedConfigView {
     /// pre-highlights them so the open-config keypress pays the cost
     /// once and every subsequent scroll/render frame is constant-time.
     #[must_use]
-    pub fn from_content(content: String, choice: crate::theme::ThemeChoice) -> Self {
-        let highlighted_lines = crate::theme::with_choice(choice, || {
+    pub fn from_content(content: String, choice: crate::ui::theme::ThemeChoice) -> Self {
+        let highlighted_lines = crate::ui::theme::with_choice(choice, || {
             content
                 .lines()
                 .map(crate::ui::overlays::config_viewer::highlight_config_line)
@@ -89,8 +89,8 @@ impl CachedConfigView {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingThemeChange {
-    previous: crate::theme::ThemeChoice,
-    selected: crate::theme::ThemeChoice,
+    previous: crate::ui::theme::ThemeChoice,
+    selected: crate::ui::theme::ThemeChoice,
     quit_after: bool,
 }
 use std::collections::HashMap;

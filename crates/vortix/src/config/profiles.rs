@@ -33,7 +33,8 @@ pub struct VpnProfile {
 
 /// Import a VPN profile from a file
 pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
-    let profiles_dir = get_profiles_dir()?;
+    let profiles_dir =
+        get_profiles_dir().map_err(|e| format!("Failed to get profiles directory: {e}"))?;
     let prepared = prepare_profile_import(path, &profiles_dir)?;
     commit_profile_import(prepared, &profiles_dir)
 }
@@ -131,7 +132,7 @@ pub(crate) fn prepare_profile_import(
     let dest_filename = format!("{name}.{extension}");
 
     // Ensure unique destination path to avoid overwriting existing profiles
-    let dest_path = crate::utils::get_unique_path(profiles_dir, &dest_filename);
+    let dest_path = crate::config::profiles::get_unique_path(profiles_dir, &dest_filename);
 
     // Update name if filename changed (e.g. from "client" to "client(1)")
     let name = dest_path
@@ -483,11 +484,6 @@ fn derive_location_from_name(name: &str) -> String {
     "Unknown".to_string()
 }
 
-/// Get the profiles directory, creating it if needed
-pub fn get_profiles_dir() -> Result<PathBuf, String> {
-    crate::utils::get_profiles_dir().map_err(|e| format!("Failed to get profiles directory: {e}"))
-}
-
 /// Load all profiles from the profiles directory
 #[must_use]
 pub fn load_profiles() -> Vec<VpnProfile> {
@@ -608,6 +604,64 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
     );
 
     profiles
+}
+
+/// Returns the VPN profiles directory path.
+///
+/// Creates the directory at `~/.config/vortix/profiles` if it doesn't exist.
+///
+/// # Errors
+///
+/// Returns an error if directory creation fails.
+pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
+    let root = crate::config::get_config_dir()?;
+    let path = root.join(crate::constants::PROFILES_DIR_NAME);
+
+    // Unconditional: `create_user_dir` is idempotent, and running it on an
+    // existing directory is what repairs the mode of an older install.
+    crate::config::owned_file::create_user_dir(&path)?;
+
+    Ok(path)
+}
+
+/// Returns a unique path by appending (n) if the file already exists.
+///
+/// # Arguments
+///
+/// * `dir` - Directory to check in
+/// * `filename` - Desired filename
+///
+/// # Returns
+///
+/// A `PathBuf` that does not currently exist.
+#[must_use]
+pub fn get_unique_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let mut path = dir.join(filename);
+    let mut counter = 1;
+
+    let path_obj = std::path::Path::new(filename);
+    let stem = path_obj
+        .file_stem()
+        .map_or(filename, |s| s.to_str().unwrap_or(filename));
+    let ext = path_obj.extension().map(|e| e.to_str().unwrap_or(""));
+
+    // Use underscores instead of parentheses to keep filenames valid as
+    // network interface names (wg-quick uses the filename as the interface).
+    while path.exists() {
+        let new_name = if let Some(e) = ext {
+            if e.is_empty() {
+                format!("{stem}_{counter}")
+            } else {
+                format!("{stem}_{counter}.{e}")
+            }
+        } else {
+            format!("{stem}_{counter}")
+        };
+        path = dir.join(new_name);
+        counter += 1;
+    }
+
+    path
 }
 
 #[cfg(test)]
@@ -989,5 +1043,35 @@ MIIDqzCCApOgAwIB...
         let result = parse_wireguard_config(config, path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("[Interface]"));
+    }
+
+    #[test]
+    fn test_get_unique_path_no_collision() {
+        let dir = tempfile::Builder::new()
+            .prefix("vortix_test_")
+            .tempdir()
+            .unwrap();
+
+        let path = get_unique_path(dir.path(), "test.conf");
+        assert_eq!(path.file_name().unwrap(), "test.conf");
+    }
+
+    #[test]
+    fn test_get_unique_path_with_collision() {
+        let dir = tempfile::Builder::new()
+            .prefix("vortix_test_")
+            .tempdir()
+            .unwrap();
+
+        // Create the file that will collide
+        std::fs::write(dir.path().join("test.conf"), "existing").unwrap();
+
+        let path = get_unique_path(dir.path(), "test.conf");
+        assert_eq!(path.file_name().unwrap(), "test_1.conf");
+
+        // Create that too
+        std::fs::write(dir.path().join("test_1.conf"), "also existing").unwrap();
+        let path2 = get_unique_path(dir.path(), "test.conf");
+        assert_eq!(path2.file_name().unwrap(), "test_2.conf");
     }
 }

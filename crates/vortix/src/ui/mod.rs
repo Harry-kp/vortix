@@ -2,7 +2,7 @@
 
 mod dashboard;
 mod footer;
-mod helpers;
+pub mod helpers;
 /// Overlays are reachable from the App layer because the open-config
 /// path pre-builds the cached `Vec<Line>` once (`CachedConfigView`)
 /// instead of letting the renderer re-parse on every frame.
@@ -10,6 +10,7 @@ pub(crate) mod overlays;
 /// Single source of truth for every sigil rendered in the TUI.
 /// Renderers + the `?` help overlay both read from `sigils::CATALOG`.
 pub(crate) mod sigils;
+pub mod theme;
 
 use crate::app::App;
 use ratatui::Frame;
@@ -18,7 +19,7 @@ pub(crate) use overlays::help::total_lines as help_total_lines;
 
 /// Main render function - dispatches to appropriate view
 pub fn render(frame: &mut Frame, app: &mut App) {
-    crate::theme::with_choice(app.runtime.config.theme, || {
+    crate::ui::theme::with_choice(app.runtime.config.theme, || {
         helpers::clear_area(frame, frame.area());
 
         // Base view
@@ -39,12 +40,12 @@ mod tests {
     #[test]
     fn fixed_theme_dashboard_never_falls_back_to_terminal_background() {
         for choice in [
-            crate::theme::ThemeChoice::Synthwave,
-            crate::theme::ThemeChoice::CatppuccinMocha,
-            crate::theme::ThemeChoice::Dracula,
-            crate::theme::ThemeChoice::Nord,
-            crate::theme::ThemeChoice::GruvboxDark,
-            crate::theme::ThemeChoice::TokyoNight,
+            crate::ui::theme::ThemeChoice::Synthwave,
+            crate::ui::theme::ThemeChoice::CatppuccinMocha,
+            crate::ui::theme::ThemeChoice::Dracula,
+            crate::ui::theme::ThemeChoice::Nord,
+            crate::ui::theme::ThemeChoice::GruvboxDark,
+            crate::ui::theme::ThemeChoice::TokyoNight,
         ] {
             let mut app = App::new_test();
             app.runtime.config.theme = choice;

@@ -1048,7 +1048,9 @@ mod tests {
                     inspect(&path, leaks);
                     continue;
                 }
-                if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+                if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs")
+                    || path.ends_with("theme.rs")
+                {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).unwrap();

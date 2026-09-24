@@ -86,11 +86,11 @@ pub struct StandardTunnelOwnershipStore {
 impl StandardTunnelOwnershipStore {
     /// Construct the production root-owned store for the invoking sudo owner.
     pub fn production(owner_uid: u32) -> Result<Self, StandardOwnershipError> {
-        if !crate::utils::is_root() {
+        if !crate::platform::is_root() {
             return Err(StandardOwnershipError::InvalidOwner);
         }
         let boot_scope =
-            crate::utils::boot_identity().ok_or(StandardOwnershipError::MissingBootIdentity)?;
+            crate::platform::boot_identity().ok_or(StandardOwnershipError::MissingBootIdentity)?;
         Self::new(DEFAULT_RUNTIME_DIR, 0, owner_uid, boot_scope)
     }
 
@@ -463,7 +463,7 @@ mod tests {
     use std::time::SystemTime;
 
     fn uid() -> u32 {
-        crate::utils::effective_user_group_ids().0
+        crate::platform::effective_user_group_ids().0
     }
 
     fn profile(root: &Path, byte: char) -> Profile {

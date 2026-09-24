@@ -260,7 +260,7 @@ pub fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex, unambiguous_legacy_artifact_key, ProfileId};
+    use super::{hex, sanitize_profile_name, unambiguous_legacy_artifact_key, ProfileId};
 
     #[test]
     fn digest_keys_are_stable_sha256_prefixes() {
@@ -311,5 +311,36 @@ mod tests {
                 "accepted malformed profile ID {malformed:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_sanitize_profile_name_ascii() {
+        assert_eq!(sanitize_profile_name("my-vpn_1"), "my-vpn_1");
+    }
+
+    #[test]
+    fn test_sanitize_profile_name_spaces() {
+        assert_eq!(sanitize_profile_name("my vpn server"), "my_vpn_server");
+    }
+
+    #[test]
+    fn test_sanitize_profile_name_special_chars() {
+        assert_eq!(sanitize_profile_name("vpn@home!#$"), "vpn_home___");
+    }
+
+    #[test]
+    fn test_sanitize_profile_name_unicode_rejected() {
+        assert_eq!(sanitize_profile_name("café-vpn"), "caf_-vpn");
+        assert_eq!(sanitize_profile_name("München"), "M_nchen");
+    }
+
+    #[test]
+    fn test_sanitize_profile_name_cjk() {
+        assert_eq!(sanitize_profile_name("日本VPN"), "__VPN");
+    }
+
+    #[test]
+    fn test_sanitize_profile_name_empty() {
+        assert_eq!(sanitize_profile_name(""), "");
     }
 }

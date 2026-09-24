@@ -359,8 +359,8 @@ impl App {
 
     fn handle_theme_persisted(
         &mut self,
-        previous: crate::theme::ThemeChoice,
-        selected: crate::theme::ThemeChoice,
+        previous: crate::ui::theme::ThemeChoice,
+        selected: crate::ui::theme::ThemeChoice,
         result: Result<crate::config::ThemePersistOutcome, String>,
     ) {
         let Some(pending) = self.pending_theme_change else {

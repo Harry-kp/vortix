@@ -50,7 +50,7 @@ pub(crate) fn acquire_profile_lock(
     if let Some(parent) = profiles_dir.parent() {
         reject_symlink(parent)?;
     }
-    crate::utils::create_user_dir(profiles_dir)?;
+    crate::config::owned_file::create_user_dir(profiles_dir)?;
     let path = profiles_dir.join(PROFILE_LOCK);
     reject_symlink(&path)?;
     let mut options = OpenOptions::new();
@@ -367,7 +367,7 @@ impl FsProfileStore {
         reject_symlink(&self.profiles_dir)?;
         let root = self.root_dir();
         reject_symlink(&root)?;
-        crate::utils::create_user_dir(&self.profiles_dir)?;
+        crate::config::owned_file::create_user_dir(&self.profiles_dir)?;
         let auth = root.join("auth");
         if auth.exists() {
             reject_symlink(&auth)?;
@@ -1146,7 +1146,7 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(invalid)?;
-    crate::utils::create_user_dir(parent)?;
+    crate::config::owned_file::create_user_dir(parent)?;
     crate::config::owned_file::write_user_file_atomic(parent, name, body)
 }
 

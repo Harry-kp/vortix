@@ -252,7 +252,7 @@ fn managed_up_body(text: &str, profile: &Profile) -> Result<String, TunnelError>
 /// `[journal] disk = false`). The fallback is deterministic within a process
 /// so repeated calls within one run yield the same subdir.
 fn resolve_session_id() -> String {
-    crate::utils::temp_session_id()
+    crate::wireguard::tunnel::temp_session_id()
 }
 
 /// Validate the interface name that `wg-quick` derives from a config basename.
@@ -382,7 +382,7 @@ fn write_managed_temp_config_unconfined(
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
     let session_id = resolve_session_id();
-    let session_root = crate::utils::get_tmp_config_dir(&session_id).map_err(|e| {
+    let session_root = crate::wireguard::tunnel::get_tmp_config_dir(&session_id).map_err(|e| {
         TunnelError::Subprocess(format!("failed to create per-session tmp dir: {e}"))
     })?;
     let lifecycle_dir = create_lifecycle_dir(&session_root)?;
@@ -1529,6 +1529,225 @@ impl WgTunnel {
     }
 }
 
+/// Returns the per-session temp config directory `${config_dir}/tmp/${session_id}/`.
+///
+/// Both the `tmp/` parent and the per-session subdir are forced to mode
+/// `0o700` — the default umask would yield `0o755`, allowing any local
+/// process to enumerate active session IDs by listing the parent. Used by
+/// `WireGuard` secondary connect-time DNS scoping: the
+/// secondary's rewritten `.conf` (with `DNS =` stripped) is written under
+/// this subdir so crashed disconnects leave isolated orphans that the
+/// startup sweep cleans only after acquiring their process-lifetime lease.
+///
+/// The subdir name matches the journal's `session_id` (`{ISO}-{pid}`), so a
+/// new Vortix process is guaranteed a fresh namespace without mistaking a
+/// concurrently running session for a crash orphan.
+///
+/// # Errors
+///
+/// Returns an error if the config directory cannot be resolved or if the
+/// per-session subdirectory cannot be created at the required mode.
+pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let root = crate::config::get_config_dir()?;
+    let tmp_root = root.join(crate::constants::TMP_CONFIG_DIR);
+
+    // Create `tmp/` and the per-session subdir at 0o700 explicitly.
+    // `recursive(true)` is idempotent on existing dirs but does NOT re-chmod
+    // them, so on first creation we set the mode through DirBuilder; on
+    // existing dirs we leave the mode alone (the only writer is this
+    // process's prior call, which used the same mode).
+    if !tmp_root.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&tmp_root)?;
+        crate::config::fix_ownership(&tmp_root);
+    }
+
+    let session_dir = tmp_root.join(session_id);
+    if !session_dir.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&session_dir)?;
+        crate::config::fix_ownership(&session_dir);
+    }
+
+    Ok(session_dir)
+}
+
+/// Process-lifetime lease for one per-session scratch directory.
+///
+/// The kernel releases the advisory lock on every process exit path,
+/// including crashes and [`std::process::exit`]. Keeping this value alive is
+/// what distinguishes a concurrently running Vortix session from a crash
+/// orphan; a different journal session ID alone is not proof of death.
+#[derive(Debug)]
+pub struct TempSessionLease {
+    _file: std::fs::File,
+}
+
+/// Resolve the scratch-session identity used by protocol-owned temporary
+/// files, including when journal disk persistence is disabled.
+#[must_use]
+pub fn temp_session_id() -> String {
+    crate::journal::global_journal()
+        .and_then(crate::journal::Journal::session_id)
+        .unwrap_or_else(|| format!("nojournal-{}", std::process::id()))
+}
+
+/// Create and exclusively lease this process's scratch-session directory.
+///
+/// # Errors
+///
+/// Returns an I/O error when the private directory or its no-follow lease
+/// file cannot be created, or when another process already holds the same
+/// session identity.
+pub fn acquire_temp_session_lease(
+    config_dir: &std::path::Path,
+    session_id: &str,
+) -> std::io::Result<TempSessionLease> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::os::unix::io::AsRawFd as _;
+
+    let tmp_root = config_dir.join(crate::constants::TMP_CONFIG_DIR);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&tmp_root)?;
+    let session_dir = tmp_root.join(session_id);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&session_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(session_dir.join(".lease"))?;
+    // SAFETY: `file` owns a valid descriptor for the lifetime of the lease;
+    // flock changes only the kernel lock associated with that descriptor.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    crate::config::fix_ownership(&tmp_root);
+    crate::config::fix_ownership(&session_dir);
+    crate::config::fix_ownership(&session_dir.join(".lease"));
+    Ok(TempSessionLease { _file: file })
+}
+
+fn legacy_temp_session_process_is_live(session_id: &str) -> bool {
+    let Some(pid) = session_id
+        .rsplit_once('-')
+        .and_then(|(_, pid)| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    // SAFETY: signal zero is a side-effect-free existence probe. Permission
+    // denial also proves that a process currently owns the PID.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Remove only scratch sessions proven not to have a live process lease.
+///
+/// Directories from older Vortix releases have no `.lease`; during the
+/// upgrade window their PID suffix remains a conservative liveness fallback.
+/// Unknown or inaccessible entries are retained rather than risking deletion
+/// of a live tunnel's teardown capability.
+pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let tmp_dir = config_dir.join(crate::constants::TMP_CONFIG_DIR);
+    let Ok(entries) = std::fs::read_dir(&tmp_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == current_session_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(entry.path().join(".lease"));
+        match lease {
+            Ok(file) => {
+                // SAFETY: `file` is an owned valid descriptor. A refused
+                // nonblocking lock means a live process still owns it.
+                //
+                // Only a refusal means that. `flock` can also fail with EINTR
+                // when a signal lands mid-call, which says nothing about
+                // ownership, and treating it as ownership silently abandons a
+                // real orphan. The test for this sweep failed intermittently
+                // under a loaded parallel run for exactly that reason. Retry an
+                // interrupt; treat anything else as owned and leave it alone.
+                let refused = loop {
+                    #[allow(unsafe_code)]
+                    let result =
+                        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                    if result == 0 {
+                        break false;
+                    }
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break true;
+                };
+                if refused {
+                    continue;
+                }
+                remove_swept_session(&entry.path());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !legacy_temp_session_process_is_live(&name) {
+                    remove_swept_session(&entry.path());
+                }
+            }
+            Err(error) => {
+                // Anything other than a missing lease is unexpected, and
+                // skipping in silence leaves scratch configuration behind with
+                // no trace of why -- the same gap `remove_swept_session`
+                // already closes for removal failures.
+                tracing::warn!(
+                    target: "vortix::process",
+                    session = %name,
+                    %error,
+                    "could not read an orphan session lease; leaving it alone"
+                );
+            }
+        }
+    }
+}
+
+/// Remove one scratch session, saying so when it cannot be removed.
+///
+/// These directories hold rendered tunnel configuration. Discarding the error
+/// let them accumulate with no trace of why.
+fn remove_swept_session(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        tracing::warn!(
+            target: "vortix::process",
+            path = %path.display(),
+            %error,
+            "could not remove an orphaned tunnel scratch directory"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2068,7 +2287,7 @@ mod tests {
         std::fs::write(prior.join("corp.conf"), "stale").unwrap();
         std::fs::write(current.join("vpn.conf"), "live").unwrap();
 
-        crate::utils::sweep_orphan_temp_configs(config_dir, "2026-05-28T120000Z-1234");
+        crate::wireguard::tunnel::sweep_orphan_temp_configs(config_dir, "2026-05-28T120000Z-1234");
 
         assert!(!prior.exists(), "orphan session subdir must be removed");
         assert!(current.exists(), "current session subdir must survive");
@@ -2079,7 +2298,7 @@ mod tests {
     fn sweep_is_noop_when_tmp_dir_missing() {
         let tmp = tempfile::tempdir().unwrap();
         // No tmp/ created. Sweep must not panic and must not create anything.
-        crate::utils::sweep_orphan_temp_configs(tmp.path(), "sid");
+        crate::wireguard::tunnel::sweep_orphan_temp_configs(tmp.path(), "sid");
         assert!(!tmp.path().join("tmp").exists());
     }
 
@@ -2088,10 +2307,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let live_id = "2026-05-28T120000Z-4321";
         let live = tmp.path().join("tmp").join(live_id);
-        let _lease = crate::utils::acquire_temp_session_lease(tmp.path(), live_id).unwrap();
+        let _lease =
+            crate::wireguard::tunnel::acquire_temp_session_lease(tmp.path(), live_id).unwrap();
         std::fs::write(live.join("corp.conf"), "live teardown capability").unwrap();
 
-        crate::utils::sweep_orphan_temp_configs(tmp.path(), "another-session-1234");
+        crate::wireguard::tunnel::sweep_orphan_temp_configs(tmp.path(), "another-session-1234");
 
         assert!(live.join("corp.conf").exists());
     }
@@ -2104,7 +2324,7 @@ mod tests {
         std::fs::create_dir_all(&live).unwrap();
         std::fs::write(live.join("corp.conf"), "pre-lease live capability").unwrap();
 
-        crate::utils::sweep_orphan_temp_configs(tmp.path(), "another-session-1234");
+        crate::wireguard::tunnel::sweep_orphan_temp_configs(tmp.path(), "another-session-1234");
 
         assert!(live.join("corp.conf").exists());
     }
@@ -2288,5 +2508,38 @@ mod tests {
             cancelled.up(&profile),
             Err(TunnelError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn test_get_tmp_config_dir_creates_session_subdir_at_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `set_temp_config_dir` writes via `set_config_dir`'s `OnceLock` —
+        // first writer wins across the whole test binary. Sibling tests are
+        // unaffected because each test passes a unique session_id; subdirs
+        // therefore can't collide even when they share a `tmp/` root.
+        let _tmp = crate::config::set_temp_config_dir();
+        let sid = format!("session-{}-{}", std::process::id(), line!());
+        let session_dir = get_tmp_config_dir(&sid).unwrap();
+        assert!(session_dir.ends_with(format!("tmp/{sid}")));
+
+        let leaf_perms = std::fs::metadata(&session_dir).unwrap().permissions();
+        assert_eq!(leaf_perms.mode() & 0o777, 0o700);
+
+        // `tmp/` root is tightened to 0o700 — default umask would produce
+        // 0o755 and leak session IDs via readdir.
+        let tmp_root = session_dir.parent().unwrap();
+        let root_perms = std::fs::metadata(tmp_root).unwrap().permissions();
+        assert_eq!(root_perms.mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn test_get_tmp_config_dir_is_idempotent() {
+        let _tmp = crate::config::set_temp_config_dir();
+        let sid = format!("idempotent-{}-{}", std::process::id(), line!());
+        let a = get_tmp_config_dir(&sid).unwrap();
+        let b = get_tmp_config_dir(&sid).unwrap();
+        assert_eq!(a, b);
+        assert!(a.exists());
     }
 }

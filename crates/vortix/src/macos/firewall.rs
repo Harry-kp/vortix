@@ -383,7 +383,7 @@ impl PfFirewall {
             "killswitch.engage"
         );
 
-        if !crate::utils::is_root() {
+        if !crate::platform::is_root() {
             error!(target: "vortix::killswitch", "kill switch requires root privileges");
             return Err(KillswitchError::NotRoot);
         }
@@ -451,7 +451,7 @@ impl PfFirewall {
     pub fn disable_blocking() -> Result<()> {
         info!(target: "vortix::killswitch", "disabling kill switch");
 
-        if !crate::utils::is_root() {
+        if !crate::platform::is_root() {
             error!(target: "vortix::killswitch", "disabling kill switch requires root");
             return Err(KillswitchError::NotRoot);
         }

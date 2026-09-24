@@ -9,7 +9,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::theme;
+use crate::ui::theme;
 
 /// The dim vertical rule between panel segments.
 pub(crate) fn divider() -> Span<'static> {
@@ -65,8 +65,8 @@ pub(crate) fn clear_area(frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Block::default().style(
             Style::default()
-                .fg(crate::theme::current().text_primary)
-                .bg(crate::theme::current().panel_bg),
+                .fg(crate::ui::theme::current().text_primary)
+                .bg(crate::ui::theme::current().panel_bg),
         ),
         area,
     );
@@ -140,7 +140,7 @@ pub(crate) fn text_entry_spans(
     cursor: String,
     after: String,
 ) -> Vec<Span<'static>> {
-    let theme = crate::theme::current();
+    let theme = crate::ui::theme::current();
     let mut spans = vec![
         Span::styled(before, Style::default().fg(theme.text_primary)),
         Span::styled(
@@ -157,10 +157,111 @@ pub(crate) fn text_entry_spans(
     spans
 }
 
+/// Formats bytes per second into a human-readable string.
+///
+/// # Arguments
+///
+/// * `bytes` - Number of bytes per second
+///
+/// # Returns
+///
+/// A formatted string with appropriate units (B/s, KB/s, or MB/s).
+///
+/// # Example
+///
+/// ```ignore
+/// assert_eq!(format_bytes_speed(1_500_000), "1.5 MB/s");
+/// assert_eq!(format_bytes_speed(1_500), "1.5 KB/s");
+/// ```
+#[must_use]
+pub fn format_bytes_speed(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB/s", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB/s", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB/s", bytes as f64 / 1_000.0)
+    } else {
+        format!("{bytes} B/s")
+    }
+}
+
+/// Returns the current local time formatted as HH:MM:SS.
+///
+/// Uses libc `localtime_r` for zero-overhead local time formatting
+/// (called every tick, so avoiding a subprocess matters).
+#[must_use]
+pub fn format_local_time() -> String {
+    format_system_time_local(std::time::SystemTime::now())
+}
+
+/// Converts any `SystemTime` into a local `HH:MM:SS` string.
+///
+/// Used for both "right now" timestamps (via `format_local_time()`) and for
+/// formatting historical log entries in the TUI.
+#[must_use]
+pub fn format_system_time_local(time: std::time::SystemTime) -> String {
+    format_system_time_inner(time).unwrap_or_else(|| "00:00:00".to_string())
+}
+
+#[allow(unsafe_code)]
+fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
+    let secs = time
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+
+    // SAFETY: localtime_r writes into our stack-allocated `tm` and is
+    // thread-safe (unlike localtime). We pass a valid pointer to both args.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // time_t is i64 on most platforms; u64→i64 is safe until year 2262
+    #[allow(clippy::cast_possible_wrap)]
+    let time_t = secs as libc::time_t;
+    let result =
+        unsafe { libc::localtime_r(std::ptr::from_ref(&time_t), std::ptr::from_mut(&mut tm)) };
+    if result.is_null() {
+        return None;
+    }
+
+    Some(format!(
+        "{:02}:{:02}:{:02}",
+        tm.tm_hour, tm.tm_min, tm.tm_sec
+    ))
+}
+
+/// Formats a `SystemTime` into a compact relative time string (e.g., 1s, 2m, 3h, 4d).
+#[must_use]
+pub fn format_relative_time(time: std::time::SystemTime) -> String {
+    let now = std::time::SystemTime::now();
+    match now.duration_since(time) {
+        Ok(duration) => {
+            let secs = duration.as_secs();
+            if secs < 60 {
+                format!("{secs}s")
+            } else if secs < 3600 {
+                format!("{}m", secs / 60)
+            } else if secs < 86400 {
+                format!("{}h", secs / 3600)
+            } else if secs < 2_592_000 {
+                // 30 days
+                format!("{}d ago", secs / 86400)
+            } else if secs < 31_536_000 {
+                // 365 days
+                format!("{}M ago", secs / 2_592_000)
+            } else {
+                format!("{}Y ago", secs / 31_536_000)
+            }
+        }
+        Err(_) => "now".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    use std::time::{Duration, SystemTime};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -214,16 +315,16 @@ mod tests {
     #[test]
     fn clear_area_paints_each_fixed_palette_and_leaves_terminal_adaptive() {
         for choice in [
-            crate::theme::ThemeChoice::Synthwave,
-            crate::theme::ThemeChoice::Terminal,
-            crate::theme::ThemeChoice::CatppuccinMocha,
-            crate::theme::ThemeChoice::Dracula,
-            crate::theme::ThemeChoice::Nord,
-            crate::theme::ThemeChoice::GruvboxDark,
-            crate::theme::ThemeChoice::TokyoNight,
+            crate::ui::theme::ThemeChoice::Synthwave,
+            crate::ui::theme::ThemeChoice::Terminal,
+            crate::ui::theme::ThemeChoice::CatppuccinMocha,
+            crate::ui::theme::ThemeChoice::Dracula,
+            crate::ui::theme::ThemeChoice::Nord,
+            crate::ui::theme::ThemeChoice::GruvboxDark,
+            crate::ui::theme::ThemeChoice::TokyoNight,
         ] {
             let mut terminal = Terminal::new(TestBackend::new(2, 1)).unwrap();
-            crate::theme::with_choice(choice, || {
+            crate::ui::theme::with_choice(choice, || {
                 terminal
                     .draw(|frame| clear_area(frame, frame.area()))
                     .unwrap();
@@ -232,5 +333,60 @@ mod tests {
             assert_eq!(cell.bg, choice.palette().panel_bg, "{choice:?}");
             assert_eq!(cell.fg, choice.palette().text_primary, "{choice:?}");
         }
+    }
+
+    #[test]
+    fn test_format_bytes_speed_bytes() {
+        assert_eq!(format_bytes_speed(0), "0 B/s");
+        assert_eq!(format_bytes_speed(2_500_000_000), "2.5 GB/s");
+        assert_eq!(format_bytes_speed(500), "500 B/s");
+        assert_eq!(format_bytes_speed(999), "999 B/s");
+    }
+
+    #[test]
+    fn test_format_bytes_speed_kilobytes() {
+        assert_eq!(format_bytes_speed(1_000), "1.0 KB/s");
+        assert_eq!(format_bytes_speed(1_500), "1.5 KB/s");
+        assert_eq!(format_bytes_speed(999_999), "1000.0 KB/s");
+    }
+
+    #[test]
+    fn test_format_bytes_speed_megabytes() {
+        assert_eq!(format_bytes_speed(1_000_000), "1.0 MB/s");
+        assert_eq!(format_bytes_speed(1_500_000), "1.5 MB/s");
+        assert_eq!(format_bytes_speed(100_000_000), "100.0 MB/s");
+    }
+
+    #[test]
+    fn test_format_relative_time() {
+        let now = SystemTime::now();
+
+        // Seconds
+        let just_now = now - Duration::from_secs(5);
+        assert_eq!(format_relative_time(just_now), "5s");
+
+        // Minutes
+        let five_mins = now - Duration::from_secs(300);
+        assert_eq!(format_relative_time(five_mins), "5m");
+
+        // Hours
+        let two_hours = now - Duration::from_secs(7200);
+        assert_eq!(format_relative_time(two_hours), "2h");
+
+        // Days
+        let three_days = now - Duration::from_secs(86400 * 3);
+        assert_eq!(format_relative_time(three_days), "3d ago");
+
+        // Months
+        let two_months = now - Duration::from_secs(2_592_000 * 2);
+        assert_eq!(format_relative_time(two_months), "2M ago");
+
+        // Years
+        let three_years = now - Duration::from_secs(31_536_000 * 3);
+        assert_eq!(format_relative_time(three_years), "3Y ago");
+
+        // Future or now
+        let future = now + Duration::from_secs(10);
+        assert_eq!(format_relative_time(future), "now");
     }
 }

@@ -7,7 +7,7 @@ mod sidebar;
 
 use super::helpers::centered_rect;
 use crate::app::{App, FocusedPanel, InputMode};
-use crate::{constants, message, theme};
+use crate::{constants, message, ui::theme};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},

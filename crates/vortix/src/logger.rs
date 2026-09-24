@@ -49,7 +49,7 @@ impl LogEntry {
     /// `[HH:MM:SS] [LEVEL] CATEGORY: message`
     #[must_use]
     pub fn format(&self) -> String {
-        let time_str = crate::utils::format_system_time_local(self.timestamp);
+        let time_str = crate::ui::helpers::format_system_time_local(self.timestamp);
         format!(
             "[{}] [{}] {}: {}",
             time_str,

@@ -5,7 +5,7 @@ use crate::cidr::Cidr;
 use crate::profile::ProtocolKind;
 use crate::tunnel::{Connection, DetailedConnectionInfo};
 use crate::ui::helpers;
-use crate::{constants, theme, utils};
+use crate::{constants, ui::theme};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -527,7 +527,7 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
                 text.push(Line::from(vec![
                     Span::styled("Last use: ", Style::default().fg(palette.text_secondary)),
                     Span::styled(
-                        utils::format_relative_time(last_used),
+                        crate::ui::helpers::format_relative_time(last_used),
                         Style::default().fg(palette.text_primary),
                     ),
                 ]));

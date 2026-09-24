@@ -382,7 +382,7 @@ impl NftFirewall {
     /// 1-4 only) — used during early bring-up and on hard-fail Armed
     /// states.
     pub fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
-        if !crate::utils::is_root() {
+        if !crate::platform::is_root() {
             error!(target: "vortix::killswitch", "kill switch requires root privileges");
             return Err(KillswitchError::NotRoot);
         }
@@ -409,7 +409,7 @@ impl NftFirewall {
     pub fn disable_blocking() -> Result<()> {
         info!(target: "vortix::killswitch", "disabling kill switch");
 
-        if !crate::utils::is_root() {
+        if !crate::platform::is_root() {
             error!(target: "vortix::killswitch", "disabling kill switch requires root");
             return Err(KillswitchError::NotRoot);
         }

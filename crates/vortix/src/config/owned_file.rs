@@ -169,7 +169,7 @@ pub(crate) fn open_owned_directory_at(
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let metadata = directory.metadata()?;
-        let effective_uid = crate::utils::effective_user_group_ids().0;
+        let effective_uid = crate::platform::effective_user_group_ids().0;
         if effective_uid == 0
             && expected_uid != 0
             && metadata.uid() == 0
@@ -249,7 +249,7 @@ fn prepare_created_descriptor(
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    let effective = crate::utils::effective_user_group_ids();
+    let effective = crate::platform::effective_user_group_ids();
     let metadata = descriptor.metadata()?;
     if metadata.uid() != effective.0 && metadata.uid() != uid {
         return Err(FileError::UnsafeFile);
@@ -466,8 +466,8 @@ pub(crate) fn write_owned_atomic_with_hook(
 /// otherwise the current user.
 pub(crate) fn invoking_owner() -> std::io::Result<(u32, u32)> {
     Ok(match crate::config::sudo_ids()? {
-        Some(ids) if crate::utils::is_root() => ids,
-        _ => crate::utils::effective_user_group_ids(),
+        Some(ids) if crate::platform::is_root() => ids,
+        _ => crate::platform::effective_user_group_ids(),
     })
 }
 
@@ -535,4 +535,163 @@ pub(crate) enum FileError {
     Io(#[from] std::io::Error),
     #[error("private state serialization failed: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Create a directory (and parents) owned by, and private to, the real user.
+///
+/// Under sudo, `create_dir_all` produces root-owned dirs, so ownership is
+/// handed back to the invoking user.
+///
+/// It also applies the caller's umask, and Debian derivatives log in at 002 —
+/// which produced a group-writable 0775 for the profile store and the session
+/// journal. The files inside are 0600, so keys stayed unreadable, but any
+/// member of the user's group could rename, delete or replace a profile.
+/// Every directory Vortix creates holds VPN state, so none of them should be
+/// reachable by anyone else whatever the umask happens to be.
+///
+/// # Errors
+///
+/// Returns an error if directory creation fails.
+pub fn create_user_dir(path: &std::path::Path) -> std::io::Result<()> {
+    create_private_dir_all(path)?;
+    make_private(path);
+    crate::config::fix_ownership(path);
+    Ok(())
+}
+
+/// Drop group and world access from a directory that already exists.
+///
+/// [`create_private_dir_all`] only sets the mode on directories it creates,
+/// so an install made before Vortix set 0700 keeps whatever the umask gave
+/// it — 0755 on macOS, 0775 on Ubuntu — for the rest of its life. These
+/// directories hold VPN private keys, inline certificates and credentials,
+/// so the mode is repaired on every run rather than only at creation.
+///
+/// Owner bits are preserved and access is only ever narrowed. A failure is
+/// not fatal: the durable-state checks reject a directory that is still
+/// unsafe, with a message that names it.
+pub fn make_private(path: &std::path::Path) {
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return;
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        let private = mode & 0o700;
+        if private == mode {
+            return;
+        }
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(private))
+        {
+            tracing::warn!(
+                target: "vortix::config",
+                path = %path.display(),
+                from = format!("{mode:04o}"),
+                to = format!("{private:04o}"),
+                %error,
+                "could not restrict a Vortix directory to owner-only access"
+            );
+        }
+    }
+}
+
+/// `create_dir_all` with 0700 on every directory it creates.
+///
+/// `DirBuilder::mode` applies to each level it makes, which plain
+/// `create_dir_all` plus a `set_permissions` on the leaf does not — the
+/// intermediate parents keep the umask. Directories that already exist are
+/// left alone, so a shared ancestor such as `~/.local/share` is untouched.
+///
+/// # Errors
+///
+/// Returns an error if directory creation fails.
+pub fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+/// Write a file owned by the real user.
+///
+/// Under sudo, `fs::write` produces root-owned files.
+/// This wraps that call and hands ownership to the invoking user.
+///
+/// # Errors
+///
+/// Returns an error if the write fails.
+pub fn write_user_file(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    crate::config::fix_ownership(path);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An install predating the 0700 rule keeps the umask's mode forever
+    /// unless startup repairs it. macOS gives 0755, Ubuntu 0775; both leave
+    /// VPN private keys readable by every other account on the machine.
+    #[test]
+    fn an_existing_world_readable_directory_is_repaired() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vortix-make-private-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        for laxity in [0o755, 0o775, 0o700] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(laxity))
+                .expect("set mode");
+            make_private(&dir);
+            let mode = std::fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "a directory created as {laxity:04o} must end up owner-only"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Narrowing only. A directory with no owner-execute bit must not gain
+    /// one just because the repair ran.
+    #[test]
+    fn make_private_never_widens_owner_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vortix-make-private-narrow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).expect("set mode");
+
+        make_private(&dir);
+
+        assert_eq!(
+            std::fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "owner bits are preserved exactly; only group and other are dropped"
+        );
+
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

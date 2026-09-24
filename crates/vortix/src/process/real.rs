@@ -504,7 +504,7 @@ impl RealRunner {
     }
 
     fn check_privilege(spec: &CommandSpec) -> Result<(), ProcessError> {
-        if spec.requires_privilege == PrivilegeReq::Root && !crate::utils::is_root() {
+        if spec.requires_privilege == PrivilegeReq::Root && !crate::platform::is_root() {
             return Err(ProcessError::PrivilegeDenied {
                 program: spec.program.clone(),
             });
@@ -534,7 +534,7 @@ impl RealRunner {
                     reason: "too many supplementary groups".into(),
                 });
             }
-            let (process_user, process_group) = crate::utils::effective_user_group_ids();
+            let (process_user, process_group) = crate::platform::effective_user_group_ids();
             if process_user != 0
                 && (process_user != credentials.uid || process_group != credentials.gid)
             {
@@ -562,7 +562,7 @@ fn configure_owner_process(command: &mut Command, spec: &CommandSpec) {
         if spec.terminate_process_group {
             command.as_std_mut().process_group(0);
         }
-        if crate::utils::effective_user_group_ids().0 == 0 {
+        if crate::platform::effective_user_group_ids().0 == 0 {
             if let Some(credentials) = spec.run_as.clone() {
                 let groups = credentials.supplementary_groups;
                 let gid = credentials.gid;
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn explicit_owner_credentials_never_resolve_to_root() {
-        let (process_user, process_group) = crate::utils::effective_user_group_ids();
+        let (process_user, process_group) = crate::platform::effective_user_group_ids();
         let (uid, gid) = if process_user == 0 {
             (65_534, 65_534)
         } else {
