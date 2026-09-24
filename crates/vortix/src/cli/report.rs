@@ -154,7 +154,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
     };
 
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let profile_counts = super::commands::count_profiles(&profiles_dir);
+    let profile_counts = super::profiles::count_profiles(&profiles_dir);
 
     let ks_state = loaded_killswitch_summary(crate::control::killswitch::load_state_checked());
 
