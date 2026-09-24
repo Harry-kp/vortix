@@ -555,7 +555,9 @@ impl RealRunner {
 }
 
 fn configure_owner_process(command: &mut Command, spec: &CommandSpec) {
-    command.kill_on_drop(spec.terminate_process_group);
+    // A one-shot never outlives its run: a timeout drops the wait, and the
+    // child must go with it rather than finish unobserved.
+    command.kill_on_drop(true);
     {
         use std::os::unix::process::CommandExt as _;
 
@@ -888,6 +890,28 @@ mod tests {
         let outcome = RealRunner::new().run_blocking(spec).unwrap();
         assert_eq!(outcome.stdout_lossy().trim(), uid.to_string());
         assert_ne!(uid, 0);
+    }
+
+    #[test]
+    fn a_timed_out_command_does_not_finish_later() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("finished");
+        let spec = CommandSpec::oneshot(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "/bin/sleep 0.4; : > \"$1\"".into(),
+                "vortix-timeout-test".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+        )
+        .timeout(Duration::from_millis(100));
+        assert!(matches!(
+            RealRunner::new().run_blocking(spec),
+            Err(ProcessError::Timeout { .. })
+        ));
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!marker.exists(), "the timed-out child kept running");
     }
 
     #[test]

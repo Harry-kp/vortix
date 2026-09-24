@@ -165,9 +165,9 @@ fn add_or_change(args: impl Fn(&str) -> Vec<String>) -> bool {
     };
     match run("add") {
         Ok(output) if String::from_utf8_lossy(&output.stderr).contains("File exists") => {
-            run("change").is_ok()
+            run("change").is_ok_and(|output| output.success())
         }
-        Ok(_) => true,
+        Ok(output) => output.success(),
         Err(_) => false,
     }
 }

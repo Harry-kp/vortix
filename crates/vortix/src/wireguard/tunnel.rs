@@ -26,6 +26,8 @@ use crate::wireguard::parser::parse_wg_conf;
 /// request is returned on [`TunnelHandle`] for the protocol-neutral policy
 /// coordinator; `wg-quick` never mutates resolver state itself.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// A wedged teardown must not hold the engine thread forever.
+const WG_QUICK_DOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STATUS_POLL: Duration = Duration::from_millis(250);
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1222,7 +1224,9 @@ fn prepare_down_target(handle: &TunnelHandle) -> Result<PreparedDownTarget, Tunn
 }
 
 fn wg_quick_down_spec(target: String) -> CommandSpec {
-    CommandSpec::oneshot("wg-quick", vec!["down".into(), target]).privilege(PrivilegeReq::Root)
+    CommandSpec::oneshot("wg-quick", vec!["down".into(), target])
+        .privilege(PrivilegeReq::Root)
+        .timeout(WG_QUICK_DOWN_TIMEOUT)
 }
 
 impl WgTunnel {
