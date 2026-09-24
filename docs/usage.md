@@ -21,7 +21,7 @@ Press `?` at any time for the complete in-app reference. The most frequently use
 | Key | Action |
 |---|---|
 | `1`–`9` | Quick-connect to profile N |
-| `d` | Disconnect, cancel, or force-kill the focused tunnel according to its phase |
+| `d` | Disconnect or cancel the focused tunnel according to its phase (a stuck process is killed automatically) |
 | `D` | Disconnect every active tunnel |
 | `r` | Reconnect |
 | `i` | Import a profile, directory, or URL |

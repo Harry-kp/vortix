@@ -737,7 +737,7 @@ pub mod help {
             "Global",
             &[
                 ("1-9", "Quick connect to profile N"),
-                ("d", "Disconnect focused tunnel / Cancel / Force Kill"),
+                ("d", "Disconnect focused tunnel / Cancel"),
                 ("D", "Disconnect ALL active tunnels (when N>1)"),
                 ("r", "Reconnect"),
                 ("i", "Import profile (file, dir, URL)"),

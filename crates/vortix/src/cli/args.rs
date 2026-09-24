@@ -118,13 +118,13 @@ pub enum Commands {
     /// means "stop the one tunnel"). With a profile name, disconnects
     /// that profile only. `--all` is the explicit script-friendly form
     /// of the no-args behaviour. If already disconnected, exits
-    /// successfully (idempotent). Use --force to SIGKILL a stuck process.
+    /// successfully (idempotent). A process still running 5 s after the
+    /// graceful stop is killed on every disconnect.
     ///
     /// EXAMPLES:
     ///     sudo vortix down              Disconnect every active tunnel
     ///     sudo vortix down corp         Disconnect only the 'corp' profile
     ///     sudo vortix down --all        Explicit "all" (script clarity)
-    ///     sudo vortix down --force      Force-kill if stuck
     ///     sudo vortix down --json       Disconnect with JSON result
     #[command(visible_alias = "disconnect")]
     Down {
@@ -138,8 +138,9 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Force-kill the VPN process (SIGKILL)
-        #[arg(short, long)]
+        /// Accepted for older scripts; every disconnect already kills a
+        /// process that ignores the graceful stop.
+        #[arg(short, long, hide = true)]
         force: bool,
     },
 

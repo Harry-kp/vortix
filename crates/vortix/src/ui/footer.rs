@@ -71,7 +71,7 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Reflects what `d` will do against the most relevant tunnel. Priority:
-    // Disconnecting (already tearing down → Force Kill) > Connecting /
+    // Disconnecting (already tearing down → no action) > Connecting /
     // Reconnecting / AwaitingCredentials (in-flight → Cancel) > Connected
     // (steady → Disconnect). When no tunnel is active but a prior session
     // exists, surface `r Reconnect`.
@@ -125,16 +125,15 @@ fn focused_profile_action(state: Option<Phase>) -> &'static str {
         FocusedTunnelAction::Connect => "Connect",
         FocusedTunnelAction::Cancel => "Cancel",
         FocusedTunnelAction::Disconnect => "Disconnect",
-        FocusedTunnelAction::ForceDisconnect => "Force Kill",
+        FocusedTunnelAction::Stopping => "Stopping…",
     }
 }
 
 fn focused_disconnect_hint(state: Option<Phase>) -> Option<(&'static str, &'static str)> {
     match focused_tunnel_action(state) {
-        FocusedTunnelAction::ForceDisconnect => Some(("d", "Force Kill")),
         FocusedTunnelAction::Cancel => Some(("d", "Cancel")),
         FocusedTunnelAction::Disconnect => Some(("d", "Disconnect")),
-        FocusedTunnelAction::Connect => None,
+        FocusedTunnelAction::Connect | FocusedTunnelAction::Stopping => None,
     }
 }
 
@@ -349,10 +348,7 @@ mod tests {
             focused_disconnect_hint(Some(connected)),
             Some(("d", "Disconnect"))
         );
-        assert_eq!(focused_profile_action(Some(disconnecting)), "Force Kill");
-        assert_eq!(
-            focused_disconnect_hint(Some(disconnecting)),
-            Some(("d", "Force Kill"))
-        );
+        assert_eq!(focused_profile_action(Some(disconnecting)), "Stopping…");
+        assert_eq!(focused_disconnect_hint(Some(disconnecting)), None);
     }
 }

@@ -56,7 +56,7 @@ pub enum Message {
     // === Connection ===
     /// Toggle connection for profile at index (None = selected)
     ToggleConnect(Option<usize>),
-    /// Disconnect from current VPN (press again while disconnecting to force-kill)
+    /// Disconnect the current tunnel
     Disconnect,
     /// Reconnect to last profile
     Reconnect,
@@ -90,10 +90,6 @@ pub enum Message {
     /// the global `Disconnect` message which targets the legacy single-
     /// tunnel active profile.
     DisconnectProfile { idx: usize },
-    /// Force-disconnect one exact profile when its teardown is already in
-    /// progress. This is the profile-scoped counterpart to the legacy global
-    /// `Disconnect` fallback.
-    ForceDisconnectProfile { idx: usize },
     /// open the "Disconnect all N tunnels?"
     /// confirmation dialog (the Shift+`D` keybinding when N>1). Fired from
     /// the sidebar; with N≤1 the input layer dispatches `DisconnectProfile`

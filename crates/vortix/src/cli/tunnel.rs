@@ -432,20 +432,37 @@ pub(super) fn handle_down(
         None,
         timeout_secs,
     );
-    if let Err(error) = run_engine_command(
+    let snapshot = match run_engine_command(
         config,
         config_dir,
         profiles.clone(),
         command,
         Duration::from_secs(timeout_secs),
     ) {
-        engine_failure_or_exit(mode, "down", error);
-    }
+        Ok(snapshot) => snapshot,
+        Err(error) => engine_failure_or_exit(mode, "down", error),
+    };
 
-    let disconnected = targets
+    // Tunnels Vortix did not start are left running; never report them gone.
+    let (unmanaged, disconnected): (Vec<String>, Vec<String>) = targets
         .iter()
         .map(|session| session.name.clone())
-        .collect::<Vec<_>>();
+        .partition(|name| snapshot.external.contains(name));
+    if !unmanaged.is_empty() {
+        print_error_and_exit(
+            mode,
+            "down",
+            CliError {
+                code: "not_managed",
+                message: format!(
+                    "Not started by Vortix, left running: {}",
+                    unmanaged.join(", ")
+                ),
+                hint: Some("Stop it with the tool that started it (e.g. wg-quick down).".into()),
+            },
+            ExitCode::StateConflict,
+        );
+    }
 
     let data = DownData {
         state: "disconnected".into(),
@@ -606,29 +623,37 @@ pub(super) fn handle_reconnect(
         }
     }
 
-    for name in &to_cycle {
-        let profile = profiles
-            .iter()
-            .find(|profile| &profile.name == name)
-            .expect("reconnect target exists");
-        let data = UpData {
+    let reconnected = to_cycle
+        .iter()
+        .filter_map(|name| profiles.iter().find(|profile| &profile.name == name))
+        .map(|profile| UpData {
             state: "connected".into(),
             profile: profile.name.clone(),
             protocol: profile.protocol.to_string(),
-        };
-        match mode {
-            OutputMode::Human => println!("● Connected to {} ({})", profile.name, profile.protocol),
-            OutputMode::Json => print_success(
+        })
+        .collect::<Vec<_>>();
+    match mode {
+        OutputMode::Human => {
+            for data in &reconnected {
+                println!("● Connected to {} ({})", data.profile, data.protocol);
+            }
+        }
+        OutputMode::Json => {
+            #[derive(Serialize)]
+            struct ReconnectData {
+                reconnected: Vec<UpData>,
+            }
+            print_success(
                 mode,
-                "up",
-                &data,
+                "reconnect",
+                &ReconnectData { reconnected },
                 vec![
                     "vortix status --json".into(),
                     "sudo vortix down --json".into(),
                 ],
-            ),
-            OutputMode::Quiet => {}
+            );
         }
+        OutputMode::Quiet => {}
     }
     0
 }

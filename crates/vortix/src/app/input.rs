@@ -21,13 +21,14 @@ pub(crate) enum FocusedTunnelAction {
     Connect,
     Cancel,
     Disconnect,
-    ForceDisconnect,
+    /// Already stopping; a stuck process is killed without being asked.
+    Stopping,
 }
 
 /// Classify one focused tunnel without falling back to another active tunnel.
 pub(crate) const fn focused_tunnel_action(phase: Option<Phase>) -> FocusedTunnelAction {
     match phase {
-        Some(Phase::Stopping) => FocusedTunnelAction::ForceDisconnect,
+        Some(Phase::Stopping) => FocusedTunnelAction::Stopping,
         Some(Phase::Starting | Phase::Waiting { .. } | Phase::AwaitingCredentials) => {
             FocusedTunnelAction::Cancel
         }
@@ -83,11 +84,8 @@ impl App {
             FocusedTunnelAction::Disconnect => {
                 self.handle_message(Message::DisconnectProfile { idx });
             }
-            FocusedTunnelAction::ForceDisconnect => {
-                self.handle_message(Message::ForceDisconnectProfile { idx });
-            }
             FocusedTunnelAction::Cancel => self.handle_message(Message::CancelConnect { idx }),
-            FocusedTunnelAction::Connect => {}
+            FocusedTunnelAction::Connect | FocusedTunnelAction::Stopping => {}
         }
     }
 
@@ -820,9 +818,7 @@ impl crate::app::App {
                         FocusedTunnelAction::Disconnect => {
                             self.handle_message(Message::DisconnectProfile { idx });
                         }
-                        FocusedTunnelAction::ForceDisconnect => {
-                            self.handle_message(Message::ForceDisconnectProfile { idx });
-                        }
+                        FocusedTunnelAction::Stopping => {}
                     }
                 }
                 KeyCode::Char('v') => {

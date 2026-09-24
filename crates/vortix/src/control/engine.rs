@@ -468,6 +468,21 @@ impl Engine {
                 self.live.insert(profile_id.clone(), live);
                 self.state.stop_failed(profile_id);
                 self.errors.insert(profile_id.clone(), error.clone());
+                // A reconnect waiting on this tunnel would otherwise see it
+                // Up again and report the cycle as done.
+                let reconnects = self
+                    .waits
+                    .iter()
+                    .filter(|(_, wait)| matches!(wait, Wait::Up(id) if id == profile_id))
+                    .map(|(ticket, _)| *ticket)
+                    .collect::<Vec<_>>();
+                for ticket in reconnects {
+                    self.waits.remove(&ticket);
+                    self.outcomes.insert(
+                        ticket,
+                        Outcome::Failed(format!("could not disconnect to reconnect: {error}")),
+                    );
+                }
                 self.notice(
                     Level::Error,
                     format!("Could not disconnect '{name}': {error}"),
@@ -793,12 +808,15 @@ impl Engine {
 
     /// Resolve tickets whose condition now holds.
     fn settle(&mut self) {
+        // Up or gone is not done until the host network matches; a failed
+        // apply is retried, and the caller's own deadline reports it.
+        let net_ok = self.apply_error.is_none();
         let mut done = Vec::new();
         for (ticket, wait) in &self.waits {
             let outcome = match wait {
                 Wait::Up(profile_id) => match self.state.get(profile_id).map(|tunnel| tunnel.phase)
                 {
-                    Some(Phase::Up) => Some(Outcome::Done),
+                    Some(Phase::Up) => net_ok.then_some(Outcome::Done),
                     None | Some(Phase::Waiting { .. }) => Some(Outcome::Failed(
                         self.errors
                             .get(profile_id)
@@ -813,7 +831,7 @@ impl Engine {
                         .filter(|profile_id| self.state.get(profile_id).is_some())
                         .collect::<Vec<_>>();
                     if remaining.is_empty() {
-                        Some(Outcome::Done)
+                        net_ok.then_some(Outcome::Done)
                     } else {
                         remaining
                             .iter()
@@ -924,6 +942,7 @@ impl Engine {
             routes,
             external: self.external.clone(),
             last_connected: self.last_connected.clone(),
+            net_error: self.apply_error.clone(),
         };
         if next == self.published {
             return;

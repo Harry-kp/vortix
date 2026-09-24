@@ -107,9 +107,9 @@ impl App {
                     self.send(crate::control::Command::Switch(profile.id));
                 }
             }
-            Message::DisconnectProfile { idx }
-            | Message::ForceDisconnectProfile { idx }
-            | Message::CancelConnect { idx } => self.disconnect_profile_by_idx(idx),
+            Message::DisconnectProfile { idx } | Message::CancelConnect { idx } => {
+                self.disconnect_profile_by_idx(idx);
+            }
             Message::RequestDisconnectAll => {
                 let count = self.tunnel_count();
                 if count > 1 {

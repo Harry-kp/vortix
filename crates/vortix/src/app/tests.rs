@@ -2212,7 +2212,7 @@ fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
     );
     assert_eq!(
         focused_tunnel_action(Some(Phase::Stopping)),
-        FocusedTunnelAction::ForceDisconnect
+        FocusedTunnelAction::Stopping
     );
     assert_eq!(focused_tunnel_action(None), FocusedTunnelAction::Connect);
 }

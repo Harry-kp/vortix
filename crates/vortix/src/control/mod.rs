@@ -145,6 +145,8 @@ pub struct Snapshot {
     /// Profiles running outside Vortix's control.
     pub external: Vec<String>,
     pub last_connected: BTreeMap<ProfileId, SystemTime>,
+    /// Why the host network does not match the plan, while it does not.
+    pub net_error: Option<String>,
 }
 
 impl Snapshot {
@@ -325,7 +327,10 @@ impl Control {
                 _ => {}
             }
             if Instant::now() >= deadline {
-                return Err("timed out waiting for the VPN".into());
+                return Err(snapshot.net_error.as_ref().map_or_else(
+                    || "timed out waiting for the VPN".into(),
+                    |error| format!("network settings not applied: {error}"),
+                ));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
