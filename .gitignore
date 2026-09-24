@@ -9,3 +9,6 @@
 # unanchored so it matches `test-profiles/` at repo root and
 # `scripts/test-profiles/` alike.
 test-profiles/
+
+# macOS Finder metadata
+.DS_Store

@@ -32,7 +32,8 @@ fi
 
 if ! $quick; then
   step "release build"; cargo build --release -p vortix --locked
-  step "release smoke"; bash tests/integration/release_smoke.sh
+  # Same budget CI enforces on aarch64-apple-darwin (integration-tests.yml).
+  step "release smoke"; VORTIX_SIZE_BUDGET_BYTES=7000000 bash tests/integration/release_smoke.sh
 fi
 
 printf '\nAll checks passed.\n'

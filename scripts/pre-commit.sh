@@ -18,7 +18,13 @@ cargo fmt --all -- --check
 echo "📎 Running linter (cargo clippy)..."
 cargo clippy --workspace --all-targets -- -D warnings
 
-# 3. Run Tests
+# 3. Secrets: profiles carry private keys; never let one into history.
+if command -v gitleaks >/dev/null 2>&1; then
+    echo "🔐 Scanning staged changes for secrets (gitleaks)..."
+    gitleaks protect --staged --redact
+fi
+
+# 4. Run Tests
 echo "🧪 Running tests (cargo test)..."
 cargo test --workspace
 

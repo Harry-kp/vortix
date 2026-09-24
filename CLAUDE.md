@@ -129,8 +129,11 @@ panes: window 0 for the TUI, window 1 for a root shell (both started with
 `sudo -s` and `export SUDO_UID=502 SUDO_GID=20 SUDO_USER=harshitchaudhary`).
 Drive them with `tmux send-keys -t vxrun:0 …` and read frames with
 `tmux capture-pane -p -t vxrun:0`. If the session is missing, ask the user to
-create it. In the TUI: digits quick-connect a profile, `D` then `y`
-disconnects all, `K` cycles the kill switch, `q` quits. Verify host state from
+create it. In the TUI: digits quick-connect a profile; with the sidebar
+focused, `D` disconnects all (and asks `y`/`n` only when 2+ tunnels are up —
+with one tunnel a following `y` copies the IP); `K` cycles the kill switch;
+`q` quits. Window 1 is a root shell and `tmux send-keys` into it is allowed
+without a prompt: treat it as root access. Verify host state from
 window 1 (`netstat -rn -f inet`, `scutil --dns`, `pfctl -a com.apple/vortix.killswitch -sr`).
 
 ## Live testing (Linux)
@@ -145,8 +148,10 @@ tmux session `vxlinux` has root windows 1 and 2 for the TUI. Check host state
 with `ip -4 route`, `resolvectl dns`, `nft list table inet vortix_killswitch`.
 Anything verified live on macOS should be verified here too.
 
-Profiles contain private keys and passwords: never print, copy or commit them.
-Credentials are typed by the user.
+## Secrets
+
+Profiles contain private keys and passwords, on both machines: never print,
+copy or commit them. Credentials are typed by the user.
 
 ## Git and PRs
 
@@ -154,11 +159,11 @@ Credentials are typed by the user.
   (`fix:`, `refactor:`, `perf:`, `test:`, `docs:`). Commit with the configured
   identity — never pass `-c user.*`.
 - End commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- A gitleaks hook blocks commits containing secret-like strings; run
-  `gitleaks protect --staged --redact` first. Never stage `.DS_Store`.
-- The pre-commit hook (`scripts/install-hooks.sh`) runs fmt, clippy and tests.
+- The pre-commit hook (`scripts/install-hooks.sh`) runs fmt, clippy, gitleaks
+  (secret scan of staged changes) and tests. `.DS_Store` is ignored.
 - PRs squash-merge into `main`. `main` has no branch protection, so the green
-  check is ours to enforce: merge only when every `gh pr checks` entry passes.
+  check is ours to enforce: merge only when every `gh pr checks` row is `pass`
+  or `skipping` (release jobs always skip) and none is failing or pending.
 - Push only when asked, or as part of `/fix-bug`.
 
 ## Build budget
