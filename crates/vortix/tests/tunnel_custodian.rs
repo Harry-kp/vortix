@@ -26,7 +26,9 @@ struct FakeProcess {
     alive: BTreeMap<ManagedProcessId, bool>,
     waits: VecDeque<bool>,
     fail_start_probe: bool,
-    calls: Vec<Call>,
+    /// The guardian is spawned, then its READY handshake fails.
+    fail_handshake: bool,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<Call>>>,
 }
 
 impl ProcessLifecycle for FakeProcess {
@@ -35,8 +37,14 @@ impl ProcessLifecycle for FakeProcess {
         identity: ManagedProcessId,
         _spec: CommandSpec,
     ) -> Result<ProcessOwnership, ProcessError> {
-        self.calls.push(Call::Spawn);
+        self.calls.lock().unwrap().push(Call::Spawn);
         self.alive.insert(identity.clone(), true);
+        if self.fail_handshake {
+            return Err(ProcessError::Timeout {
+                program: "process-guardian".into(),
+                duration: Duration::from_secs(3),
+            });
+        }
         Ok(ProcessOwnership {
             identity,
             pid: 4242,
@@ -44,7 +52,7 @@ impl ProcessLifecycle for FakeProcess {
     }
 
     fn is_alive(&mut self, identity: &ManagedProcessId) -> Result<bool, ProcessError> {
-        self.calls.push(Call::Probe);
+        self.calls.lock().unwrap().push(Call::Probe);
         if self.fail_start_probe {
             self.fail_start_probe = false;
             return Ok(false);
@@ -53,7 +61,7 @@ impl ProcessLifecycle for FakeProcess {
     }
 
     fn graceful_stop(&mut self, _identity: &ManagedProcessId) -> Result<(), ProcessError> {
-        self.calls.push(Call::Graceful);
+        self.calls.lock().unwrap().push(Call::Graceful);
         Ok(())
     }
 
@@ -62,7 +70,7 @@ impl ProcessLifecycle for FakeProcess {
         identity: &ManagedProcessId,
         _timeout: Duration,
     ) -> Result<bool, ProcessError> {
-        self.calls.push(Call::Wait);
+        self.calls.lock().unwrap().push(Call::Wait);
         let exited = self.waits.pop_front().unwrap_or(true);
         if exited {
             self.alive.insert(identity.clone(), false);
@@ -71,13 +79,13 @@ impl ProcessLifecycle for FakeProcess {
     }
 
     fn force_kill(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError> {
-        self.calls.push(Call::Force);
+        self.calls.lock().unwrap().push(Call::Force);
         self.alive.insert(identity.clone(), false);
         Ok(())
     }
 
     fn reap(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError> {
-        self.calls.push(Call::Reap);
+        self.calls.lock().unwrap().push(Call::Reap);
         self.alive.remove(identity);
         Ok(())
     }
@@ -134,6 +142,28 @@ fn failed_startup_is_force_killed_reaped_and_never_owned() {
         Err(CustodianError::StartupFailed)
     ));
     assert!(!custodian.owns(&id));
+}
+
+/// The real lifecycle keeps the guardian registered when READY never comes;
+/// the custodian must kill and reap it rather than leak it.
+#[test]
+fn a_failed_ready_handshake_kills_and_reaps_the_guardian() {
+    let calls = std::sync::Arc::default();
+    let fake = FakeProcess {
+        fail_handshake: true,
+        calls: std::sync::Arc::clone(&calls),
+        ..FakeProcess::default()
+    };
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
+    let id = identity(10);
+    assert!(custodian
+        .start(id.clone(), CommandSpec::oneshot("fake-openvpn", Vec::new()))
+        .is_err());
+    assert!(!custodian.owns(&id));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [Call::Spawn, Call::Force, Call::Wait, Call::Reap]
+    );
 }
 
 #[test]
