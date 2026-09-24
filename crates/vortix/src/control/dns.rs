@@ -205,7 +205,7 @@ pub trait DnsPolicyAdapter {
 
 const DNS_PROOF_MAX_AGE: Duration = Duration::from_secs(5);
 
-/// Monotonic coordinator state shared by local CLI/TUI and the later service.
+/// Monotonic DNS coordinator state shared by the CLI and TUI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsPolicyCoordinator {
     desired: Option<DnsPolicy>,
@@ -249,22 +249,6 @@ impl DnsPolicyCoordinator {
         &self.effective
     }
 
-    /// Recover the last requested resolver intent for same-boot/process
-    /// restart reconciliation. Live protocol evidence replaces this cache.
-    #[must_use]
-    pub fn request_for(&self, profile_id: &ProfileId) -> Option<DnsRequest> {
-        let assignment = self
-            .desired
-            .as_ref()?
-            .assignments
-            .iter()
-            .find(|assignment| &assignment.profile_id == profile_id)?;
-        Some(DnsRequest {
-            servers: assignment.servers.clone(),
-            search_domains: assignment.search_domains.clone(),
-        })
-    }
-
     /// Persisted effective state is recovery evidence, never fresh platform
     /// verification. Force the next reconcile to reapply/read back.
     pub fn invalidate_effective(&mut self, reason: impl Into<String>) {
@@ -285,31 +269,6 @@ impl DnsPolicyCoordinator {
     /// Force a read-only platform proof on the next unchanged reconcile.
     pub fn invalidate_verification(&mut self) {
         self.clear_verification();
-    }
-
-    /// Read back an already-applied policy without changing resolver state.
-    /// The requested intents must still describe the coordinator's exact
-    /// current policy; otherwise an old proof cannot be refreshed.
-    pub fn verify_current<A: DnsPolicyAdapter>(
-        &self,
-        intents: &[DnsTunnelIntent],
-        adapter: &A,
-    ) -> Result<(), Vec<String>> {
-        if !self.runtime_authority {
-            return Err(vec!["DNS runtime authority is unavailable".into()]);
-        }
-        let desired = self
-            .desired
-            .as_ref()
-            .ok_or_else(|| vec!["DNS desired policy is unavailable".into()])?;
-        let candidate = DnsPolicy::compute(desired.generation, intents, adapter.capabilities())
-            .map_err(|error| vec![error.to_string()])?;
-        if !desired.same_content(&candidate) {
-            return Err(vec![
-                "DNS desired policy no longer matches the applied topology".into(),
-            ]);
-        }
-        adapter.verify(desired, &self.effective)
     }
 
     /// Recompute and apply the entire policy. Identical effective content is

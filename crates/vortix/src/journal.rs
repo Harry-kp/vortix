@@ -2,7 +2,7 @@
 //!
 //! Two output paths in parallel:
 //! - **Bounded mpsc to a writer task** that appends to
-//!   `${XDG_DATA_HOME}/vortix/sessions/<ISO>-<pid>.jsonl`. Each line is one
+//!   `<config_dir>/sessions/<ISO>-<pid>.jsonl`. Each line is one
 //!   [`EventEnvelope`] serialised as JSON. Saturation is returned and counted.
 //! - **Lossy broadcast** (`tokio::sync::broadcast`, capacity 1024). Slow
 //!   subscribers get `Lagged(N)`; they re-sync via [`Journal::tail`].
@@ -334,8 +334,8 @@ pub struct JournalConfig {
     pub retention_days: u32,
     /// At most this many session files are retained.
     pub retention_count: u32,
-    /// Directory holding session files. Falls back to
-    /// `${XDG_DATA_HOME}/vortix/sessions/` when unset.
+    /// Directory holding session files; the app passes
+    /// `<config_dir>/sessions`. Falls back to `${XDG_DATA_HOME}/vortix/sessions/`.
     pub journal_dir: Option<PathBuf>,
     /// Capacity of the in-memory tail buffer.
     pub tail_capacity: usize,

@@ -1,4 +1,4 @@
-//! Owner-readable receipts for successful Standard-mode `WireGuard` connects.
+//! Owner-readable receipts for successful `WireGuard` connects.
 //!
 //! A receipt is display/adoption evidence only. It is deliberately never
 //! accepted as authority to remove an interface, change routes, or mutate

@@ -207,19 +207,6 @@ impl App {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn rename_profile(&mut self, idx: usize, new_name: &str) {
-        let Some(profile_id) = self
-            .runtime
-            .profiles
-            .get(idx)
-            .map(|profile| profile.id.clone())
-        else {
-            return;
-        };
-        self.rename_profile_by_id(&profile_id, new_name);
-    }
-
     /// Import a profile from a file path or bulk import from directory
     pub(crate) fn import_profile_from_path(&mut self, path_str: &str) {
         use crate::config::import::{resolve_target, ImportTarget};

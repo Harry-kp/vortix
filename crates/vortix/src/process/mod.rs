@@ -10,7 +10,7 @@ pub mod mock;
 pub mod orphan_scan;
 pub mod real;
 
-pub use custodian::{CustodianError, CustodianHandshake, StandardCustodian};
+pub use custodian::{Custodian, CustodianError, CustodianHandshake};
 #[cfg(test)]
 pub use mock::MockRunner;
 pub use orphan_scan::{filter_untracked, scan_orphans, OrphanProcess};
@@ -276,12 +276,6 @@ impl CommandOutcome {
     pub fn stdout_lossy(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.stdout)
     }
-
-    /// Convenience: stderr as a UTF-8 string (lossy).
-    #[must_use]
-    pub fn stderr_lossy(&self) -> std::borrow::Cow<'_, str> {
-        String::from_utf8_lossy(&self.stderr)
-    }
 }
 
 /// Stable ownership key for a foreground protocol child.
@@ -335,7 +329,7 @@ pub struct ProcessOwnership {
     pub pid: u32,
 }
 
-/// Process-lifecycle port used by the Standard-mode custodian. Protocol
+/// Process-lifecycle port used by the custodian. Protocol
 /// adapters build the command specification; only the process layer spawns,
 /// signals, waits for, and reaps the child.
 pub trait ProcessLifecycle: Send + 'static {

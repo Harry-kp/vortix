@@ -877,8 +877,7 @@ fn save_state_at(
         mode,
         state: legacy_state,
         effective_state: Some(state),
-        // V1 legacy fields — left empty on fresh V2 writes. V1 readers
-        // that lack `#[serde(default)]` tolerance need D5 (see plan).
+        // V1 fields, left empty on V2 writes so older readers still parse.
         vpn_interface: None,
         vpn_server_ip: None,
         active_tunnels,

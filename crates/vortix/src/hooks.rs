@@ -136,7 +136,7 @@ mod runner {
     }
 
     impl VerifiedHookOwner {
-        /// Prove the owner for Standard mode.
+        /// Prove the owner.
         ///
         /// A direct non-root invocation must own the selected configuration path.
         /// A root invocation additionally needs coherent sudo uid/gid/user facts;
@@ -458,7 +458,7 @@ mod runner {
 
         /// Stop accepting control events and give already-queued observers a
         /// bounded opportunity to finish. Lifecycle never waits for hook success;
-        /// this is only the Standard-mode process-exit drain.
+        /// this is only the process-exit drain.
         pub async fn shutdown_bounded(mut self, timeout: std::time::Duration) {
             drop(self.dispatcher.take());
             let Some(task) = self.task.take() else {

@@ -8,7 +8,7 @@ use serde::Serialize;
 use vortix::process::{
     CommandSpec, ManagedProcessId, ProcessError, ProcessLifecycle, ProcessOwnership,
 };
-use vortix::process::{CustodianError, StandardCustodian};
+use vortix::process::{Custodian, CustodianError};
 use vortix::profile::ProfileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +94,7 @@ fn identity(generation: u64) -> ManagedProcessId {
 #[test]
 fn foreground_child_handshake_then_graceful_stop_and_reap() {
     let fake = FakeProcess::default();
-    let mut custodian = StandardCustodian::new(fake, Duration::from_millis(10));
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
     let id = identity(7);
     let handshake = custodian
         .start(id.clone(), CommandSpec::oneshot("fake-openvpn", Vec::new()))
@@ -112,7 +112,7 @@ fn deadline_escalates_to_process_group_kill_then_reaps() {
         waits: VecDeque::from([false, true]),
         ..FakeProcess::default()
     };
-    let mut custodian = StandardCustodian::new(fake, Duration::from_millis(10));
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
     let id = identity(8);
     custodian
         .start(id.clone(), CommandSpec::oneshot("fake-openvpn", Vec::new()))
@@ -127,7 +127,7 @@ fn failed_startup_is_force_killed_reaped_and_never_owned() {
         fail_start_probe: true,
         ..FakeProcess::default()
     };
-    let mut custodian = StandardCustodian::new(fake, Duration::from_millis(10));
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
     let id = identity(9);
     assert!(matches!(
         custodian.start(id.clone(), CommandSpec::oneshot("fake-openvpn", Vec::new())),
@@ -139,7 +139,7 @@ fn failed_startup_is_force_killed_reaped_and_never_owned() {
 #[test]
 fn crash_containment_cleans_every_child_without_control_authority() {
     let fake = FakeProcess::default();
-    let mut custodian = StandardCustodian::new(fake, Duration::from_millis(10));
+    let mut custodian = Custodian::new(fake, Duration::from_millis(10));
     let first = identity(10);
     let mut second = identity(11);
     second.profile_id = ProfileId::new("other-stable-profile");
@@ -346,7 +346,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
         Some(&first)
     );
 
-    // A later one-shot Standard-mode authority reconstructs the exact
+    // A later one-shot authority reconstructs the exact
     // OpenVPN handle from the authenticated custodian receipt and can stop it
     // without an in-memory executor ledger.
     let recovered_identity = real_identity('0');

@@ -1265,42 +1265,42 @@ fn assert_rename_rejected(app: &App) {
 #[test]
 fn rename_rejects_empty_name() {
     let mut app = setup_rename_app();
-    app.rename_profile(0, "   ");
+    rename_first(&mut app, "   ");
     assert_rename_rejected(&app);
 }
 
 #[test]
 fn rename_rejects_forward_slash() {
     let mut app = setup_rename_app();
-    app.rename_profile(0, "../etc/passwd");
+    rename_first(&mut app, "../etc/passwd");
     assert_rename_rejected(&app);
 }
 
 #[test]
 fn rename_rejects_backslash() {
     let mut app = setup_rename_app();
-    app.rename_profile(0, "..\\windows\\system32");
+    rename_first(&mut app, "..\\windows\\system32");
     assert_rename_rejected(&app);
 }
 
 #[test]
 fn rename_rejects_dot_dot_traversal() {
     let mut app = setup_rename_app();
-    app.rename_profile(0, "foo..bar");
+    rename_first(&mut app, "foo..bar");
     assert_rename_rejected(&app);
 }
 
 #[test]
 fn rename_rejects_hidden_file_prefix() {
     let mut app = setup_rename_app();
-    app.rename_profile(0, ".hidden");
+    rename_first(&mut app, ".hidden");
     assert_rename_rejected(&app);
 }
 
 #[test]
 fn rename_accepts_valid_alphanumeric() {
     let mut app = setup_rename_app();
-    app.rename_profile(0, "my-vpn-2024");
+    rename_first(&mut app, "my-vpn-2024");
     // Name changes only if the filesystem rename succeeds; in tests there
     // is no real file, so the rename may fail at the fs level — but the
     // validation itself must NOT reject a valid name (no early return).
@@ -1315,7 +1315,7 @@ fn rename_accepts_valid_alphanumeric() {
 #[test]
 fn rename_accepts_unicode_name() {
     let mut app = setup_rename_app();
-    app.rename_profile(0, "日本-VPN");
+    rename_first(&mut app, "日本-VPN");
     let last_toast = app.toast.as_ref().map(|t| t.message.clone());
     assert!(
         !last_toast.as_deref().unwrap_or("").contains("Invalid name"),
@@ -1326,7 +1326,7 @@ fn rename_accepts_unicode_name() {
 #[test]
 fn rename_accepts_spaces_and_hyphens() {
     let mut app = setup_rename_app();
-    app.rename_profile(0, "My Work VPN - US East");
+    rename_first(&mut app, "My Work VPN - US East");
     let last_toast = app.toast.as_ref().map(|t| t.message.clone());
     assert!(
         !last_toast.as_deref().unwrap_or("").contains("Invalid name"),
@@ -2493,4 +2493,9 @@ fn a_reconnecting_full_tunnel_with_no_other_exit_is_still_primary() {
         app.role(&tunnel),
         crate::app::Role::AddressableSuppressed { .. }
     ));
+}
+
+fn rename_first(app: &mut App, new_name: &str) {
+    let profile_id = app.runtime.profiles[0].id.clone();
+    app.rename_profile_by_id(&profile_id, new_name);
 }

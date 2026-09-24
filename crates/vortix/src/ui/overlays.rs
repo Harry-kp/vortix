@@ -1503,7 +1503,7 @@ pub mod import {
                     Style::default().fg(theme::current().nord_purple),
                 ),
                 Span::styled(
-                    format!(" → {}", constants::PROTO_WIREGUARD),
+                    format!(" → {}", crate::profile::ProtocolKind::WireGuard),
                     Style::default().fg(theme::current().text_secondary),
                 ),
             ]),
@@ -1513,7 +1513,7 @@ pub mod import {
                     Style::default().fg(theme::current().warning),
                 ),
                 Span::styled(
-                    format!(" → {}", constants::PROTO_OPENVPN),
+                    format!(" → {}", crate::profile::ProtocolKind::OpenVpn),
                     Style::default().fg(theme::current().text_secondary),
                 ),
             ]),

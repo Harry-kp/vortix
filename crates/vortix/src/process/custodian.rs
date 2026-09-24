@@ -1,4 +1,4 @@
-//! Tunnel-scoped Standard-mode process custodian.
+//! Tunnel-scoped process custodian.
 //!
 //! A one-shot CLI may exit after `up`, so a foreground protocol child cannot
 //! remain owned by process-global memory. Each attempt gets a small private
@@ -108,13 +108,13 @@ struct OwnershipReceipt {
 /// Bounded lifecycle custodian parameterized by a deterministic fake or real
 /// process backend. The production hidden entrypoint owns exactly one child;
 /// the map keeps the teardown contract independently unit-testable.
-pub struct StandardCustodian<P: ProcessLifecycle> {
+pub struct Custodian<P: ProcessLifecycle> {
     process: P,
     owned: BTreeMap<ManagedProcessId, u32>,
     graceful_timeout: Duration,
 }
 
-impl<P: ProcessLifecycle> StandardCustodian<P> {
+impl<P: ProcessLifecycle> Custodian<P> {
     #[must_use]
     pub fn new(process: P, graceful_timeout: Duration) -> Self {
         Self {
@@ -358,7 +358,7 @@ pub fn load_identity(profile_id: &ProfileId) -> Result<Option<ManagedProcessId>,
     Ok(load_handshake(profile_id)?.map(|receipt| receipt.identity))
 }
 
-/// Read the authenticated Standard-mode child capability and PID needed to
+/// Read the authenticated child capability and PID needed to
 /// reconstruct an exact lifecycle handle in a later one-shot process.
 pub fn load_handshake(
     profile_id: &ProfileId,
@@ -565,7 +565,7 @@ fn run_hidden() -> Result<(), CustodianError> {
             "custodian terminated before child spawn".into(),
         ));
     }
-    let mut custodian = StandardCustodian::new(RealProcessLifecycle::default(), graceful_timeout);
+    let mut custodian = Custodian::new(RealProcessLifecycle::default(), graceful_timeout);
     let handshake = match custodian.start(request.identity.clone(), request.spec) {
         Ok(mut handshake) => {
             handshake.operation_id = request.operation_id;
@@ -673,7 +673,7 @@ fn run_hidden() -> Result<(), CustodianError> {
 fn handle_client<P: ProcessLifecycle>(
     mut stream: UnixStream,
     owned: &ManagedProcessId,
-    custodian: &mut StandardCustodian<P>,
+    custodian: &mut Custodian<P>,
 ) -> Result<bool, CustodianError> {
     if stream.set_read_timeout(Some(IPC_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(IPC_TIMEOUT)).is_err()

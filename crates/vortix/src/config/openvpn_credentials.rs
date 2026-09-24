@@ -170,7 +170,7 @@ pub enum CredentialStoreError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootOwnedCredentialAdoption {
     Disabled,
-    StandardAuthority,
+    Enabled,
 }
 
 /// Filesystem-backed remembered `OpenVPN` credential authority.
@@ -195,7 +195,7 @@ impl FsOpenVpnCredentialStore {
         }
     }
 
-    /// Construct the Standard-mode authority. Adoption still requires the
+    /// Construct the authority. Adoption still requires the
     /// effective process UID to be root at the moment the record is inspected.
     #[must_use]
     pub fn for_standard_owner(config_directory: impl Into<PathBuf>, uid: u32, gid: u32) -> Self {
@@ -203,7 +203,7 @@ impl FsOpenVpnCredentialStore {
             config_directory: config_directory.into(),
             expected_uid: uid,
             expected_gid: gid,
-            root_adoption: RootOwnedCredentialAdoption::StandardAuthority,
+            root_adoption: RootOwnedCredentialAdoption::Enabled,
         }
     }
 
@@ -567,7 +567,7 @@ fn classify_entry(
         && (facts.gid == expected_gid || facts.gid == effective_owner.1)
         && expected_uid != 0
         && canonical_stable_id
-        && adoption == RootOwnedCredentialAdoption::StandardAuthority
+        && adoption == RootOwnedCredentialAdoption::Enabled
         && effective_owner.0 == 0
     {
         return Ok(EntryAction::AdoptRoot);
@@ -767,24 +767,16 @@ mod tests {
                 501,
                 20,
                 true,
-                RootOwnedCredentialAdoption::StandardAuthority,
+                RootOwnedCredentialAdoption::Enabled,
                 (0, 0),
             )
             .unwrap(),
             EntryAction::AdoptRoot
         );
         for (stable, mode, effective) in [
-            (
-                false,
-                RootOwnedCredentialAdoption::StandardAuthority,
-                (0, 0),
-            ),
+            (false, RootOwnedCredentialAdoption::Enabled, (0, 0)),
             (true, RootOwnedCredentialAdoption::Disabled, (0, 0)),
-            (
-                true,
-                RootOwnedCredentialAdoption::StandardAuthority,
-                (501, 20),
-            ),
+            (true, RootOwnedCredentialAdoption::Enabled, (501, 20)),
         ] {
             assert!(matches!(
                 classify_entry(safe_root, 501, 20, stable, mode, effective),

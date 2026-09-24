@@ -17,7 +17,7 @@ use crate::profile::{Profile, ProfileId, ProtocolKind};
 use crate::tunnel::TunnelRevision;
 use crate::tunnel::{AuthorityEpoch, OperationId};
 use crate::tunnel::{TunnelCancellation, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
-use crate::wireguard::ownership::StandardTunnelOwnershipStore;
+use crate::wireguard::ownership::TunnelOwnershipStore;
 
 use crate::openvpn::OvpnTunnel;
 use crate::tunnel::{TunnelError, TunnelStatus};
@@ -107,7 +107,7 @@ fn revision(generation: u64) -> TunnelRevision {
 /// Bring a tunnel up. Blocks until it is up, failed, or `deadline` passes.
 pub fn start(
     settings: &Settings,
-    ownership: &StandardTunnelOwnershipStore,
+    ownership: &TunnelOwnershipStore,
     profile: &Profile,
     generation: u64,
     credentials: Option<OpenVpnStaticChallengeCredentials>,
@@ -141,7 +141,7 @@ pub fn start(
 /// Take a tunnel down and forget its ownership records.
 pub fn stop(
     settings: &Settings,
-    ownership: &StandardTunnelOwnershipStore,
+    ownership: &TunnelOwnershipStore,
     live: Live,
 ) -> Result<(), String> {
     let Live { mut kind, handle } = live;
@@ -162,7 +162,7 @@ pub fn stop(
 /// session is not ours.
 pub fn adopt(
     settings: &Settings,
-    ownership: &StandardTunnelOwnershipStore,
+    ownership: &TunnelOwnershipStore,
     profile: &Profile,
     session: &ActiveSession,
 ) -> Result<Option<Live>, String> {
@@ -197,7 +197,7 @@ pub fn adopt(
             }))
         }
         ProtocolKind::OpenVpn => {
-            let Some(owner) = standard_openvpn_owner(&profile.id, session)? else {
+            let Some(owner) = openvpn_owner(&profile.id, session)? else {
                 return Ok(None);
             };
             let kind = TunnelKind::new(ProtocolKind::OpenVpn, settings);
@@ -236,7 +236,7 @@ pub fn adopt(
 
 fn record_wireguard(
     settings: &Settings,
-    ownership: &StandardTunnelOwnershipStore,
+    ownership: &TunnelOwnershipStore,
     profile: &Profile,
     generation: u64,
     handle: &mut TunnelHandle,
@@ -391,12 +391,12 @@ impl TunnelKind {
     }
 }
 
-pub(crate) struct StandardOpenVpnOwner {
+pub(crate) struct OpenVpnOwner {
     custody: crate::process::CustodianHandshake,
     protocol_pid: u32,
 }
 
-impl StandardOpenVpnOwner {
+impl OpenVpnOwner {
     #[must_use]
     pub(crate) const fn generation(&self) -> u64 {
         self.custody.identity.generation
@@ -413,10 +413,10 @@ impl StandardOpenVpnOwner {
     }
 }
 
-pub(crate) fn standard_openvpn_owner(
+pub(crate) fn openvpn_owner(
     profile_id: &ProfileId,
     session: &crate::control::scanner::ActiveSession,
-) -> Result<Option<StandardOpenVpnOwner>, String> {
+) -> Result<Option<OpenVpnOwner>, String> {
     let Some(custody) = crate::process::custodian::load_handshake(profile_id)
         .map_err(|error| format!("OpenVPN ownership receipt rejected: {error}"))?
     else {
@@ -438,7 +438,7 @@ pub(crate) fn standard_openvpn_owner(
             "OpenVPN scanner PID is not contained by the authenticated custodian group".into(),
         );
     }
-    Ok(Some(StandardOpenVpnOwner {
+    Ok(Some(OpenVpnOwner {
         custody,
         protocol_pid: scanner_pid,
     }))

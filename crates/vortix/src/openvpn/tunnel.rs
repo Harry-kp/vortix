@@ -1,6 +1,6 @@
 //! `OvpnTunnel` — `OpenVPN` impl of the `Tunnel` port.
 //!
-//! Spawns `OpenVPN` as a foreground child owned by the Standard-mode lifecycle
+//! Spawns `OpenVPN` as a foreground child owned by the lifecycle
 //! custodian, then polls the log for protocol readiness. `OpenVPN` never
 //! self-daemonizes, so Vortix retains a reapable process-group owner.
 
@@ -144,12 +144,6 @@ fn prepare_managed_config(profile: &Profile) -> Result<String, TunnelError> {
     resolve_managed_endpoints(profile, &sanitized)
 }
 
-#[cfg(test)]
-fn managed_config(profile: &Profile, identity: &ManagedProcessId) -> Result<PathBuf, TunnelError> {
-    let stripped = prepare_managed_config(profile)?;
-    write_managed_config(profile, identity, &stripped)
-}
-
 fn write_managed_config(
     profile: &Profile,
     identity: &ManagedProcessId,
@@ -235,7 +229,7 @@ fn read_mgmt_credentials_bundle(path: &Path) -> std::io::Result<Option<(String, 
     }
 }
 
-/// Adapt the shared bounded management driver to the Standard-mode tunnel
+/// Adapt the shared bounded management driver to the tunnel
 /// error vocabulary. A non-empty answer selects the supported SCRV1 static
 /// challenge; every other interactive challenge remains fail-closed.
 fn drive_mgmt_auth(
@@ -428,7 +422,7 @@ impl OvpnTunnel {
         }
     }
 
-    /// Fence the Standard-mode custodian capability to one control revision.
+    /// Fence the custodian capability to one control revision.
     #[must_use]
     pub fn for_generation(mut self, generation: u64) -> Self {
         self.generation = Some(generation);
@@ -772,7 +766,7 @@ fn build_ovpn_args(
 }
 
 fn resolve_standard_openvpn_binary() -> Result<PathBuf, TunnelError> {
-    // Standard mode deliberately accepts the owner's full client and package
+    // deliberately accepts the owner's full client and package
     // installation as root-trusted input (including Homebrew). Canonicalizing
     // the existing PATH result prevents a second lookup inside the privileged
     // child.
@@ -1216,6 +1210,13 @@ fn cleanup_startup_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_config(
+        profile: &Profile,
+        identity: &ManagedProcessId,
+    ) -> Result<PathBuf, TunnelError> {
+        write_managed_config(profile, identity, &prepare_managed_config(profile)?)
+    }
 
     fn test_tunnel(run_dir: PathBuf) -> OvpnTunnel {
         let auth_dir = run_dir.join("auth");

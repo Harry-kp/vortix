@@ -127,9 +127,6 @@ pub const WIREGUARD_RUN_DIR: &str = "/var/run/wireguard";
 /// Linux network device statistics pseudo-file.
 #[cfg(target_os = "linux")]
 pub const PROC_NET_DEV_PATH: &str = "/proc/net/dev";
-/// Linux iptables custom chain name for kill switch.
-#[cfg(target_os = "linux")]
-pub const IPTABLES_CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
 /// Linux nftables table name for kill switch.
 #[cfg(target_os = "linux")]
 pub const NFT_TABLE_NAME: &str = "vortix_killswitch";
@@ -197,9 +194,6 @@ pub const MSG_UNAVAILABLE: &str = "unavailable";
 
 // === Platform Defaults ===
 
-#[cfg(target_os = "linux")]
-pub const DEFAULT_VPN_INTERFACE: &str = "wg0";
-
 /// Emergency instructions for the user if the kill switch cannot be disabled normally.
 #[cfg(target_os = "macos")]
 pub const KILLSWITCH_EMERGENCY_MSG: &str =
@@ -223,8 +217,6 @@ pub const TMP_CONFIG_DIR: &str = "tmp";
 pub const DEFAULT_OVPN_VERBOSITY: &str = "3";
 /// Subdirectory under the Vortix config dir for `OpenVPN` saved credentials.
 pub const OPENVPN_AUTH_DIR: &str = "auth";
-/// `OpenVPN` config directive that triggers interactive auth prompts.
-pub const OVPN_AUTH_USER_PASS: &str = "auth-user-pass";
 
 // === Auth UI Labels ===
 
@@ -266,8 +258,6 @@ pub const FLIP_ANIMATION_MIN_WIDTH: u16 = 3;
 pub const LABEL_SUPPORTED_FORMATS: &str = "Supported formats:";
 pub const EXT_CONF: &str = ".conf";
 pub const EXT_OVPN: &str = ".ovpn";
-pub const PROTO_WIREGUARD: &str = "WireGuard";
-pub const PROTO_OPENVPN: &str = "OpenVPN";
 
 // === Messages: General (Toast/Logs) ===
 

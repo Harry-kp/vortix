@@ -15,7 +15,7 @@ use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 use crate::platform::DefaultRouteObservation;
 use crate::profile::{ProfileId, ProtocolKind};
 use crate::tunnel::TunnelCancellation;
-use crate::wireguard::ownership::StandardTunnelOwnershipStore;
+use crate::wireguard::ownership::TunnelOwnershipStore;
 
 use super::net::Net;
 use super::plan::{plan, NetworkPlan};
@@ -80,7 +80,7 @@ pub(super) struct Engine {
     applied: Option<NetworkPlan>,
     apply_error: Option<String>,
     applied_at: Instant,
-    ownership: Arc<StandardTunnelOwnershipStore>,
+    ownership: Arc<TunnelOwnershipStore>,
     credentials: Arc<Mutex<FsOpenVpnCredentialStore>>,
     tx: mpsc::Sender<Msg>,
     shared: Arc<Mutex<Arc<Snapshot>>>,
@@ -115,9 +115,8 @@ impl Engine {
             .filter_map(|profile| Some((profile.id.clone(), profile.last_used?)))
             .collect();
         let entries = profiles::load(&config.config_dir, profiles);
-        let ownership = Arc::new(
-            StandardTunnelOwnershipStore::production(uid).map_err(|error| error.to_string())?,
-        );
+        let ownership =
+            Arc::new(TunnelOwnershipStore::production(uid).map_err(|error| error.to_string())?);
         let kill_switch = crate::control::killswitch::load_state_checked()
             .map_err(|error| {
                 format!(

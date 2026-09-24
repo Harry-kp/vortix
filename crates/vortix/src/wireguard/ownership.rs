@@ -1,4 +1,4 @@
-//! Root-owned, boot-scoped ownership for Standard-mode kernel tunnels.
+//! Root-owned, boot-scoped ownership for kernel tunnels.
 //!
 //! This store is deliberately separate from [`super::receipt`].
 //! The latter is owner-readable display evidence; this module is a private
@@ -25,22 +25,22 @@ const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_RUNTIME_DIR: &str = "/var/run/vortix-standard-tunnel-ownership";
 
 #[derive(Debug, Error)]
-pub enum StandardOwnershipError {
-    #[error("Standard-mode tunnel ownership has an invalid invoking owner")]
+pub enum OwnershipError {
+    #[error("tunnel ownership has an invalid invoking owner")]
     InvalidOwner,
     #[error("OS boot identity is unavailable")]
     MissingBootIdentity,
-    #[error("unsafe Standard-mode ownership path")]
+    #[error("unsafe tunnel ownership path")]
     UnsafePath,
-    #[error("Standard-mode ownership record is missing")]
+    #[error("tunnel ownership record is missing")]
     Missing,
-    #[error("Standard-mode ownership record is stale or does not match current evidence")]
+    #[error("tunnel ownership record is stale or does not match current evidence")]
     Stale,
-    #[error("Standard-mode ownership record exceeds its fixed bound")]
+    #[error("tunnel ownership record exceeds its fixed bound")]
     Capacity,
-    #[error("Standard-mode ownership I/O failed: {0}")]
+    #[error("tunnel ownership I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Standard-mode ownership record is malformed")]
+    #[error("tunnel ownership record is malformed")]
     Malformed,
 }
 
@@ -74,23 +74,23 @@ pub struct ValidatedWireGuardOwnership {
     pub teardown_config: TunnelTeardownConfig,
 }
 
-/// Private Standard-mode store. Background/helper code must not construct it.
+/// Root-owned store of which kernel tunnels Vortix started.
 #[derive(Debug, Clone)]
-pub struct StandardTunnelOwnershipStore {
+pub struct TunnelOwnershipStore {
     root: PathBuf,
     expected_runtime_uid: u32,
     owner_uid: u32,
     boot_scope: String,
 }
 
-impl StandardTunnelOwnershipStore {
+impl TunnelOwnershipStore {
     /// Construct the production root-owned store for the invoking sudo owner.
-    pub fn production(owner_uid: u32) -> Result<Self, StandardOwnershipError> {
+    pub fn production(owner_uid: u32) -> Result<Self, OwnershipError> {
         if !crate::platform::is_root() {
-            return Err(StandardOwnershipError::InvalidOwner);
+            return Err(OwnershipError::InvalidOwner);
         }
         let boot_scope =
-            crate::platform::boot_identity().ok_or(StandardOwnershipError::MissingBootIdentity)?;
+            crate::platform::boot_identity().ok_or(OwnershipError::MissingBootIdentity)?;
         Self::new(DEFAULT_RUNTIME_DIR, 0, owner_uid, boot_scope)
     }
 
@@ -100,10 +100,10 @@ impl StandardTunnelOwnershipStore {
         expected_runtime_uid: u32,
         owner_uid: u32,
         boot_scope: impl Into<String>,
-    ) -> Result<Self, StandardOwnershipError> {
+    ) -> Result<Self, OwnershipError> {
         let boot_scope = boot_scope.into();
         if boot_scope.is_empty() || boot_scope.len() > 128 {
-            return Err(StandardOwnershipError::InvalidOwner);
+            return Err(OwnershipError::InvalidOwner);
         }
         let store = Self {
             root: root.into(),
@@ -129,14 +129,14 @@ impl StandardTunnelOwnershipStore {
         teardown_config: &TunnelTeardownConfig,
         handshake: HandshakeEvidence,
         probe_receipts: Vec<ProbeReceipt>,
-    ) -> Result<ValidatedWireGuardOwnership, StandardOwnershipError> {
+    ) -> Result<ValidatedWireGuardOwnership, OwnershipError> {
         if profile.protocol != ProtocolKind::WireGuard
             || revision.generation == 0
             || handshake.generation != revision.generation
             || interface_name.is_empty()
             || !teardown_config.managed
         {
-            return Err(StandardOwnershipError::Stale);
+            return Err(OwnershipError::Stale);
         }
         let wg_quick_interface = profile_wg_quick_interface(profile)?;
         if teardown_config.wg_quick_interface.as_deref() != Some(&wg_quick_interface)
@@ -146,7 +146,7 @@ impl StandardTunnelOwnershipStore {
                 .and_then(|value| value.to_str())
                 != Some(&wg_quick_interface)
         {
-            return Err(StandardOwnershipError::Stale);
+            return Err(OwnershipError::Stale);
         }
         let teardown_bytes = read_managed_config(&teardown_config.path, self.expected_runtime_uid)?;
         let teardown_config_identity = content_identity(&teardown_bytes);
@@ -166,9 +166,9 @@ impl StandardTunnelOwnershipStore {
             handshake,
             probe_receipts,
         };
-        let bytes = serde_json::to_vec(&record).map_err(|_| StandardOwnershipError::Malformed)?;
+        let bytes = serde_json::to_vec(&record).map_err(|_| OwnershipError::Malformed)?;
         if bytes.len() as u64 > MAX_LEDGER_BYTES {
-            return Err(StandardOwnershipError::Capacity);
+            return Err(OwnershipError::Capacity);
         }
         if let Err(error) = self.atomic_write_path(&self.record_path(&profile.id), &bytes) {
             let _ = std::fs::remove_file(self.teardown_path(&profile.id));
@@ -186,7 +186,7 @@ impl StandardTunnelOwnershipStore {
         &self,
         profile: &Profile,
         session: &ActiveSession,
-    ) -> Result<ValidatedWireGuardOwnership, StandardOwnershipError> {
+    ) -> Result<ValidatedWireGuardOwnership, OwnershipError> {
         let record = self.load(&profile.id)?;
         let wg_quick_interface = profile_wg_quick_interface(profile)?;
         let teardown_path = self.teardown_path(&profile.id);
@@ -216,7 +216,7 @@ impl StandardTunnelOwnershipStore {
             || !peer_matches
             || record.teardown_config_identity != content_identity(&teardown_bytes)
         {
-            return Err(StandardOwnershipError::Stale);
+            return Err(OwnershipError::Stale);
         }
         Ok(validated(record, teardown_path, wg_quick_interface))
     }
@@ -226,10 +226,10 @@ impl StandardTunnelOwnershipStore {
         &self,
         profile_id: &ProfileId,
         active: &[ActiveSession],
-    ) -> Result<bool, StandardOwnershipError> {
+    ) -> Result<bool, OwnershipError> {
         let record = match self.load(profile_id) {
             Ok(record) => record,
-            Err(StandardOwnershipError::Missing) => {
+            Err(OwnershipError::Missing) => {
                 if active.is_empty() {
                     let _ = std::fs::remove_file(self.teardown_path(profile_id));
                 }
@@ -260,7 +260,7 @@ impl StandardTunnelOwnershipStore {
         }
     }
 
-    fn ensure_root(&self) -> Result<(), StandardOwnershipError> {
+    fn ensure_root(&self) -> Result<(), OwnershipError> {
         let created = match std::fs::symlink_metadata(&self.root) {
             Ok(_) => false,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -277,23 +277,20 @@ impl StandardTunnelOwnershipStore {
         }
         let metadata = std::fs::symlink_metadata(&self.root)?;
         if !metadata.is_dir() {
-            return Err(StandardOwnershipError::UnsafePath);
+            return Err(OwnershipError::UnsafePath);
         }
         {
             use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
             if metadata.uid() != self.expected_runtime_uid
                 || metadata.permissions().mode() & 0o077 != 0
             {
-                return Err(StandardOwnershipError::UnsafePath);
+                return Err(OwnershipError::UnsafePath);
             }
         }
         Ok(())
     }
 
-    fn load(
-        &self,
-        profile_id: &ProfileId,
-    ) -> Result<WireGuardOwnershipRecord, StandardOwnershipError> {
+    fn load(&self, profile_id: &ProfileId) -> Result<WireGuardOwnershipRecord, OwnershipError> {
         self.ensure_root()?;
         let path = self.record_path(profile_id);
         let mut options = OpenOptions::new();
@@ -305,7 +302,7 @@ impl StandardTunnelOwnershipStore {
         let mut file = match options.open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StandardOwnershipError::Missing)
+                return Err(OwnershipError::Missing)
             }
             Err(error) => return Err(error.into()),
         };
@@ -315,26 +312,22 @@ impl StandardTunnelOwnershipStore {
             .take(MAX_LEDGER_BYTES + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_LEDGER_BYTES {
-            return Err(StandardOwnershipError::Capacity);
+            return Err(OwnershipError::Capacity);
         }
         let record: WireGuardOwnershipRecord =
-            serde_json::from_slice(&bytes).map_err(|_| StandardOwnershipError::Malformed)?;
+            serde_json::from_slice(&bytes).map_err(|_| OwnershipError::Malformed)?;
         if record.schema_version != SCHEMA_VERSION || record.profile_id != profile_id.as_str() {
-            return Err(StandardOwnershipError::Stale);
+            return Err(OwnershipError::Stale);
         }
         Ok(record)
     }
 
-    fn atomic_write_path(
-        &self,
-        final_path: &Path,
-        bytes: &[u8],
-    ) -> Result<(), StandardOwnershipError> {
+    fn atomic_write_path(&self, final_path: &Path, bytes: &[u8]) -> Result<(), OwnershipError> {
         self.ensure_root()?;
         let leaf = final_path
             .file_name()
             .and_then(|value| value.to_str())
-            .ok_or(StandardOwnershipError::UnsafePath)?;
+            .ok_or(OwnershipError::UnsafePath)?;
         let temporary = self
             .root
             .join(format!(".{leaf}.{}.tmp", std::process::id()));
@@ -347,7 +340,7 @@ impl StandardTunnelOwnershipStore {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let mut file = options.open(&temporary)?;
-        let result = (|| -> Result<(), StandardOwnershipError> {
+        let result = (|| -> Result<(), OwnershipError> {
             validate_owned_file(&file, self.expected_runtime_uid, MAX_CONFIG_BYTES)?;
             file.write_all(bytes)?;
             file.sync_all()?;
@@ -390,14 +383,14 @@ fn validated(
     }
 }
 
-fn profile_wg_quick_interface(profile: &Profile) -> Result<String, StandardOwnershipError> {
+fn profile_wg_quick_interface(profile: &Profile) -> Result<String, OwnershipError> {
     let interface = profile
         .config_path
         .file_stem()
         .and_then(|value| value.to_str())
-        .ok_or(StandardOwnershipError::Stale)?;
+        .ok_or(OwnershipError::Stale)?;
     crate::profile::validate_wireguard_interface_name(interface)
-        .map_err(|_| StandardOwnershipError::Stale)?;
+        .map_err(|_| OwnershipError::Stale)?;
     Ok(interface.to_owned())
 }
 
@@ -405,15 +398,15 @@ fn record_key(profile_id: &ProfileId) -> String {
     profile_id.digest_key(16)
 }
 
-fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, StandardOwnershipError> {
+fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, OwnershipError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
-        return Err(StandardOwnershipError::UnsafePath);
+        return Err(OwnershipError::UnsafePath);
     }
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(StandardOwnershipError::UnsafePath);
+            return Err(OwnershipError::UnsafePath);
         }
     }
     let mut options = OpenOptions::new();
@@ -429,7 +422,7 @@ fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, Standa
         .take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut contents)?;
     if contents.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(StandardOwnershipError::Capacity);
+        return Err(OwnershipError::Capacity);
     }
     Ok(contents)
 }
@@ -442,15 +435,15 @@ fn validate_owned_file(
     file: &File,
     expected_uid: u32,
     max_bytes: u64,
-) -> Result<(), StandardOwnershipError> {
+) -> Result<(), OwnershipError> {
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > max_bytes {
-        return Err(StandardOwnershipError::UnsafePath);
+        return Err(OwnershipError::UnsafePath);
     }
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(StandardOwnershipError::UnsafePath);
+            return Err(OwnershipError::UnsafePath);
         }
     }
     Ok(())
@@ -530,8 +523,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let profile = profile(temp.path(), 'a');
         let store =
-            StandardTunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a")
-                .unwrap();
+            TunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a").unwrap();
         let evidence = handshake(7);
         let teardown = teardown_config(temp.path(), 'a');
         store
@@ -578,8 +570,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let profile = profile(temp.path(), 'a');
         let store =
-            StandardTunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a")
-                .unwrap();
+            TunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a").unwrap();
         let evidence = handshake(7);
         let teardown = teardown_config(temp.path(), 'a');
         store
@@ -617,7 +608,7 @@ mod tests {
         let first = profile(temp.path(), 'a');
         let second = profile(temp.path(), 'b');
         let root = temp.path().join("runtime");
-        let store = StandardTunnelOwnershipStore::new(&root, uid(), 501, "boot-a").unwrap();
+        let store = TunnelOwnershipStore::new(&root, uid(), 501, "boot-a").unwrap();
         let evidence = handshake(7);
         let teardown = teardown_config(temp.path(), 'a');
         store
@@ -636,14 +627,14 @@ mod tests {
             .unwrap();
         let active = session(&first, &evidence);
 
-        let other_boot = StandardTunnelOwnershipStore::new(&root, uid(), 501, "boot-b").unwrap();
+        let other_boot = TunnelOwnershipStore::new(&root, uid(), 501, "boot-b").unwrap();
         assert!(matches!(
             other_boot.validate_wireguard(&first, &active),
-            Err(StandardOwnershipError::Stale)
+            Err(OwnershipError::Stale)
         ));
         assert!(matches!(
             store.validate_wireguard(&second, &active),
-            Err(StandardOwnershipError::Missing)
+            Err(OwnershipError::Missing)
         ));
 
         std::fs::write(&first.config_path, "[Interface]\nPrivateKey = changed\n").unwrap();
@@ -652,7 +643,7 @@ mod tests {
         std::fs::write(store.teardown_path(&first.id), "tampered teardown config").unwrap();
         assert!(matches!(
             store.validate_wireguard(&first, &active),
-            Err(StandardOwnershipError::Stale)
+            Err(OwnershipError::Stale)
         ));
         std::fs::write(
             store.teardown_path(&first.id),
@@ -666,7 +657,7 @@ mod tests {
             std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(matches!(
                 store.validate_wireguard(&first, &active),
-                Err(StandardOwnershipError::UnsafePath)
+                Err(OwnershipError::UnsafePath)
             ));
             std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
@@ -674,22 +665,19 @@ mod tests {
         std::fs::write(store.record_path(&first.id), b"{tampered").unwrap();
         assert!(matches!(
             store.validate_wireguard(&first, &active),
-            Err(StandardOwnershipError::Malformed)
+            Err(OwnershipError::Malformed)
         ));
         std::fs::remove_file(store.record_path(&first.id)).unwrap();
         assert!(matches!(
             store.validate_wireguard(&first, &active),
-            Err(StandardOwnershipError::Missing)
+            Err(OwnershipError::Missing)
         ));
     }
 
     #[test]
     fn direct_root_is_a_valid_bound_owner_identity() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(
-            StandardTunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 0, "boot-a")
-                .is_ok()
-        );
+        assert!(TunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 0, "boot-a").is_ok());
     }
 
     #[test]
@@ -701,12 +689,12 @@ mod tests {
         std::fs::create_dir(&runtime).unwrap();
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
-            StandardTunnelOwnershipStore::new(&runtime, uid(), 501, "boot-a"),
-            Err(StandardOwnershipError::UnsafePath)
+            TunnelOwnershipStore::new(&runtime, uid(), 501, "boot-a"),
+            Err(OwnershipError::UnsafePath)
         ));
 
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let store = StandardTunnelOwnershipStore::new(&runtime, uid(), 501, "boot-a").unwrap();
+        let store = TunnelOwnershipStore::new(&runtime, uid(), 501, "boot-a").unwrap();
         let profile = profile(temp.path(), 'a');
         symlink(&profile.config_path, store.record_path(&profile.id)).unwrap();
         assert!(store.load(&profile.id).is_err());

@@ -36,8 +36,7 @@ pub struct OvpnRoute {
 /// `static-challenge` directive: the server requests an inline second-factor
 /// alongside the username/password. `prompt` is the user-facing text rendered
 /// next to the OTP input; `echo` records the server-declared echo bit but is
-/// not used to decide masking — vortix always masks OTP input (see plan
-/// the parser decision record).
+/// not used to decide masking — vortix always masks OTP input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticChallenge {
     pub prompt: String,

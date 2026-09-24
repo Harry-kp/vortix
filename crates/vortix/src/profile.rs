@@ -192,7 +192,7 @@ pub struct Profile {
     /// authenticated and parsed. Empty means hostname startup must fail
     /// closed rather than ask DNS through a blocking firewall.
     pub endpoint_resolutions: Vec<ResolvedEndpoint>,
-    /// Canonical Standard mode requires every hostname to be replaced in the
+    /// Canonical requires every hostname to be replaced in the
     /// managed config. Legacy callers default to protocol-native DNS.
     pub require_managed_endpoint_resolution: bool,
 }
