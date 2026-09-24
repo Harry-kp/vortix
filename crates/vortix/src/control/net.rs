@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use crate::control::dns::{DnsEffectiveStatus, DnsPolicyCoordinator};
-use crate::control::killswitch::KillSwitchMode;
+use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::platform::DefaultRouteObservation;
 
 use super::plan::{Firewall, NetworkPlan};
@@ -107,23 +107,27 @@ impl Net {
         {
             return Ok(());
         }
-        let allow = match &target.firewall {
-            Firewall::Block(allow) => {
-                crate::control::killswitch::enable_blocking_multi(allow)
-                    .map_err(|e| e.to_string())?;
-                allow.as_slice()
-            }
-            Firewall::Open => {
-                crate::control::killswitch::disable_blocking().map_err(|e| e.to_string())?;
-                &[]
-            }
+        let (allow, applied) = match &target.firewall {
+            Firewall::Block(allow) => (
+                allow.as_slice(),
+                crate::control::killswitch::enable_blocking_multi(allow),
+            ),
+            Firewall::Open => (&[][..], crate::control::killswitch::disable_blocking()),
+        };
+        // A failed apply is persisted too, so no later process trusts the
+        // previous state on disk.
+        let state = if applied.is_err() && mode != KillSwitchMode::Off {
+            KillSwitchState::Degraded
+        } else {
+            target.kill_switch_state
         };
         crate::control::killswitch::save_state(
             mode,
-            target.kill_switch_state,
+            state,
             crate::control::killswitch::persisted_from_active(allow),
         )
         .map_err(|error| error.to_string())?;
+        applied.map_err(|error| error.to_string())?;
         self.saved_mode = Some(mode);
         Ok(())
     }
