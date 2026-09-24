@@ -1102,11 +1102,7 @@ impl Engine {
     }
 
     fn next_generation(&mut self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-            });
+        let now = super::dns::now_unix_ms();
         self.last_generation = now.max(self.last_generation + 1);
         self.last_generation
     }
@@ -1151,11 +1147,7 @@ impl Engine {
             profile_id: profile_id.clone(),
             display_name: entry.profile.name.clone(),
             protocol: entry.profile.protocol,
-            occurred_at_millis: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_or(0, |elapsed| {
-                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-                }),
+            occurred_at_millis: super::dns::now_unix_ms(),
         });
     }
 }

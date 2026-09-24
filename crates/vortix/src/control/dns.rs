@@ -418,7 +418,7 @@ impl DnsPolicyCoordinator {
     }
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

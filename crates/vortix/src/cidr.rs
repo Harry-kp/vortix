@@ -45,6 +45,13 @@ impl<'de> Deserialize<'de> for Cidr {
 }
 
 impl Cidr {
+    /// The single-address prefix for `addr`: `/32` or `/128`.
+    #[must_use]
+    pub const fn host(addr: IpAddr) -> Self {
+        let prefix_len = if addr.is_ipv4() { 32 } else { 128 };
+        Self { addr, prefix_len }
+    }
+
     /// Construct a new `Cidr`. Returns `None` if `prefix_len` exceeds the
     /// address-family width (32 for v4, 128 for v6).
     #[must_use]

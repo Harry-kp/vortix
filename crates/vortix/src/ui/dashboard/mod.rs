@@ -468,7 +468,7 @@ fn render_route_overlap_confirm(
         let head = overlapping_cidrs
             .iter()
             .take(2)
-            .map(|cidr| format!("{}/{}", cidr.addr, cidr.prefix_len))
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         let tail = format!(", +{} more", overlapping_cidrs.len() - 2);
@@ -480,7 +480,7 @@ fn render_route_overlap_confirm(
     } else {
         let summary = overlapping_cidrs
             .iter()
-            .map(|cidr| format!("{}/{}", cidr.addr, cidr.prefix_len))
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         crate::ui::helpers::truncate_to_width(&summary, cidr_budget)

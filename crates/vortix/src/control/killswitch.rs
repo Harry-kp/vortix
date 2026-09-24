@@ -450,7 +450,7 @@ pub(crate) fn policy_digest_bytes(active: &[ActiveTunnelInfo]) -> [u8; 32] {
             let mut cidrs: Vec<String> = tunnel
                 .declared_cidrs
                 .iter()
-                .map(|cidr| format!("{}/{}", cidr.addr, cidr.prefix_len))
+                .map(ToString::to_string)
                 .collect();
             cidrs.sort_unstable();
             format!(
@@ -922,11 +922,7 @@ pub fn persisted_from_active(active: &[ActiveTunnelInfo]) -> Vec<PersistedTunnel
         .map(|a| PersistedTunnelInfo {
             interface: a.interface.clone(),
             server_ips: a.server_ips.iter().map(ToString::to_string).collect(),
-            declared_cidrs: a
-                .declared_cidrs
-                .iter()
-                .map(|c| format!("{}/{}", c.addr, c.prefix_len))
-                .collect(),
+            declared_cidrs: a.declared_cidrs.iter().map(ToString::to_string).collect(),
             is_primary: a.is_primary,
         })
         .collect()

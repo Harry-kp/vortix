@@ -629,13 +629,9 @@ const fn role_kind_label(role: &Role) -> &'static str {
 fn format_role_cidrs(cidrs: &[Cidr]) -> String {
     match cidrs.len() {
         0 => "-".to_string(),
-        1 => format_cidr(&cidrs[0]),
+        1 => cidrs[0].to_string(),
         _ => "multi".to_string(),
     }
-}
-
-fn format_cidr(c: &Cidr) -> String {
-    format!("{}/{}", c.addr, c.prefix_len)
 }
 
 /// Call-to-action while the engine waits for credentials.

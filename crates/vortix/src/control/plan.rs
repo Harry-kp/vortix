@@ -83,18 +83,15 @@ impl NetworkPlan {
     /// which would answer the lookup instead.
     #[must_use]
     pub fn probe_address(&self, cidr: Cidr) -> Option<IpAddr> {
-        let host = |ip: IpAddr| Cidr::new(ip, if ip.is_ipv4() { 32 } else { 128 });
         let covered: Vec<Cidr> = self
             .routes
             .keys()
             .filter(|route| route.prefix_len > cidr.prefix_len && route.intersects(&cidr))
             .copied()
-            .chain(self.host_routes.iter().filter_map(|ip| host(*ip)))
+            .chain(self.host_routes.iter().map(|ip| Cidr::host(*ip)))
             .collect();
         let free = crate::cidr::cidr_subtract(&[cidr], &covered);
-        let is_free = |ip: IpAddr| {
-            host(ip).is_some_and(|probe| free.iter().any(|block| block.intersects(&probe)))
-        };
+        let is_free = |ip: IpAddr| free.iter().any(|block| block.intersects(&Cidr::host(ip)));
         let preferred = match cidr.addr {
             IpAddr::V4(addr) if addr.is_unspecified() => IpAddr::from([1, 1, 1, 1]),
             IpAddr::V6(addr) if addr.is_unspecified() => {

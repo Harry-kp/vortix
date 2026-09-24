@@ -812,11 +812,7 @@ impl WgTunnel {
             probes.push(ProbePlan {
                 peer_public_key: peer.public_key.clone(),
                 target,
-                allowed_routes: peer
-                    .allowed_ips
-                    .iter()
-                    .map(|route| format!("{}/{}", route.addr, route.prefix_len))
-                    .collect(),
+                allowed_routes: peer.allowed_ips.iter().map(ToString::to_string).collect(),
             });
         }
         Ok(HandshakePlan { expected, probes })
@@ -1006,8 +1002,7 @@ fn peer_covers_target(peer: &crate::wireguard::parser::WgPeer, target: IpAddr) -
 }
 
 fn route_covers_target(route: crate::cidr::Cidr, target: IpAddr) -> bool {
-    let prefix = if target.is_ipv4() { 32 } else { 128 };
-    crate::cidr::Cidr::new(target, prefix).is_some_and(|target| route.intersects(&target))
+    route.intersects(&crate::cidr::Cidr::host(target))
 }
 
 /// Verify that a configured health target is currently routed through the

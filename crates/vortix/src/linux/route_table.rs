@@ -149,11 +149,10 @@ pub(crate) fn bind_route_args(cidr: &str, interface: &str) -> Vec<String> {
 }
 
 pub(crate) fn bind_host_route_args(destination: IpAddr, gateway: &str) -> Vec<String> {
-    let prefix = if destination.is_ipv4() { 32 } else { 128 };
     vec![
         "route".into(),
         "replace".into(),
-        format!("{destination}/{prefix}"),
+        crate::cidr::Cidr::host(destination).to_string(),
         "via".into(),
         gateway.into(),
     ]
@@ -170,11 +169,10 @@ pub(crate) fn unbind_route_args(cidr: &str, interface: &str) -> Vec<String> {
 }
 
 pub(crate) fn unbind_host_route_args(destination: IpAddr) -> Vec<String> {
-    let prefix = if destination.is_ipv4() { 32 } else { 128 };
     vec![
         "route".into(),
         "del".into(),
-        format!("{destination}/{prefix}"),
+        crate::cidr::Cidr::host(destination).to_string(),
     ]
 }
 

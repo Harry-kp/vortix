@@ -613,8 +613,7 @@ mod nft_policy {
     }
 
     fn host_cidr(address: IpAddr) -> Cidr {
-        let prefix_len = if address.is_ipv4() { 32 } else { 128 };
-        Cidr::new(address, prefix_len).expect("a host prefix is valid for its address family")
+        Cidr::host(address)
     }
 
     fn parse_accept_rule(line: &str) -> Option<AcceptRule> {
