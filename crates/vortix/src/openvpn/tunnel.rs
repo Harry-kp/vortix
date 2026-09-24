@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use crate::config::secret::Secret;
@@ -490,14 +489,7 @@ impl OvpnTunnel {
     }
 
     fn runtime_log_path(&self, profile: &Profile) -> PathBuf {
-        let canonical_log = self.log_path(profile.id.as_str());
-        if canonical_log.exists() {
-            canonical_log
-        } else if let Some(legacy_key) = unambiguous_legacy_artifact_key(&profile.display_name) {
-            self.log_path(legacy_key)
-        } else {
-            canonical_log
-        }
+        super::runtime_log_path(&self.run_dir, profile.id.as_str(), &profile.display_name)
     }
 
     pub(crate) fn requested_runtime_evidence(
@@ -525,11 +517,11 @@ impl OvpnTunnel {
     }
 
     fn pid_path(&self, profile_id: &str) -> PathBuf {
-        self.run_dir.join(format!("{profile_id}.pid"))
+        super::run_file(&self.run_dir, profile_id, "pid")
     }
 
     fn log_path(&self, profile_id: &str) -> PathBuf {
-        self.run_dir.join(format!("{profile_id}.log"))
+        super::run_file(&self.run_dir, profile_id, "log")
     }
 
     fn auth_path(&self, profile_id: &str) -> PathBuf {
@@ -547,8 +539,7 @@ impl OvpnTunnel {
     }
 
     fn management_socket_path(&self, profile_id: &str) -> PathBuf {
-        let key = crate::profile::hex(&Sha256::digest(profile_id.as_bytes())[..16]);
-        self.run_dir.join(format!("{key}.mgmt.sock"))
+        super::management_socket_path(&self.run_dir, profile_id)
     }
 
     fn validate_management_socket_path(path: &Path) -> Result<(), TunnelError> {
@@ -562,17 +553,11 @@ impl OvpnTunnel {
     }
 
     fn cleanup_run_artifacts(&self, handle: &TunnelHandle) {
-        let artifact_key = handle.profile_id.as_str();
-        let _ = std::fs::remove_file(self.pid_path(artifact_key));
-        let _ = std::fs::remove_file(self.log_path(artifact_key));
-        let _ = std::fs::remove_file(self.management_socket_path(artifact_key));
-        if let Some(legacy_key) = unambiguous_legacy_artifact_key(&handle.display_name) {
-            if legacy_key != artifact_key {
-                let _ = std::fs::remove_file(self.pid_path(legacy_key));
-                let _ = std::fs::remove_file(self.log_path(legacy_key));
-                let _ = std::fs::remove_file(self.management_socket_path(legacy_key));
-            }
-        }
+        super::remove_run_files(
+            &self.run_dir,
+            handle.profile_id.as_str(),
+            &handle.display_name,
+        );
     }
 
     fn existing_auth_path(&self, profile: &Profile) -> Option<PathBuf> {

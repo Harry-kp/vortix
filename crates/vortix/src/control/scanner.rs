@@ -426,16 +426,7 @@ fn check_openvpn_by_pid(
     // socket), we read the log vortix's own protocol layer wrote.
     if let Ok(config_dir) = crate::config::get_config_dir() {
         let run_dir = config_dir.join(crate::constants::OPENVPN_RUN_DIR);
-        let canonical_log = run_dir.join(format!("{profile_id}.log"));
-        let log_path = if canonical_log.exists() {
-            canonical_log
-        } else if let Some(legacy_key) =
-            crate::profile::unambiguous_legacy_artifact_key(display_name)
-        {
-            run_dir.join(format!("{legacy_key}.log"))
-        } else {
-            canonical_log
-        };
+        let log_path = crate::openvpn::runtime_log_path(&run_dir, profile_id, display_name);
         if let Ok(log_text) = std::fs::read_to_string(&log_path) {
             if let Some(iface) = crate::openvpn::tunnel::parse_kernel_interface(&log_text) {
                 detected_iface = iface;

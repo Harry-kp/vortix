@@ -316,29 +316,51 @@ pub(crate) fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
     }
 }
 
-/// Returns `(pid_path, log_path)` for an opaque profile artifact key.
-///
-/// Production callers pass [`crate::profile::ProfileId::as_str`].
-/// Display names are accepted only by explicit legacy compatibility helpers.
-///
-/// # Errors
-///
-/// Returns an error if directory creation fails.
-pub fn get_openvpn_run_paths(
-    profile_key: &str,
-) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
-    validate_openvpn_artifact_key(profile_key)?;
-    let root = crate::config::get_config_dir()?;
-    let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
+/// `<run_dir>/<key>.<ext>`: the daemon's `pid` and `log` files.
+pub(crate) fn run_file(run_dir: &std::path::Path, key: &str, ext: &str) -> std::path::PathBuf {
+    run_dir.join(format!("{key}.{ext}"))
+}
 
-    if !run_dir.exists() {
-        crate::config::owned_file::create_user_dir(&run_dir)?;
+/// The management socket, named by a digest so the path stays short.
+pub(crate) fn management_socket_path(run_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+    use sha2::Digest as _;
+    let key = crate::profile::hex(&sha2::Sha256::digest(key.as_bytes())[..16]);
+    run_dir.join(format!("{key}.mgmt.sock"))
+}
+
+/// The keys a profile's run files may use: its id, then its legacy
+/// display-name key when that is unambiguous and different.
+fn run_file_keys<'a>(profile_id: &'a str, display_name: &'a str) -> Vec<&'a str> {
+    let mut keys = vec![profile_id];
+    keys.extend(
+        crate::profile::unambiguous_legacy_artifact_key(display_name)
+            .filter(|legacy| *legacy != profile_id),
+    );
+    keys
+}
+
+/// The log the daemon is writing: the id-keyed one, else the legacy one.
+pub(crate) fn runtime_log_path(
+    run_dir: &std::path::Path,
+    profile_id: &str,
+    display_name: &str,
+) -> std::path::PathBuf {
+    run_file_keys(profile_id, display_name)
+        .into_iter()
+        .map(|key| run_file(run_dir, key, "log"))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| run_file(run_dir, profile_id, "log"))
+}
+
+/// Remove a profile's pid, log and management socket under every key it
+/// may use. Ambiguous legacy names are left for manual cleanup rather than
+/// risk another profile's live daemon.
+pub(crate) fn remove_run_files(run_dir: &std::path::Path, profile_id: &str, display_name: &str) {
+    for key in run_file_keys(profile_id, display_name) {
+        let _ = std::fs::remove_file(run_file(run_dir, key, "pid"));
+        let _ = std::fs::remove_file(run_file(run_dir, key, "log"));
+        let _ = std::fs::remove_file(management_socket_path(run_dir, key));
     }
-
-    let pid_path = run_dir.join(format!("{profile_key}.pid"));
-    let log_path = run_dir.join(format!("{profile_key}.log"));
-
-    Ok((pid_path, log_path))
 }
 
 /// PIDs recorded in `<config_dir>/run/*.pid` — the `OpenVPN` daemons a
@@ -361,23 +383,11 @@ pub fn tracked_openvpn_pids() -> Vec<u32> {
         .collect()
 }
 
-/// Cleans up `OpenVPN` runtime files (pid, log) for a given profile.
-pub fn cleanup_openvpn_run_files(profile_key: &str) {
-    if let Ok((pid_path, log_path)) = get_openvpn_run_paths(profile_key) {
-        let _ = std::fs::remove_file(&pid_path);
-        let _ = std::fs::remove_file(&log_path);
-    }
-}
-
-/// Remove canonical ID-keyed run files and, when collision-free, legacy
-/// name-keyed files. Ambiguous sanitized legacy names are deliberately left
-/// for manual cleanup rather than risking another profile's active daemon.
+/// Remove a profile's run files from the config directory's run dir.
 pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &str) {
-    cleanup_openvpn_run_files(profile_id);
-    if let Some(legacy_key) = crate::profile::unambiguous_legacy_artifact_key(legacy_display_name) {
-        if legacy_key != profile_id {
-            cleanup_openvpn_run_files(legacy_key);
-        }
+    if let Ok(root) = crate::config::get_config_dir() {
+        let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
+        remove_run_files(&run_dir, profile_id, legacy_display_name);
     }
 }
 
@@ -430,5 +440,21 @@ mod tests {
         let _tmp = crate::config::set_temp_config_dir();
         scrub_stale_scrv1_auth_files();
         // No assertion needed — the test passes by not panicking.
+    }
+
+    #[test]
+    fn removing_run_files_takes_the_management_socket_too() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let id = "a".repeat(64);
+        let files = [
+            run_file(run_dir.path(), &id, "pid"),
+            run_file(run_dir.path(), &id, "log"),
+            management_socket_path(run_dir.path(), &id),
+        ];
+        for file in &files {
+            std::fs::write(file, b"x").unwrap();
+        }
+        remove_run_files(run_dir.path(), &id, "corp");
+        assert!(files.iter().all(|file| !file.exists()));
     }
 }
