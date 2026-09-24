@@ -5,8 +5,8 @@ use std::path::Path;
 use super::{App, InputMode, ToastType};
 use crate::config::profile_store::FsProfileStore;
 use crate::constants;
-use crate::core::profile::ProfileId;
-use crate::core::profile::ProtocolKind;
+use crate::profile::ProfileId;
+use crate::profile::ProtocolKind;
 use crate::utils;
 
 fn importable_profile_paths(dir_path: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
@@ -171,7 +171,7 @@ impl App {
             // started. Re-check the stable identity at the mutation point;
             // an index or display-name check can be invalidated by sorting or
             // another rename while the dialog is open.
-            use crate::core::engine::state::Connection;
+            use crate::tunnel::Connection;
             if self
                 .registry
                 .snapshot(&stable_id)
@@ -228,7 +228,7 @@ impl App {
 
     /// Import a profile from a file path or bulk import from directory
     pub(crate) fn import_profile_from_path(&mut self, path_str: &str) {
-        use crate::core::importer::{resolve_target, ImportTarget};
+        use crate::config::import::{resolve_target, ImportTarget};
         use crate::message::Message;
 
         let mut last_imported_name: Option<String> = None;
@@ -241,7 +241,7 @@ impl App {
                 should_close_overlay = false;
 
                 std::thread::spawn(
-                    move || match crate::core::downloader::download_profile(&url) {
+                    move || match crate::config::import::download_profile(&url) {
                         Ok(path) => {
                             let path_string = path.to_string_lossy().to_string();
                             let _ = tx.send(Message::Import(path_string));
@@ -258,7 +258,7 @@ impl App {
             Ok(ImportTarget::File(path)) => {
                 last_imported_name = self.import_single_file(&path);
                 should_close_overlay = last_imported_name.is_some();
-                crate::core::downloader::cleanup_temp_download(&path);
+                crate::config::import::cleanup_temp_download(&path);
             }
             Ok(ImportTarget::Directory(path)) => {
                 let count = self.import_from_directory(&path);

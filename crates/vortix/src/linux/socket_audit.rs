@@ -21,7 +21,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use crate::core::ports::socket_audit::{SocketAuditResult, SocketProtocol, SocketSnapshot};
+use crate::platform::{SocketAuditResult, SocketProtocol, SocketSnapshot};
 
 /// Marker type implementing the [`SocketAudit`] trait for Linux.
 #[derive(Debug, Clone, Copy, Default)]

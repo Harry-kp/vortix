@@ -11,8 +11,8 @@
 
 use std::net::SocketAddr;
 
-use crate::core::cidr::Cidr;
-use crate::core::ports::tunnel::ParseError;
+use crate::cidr::Cidr;
+use crate::tunnel::ParseError;
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_PEERS: usize = 256;
@@ -70,8 +70,8 @@ impl WgParsedProfile {
     }
 
     #[must_use]
-    pub fn dns_request(&self) -> crate::core::ports::dns::DnsRequest {
-        crate::core::ports::dns::DnsRequest {
+    pub fn dns_request(&self) -> crate::control::dns::DnsRequest {
+        crate::control::dns::DnsRequest {
             servers: self
                 .dns_servers
                 .iter()

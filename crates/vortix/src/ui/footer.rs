@@ -1,8 +1,8 @@
 //! Footer widget with context-aware keybinding hints
 
+use crate::app::registry::TunnelSnapshot;
 use crate::app::{focused_tunnel_action, App, FocusedTunnelAction};
-use crate::core::engine::registry::TunnelSnapshot;
-use crate::core::engine::state::Connection;
+use crate::tunnel::Connection;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -341,8 +341,8 @@ mod tests {
 
     #[test]
     fn focused_footer_labels_match_profile_scoped_shortcuts() {
-        use crate::core::engine::state::DetailedConnectionInfo;
-        use crate::core::profile::ProfileId;
+        use crate::profile::ProfileId;
+        use crate::tunnel::DetailedConnectionInfo;
         use std::time::SystemTime;
 
         let profile_id = ProfileId::new("focused");

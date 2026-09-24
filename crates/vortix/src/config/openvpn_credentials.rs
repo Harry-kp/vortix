@@ -11,7 +11,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::constants::OPENVPN_AUTH_DIR;
-use crate::core::profile::{unambiguous_legacy_artifact_key, ProfileId};
+use crate::profile::{unambiguous_legacy_artifact_key, ProfileId};
 
 use super::owned_file::{
     open_owned_directory, open_owned_directory_at, write_owned_atomic_with_hook, AtomicWriteError,

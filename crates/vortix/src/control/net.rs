@@ -3,9 +3,9 @@
 
 use std::path::PathBuf;
 
-use crate::core::killswitch::KillSwitchMode;
-use crate::core::ports::dns::{DnsEffectiveStatus, DnsPolicyCoordinator};
-use crate::core::ports::route_table::DefaultRouteObservation;
+use crate::control::dns::{DnsEffectiveStatus, DnsPolicyCoordinator};
+use crate::control::killswitch::KillSwitchMode;
+use crate::platform::DefaultRouteObservation;
 
 use super::plan::{Firewall, NetworkPlan};
 
@@ -22,7 +22,7 @@ impl Net {
     #[must_use]
     pub fn new(config_dir: PathBuf, applied: NetworkPlan) -> Self {
         Self {
-            dns: crate::core::dns_policy::load(&config_dir).unwrap_or_default(),
+            dns: crate::control::dns_policy::load(&config_dir).unwrap_or_default(),
             config_dir,
             applied,
             saved_mode: None,
@@ -82,13 +82,13 @@ impl Net {
     }
 
     fn apply_dns(&mut self, target: &NetworkPlan) -> Result<(), String> {
-        let _lock = crate::core::dns_policy::acquire_policy_lock(&self.config_dir)
+        let _lock = crate::control::dns_policy::acquire_policy_lock(&self.config_dir)
             .map_err(|error| format!("DNS policy lock failed: {error}"))?;
         let config_dir = &self.config_dir;
         let effective = self
             .dns
             .reconcile_durable(&target.dns, &crate::platform::Dns, |state| {
-                crate::core::dns_policy::save(config_dir, state)
+                crate::control::dns_policy::save(config_dir, state)
             })
             .map_err(|error| error.to_string())?;
         match effective.status {
@@ -109,18 +109,19 @@ impl Net {
         }
         let allow = match &target.firewall {
             Firewall::Block(allow) => {
-                crate::core::killswitch::enable_blocking_multi(allow).map_err(|e| e.to_string())?;
+                crate::control::killswitch::enable_blocking_multi(allow)
+                    .map_err(|e| e.to_string())?;
                 allow.as_slice()
             }
             Firewall::Open => {
-                crate::core::killswitch::disable_blocking().map_err(|e| e.to_string())?;
+                crate::control::killswitch::disable_blocking().map_err(|e| e.to_string())?;
                 &[]
             }
         };
-        crate::core::killswitch::save_state(
+        crate::control::killswitch::save_state(
             mode,
             target.kill_switch_state,
-            crate::core::killswitch::persisted_from_active(allow),
+            crate::control::killswitch::persisted_from_active(allow),
         )
         .map_err(|error| error.to_string())?;
         self.saved_mode = Some(mode);
@@ -138,11 +139,7 @@ impl Net {
         Ok(())
     }
 
-    fn routes_through(
-        target: &NetworkPlan,
-        cidr: crate::core::cidr::Cidr,
-        interface: &str,
-    ) -> bool {
+    fn routes_through(target: &NetworkPlan, cidr: crate::cidr::Cidr, interface: &str) -> bool {
         let Some(probe) = target.probe_address(cidr) else {
             return true;
         };

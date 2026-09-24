@@ -34,6 +34,7 @@ mod update;
 
 pub(crate) use input::{focused_tunnel_action, FocusedTunnelAction};
 
+pub mod registry;
 #[cfg(test)]
 mod tests;
 
@@ -94,8 +95,8 @@ pub(crate) struct PendingThemeChange {
 }
 use std::collections::HashMap;
 
+use crate::app::registry::TunnelRegistry;
 use crate::constants;
-use crate::core::engine::TunnelRegistry;
 use crate::logger;
 use crate::message::Message;
 use runtime::VpnRuntime;
@@ -135,9 +136,9 @@ pub struct App {
     /// Highest engine notice already shown.
     pub(crate) notices_seen: u64,
     /// Kept when every tunnel is gone, so reconnect means "the last one".
-    pub(crate) last_control_connected_profile: Option<crate::core::profile::ProfileId>,
+    pub(crate) last_control_connected_profile: Option<crate::profile::ProfileId>,
     /// Kill switch mode sent but not yet in a snapshot.
-    pub(crate) pending_control_killswitch_mode: Option<crate::core::killswitch::KillSwitchMode>,
+    pub(crate) pending_control_killswitch_mode: Option<crate::control::killswitch::KillSwitchMode>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -198,7 +199,7 @@ impl App {
 
         // Seed from disk so the first frame cannot show Off while a
         // persisted firewall is still present.
-        let (kill_switch, kill_switch_state) = crate::core::killswitch::persisted();
+        let (kill_switch, kill_switch_state) = crate::control::killswitch::persisted();
         let registry = TunnelRegistry::new();
 
         let mut app = Self {

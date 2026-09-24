@@ -13,7 +13,7 @@
 
 #![allow(clippy::must_use_candidate)]
 
-use crate::core::ports::socket_audit::{SocketAuditResult, SocketProtocol, SocketSnapshot};
+use crate::platform::{SocketAuditResult, SocketProtocol, SocketSnapshot};
 
 use super::libproc_ffi::{self, InetKind, SocketView};
 

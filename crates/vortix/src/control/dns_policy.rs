@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::owned_file;
-use crate::core::ports::dns::DnsPolicyCoordinator;
+use crate::control::dns::DnsPolicyCoordinator;
 
 const DNS_POLICY_STATE_FILE: &str = "dns-policy.state";
 const DNS_POLICY_LOCK_FILE: &str = "dns-policy.lock";
@@ -193,7 +193,7 @@ mod tests {
         let loaded = load(temp.path()).unwrap();
         assert_eq!(
             loaded.effective().status,
-            crate::core::ports::dns::DnsEffectiveStatus::Degraded
+            crate::control::dns::DnsEffectiveStatus::Degraded
         );
         assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| !entry
             .unwrap()
@@ -225,7 +225,7 @@ mod tests {
         let path = temp.path().join(DNS_POLICY_STATE_FILE);
         let mut state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let attacker_profile = crate::core::profile::ProfileId::parse("a".repeat(64)).unwrap();
+        let attacker_profile = crate::profile::ProfileId::parse("a".repeat(64)).unwrap();
         state["coordinator"]["effective"]["applied_generation"] = serde_json::json!(7);
         state["coordinator"]["effective"]["status"] = serde_json::json!("Applied");
         state["coordinator"]["effective"]["owned"] = serde_json::json!([{
@@ -241,7 +241,7 @@ mod tests {
         assert!(loaded.effective().owned.is_empty());
         assert_eq!(
             loaded.effective().status,
-            crate::core::ports::dns::DnsEffectiveStatus::Degraded
+            crate::control::dns::DnsEffectiveStatus::Degraded
         );
     }
 }

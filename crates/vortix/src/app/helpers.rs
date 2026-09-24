@@ -14,10 +14,7 @@ use crate::utils;
 impl App {
     /// Profile name for logs and dialogs. Profile ids are 64-char digests and
     /// mean nothing to the reader.
-    pub(crate) fn profile_display_name(
-        &self,
-        profile_id: &crate::core::profile::ProfileId,
-    ) -> String {
+    pub(crate) fn profile_display_name(&self, profile_id: &crate::profile::ProfileId) -> String {
         self.runtime
             .profiles
             .iter()
@@ -31,8 +28,8 @@ impl App {
     /// The tunnel the dashboard treats as current: the primary, else the
     /// first one that is not disconnected.
     #[must_use]
-    pub fn current_tunnel(&self) -> Option<crate::core::engine::TunnelSnapshot> {
-        use crate::core::engine::state::Connection;
+    pub fn current_tunnel(&self) -> Option<crate::app::registry::TunnelSnapshot> {
+        use crate::tunnel::Connection;
         self.registry
             .primary()
             .and_then(|pid| self.registry.snapshot(pid))
@@ -73,7 +70,7 @@ impl App {
     }
 
     pub(crate) fn has_active_connection(&self) -> bool {
-        use crate::core::engine::state::Connection;
+        use crate::tunnel::Connection;
         self.registry
             .snapshot_all()
             .iter()
@@ -108,7 +105,7 @@ impl App {
     /// `AwaitingUserInput`, and any other in-flight states.
     #[must_use]
     pub(crate) fn active_tunnel_count(&self) -> usize {
-        use crate::core::engine::state::Connection;
+        use crate::tunnel::Connection;
         self.registry
             .snapshot_all()
             .iter()
@@ -121,7 +118,7 @@ impl App {
     pub(crate) fn profile_id_for_name(
         &self,
         display_name: &str,
-    ) -> Option<crate::core::profile::ProfileId> {
+    ) -> Option<crate::profile::ProfileId> {
         self.runtime
             .profiles
             .iter()
@@ -136,7 +133,7 @@ impl App {
     /// tunnel.
     #[must_use]
     pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
-        use crate::core::engine::state::Connection;
+        use crate::tunnel::Connection;
         self.profile_id_for_name(profile_name)
             .and_then(|id| self.registry.snapshot(&id))
             .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected))
@@ -146,7 +143,7 @@ impl App {
     /// Used by the `c` cancel keybinding ().
     #[must_use]
     pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
-        use crate::core::engine::state::Connection;
+        use crate::tunnel::Connection;
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };

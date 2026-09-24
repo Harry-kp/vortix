@@ -1,11 +1,11 @@
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use vortix::core::ports::dns::{
+use vortix::control::dns::{
     DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource, DnsPlatformCapabilities, DnsPolicy,
     DnsPolicyAdapter, DnsPolicyCoordinator, DnsRequest, DnsScope, DnsTunnelIntent, DnsTunnelRole,
 };
-use vortix::core::profile::ProfileId;
+use vortix::profile::ProfileId;
 
 #[derive(Clone, Default)]
 struct RecordingAdapter {

@@ -3,7 +3,7 @@ use thiserror::Error;
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use crate::core::openvpn_routes::{
+use crate::openvpn::routes::{
     OpenVpnDefaultGateways, OpenVpnRedirectFlag, OpenVpnRedirectGateway, OpenVpnRoute,
     OpenVpnRouteDefaults, OpenVpnRouteEvidence, OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
     MAX_ROUTES,
@@ -366,9 +366,7 @@ mod tests {
         openvpn_route_evidence, pushed_route_evidence, selected_remote_address,
         PushReplySelectionError, PushedRouteEvidenceError, SelectedRemoteEvidenceError,
     };
-    use crate::core::openvpn_routes::{
-        OpenVpnDefaultGateway, OpenVpnRedirectFlag, OpenVpnRouteGateway,
-    };
+    use crate::openvpn::routes::{OpenVpnDefaultGateway, OpenVpnRedirectFlag, OpenVpnRouteGateway};
 
     #[test]
     fn standard_runtime_evidence_preserves_server_pushed_default_route() {

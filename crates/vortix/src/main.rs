@@ -170,7 +170,7 @@ fn main() -> Result<()> {
         .map(|r| r.runtime().handle().clone())
     {
         let _guard = handle.enter();
-        match vortix::core::journal::Journal::open(vortix::core::journal::JournalConfig {
+        match vortix::journal::Journal::open(vortix::journal::JournalConfig {
             disk: settings.journal.disk,
             retention_days: settings.journal.retention_days,
             retention_count: settings.journal.retention_count,
@@ -182,7 +182,7 @@ fn main() -> Result<()> {
             ..Default::default()
         }) {
             Ok(journal) => {
-                vortix::core::journal::set_global_journal(journal);
+                vortix::journal::set_global_journal(journal);
             }
             Err(e) => {
                 eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
@@ -356,7 +356,7 @@ fn main() -> Result<()> {
     // evidence is not evidence of an orphan, so only scan where the
     // evidence is readable.
     let mut tracked_pids = vortix::utils::tracked_openvpn_pids();
-    tracked_pids.extend(vortix::core::managed_wireguard::tracked_wireguard_pids(
+    tracked_pids.extend(vortix::wireguard::receipt::tracked_wireguard_pids(
         &config_dir,
     ));
     let orphans = vortix::process::filter_untracked(vortix::process::scan_orphans(), &tracked_pids);

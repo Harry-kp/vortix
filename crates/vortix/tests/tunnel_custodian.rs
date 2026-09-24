@@ -5,11 +5,11 @@ use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
-use vortix::core::ports::process::{
+use vortix::process::{
     CommandSpec, ManagedProcessId, ProcessError, ProcessLifecycle, ProcessOwnership,
 };
-use vortix::core::profile::ProfileId;
 use vortix::process::{CustodianError, StandardCustodian};
+use vortix::profile::ProfileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
@@ -349,7 +349,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     // OpenVPN handle from the authenticated custodian receipt and can stop it
     // without an in-memory executor ledger.
     let recovered_identity = real_identity('0');
-    let operation: vortix::core::ids::OperationId =
+    let operation: vortix::tunnel::OperationId =
         serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap();
     let recovered_child_pid_path = temp.path().join("recovered-openvpn-child.pid");
     let recovered_handshake = vortix::process::start_managed_foreground_for_operation(

@@ -49,10 +49,10 @@
 //! `unicode_width_of_reconnecting_glyph_is_one` — which is load-bearing for
 //! the `fixed_cols` arithmetic above.
 
+use crate::app::registry::{Role, TunnelSnapshot};
 use crate::app::App;
-use crate::core::engine::state::Connection;
-use crate::core::engine::{Role, TunnelSnapshot};
-use crate::core::profile::ProfileId;
+use crate::profile::ProfileId;
+use crate::tunnel::Connection;
 use crate::{theme, utils};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
@@ -75,7 +75,7 @@ use ratatui::{
 /// between this renderer and the `?` help overlay's Sigils tab.
 fn status_badge_for(
     snapshot: &TunnelSnapshot,
-    protocol: Option<crate::core::profile::ProtocolKind>,
+    protocol: Option<crate::profile::ProtocolKind>,
 ) -> Option<(&'static str, Style)> {
     use crate::ui::sigils::sigil;
     let id = status_sigil_id(snapshot, protocol)?;
@@ -85,7 +85,7 @@ fn status_badge_for(
 
 fn status_sigil_id(
     snapshot: &TunnelSnapshot,
-    protocol: Option<crate::core::profile::ProtocolKind>,
+    protocol: Option<crate::profile::ProtocolKind>,
 ) -> Option<crate::ui::sigils::SigilId> {
     use crate::ui::sigils::SigilId;
     Some(match &snapshot.state {
@@ -103,10 +103,7 @@ fn status_sigil_id(
             }
         }
         Connection::Connecting { .. } => {
-            if matches!(
-                protocol,
-                Some(crate::core::profile::ProtocolKind::WireGuard)
-            ) {
+            if matches!(protocol, Some(crate::profile::ProtocolKind::WireGuard)) {
                 SigilId::Handshaking
             } else {
                 SigilId::Connecting
@@ -130,7 +127,7 @@ fn has_risk_annotation(snapshot: &TunnelSnapshot) -> bool {
     matches!(snapshot.role, Role::AddressableSuppressed { .. })
         || matches!(
             snapshot.health,
-            crate::core::engine::state::ConnectionHealth::Degraded { .. }
+            crate::tunnel::ConnectionHealth::Degraded { .. }
         )
 }
 
@@ -177,7 +174,7 @@ fn signal_for(
     snapshots: &[TunnelSnapshot],
     primary: Option<&ProfileId>,
     profile_id: &ProfileId,
-    protocol: crate::core::profile::ProtocolKind,
+    protocol: crate::profile::ProtocolKind,
 ) -> RowSignal {
     let Some(snap) = snapshots.iter().find(|s| &s.profile_id == profile_id) else {
         return RowSignal::empty();
@@ -264,8 +261,8 @@ fn profile_row(
     let name_cell = Cell::from(Line::from(name_spans));
 
     let proto_icon = match profile.protocol {
-        crate::core::profile::ProtocolKind::WireGuard => "WG",
-        crate::core::profile::ProtocolKind::OpenVpn => "OV",
+        crate::profile::ProtocolKind::WireGuard => "WG",
+        crate::profile::ProtocolKind::OpenVpn => "OV",
     };
     let proto_color = if is_selected {
         theme::current().row_selected_fg
@@ -434,13 +431,13 @@ mod tests {
     //! and the narrow-width fallback at the 24-char inner-width boundary.
     //! Earlier smoke tests (empty-state, row rendering) remain.
     use super::*;
+    use crate::app::registry::Role;
     use crate::app::App;
+    use crate::cidr::Cidr;
     use crate::config::profiles::VpnProfile;
-    use crate::core::cidr::Cidr;
-    use crate::core::engine::registry::Role;
-    use crate::core::engine::state::ConnectionHealth;
-    use crate::core::profile::ProfileId;
-    use crate::core::profile::ProtocolKind;
+    use crate::profile::ProfileId;
+    use crate::profile::ProtocolKind;
+    use crate::tunnel::ConnectionHealth;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -449,7 +446,7 @@ mod tests {
 
     fn make_profile(name: &str) -> VpnProfile {
         VpnProfile {
-            id: crate::core::profile::ProfileId::new(name),
+            id: crate::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: ProtocolKind::WireGuard,
             location: String::new(),

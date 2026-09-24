@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::core::ports::tunnel::{
+use crate::process::{CommandSpec, PrivilegeReq};
+use crate::profile::Profile;
+use crate::tunnel::{
     HandshakeAttempt, ProbeReceipt, TunnelError, TunnelExecutionContext, TunnelHandle,
     TunnelKindTag, TunnelPeerStatus, TunnelStatus, TunnelTeardownConfig,
 };
-use crate::core::profile::Profile;
-use crate::process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
 use crate::wireguard::parser::parse_wg_conf;
@@ -58,7 +58,7 @@ pub struct WgTunnel {
 
 #[derive(Debug, Clone)]
 struct WgInflightAttempt {
-    profile_id: crate::core::profile::ProfileId,
+    profile_id: crate::profile::ProfileId,
     display_name: String,
     interface_basename: String,
     started_at: SystemTime,
@@ -266,8 +266,7 @@ pub(crate) fn interface_name_from_path(path: &Path) -> Result<String, TunnelErro
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| TunnelError::Subprocess("WireGuard config has no valid name".into()))?;
-    crate::core::profile::validate_wireguard_interface_name(name)
-        .map_err(TunnelError::Subprocess)?;
+    crate::profile::validate_wireguard_interface_name(name).map_err(TunnelError::Subprocess)?;
     Ok(name.to_owned())
 }
 
@@ -288,7 +287,7 @@ fn write_managed_temp_config_at(
     user_conf_path: &Path,
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
-    use crate::core::secret_file::{write_secret_file, SecretFileError};
+    use crate::config::secret::{write_secret_file, SecretFileError};
 
     interface_name_from_path(user_conf_path)?;
     let basename = user_conf_path
@@ -341,7 +340,7 @@ fn write_managed_config_in_wireguard_dir(
     user_conf_path: &Path,
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
-    use crate::core::secret_file::{write_secret_file, SecretFileError};
+    use crate::config::secret::{write_secret_file, SecretFileError};
 
     interface_name_from_path(user_conf_path)?;
     let basename = user_conf_path
@@ -543,7 +542,7 @@ pub fn parse_wg_dump(
             .filter(|route| !route.is_empty())
             .map(|route| {
                 route
-                    .parse::<crate::core::cidr::Cidr>()
+                    .parse::<crate::cidr::Cidr>()
                     .map(|_| route.to_string())
                     .map_err(|_| TunnelError::MalformedStatus("WireGuard AllowedIPs".into()))
             })
@@ -764,7 +763,7 @@ impl WgTunnel {
                 managed: true,
                 wg_quick_interface: Some(attempt.interface_basename),
             }),
-            dns_request: crate::core::ports::dns::DnsRequest::default(),
+            dns_request: crate::control::dns::DnsRequest::default(),
             openvpn_routes: None,
         };
         self.down(&handle)?;
@@ -826,13 +825,7 @@ impl WgTunnel {
         handle: &TunnelHandle,
         attempt: &HandshakeAttempt,
         probes: &[ProbePlan],
-    ) -> Result<
-        (
-            crate::core::ports::tunnel::HandshakeEvidence,
-            Vec<ProbeReceipt>,
-        ),
-        TunnelError,
-    > {
+    ) -> Result<(crate::tunnel::HandshakeEvidence, Vec<ProbeReceipt>), TunnelError> {
         let local_deadline = Instant::now()
             .checked_add(self.handshake_timeout)
             .ok_or_else(|| TunnelError::Other("WireGuard deadline overflowed".into()))?;
@@ -900,7 +893,7 @@ impl WgTunnel {
         temp_path: PathBuf,
         generation: u64,
         started_at: SystemTime,
-        dns_request: crate::core::ports::dns::DnsRequest,
+        dns_request: crate::control::dns::DnsRequest,
         original: TunnelError,
     ) -> TunnelError {
         let basename = interface_from_path(&temp_path);
@@ -970,11 +963,11 @@ fn settle_failed_attempt(
 }
 
 fn verify_probe_route(
-    observation: crate::core::ports::route_table::DefaultRouteObservation,
+    observation: crate::platform::DefaultRouteObservation,
     target: IpAddr,
     owned_interface: &str,
 ) -> Result<(), TunnelError> {
-    use crate::core::ports::route_table::DefaultRouteObservation;
+    use crate::platform::DefaultRouteObservation;
     match observation {
             DefaultRouteObservation::Interface(interface) if interface == owned_interface => Ok(()),
             DefaultRouteObservation::Interface(interface) => Err(TunnelError::HandshakeFailed(
@@ -1010,9 +1003,9 @@ fn peer_covers_target(peer: &crate::wireguard::parser::WgPeer, target: IpAddr) -
         .any(|route| route_covers_target(*route, target))
 }
 
-fn route_covers_target(route: crate::core::cidr::Cidr, target: IpAddr) -> bool {
+fn route_covers_target(route: crate::cidr::Cidr, target: IpAddr) -> bool {
     let prefix = if target.is_ipv4() { 32 } else { 128 };
-    crate::core::cidr::Cidr::new(target, prefix).is_some_and(|target| route.intersects(&target))
+    crate::cidr::Cidr::new(target, prefix).is_some_and(|target| route.intersects(&target))
 }
 
 /// Verify that a configured health target is currently routed through the
@@ -1106,7 +1099,7 @@ fn wait_for_interface_absence(interface_name: &str, timeout: Duration) -> bool {
 fn resolve_kernel_iface(
     basename: &str,
     port_result: Option<String>,
-    profile_id: &crate::core::profile::ProfileId,
+    profile_id: &crate::profile::ProfileId,
 ) -> String {
     if let Some(iface) = port_result {
         return iface;
@@ -1174,7 +1167,7 @@ fn prepare_down_target_with(
             .wg_quick_interface
             .as_deref()
             .unwrap_or(&handle.interface_name);
-        crate::core::profile::validate_wireguard_interface_name(wg_quick_interface)
+        crate::profile::validate_wireguard_interface_name(wg_quick_interface)
             .map_err(TunnelError::Subprocess)?;
         if interface_from_path(&config.path) != wg_quick_interface {
             if Path::new(wg_quick_interface).components().count() != 1 {
@@ -1541,12 +1534,12 @@ mod tests {
     use super::*;
 
     fn managed_profile(
-        resolutions: impl IntoIterator<Item = crate::core::profile::ResolvedEndpoint>,
+        resolutions: impl IntoIterator<Item = crate::profile::ResolvedEndpoint>,
     ) -> Profile {
         Profile::new(
-            crate::core::profile::ProfileId::new("managed-test"),
+            crate::profile::ProfileId::new("managed-test"),
             "managed-test",
-            crate::core::profile::ProtocolKind::WireGuard,
+            crate::profile::ProtocolKind::WireGuard,
             PathBuf::from("managed-test.conf"),
         )
         .with_endpoint_resolutions(resolutions)
@@ -1566,7 +1559,7 @@ mod tests {
         // macOS-shape: platform port returns the underlying utun device.
         // This is the value the registry must store to match `route get`'s
         // output byte-for-byte.
-        let profile_id = crate::core::profile::ProfileId::new("corp");
+        let profile_id = crate::profile::ProfileId::new("corp");
         let resolved = resolve_kernel_iface("corp", Some("utun7".to_string()), &profile_id);
         assert_eq!(resolved, "utun7");
     }
@@ -1576,7 +1569,7 @@ mod tests {
         // Linux-shape: platform port returns None because the kernel
         // device name IS the config basename. The fallback is the
         // correct value to store.
-        let profile_id = crate::core::profile::ProfileId::new("corp");
+        let profile_id = crate::profile::ProfileId::new("corp");
         let resolved = resolve_kernel_iface("corp", None, &profile_id);
         assert_eq!(resolved, "corp");
     }
@@ -1588,7 +1581,7 @@ mod tests {
         // be preserved verbatim — the helper has no business stripping
         // the port's answer just because it happens to equal the
         // basename.
-        let profile_id = crate::core::profile::ProfileId::new("corp");
+        let profile_id = crate::profile::ProfileId::new("corp");
         let resolved = resolve_kernel_iface("corp", Some("corp".to_string()), &profile_id);
         assert_eq!(resolved, "corp");
     }
@@ -1643,7 +1636,7 @@ mod tests {
     #[test]
     fn managed_up_config_rewrites_cached_hostname_without_dns() {
         let input = "[Interface]\nPrivateKey = abc\nDNS = 10.0.0.53\n[Peer]\nPublicKey = xyz\nEndpoint = vpn.example:51820\nAllowedIPs = 0.0.0.0/0\n";
-        let resolution = crate::core::profile::ResolvedEndpoint::new(
+        let resolution = crate::profile::ResolvedEndpoint::new(
             "vpn.example",
             51820,
             "203.0.113.19".parse().unwrap(),
@@ -1661,7 +1654,7 @@ mod tests {
     #[test]
     fn managed_up_config_preserves_ipv6_endpoint_family_and_port() {
         let input = "[Interface]\nPrivateKey = abc\n[Peer]\nPublicKey = xyz\nEndpoint = vpn.example:51820\n";
-        let resolution = crate::core::profile::ResolvedEndpoint::new(
+        let resolution = crate::profile::ResolvedEndpoint::new(
             "vpn.example",
             51820,
             "2001:db8::19".parse().unwrap(),
@@ -1675,7 +1668,7 @@ mod tests {
         teardown_config: Option<TunnelTeardownConfig>,
     ) -> TunnelHandle {
         TunnelHandle {
-            profile_id: crate::core::profile::ProfileId::new("corp"),
+            profile_id: crate::profile::ProfileId::new("corp"),
             display_name: "corp".to_string(),
             interface_name: interface_name.to_string(),
             pid: None,
@@ -1686,7 +1679,7 @@ mod tests {
             probe_receipts: Vec::new(),
             process_ownership: None,
             teardown_config,
-            dns_request: crate::core::ports::dns::DnsRequest::default(),
+            dns_request: crate::control::dns::DnsRequest::default(),
             openvpn_routes: None,
         }
     }
@@ -2157,7 +2150,7 @@ mod tests {
 
     #[test]
     fn probe_route_must_resolve_to_exact_owned_interface() {
-        use crate::core::ports::route_table::DefaultRouteObservation;
+        use crate::platform::DefaultRouteObservation;
         let target = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 7));
         assert!(verify_probe_route(
             DefaultRouteObservation::Interface("wg0".into()),
@@ -2272,9 +2265,9 @@ mod tests {
     #[test]
     fn invalid_or_cancelled_policy_fails_before_profile_io() {
         let profile = Profile::new(
-            crate::core::profile::ProfileId::new("missing"),
+            crate::profile::ProfileId::new("missing"),
             "missing",
-            crate::core::profile::ProtocolKind::WireGuard,
+            crate::profile::ProtocolKind::WireGuard,
             PathBuf::from("/definitely/missing.conf"),
         );
         let mut invalid = WgTunnel::new().with_handshake_policy(Duration::ZERO, []);
@@ -2285,7 +2278,7 @@ mod tests {
             Err(TunnelError::Other(_))
         ));
 
-        let cancellation = crate::core::ports::tunnel::TunnelCancellation::default();
+        let cancellation = crate::tunnel::TunnelCancellation::default();
         cancellation.cancel();
         let mut cancelled = WgTunnel::new().with_execution_context(TunnelExecutionContext {
             cancellation,

@@ -17,7 +17,7 @@ impl App {
 
         for (epoch, update) in updates {
             if epoch == self.runtime.telemetry_epoch
-                || matches!(update, crate::core::telemetry::TelemetryUpdate::Log(..))
+                || matches!(update, crate::telemetry::TelemetryUpdate::Log(..))
             {
                 self.handle_message(Message::Telemetry(update));
             }

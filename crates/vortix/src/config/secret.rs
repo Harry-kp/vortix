@@ -1,23 +1,45 @@
-//! Credential-safe file writes with TOCTOU mitigation.
-//!
-//! [`write_secret_file`] creates a new file at a fixed `0o600` mode by holding
-//! an open file descriptor to the parent directory and using [`libc::openat`].
-//! The parent is opened with `O_NOFOLLOW | O_DIRECTORY`, which rejects
-//! symlinked parents and pins the resolved directory inode for the duration
-//! of the write. This closes the parent-directory TOCTOU window that exists
-//! with the naive `fs::write` + `chmod` two-step pattern: between the path
-//! lookup and the open, an attacker who controls a writable ancestor cannot
-//! swap a directory component for a symlink that points at a sensitive
-//! target.
-//!
-//! Combined with `O_CREAT | O_EXCL` and a `0o600` mode at creation time, the
-//! file lands on disk already locked down — there is no window during which
-//! the file exists with looser permissions.
-//!
-//! Unix only. Windows callers receive an `Unsupported` I/O error today; a
-//! native Windows implementation would need different primitives (e.g.
-//! `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` handling and ACL
-//! tightening) and is tracked as a TODO.
+//! Memory-only secret bytes that never serialize, log or clone.
+
+use zeroize::Zeroize;
+
+/// Memory-only secret. Dropping it overwrites its allocation before release.
+///
+/// It intentionally implements neither `Clone`, `Debug`, nor serde traits.
+///
+/// ```compile_fail
+/// use vortix::tunnel::Secret;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<Secret>();
+/// ```
+///
+/// ```compile_fail
+/// use vortix::tunnel::Secret;
+/// let secret = Secret::new(b"answer".to_vec());
+/// let _ = serde_json::to_string(&secret);
+/// ```
+pub struct Secret(Box<[u8]>);
+
+impl Secret {
+    #[must_use]
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into().into_boxed_slice())
+    }
+
+    /// Borrow credential bytes only at the final in-process protocol boundary.
+    pub(crate) fn expose(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn clear(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
 
 use std::path::Path;
 

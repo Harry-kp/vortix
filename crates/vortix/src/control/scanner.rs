@@ -3,7 +3,7 @@
 //! This module provides functionality to detect active VPN connections
 //! by scanning system interfaces and processes for `WireGuard` and `OpenVPN` sessions.
 
-use crate::core::profile::ProtocolKind;
+use crate::profile::ProtocolKind;
 
 use crate::config::profiles::VpnProfile;
 use crate::process::simple_output as cmd_output;
@@ -21,9 +21,9 @@ pub struct ActiveSession {
     /// `details.interface_authoritative` is false only when the macOS
     /// `OpenVPN` fallback guessed the utun by scanning `ifconfig`, which cannot
     /// tell several `OpenVPN` processes apart.
-    pub details: crate::core::engine::state::DetailedConnectionInfo,
+    pub details: crate::tunnel::DetailedConnectionInfo,
     /// Typed `WireGuard` peer facts. Empty for `OpenVPN`.
-    pub wireguard_peers: Vec<crate::core::ports::tunnel::TunnelPeerStatus>,
+    pub wireguard_peers: Vec<crate::tunnel::TunnelPeerStatus>,
 }
 
 /// Combined result of a scanner sweep: active VPN sessions plus the
@@ -32,7 +32,7 @@ pub struct ActiveSession {
 #[derive(Default, Debug)]
 pub struct ScannerResult {
     pub sessions: Vec<ActiveSession>,
-    pub default_route: crate::core::ports::route_table::DefaultRouteObservation,
+    pub default_route: crate::platform::DefaultRouteObservation,
     /// `false` means at least one protocol-wide probe failed, so missing
     /// sessions are unknown rather than proof of absence.
     pub tunnel_observation_complete: bool,
@@ -267,7 +267,7 @@ fn check_wireguard_by_name(
     let interface_name = crate::platform::Interface::resolve_wireguard_interface(name)?;
 
     let mut session = ActiveSession {
-        details: crate::core::engine::state::DetailedConnectionInfo {
+        details: crate::tunnel::DetailedConnectionInfo {
             interface: interface_name.clone(),
             ..Default::default()
         },
@@ -377,7 +377,7 @@ fn check_openvpn_by_pid(
     display_name: &str,
 ) -> Option<ActiveSession> {
     let mut session = ActiveSession {
-        details: crate::core::engine::state::DetailedConnectionInfo {
+        details: crate::tunnel::DetailedConnectionInfo {
             pid: Some(pid),
             ..Default::default()
         },
@@ -439,7 +439,7 @@ fn check_openvpn_by_pid(
         let log_path = if canonical_log.exists() {
             canonical_log
         } else if let Some(legacy_key) =
-            crate::core::profile::unambiguous_legacy_artifact_key(display_name)
+            crate::profile::unambiguous_legacy_artifact_key(display_name)
         {
             run_dir.join(format!("{legacy_key}.log"))
         } else {
@@ -797,7 +797,7 @@ mod tests {
         assert!(
             matches!(
                 result.default_route,
-                crate::core::ports::route_table::DefaultRouteObservation::ProbeFailed
+                crate::platform::DefaultRouteObservation::ProbeFailed
             ),
             "default ScannerResult must have no route interface"
         );
@@ -805,7 +805,7 @@ mod tests {
 
     #[test]
     fn managed_openvpn_config_matches_only_its_exact_stable_profile_id() {
-        use crate::core::profile::ProfileId;
+        use crate::profile::ProfileId;
 
         let id = "a".repeat(ProfileId::HEX_LEN);
         let source = "/profiles/corp.ovpn";

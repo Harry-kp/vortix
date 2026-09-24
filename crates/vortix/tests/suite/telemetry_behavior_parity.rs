@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use vortix::core::telemetry_http;
+use vortix::telemetry;
 
 /// Bind an ephemeral port and serve the test's single expected request.
 /// The guard joins that exact connection handler, so no detached fixture
@@ -124,7 +124,7 @@ fn write_response(stream: &mut TcpStream, path: &str) {
 #[test]
 fn get_text_returns_body_on_200() {
     let server = spawn_mock_server();
-    let body = telemetry_http::get_text_v4(&server.url("/ok"), Duration::from_secs(2))
+    let body = telemetry::get_text_v4(&server.url("/ok"), Duration::from_secs(2))
         .expect("expected 200 + body");
     assert_eq!(body.trim(), "203.0.113.5");
 }
@@ -135,7 +135,7 @@ fn get_text_returns_none_on_5xx() {
     // and doesn't follow; our helper maps non-success → None to match
     // the prior caller's `output.status.success()` check.
     let server = spawn_mock_server();
-    let result = telemetry_http::get_text_v4(&server.url("/500"), Duration::from_secs(2));
+    let result = telemetry::get_text_v4(&server.url("/500"), Duration::from_secs(2));
     assert!(result.is_none(), "expected None on 5xx, got {result:?}");
 }
 
@@ -145,7 +145,7 @@ fn get_text_does_not_follow_redirects() {
     // response itself. Our helper is configured with `Policy::none()`
     // so reqwest behaves the same way: redirect → None (not-2xx).
     let server = spawn_mock_server();
-    let result = telemetry_http::get_text_v4(&server.url("/redirect"), Duration::from_secs(2));
+    let result = telemetry::get_text_v4(&server.url("/redirect"), Duration::from_secs(2));
     assert!(
         result.is_none(),
         "expected None on un-followed redirect, got {result:?}"
@@ -158,7 +158,7 @@ fn get_text_times_out_within_budget() {
     // prove the timeout without making every suite run wait three seconds.
     let server = spawn_mock_server();
     let start = std::time::Instant::now();
-    let result = telemetry_http::get_text_v4(&server.url("/slow"), Duration::from_millis(100));
+    let result = telemetry::get_text_v4(&server.url("/slow"), Duration::from_millis(100));
     let elapsed = start.elapsed();
     assert!(result.is_none(), "expected timeout None, got {result:?}");
     assert!(
@@ -176,7 +176,7 @@ fn unreachable_endpoint_returns_none() {
     let port = listener.local_addr().unwrap().port();
     drop(listener); // free the port so subsequent connects refuse
     let url = format!("http://127.0.0.1:{port}/whatever");
-    let result = telemetry_http::get_text_v4(&url, Duration::from_secs(2));
+    let result = telemetry::get_text_v4(&url, Duration::from_secs(2));
     assert!(
         result.is_none(),
         "expected None for connection-refused, got {result:?}"

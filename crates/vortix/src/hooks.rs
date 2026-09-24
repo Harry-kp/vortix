@@ -9,7 +9,7 @@ mod event {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::core::profile::{ProfileId, ProtocolKind};
+    use crate::profile::{ProfileId, ProtocolKind};
 
     /// Lifecycle transitions available to global hook specifications.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -118,9 +118,9 @@ mod runner {
     use tokio::task::{JoinHandle, JoinSet};
 
     use crate::config::hooks_config::{validate_hooks, HookConfigError, HookSpec};
-    use crate::core::ports::process::{ProcessCredentials, ProcessError};
     use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
     use crate::process::{CommandRunner, CommandSpec};
+    use crate::process::{ProcessCredentials, ProcessError};
 
     const HOOK_QUEUE_CAPACITY: usize = 64;
     const HOOK_DIAGNOSTIC_CAPACITY: usize = 128;
@@ -562,8 +562,8 @@ mod runner {
         env.insert(
             "VORTIX_PROTOCOL".into(),
             match job.fact.protocol {
-                crate::core::profile::ProtocolKind::WireGuard => "wireguard",
-                crate::core::profile::ProtocolKind::OpenVpn => "openvpn",
+                crate::profile::ProtocolKind::WireGuard => "wireguard",
+                crate::profile::ProtocolKind::OpenVpn => "openvpn",
             }
             .into(),
         );
@@ -620,7 +620,7 @@ mod runner {
         use std::time::Duration;
 
         use super::*;
-        use crate::core::profile::{ProfileId, ProtocolKind};
+        use crate::profile::{ProfileId, ProtocolKind};
 
         #[test]
         fn empty_configuration_starts_no_runner() {

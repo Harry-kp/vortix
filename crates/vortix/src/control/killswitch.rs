@@ -429,9 +429,8 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-// Re-export the canonical types so existing `crate::core::killswitch::*`
+// Re-export the canonical types so existing `crate::control::killswitch::*`
 // imports keep resolving.
-pub use crate::core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
 
 /// Typed proof attached only after a platform adapter has read back the
 /// Vortix-owned policy it just applied.
@@ -504,7 +503,7 @@ fn local_executor_epoch() -> &'static str {
 /// never promote protection truth.
 #[must_use]
 pub fn policy_digest(active: &[ActiveTunnelInfo]) -> String {
-    crate::core::profile::hex(&policy_digest_bytes(active))
+    crate::profile::hex(&policy_digest_bytes(active))
 }
 
 /// Raw policy digest for platform formats with constrained encodings.
@@ -1116,7 +1115,7 @@ mod tests {
 
     #[test]
     fn policy_digest_covers_full_policy_but_not_iteration_order() {
-        use crate::core::cidr::Cidr;
+        use crate::cidr::Cidr;
         use std::net::IpAddr;
 
         let first = ActiveTunnelInfo {
@@ -1407,7 +1406,7 @@ mod tests {
 
     #[test]
     fn persisted_from_active_stringifies_addresses_and_cidrs() {
-        use crate::core::cidr::Cidr;
+        use crate::cidr::Cidr;
         use std::net::IpAddr;
         let active = vec![ActiveTunnelInfo {
             interface: "utun3".to_string(),
@@ -1480,5 +1479,81 @@ mod tests {
         let mut current: PersistedState = serde_json::from_str(&json).unwrap();
         current.state = current.effective_state.unwrap_or(current.state);
         assert_eq!(current.state, KillSwitchState::Degraded);
+    }
+}
+
+use std::net::IpAddr;
+
+use thiserror::Error;
+
+use crate::cidr::Cidr;
+
+/// Result alias for kill-switch operations.
+pub type Result<T> = std::result::Result<T, KillswitchError>;
+
+/// Errors that can occur during kill-switch operations.
+#[derive(Debug, Error)]
+pub enum KillswitchError {
+    /// The normalized policy contains an unsafe or unsupported value.
+    #[error("invalid kill-switch policy: {0}")]
+    InvalidPolicy(String),
+    /// A firewall subprocess returned a non-zero exit or otherwise failed.
+    #[error("firewall command failed: {0}")]
+    CommandFailed(String),
+    /// I/O error (reading/writing pf config, opening sockets, etc.).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The caller is not running as root and the operation requires root.
+    #[error("kill switch requires root privileges")]
+    NotRoot,
+    /// No safe firewall backend is available on this host (Linux requires
+    /// `nft`; split-family iptables replacement cannot be atomic).
+    #[error("no firewall backend available on this host")]
+    NoBackendAvailable,
+}
+
+/// Per-tunnel state needed to synthesise multi-interface killswitch
+/// rules. The platform impl uses the interface name for interface-allow
+/// rules, the server IPs for reconnect-allow rules, and the declared
+/// CIDRs to subtract from the RFC1918 base when this tunnel is a
+/// secondary.
+///
+/// Primary tunnels (claiming the default route, `is_primary == true`)
+/// do **not** contribute to RFC1918 subtraction — their interface allow
+/// rule covers all egress, and subtracting `0.0.0.0/0` would strip
+/// loopback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTunnelInfo {
+    /// VPN tunnel interface name, e.g. `"utun3"` (macOS) or `"wg0"` (Linux).
+    pub interface: String,
+    /// Server IPs to allow for reconnection. May be empty if the tunnel
+    /// has no externally observable server endpoint (mock / dev).
+    pub server_ips: Vec<IpAddr>,
+    /// CIDRs this tunnel declares as its routed scope. Used only for
+    /// secondaries: subtracted from the RFC1918 base so traffic to those
+    /// nets cannot escape onto the underlay.
+    pub declared_cidrs: Vec<Cidr>,
+    /// `true` when this tunnel claims the default route (primary).
+    /// Primaries are excluded from RFC1918 subtraction.
+    pub is_primary: bool,
+}
+
+impl ActiveTunnelInfo {
+    /// Policy-only endpoint allowance used while a tunnel interface does not
+    /// exist yet. Platform adapters emit only the destination exceptions and
+    /// never an interface allow rule for this value.
+    #[must_use]
+    pub fn endpoint_allowlist(server_ips: Vec<IpAddr>) -> Self {
+        Self {
+            interface: String::new(),
+            server_ips,
+            declared_cidrs: Vec::new(),
+            is_primary: false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_endpoint_allowlist(&self) -> bool {
+        self.interface.is_empty()
     }
 }

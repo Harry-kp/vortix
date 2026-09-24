@@ -5,17 +5,17 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::app::registry::Conflict;
 use crate::config::openvpn_credentials::{FsOpenVpnCredentialStore, RememberedOpenVpnCredentials};
-use crate::core::engine::Conflict;
-use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
-use crate::core::ports::route_table::DefaultRouteObservation;
-use crate::core::ports::tunnel::TunnelCancellation;
-use crate::core::profile::{ProfileId, ProtocolKind};
-use crate::core::scanner::{ActiveSession, ScannerResult};
-use crate::core::secret::Secret;
-use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
+use crate::config::secret::Secret;
+use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
+use crate::control::scanner::{ActiveSession, ScannerResult};
 use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
+use crate::platform::DefaultRouteObservation;
+use crate::profile::{ProfileId, ProtocolKind};
+use crate::tunnel::TunnelCancellation;
+use crate::wireguard::ownership::StandardTunnelOwnershipStore;
 
 use super::net::Net;
 use super::plan::{plan, NetworkPlan};
@@ -95,8 +95,8 @@ pub(super) struct Engine {
     health: BTreeMap<
         ProfileId,
         (
-            crate::core::engine::state::ConnectionHealth,
-            crate::core::managed_wireguard::PeerActivity,
+            crate::tunnel::ConnectionHealth,
+            crate::wireguard::receipt::PeerActivity,
         ),
     >,
 }
@@ -118,7 +118,7 @@ impl Engine {
         let ownership = Arc::new(
             StandardTunnelOwnershipStore::production(uid).map_err(|error| error.to_string())?,
         );
-        let kill_switch = crate::core::killswitch::load_state_checked()
+        let kill_switch = crate::control::killswitch::load_state_checked()
             .map_err(|error| {
                 format!(
                     "kill switch state is unreadable ({error}); run `sudo vortix release-killswitch`"
@@ -129,7 +129,7 @@ impl Engine {
             .values()
             .map(|entry| entry.profile.clone())
             .collect::<Vec<_>>();
-        let scan = crate::core::scanner::gather_system_state(&catalog);
+        let scan = crate::control::scanner::gather_system_state(&catalog);
         if !scan.tunnel_observation_complete {
             return Err("could not list running tunnels".into());
         }
@@ -529,31 +529,29 @@ impl Engine {
                 continue;
             };
             let Some(mut receipt) =
-                crate::core::managed_wireguard::load(&self.config.config_dir, &profile_id)
+                crate::wireguard::receipt::load(&self.config.config_dir, &profile_id)
                     .filter(|receipt| receipt.validates(&profile_id, session))
             else {
                 continue;
             };
             let (health, activity) = self.health.entry(profile_id.clone()).or_default();
-            let current = crate::core::managed_wireguard::health_from_peers(
+            let current = crate::wireguard::receipt::health_from_peers(
                 &session.wireguard_peers,
                 activity,
                 &receipt.probe_receipts,
                 self.config.wireguard_stale_after,
             );
-            if let Ok(Some(old)) = crate::core::managed_wireguard::update_health(
+            if let Ok(Some(old)) = crate::wireguard::receipt::update_health(
                 &self.config.config_dir,
                 &mut receipt,
                 current.clone(),
             ) {
-                if let Some(journal) = crate::core::journal::global_journal() {
-                    let _ = journal.append(
-                        crate::core::journal::JournalEvent::ConnectionHealthChanged {
-                            profile_id: profile_id.clone(),
-                            old,
-                            new: current.clone(),
-                        },
-                    );
+                if let Some(journal) = crate::journal::global_journal() {
+                    let _ = journal.append(crate::journal::JournalEvent::ConnectionHealthChanged {
+                        profile_id: profile_id.clone(),
+                        old,
+                        new: current.clone(),
+                    });
                 }
             }
             *health = current;
@@ -744,7 +742,7 @@ impl Engine {
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let started = Instant::now();
-                let result = crate::core::scanner::gather_system_state(&catalog);
+                let result = crate::control::scanner::gather_system_state(&catalog);
                 let _ = tx.send(Msg::Event(Box::new(Event::Scanned { result, started })));
             });
         }
@@ -1101,8 +1099,8 @@ impl Engine {
 
     fn notice(&mut self, level: Level, text: String) {
         tracing::info!(target: "vortix::engine", ?level, %text);
-        if let Some(journal) = crate::core::journal::global_journal() {
-            let _ = journal.append(crate::core::journal::JournalEvent::Notice {
+        if let Some(journal) = crate::journal::global_journal() {
+            let _ = journal.append(crate::journal::JournalEvent::Notice {
                 level: format!("{level:?}").to_ascii_lowercase(),
                 text: text.clone(),
             });

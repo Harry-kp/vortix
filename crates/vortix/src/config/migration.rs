@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use crate::config::profile_store::{
     acquire_profile_lock, is_profile_config_name, write_atomic, FsProfileStore, Sidecar,
 };
-use crate::core::profile::{sanitize_profile_name, ProfileId, ProtocolKind};
+use crate::profile::{sanitize_profile_name, ProfileId, ProtocolKind};
 
 const INVENTORY_FILE: &str = ".vortix-profile-inventory-v1.toml";
 const LEGACY_SIDECAR_ARCHIVE_DIR: &str = ".vortix-legacy-sidecars-v1";
@@ -53,7 +53,7 @@ pub(crate) fn rename_inventory_entry(
 
 pub(crate) fn insert_inventory_entry(
     profiles_dir: &Path,
-    profile: &crate::core::profile::Profile,
+    profile: &crate::profile::Profile,
 ) -> std::io::Result<()> {
     let path = profiles_dir.join(INVENTORY_FILE);
     if !path.exists() {
@@ -621,7 +621,7 @@ fn read_legacy_sidecar_bytes(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    crate::core::profile::hex(&Sha256::digest(bytes))
+    crate::profile::hex(&Sha256::digest(bytes))
 }
 
 fn archive_legacy_sidecars(
@@ -1039,7 +1039,7 @@ fn legacy_v1_profile_id(config_path: &Path, display_name: &str) -> std::io::Resu
     hasher.update(display_name.as_bytes());
     hasher.update(b"\0");
     hasher.update(&prefix[..read]);
-    Ok(crate::core::profile::hex(&hasher.finalize()))
+    Ok(crate::profile::hex(&hasher.finalize()))
 }
 
 fn validate_pending_archive(

@@ -54,7 +54,7 @@ fn show_lifecycle_progress(
 
 fn connect_operation_timeout_secs(
     explicit: Option<u64>,
-    protocol: crate::core::profile::ProtocolKind,
+    protocol: crate::profile::ProtocolKind,
     config: &AppConfig,
 ) -> u64 {
     explicit.unwrap_or_else(|| config.connect_operation_timeout_secs(protocol))
@@ -210,13 +210,13 @@ pub fn handle_command(
 /// `vortix audit` — per-process socket snapshot.
 #[derive(Serialize)]
 struct AuditData {
-    sockets: Vec<crate::core::ports::socket_audit::SocketSnapshot>,
+    sockets: Vec<crate::platform::SocketSnapshot>,
 }
 
 fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i32 {
     let mut snapshots = match crate::platform::SocketAudit::snapshot() {
         Ok(s) => s,
-        Err(crate::core::ports::socket_audit::SocketAuditError::Unsupported) => {
+        Err(crate::platform::SocketAuditError::Unsupported) => {
             print_error_and_exit(
                 mode,
                 "audit",
@@ -391,21 +391,21 @@ fn handle_up(
         if let Some(conflict) = detect_conflict_for_cli(&profiles, config_dir, &profile_name) {
             // Conflicts carry opaque profile IDs; the reader needs the name
             // they typed, so resolve through the catalog before formatting.
-            let named = |id: &crate::core::profile::ProfileId| {
+            let named = |id: &crate::profile::ProfileId| {
                 profiles
                     .iter()
                     .find(|profile| &profile.id == id)
                     .map_or_else(|| id.to_string(), |profile| profile.name.clone())
             };
             let (code, message) = match &conflict {
-                crate::core::engine::Conflict::DefaultRouteTakeover { current, new: _ } => (
+                crate::app::registry::Conflict::DefaultRouteTakeover { current, new: _ } => (
                     "state_conflict_default_route",
                     format!(
                         "Profile '{profile_name}' would take over the default route from '{}'",
                         named(current)
                     ),
                 ),
-                crate::core::engine::Conflict::RouteOverlap {
+                crate::app::registry::Conflict::RouteOverlap {
                     with,
                     overlapping_cidrs,
                 } => (
@@ -548,7 +548,7 @@ fn engine_failure_or_exit(mode: OutputMode, command: &str, message: String) -> !
 /// The CLI doesn't share an in-memory `TunnelRegistry` with the running
 /// session — active tunnels are discovered via
 /// `scanner::get_active_profiles`. We inspect each active session's parsed
-/// config and use the **shared** `core::cidr` and
+/// config and use the **shared** `cidr` and
 /// `claims_default_route_*` helpers (same logic the TUI's
 /// `TunnelRegistry::detect_conflict` uses) so the two surfaces refuse the
 /// same set of takeovers. The route-overlap branch is a CLI-only
@@ -588,10 +588,10 @@ fn detect_conflict_for_cli(
     profiles: &[crate::config::profiles::VpnProfile],
     config_dir: &Path,
     target_name: &str,
-) -> Option<crate::core::engine::Conflict> {
+) -> Option<crate::app::registry::Conflict> {
     let target_profile = profiles.iter().find(|p| p.name == target_name)?;
     let specs = crate::control::profiles::load(config_dir, profiles.to_vec());
-    let routes = |id: &crate::core::profile::ProfileId| {
+    let routes = |id: &crate::profile::ProfileId| {
         specs
             .get(id)
             .and_then(|entry| entry.spec.as_ref().ok())
@@ -600,7 +600,7 @@ fn detect_conflict_for_cli(
     };
     let target_allowed = routes(&target_profile.id);
 
-    let active = crate::core::scanner::get_active_profiles(profiles);
+    let active = crate::control::scanner::get_active_profiles(profiles);
     for session in &active {
         if session.name == target_name {
             // Re-up of an already-up profile isn't a conflict — the
@@ -611,7 +611,7 @@ fn detect_conflict_for_cli(
             continue;
         };
         let active_allowed = routes(&active_profile.id);
-        if let Some(conflict) = crate::core::engine::classify_route_conflict(
+        if let Some(conflict) = crate::app::registry::classify_route_conflict(
             &target_allowed,
             &active_allowed,
             &active_profile.id,
@@ -653,8 +653,8 @@ fn handle_down(
     }
 
     // Discover every active tunnel, then filter to the requested target.
-    let mut targets: Vec<crate::core::scanner::ActiveSession> =
-        crate::core::scanner::get_active_profiles(&profiles);
+    let mut targets: Vec<crate::control::scanner::ActiveSession> =
+        crate::control::scanner::get_active_profiles(&profiles);
     if let Some(name) = profile_filter {
         targets.retain(|s| s.name == name);
     }
@@ -770,7 +770,7 @@ fn handle_reconnect(
     // - Without: every currently-Connected tunnel. If none are
     //   currently active, fall back to the last-used profile so the
     //   single-tunnel `vortix reconnect` muscle memory still works.
-    let active = crate::core::scanner::get_active_profiles(&profiles);
+    let active = crate::control::scanner::get_active_profiles(&profiles);
 
     let to_cycle: Vec<String> = if let Some(name) = profile_filter {
         vec![name.to_string()]
@@ -1147,7 +1147,7 @@ fn human_status_headline(snap: &crate::cli::status::StatusSnapshot) -> String {
         "connected" => snap.health.as_ref().map_or_else(
             || format!("● Connected to {profile} ({protocol})"),
             |health| match health {
-                crate::core::engine::state::ConnectionHealth::Degraded { .. } => format!(
+                crate::tunnel::ConnectionHealth::Degraded { .. } => format!(
                     "⚠ Connected to {profile} ({protocol}) — {}",
                     connection_health_human(health)
                 ),
@@ -1163,10 +1163,8 @@ fn human_status_headline(snap: &crate::cli::status::StatusSnapshot) -> String {
     }
 }
 
-fn connection_health_entry(
-    health: &crate::core::engine::state::ConnectionHealth,
-) -> ConnectionHealthEntry {
-    use crate::core::engine::state::ConnectionHealth;
+fn connection_health_entry(health: &crate::tunnel::ConnectionHealth) -> ConnectionHealthEntry {
+    use crate::tunnel::ConnectionHealth;
     match health {
         ConnectionHealth::Unknown => ConnectionHealthEntry {
             status: "unknown".into(),
@@ -1183,8 +1181,8 @@ fn connection_health_entry(
     }
 }
 
-fn connection_health_human(health: &crate::core::engine::state::ConnectionHealth) -> String {
-    use crate::core::engine::state::ConnectionHealth;
+fn connection_health_human(health: &crate::tunnel::ConnectionHealth) -> String {
+    use crate::tunnel::ConnectionHealth;
     match health {
         ConnectionHealth::Unknown => "Unknown (measuring)".into(),
         ConnectionHealth::Healthy => "Healthy".into(),
@@ -1194,8 +1192,8 @@ fn connection_health_human(health: &crate::core::engine::state::ConnectionHealth
     }
 }
 
-fn degraded_reason_human(reason: &crate::core::engine::state::DegradedReason) -> String {
-    use crate::core::engine::state::DegradedReason;
+fn degraded_reason_human(reason: &crate::tunnel::DegradedReason) -> String {
+    use crate::tunnel::DegradedReason;
     match reason {
         DegradedReason::HandshakeStale {
             seconds_since_last_handshake,
@@ -1239,7 +1237,7 @@ mod handshake_status_tests {
         assert_eq!(ts.len(), 20, "{ts}");
         assert!(ts.ends_with('Z') && ts.as_bytes()[10] == b'T', "{ts}");
     }
-    use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
+    use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 
     fn snapshot(state: &str, protocol: &str) -> crate::cli::status::StatusSnapshot {
         crate::cli::status::StatusSnapshot {
@@ -1313,8 +1311,8 @@ mod handshake_status_tests {
 
     #[test]
     fn human_projection_preserves_typed_health_generation() {
-        let degraded = crate::core::engine::state::ConnectionHealth::Degraded {
-            reason: crate::core::engine::state::DegradedReason::WireGuardPeerStale {
+        let degraded = crate::tunnel::ConnectionHealth::Degraded {
+            reason: crate::tunnel::DegradedReason::WireGuardPeerStale {
                 peer_public_key: "peer-public-key".into(),
                 allowed_routes: vec!["10.0.0.0/24".into()],
                 seconds_since_last_handshake: 181,
@@ -1327,7 +1325,7 @@ mod handshake_status_tests {
         let projected = connection_health_entry(snap.health.as_ref().unwrap());
         assert_eq!(projected.status, "degraded");
         assert!(projected.reason.unwrap().contains("peer-pub"));
-        snap.health = Some(crate::core::engine::state::ConnectionHealth::Healthy);
+        snap.health = Some(crate::tunnel::ConnectionHealth::Healthy);
         assert_eq!(
             connection_health_entry(snap.health.as_ref().unwrap()).status,
             "healthy"
@@ -1459,7 +1457,7 @@ fn handle_list(
     // active profile gets its dot — not just the first one (the
     // pre-fix `active.first()` was single-tunnel-era legacy).
     let active_names: std::collections::HashSet<String> =
-        crate::core::scanner::get_active_profiles(&all)
+        crate::control::scanner::get_active_profiles(&all)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -1581,12 +1579,12 @@ mod list_tests {
     //! decision (per-row connected flag) lives in this helper.
     use super::*;
     use crate::config::profiles::VpnProfile;
-    use crate::core::profile::ProtocolKind;
+    use crate::profile::ProtocolKind;
     use std::collections::HashSet;
 
     fn profile(name: &str) -> VpnProfile {
         VpnProfile {
-            id: crate::core::profile::ProfileId::new(name),
+            id: crate::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: ProtocolKind::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -1665,18 +1663,18 @@ mod list_tests {
 }
 
 fn handle_import(file: &str, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
-    use crate::core::importer::{resolve_target, ImportTarget};
+    use crate::config::import::{resolve_target, ImportTarget};
 
     match resolve_target(file) {
         Ok(ImportTarget::Url(url)) => {
             if matches!(mode, OutputMode::Human) {
                 println!("Downloading...");
             }
-            match crate::core::downloader::download_profile(&url) {
+            match crate::config::import::download_profile(&url) {
                 Ok(downloaded_path) => {
                     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "import");
                     let result = import_profile_via_control(&downloaded_path, config, config_dir);
-                    crate::core::downloader::cleanup_temp_download(&downloaded_path);
+                    crate::config::import::cleanup_temp_download(&downloaded_path);
                     match result {
                         Ok(profile) => {
                             print_import_success(&profile, mode);
@@ -1967,7 +1965,7 @@ fn require_profile_inactive(
     retry_command: &str,
     mode: OutputMode,
 ) {
-    let active = crate::core::scanner::get_active_profiles(profiles);
+    let active = crate::control::scanner::get_active_profiles(profiles);
     if active.iter().any(|session| session.name == active_name) {
         print_error_and_exit(
             mode,
@@ -2060,7 +2058,7 @@ fn handle_delete(profile_name: &str, yes: bool, config_dir: &Path, mode: OutputM
             ExitCode::GeneralError,
         );
     }
-    if fresh_profile.protocol == crate::core::profile::ProtocolKind::OpenVpn {
+    if fresh_profile.protocol == crate::profile::ProtocolKind::OpenVpn {
         crate::utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &fresh_name);
     }
 
@@ -2154,8 +2152,8 @@ fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: OutputMode) -> i
         mode,
     );
 
-    if fresh_profile.protocol == crate::core::profile::ProtocolKind::WireGuard
-        && crate::core::profile::validate_wireguard_interface_name(trimmed).is_err()
+    if fresh_profile.protocol == crate::profile::ProtocolKind::WireGuard
+        && crate::profile::validate_wireguard_interface_name(trimmed).is_err()
     {
         print_error_and_exit(
             mode,
@@ -2225,8 +2223,8 @@ struct KsData {
 
 /// Print the active mode, what it is doing right now, and the other choices.
 fn print_killswitch_status(
-    mode: crate::core::killswitch::KillSwitchMode,
-    state: crate::core::killswitch::KillSwitchState,
+    mode: crate::control::killswitch::KillSwitchMode,
+    state: crate::control::killswitch::KillSwitchState,
 ) {
     println!(
         "Kill Switch: {} — currently {}",
@@ -2236,7 +2234,7 @@ fn print_killswitch_status(
     // Degraded means this mode's rules are not in place. Printing the mode's
     // behaviour here read as a description of what is happening, so "no
     // internet at all" appeared over a working connection.
-    if state == crate::core::killswitch::KillSwitchState::Degraded {
+    if state == crate::control::killswitch::KillSwitchState::Degraded {
         // Degraded is "this process cannot prove the rules are in place",
         // which is not the same as "they are not". Proof is bound to the
         // process that applied it, so a separate CLI invocation reaches
@@ -2259,9 +2257,9 @@ fn print_killswitch_status(
     println!();
     println!("Other modes:");
     for other in [
-        crate::core::killswitch::KillSwitchMode::Off,
-        crate::core::killswitch::KillSwitchMode::Auto,
-        crate::core::killswitch::KillSwitchMode::AlwaysOn,
+        crate::control::killswitch::KillSwitchMode::Off,
+        crate::control::killswitch::KillSwitchMode::Auto,
+        crate::control::killswitch::KillSwitchMode::AlwaysOn,
     ] {
         if other == mode {
             continue;
@@ -2282,10 +2280,11 @@ fn handle_killswitch(
     output_mode: OutputMode,
 ) -> i32 {
     let profiles = crate::config::profiles::load_profiles();
-    let (mut mode, mut state) = crate::core::killswitch::persisted();
+    let (mut mode, mut state) = crate::control::killswitch::persisted();
 
     if let Some(new_mode) = mode_arg {
-        let Some(ks_mode) = crate::core::killswitch::KillSwitchMode::from_cli_verb(new_mode) else {
+        let Some(ks_mode) = crate::control::killswitch::KillSwitchMode::from_cli_verb(new_mode)
+        else {
             print_error_and_exit(
                 output_mode,
                 "killswitch",
@@ -2300,7 +2299,7 @@ fn handle_killswitch(
             );
         };
 
-        if !crate::utils::is_root() && ks_mode != crate::core::killswitch::KillSwitchMode::Off {
+        if !crate::utils::is_root() && ks_mode != crate::control::killswitch::KillSwitchMode::Off {
             print_error_and_exit(
                 output_mode,
                 "killswitch",
@@ -2398,13 +2397,13 @@ pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
         )
     });
 
-    crate::core::killswitch::disable_blocking().unwrap_or_else(|error| {
+    crate::control::killswitch::disable_blocking().unwrap_or_else(|error| {
         emergency_release_failed(
             mode,
             format!("Could not remove Vortix firewall state: {error}"),
         )
     });
-    crate::core::killswitch::verify_disabled().unwrap_or_else(|error| {
+    crate::control::killswitch::verify_disabled().unwrap_or_else(|error| {
         emergency_release_failed(
             mode,
             format!("Vortix firewall state was not proven absent: {error}"),
@@ -2429,7 +2428,7 @@ pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
 }
 
 fn persist_emergency_release_off(config_dir: &Path) -> Result<(), String> {
-    crate::core::killswitch::save_emergency_release_state(config_dir)
+    crate::control::killswitch::save_emergency_release_state(config_dir)
         .map_err(|error| error.to_string())
 }
 
@@ -2481,7 +2480,7 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
     // Session-journal path. Folded into `vortix info` as part
     // of the v0.3.0 CLI surface cleanup — `vortix journal path` was
     // dropped in favour of surfacing the path here.
-    let journal_session = crate::core::journal::global_journal()
+    let journal_session = crate::journal::global_journal()
         .and_then(|j| j.session_path.as_ref().map(|p| p.display().to_string()));
 
     let data = InfoData {
@@ -2642,11 +2641,12 @@ mod tests {
         let saved =
             std::fs::read_to_string(config.path().join(crate::constants::KILLSWITCH_STATE_FILE))
                 .unwrap();
-        let state: crate::core::killswitch::PersistedState = serde_json::from_str(&saved).unwrap();
-        assert_eq!(state.mode, crate::core::killswitch::KillSwitchMode::Off);
+        let state: crate::control::killswitch::PersistedState =
+            serde_json::from_str(&saved).unwrap();
+        assert_eq!(state.mode, crate::control::killswitch::KillSwitchMode::Off);
         assert_eq!(
             state.state,
-            crate::core::killswitch::KillSwitchState::Disabled
+            crate::control::killswitch::KillSwitchState::Disabled
         );
         assert!(state.emergency_release_fence);
     }
@@ -2661,19 +2661,11 @@ mod tests {
         };
 
         assert_eq!(
-            connect_operation_timeout_secs(
-                None,
-                crate::core::profile::ProtocolKind::WireGuard,
-                &config
-            ),
+            connect_operation_timeout_secs(None, crate::profile::ProtocolKind::WireGuard, &config),
             22
         );
         assert_eq!(
-            connect_operation_timeout_secs(
-                None,
-                crate::core::profile::ProtocolKind::OpenVpn,
-                &config
-            ),
+            connect_operation_timeout_secs(None, crate::profile::ProtocolKind::OpenVpn, &config),
             32
         );
     }
@@ -2683,7 +2675,7 @@ mod tests {
         assert_eq!(
             connect_operation_timeout_secs(
                 Some(7),
-                crate::core::profile::ProtocolKind::WireGuard,
+                crate::profile::ProtocolKind::WireGuard,
                 &AppConfig::default(),
             ),
             7

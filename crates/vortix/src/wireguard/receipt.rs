@@ -12,10 +12,10 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::engine::state::ConnectionHealth;
-use crate::core::ports::tunnel::{HandshakeEvidence, ProbeReceipt};
-use crate::core::profile::ProfileId;
-use crate::core::scanner::ActiveSession;
+use crate::control::scanner::ActiveSession;
+use crate::profile::ProfileId;
+use crate::tunnel::ConnectionHealth;
+use crate::tunnel::{HandshakeEvidence, ProbeReceipt};
 
 const DIRECTORY: &str = "managed-wireguard";
 const LOCK_FILE: &str = "managed-wireguard.lock";
@@ -276,15 +276,15 @@ pub type PeerActivity = std::collections::HashMap<String, WireGuardPeerActivity>
 /// Classify a `WireGuard` tunnel from its peers. `activity` carries byte
 /// counters between observations so a transfer counts as traffic.
 pub fn health_from_peers(
-    peers: &[crate::core::ports::tunnel::TunnelPeerStatus],
+    peers: &[crate::tunnel::TunnelPeerStatus],
     activity: &mut PeerActivity,
-    probe_receipts: &[crate::core::ports::tunnel::ProbeReceipt],
+    probe_receipts: &[crate::tunnel::ProbeReceipt],
     stale_after: std::time::Duration,
-) -> crate::core::engine::state::ConnectionHealth {
-    use crate::core::engine::state::{ConnectionHealth, DegradedReason};
-    use crate::core::ports::tunnel::{
+) -> crate::tunnel::ConnectionHealth {
+    use crate::tunnel::{
         classify_peer_handshake_health, PeerHandshakeHealth, PeerTrafficExpectation,
     };
+    use crate::tunnel::{ConnectionHealth, DegradedReason};
 
     let now = std::time::SystemTime::now();
     let expectation_window = stale_after.saturating_mul(2);
@@ -367,7 +367,7 @@ pub fn health_from_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ports::tunnel::TunnelPeerStatus;
+    use crate::tunnel::TunnelPeerStatus;
     use std::time::Duration;
 
     fn evidence(generation: u64, at: SystemTime) -> HandshakeEvidence {
@@ -402,7 +402,7 @@ mod tests {
         let receipt = load(dir.path(), &profile).unwrap();
         let session = ActiveSession {
             name: "corp".into(),
-            details: crate::core::engine::state::DetailedConnectionInfo {
+            details: crate::tunnel::DetailedConnectionInfo {
                 interface: "wg0".into(),
                 ..Default::default()
             },

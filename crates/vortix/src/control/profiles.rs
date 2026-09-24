@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cidr::Cidr;
 use crate::config::profiles::VpnProfile;
-use crate::core::cidr::Cidr;
-use crate::core::openvpn_routes::OpenVpnRedirectGateway;
-use crate::core::profile::{Profile, ProfileId, ProtocolKind, ResolvedEndpoint};
+use crate::openvpn::routes::OpenVpnRedirectGateway;
+use crate::profile::{Profile, ProfileId, ProtocolKind, ResolvedEndpoint};
 
 use super::state::Spec;
 

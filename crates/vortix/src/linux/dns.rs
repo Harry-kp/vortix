@@ -3,7 +3,7 @@
 //! Read-only inspection and generation-owned mutation both live behind DNS
 //! ports. Protocol adapters never invoke resolver commands directly.
 
-use crate::core::ports::dns::{
+use crate::control::dns::{
     DnsAssignment, DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource,
     DnsPlatformCapabilities, DnsPolicy, DnsPolicyAdapter, DnsScope,
 };
@@ -1222,7 +1222,7 @@ fn interface_exists(interface: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::profile::ProfileId;
+    use crate::profile::ProfileId;
     use std::collections::VecDeque;
 
     #[derive(Debug)]

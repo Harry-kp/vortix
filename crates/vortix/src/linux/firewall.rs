@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
+use crate::control::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
 use crate::process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, error, info};
 
@@ -387,7 +387,7 @@ impl NftFirewall {
             return Err(KillswitchError::NotRoot);
         }
 
-        crate::core::killswitch::validate_policy(active)?;
+        crate::control::killswitch::validate_policy(active)?;
 
         info!(
             target: "vortix::killswitch",
@@ -438,7 +438,7 @@ impl NftFirewall {
     }
 
     pub fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
-        crate::core::killswitch::validate_policy(active)?;
+        crate::control::killswitch::validate_policy(active)?;
         match Self::nft_table_snapshot()? {
             Some(snapshot) if nft_policy::snapshot_matches(active, &snapshot) => Ok(()),
             Some(_) | None => Err(KillswitchError::CommandFailed(
@@ -488,9 +488,9 @@ mod nft_policy {
     use std::net::IpAddr;
 
     use super::POLICY_COMMENT_PREFIX;
-    use crate::core::cidr::{rfc1918_ranges, Cidr};
-    use crate::core::cidr_subtract::cidr_subtract;
-    use crate::core::ports::killswitch::ActiveTunnelInfo;
+    use crate::cidr::cidr_subtract;
+    use crate::cidr::{rfc1918_ranges, Cidr};
+    use crate::control::killswitch::ActiveTunnelInfo;
 
     pub(super) const MISSING_ERROR: &str = "No such file or directory";
 
@@ -515,7 +515,7 @@ mod nft_policy {
 
     impl ExpectedPolicy {
         pub(super) fn new(active: &[ActiveTunnelInfo], mode: BatchMode) -> Self {
-            let digest = crate::core::killswitch::policy_digest(active);
+            let digest = crate::control::killswitch::policy_digest(active);
             let ruleset = render(active, mode, &digest);
             let accept_rules = parse_accept_rules(&ruleset)
                 .expect("the package-owned nft renderer emits canonical accept rules");
@@ -731,7 +731,7 @@ mod nft_policy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::cidr::Cidr;
+    use crate::cidr::Cidr;
     use std::net::IpAddr;
 
     fn cidr(s: &str) -> Cidr {
@@ -954,7 +954,7 @@ mod tests {
             tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true),
             tunnel("wg1", &["5.6.7.8"], &["10.0.0.0/8"], false),
         ];
-        let digest = crate::core::killswitch::policy_digest(&active);
+        let digest = crate::control::killswitch::policy_digest(&active);
         let expected = format!(
             "table inet {table} {{
   chain output {{

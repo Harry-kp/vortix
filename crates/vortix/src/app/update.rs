@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use super::{App, FocusedPanel, InputMode, ToastType};
 use crate::constants;
-use crate::core::profile::ProtocolKind;
-use crate::core::telemetry::TelemetryUpdate;
 use crate::logger;
 use crate::message::{Message, ScrollMove, SelectionMove};
+use crate::profile::ProtocolKind;
+use crate::telemetry::TelemetryUpdate;
 
 /// A `Message` handler taking longer than this is treated as a UI-thread
 /// stutter and surfaced via `tracing::warn`. Threshold is empirically the
@@ -148,10 +148,7 @@ impl App {
                 {
                     let connected = self.current_tunnel().is_some_and(|tunnel| {
                         tunnel.profile_id == profile_id
-                            && matches!(
-                                tunnel.state,
-                                crate::core::engine::state::Connection::Connected { .. }
-                            )
+                            && matches!(tunnel.state, crate::tunnel::Connection::Connected { .. })
                     });
                     if connected {
                         self.send(crate::control::Command::Reconnect(profile_id));
@@ -533,7 +530,7 @@ impl App {
     }
     fn handle_auth_submit(
         &mut self,
-        profile_id: crate::core::profile::ProfileId,
+        profile_id: crate::profile::ProfileId,
         username: crate::app::state::SecretText,
         password: crate::app::state::SecretText,
         otp: Option<crate::app::state::SecretText>,
@@ -666,14 +663,15 @@ impl App {
                     && !self.default_route_is_tunnel();
                 let no_tunnel_routes_v6 = is_connected
                     && !self.registry.snapshot_all().into_iter().any(|snap| {
-                        use crate::core::engine::{Connection, Role};
+                        use crate::app::registry::Role;
+                        use crate::tunnel::Connection;
                         match (snap.state, snap.role) {
                             (
                                 Connection::Connected { .. },
                                 Role::Primary { allowed_ips }
                                 | Role::Addressable { allowed_ips }
                                 | Role::AddressableSuppressed { allowed_ips },
-                            ) => crate::core::cidr::claims_default_route_v6(&allowed_ips),
+                            ) => crate::cidr::claims_default_route_v6(&allowed_ips),
                             _ => false,
                         }
                     });
@@ -687,7 +685,7 @@ impl App {
                                 self.log(&format!("NET: Real IPv6 detected: {ip}"));
                             }
                             self.runtime.real_ipv6 = Some(ip.clone());
-                            crate::core::real_ip_cache::save_ipv6(&self.runtime.config_dir, ip);
+                            crate::telemetry::ip_cache::save_ipv6(&self.runtime.config_dir, ip);
                         }
                         self.runtime.real_ipv6_from_cache = false;
                     }
@@ -712,7 +710,7 @@ impl App {
         }
     }
 
-    fn apply_egress_identity(&mut self, identity: crate::core::telemetry::EgressIdentity) {
+    fn apply_egress_identity(&mut self, identity: crate::telemetry::EgressIdentity) {
         let same_exit = self.runtime.public_ip == identity.public_ip;
         self.apply_public_ipv4(identity.public_ip);
 
@@ -763,8 +761,8 @@ impl App {
         let old_ip = self.runtime.public_ip.clone();
 
         if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
-            if let Some(journal) = crate::core::journal::global_journal() {
-                let _ = journal.append(crate::core::journal::JournalEvent::IpChanged {
+            if let Some(journal) = crate::journal::global_journal() {
+                let _ = journal.append(crate::journal::JournalEvent::IpChanged {
                     old: Some(old_ip.clone()),
                     new: ip.clone(),
                 });
@@ -786,7 +784,7 @@ impl App {
             self.runtime.real_ip = Some(ip.clone());
             self.runtime.real_ip_from_cache = false;
             if first_detection || changed {
-                crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
+                crate::telemetry::ip_cache::save(&self.runtime.config_dir, &ip);
             }
         } else if self.runtime.public_ip != ip && self.runtime.public_ip != constants::MSG_FETCHING
         {

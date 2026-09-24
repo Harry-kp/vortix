@@ -15,9 +15,9 @@ use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::time::Duration;
 
-use crate::core::cidr::{rfc1918_ranges, Cidr};
-use crate::core::cidr_subtract::cidr_subtract;
-use crate::core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
+use crate::cidr::cidr_subtract;
+use crate::cidr::{rfc1918_ranges, Cidr};
+use crate::control::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
 use crate::process::{CommandSpec, PrivilegeReq};
 use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use tracing::{debug, error, info};
@@ -185,7 +185,8 @@ impl PfFirewall {
         // PF evaluates the last matching rule. All allow exceptions must
         // precede a terminal quick block so later root rules cannot override
         // the Vortix anchor, while the block cannot shadow our own allows.
-        let digest = URL_SAFE_NO_PAD.encode(crate::core::killswitch::policy_digest_bytes(active));
+        let digest =
+            URL_SAFE_NO_PAD.encode(crate::control::killswitch::policy_digest_bytes(active));
         debug_assert!(POLICY_LABEL_PREFIX.len() + digest.len() <= PF_RULE_LABEL_MAX_BYTES);
         writeln!(rules).unwrap();
         writeln!(rules, "# Default: block all remaining egress").unwrap();
@@ -387,7 +388,7 @@ impl PfFirewall {
             return Err(KillswitchError::NotRoot);
         }
 
-        crate::core::killswitch::validate_policy(active)?;
+        crate::control::killswitch::validate_policy(active)?;
 
         // Preflight traversal before loading an anchor or enabling PF. A
         // populated but inert anchor must not mutate global PF state.
@@ -882,8 +883,11 @@ mod tests {
         );
         let encoded_digest = label.strip_prefix(POLICY_LABEL_PREFIX).unwrap();
         let decoded_digest = URL_SAFE_NO_PAD.decode(encoded_digest).unwrap();
-        let decoded_hex = crate::core::profile::hex(&decoded_digest);
-        assert_eq!(decoded_hex, crate::core::killswitch::policy_digest(&policy));
+        let decoded_hex = crate::profile::hex(&decoded_digest);
+        assert_eq!(
+            decoded_hex,
+            crate::control::killswitch::policy_digest(&policy)
+        );
     }
 
     #[test]

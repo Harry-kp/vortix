@@ -5,7 +5,9 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod ownership;
 pub mod parser;
+pub mod receipt;
 pub mod tunnel;
 
 pub use tunnel::WgTunnel;

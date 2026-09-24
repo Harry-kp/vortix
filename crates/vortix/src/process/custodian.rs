@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::core::ids::OperationId;
-use crate::core::ports::process::{CommandSpec, ManagedProcessId, ProcessError, ProcessLifecycle};
-use crate::core::profile::ProfileId;
 use crate::process::real::RealProcessLifecycle;
+use crate::process::{CommandSpec, ManagedProcessId, ProcessError, ProcessLifecycle};
+use crate::profile::ProfileId;
+use crate::tunnel::OperationId;
 
 const HIDDEN_ARG: &str = "__vortix-tunnel-custodian";
 const MAX_FRAME: usize = 64 * 1024;

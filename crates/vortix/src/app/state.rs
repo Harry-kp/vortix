@@ -3,8 +3,8 @@
 mod ui {
     //! UI state types.
 
-    use crate::core::cidr::Cidr;
-    use crate::core::profile::ProfileId;
+    use crate::cidr::Cidr;
+    use crate::profile::ProfileId;
     use std::fmt;
     use std::ops::Deref;
     use std::time::{Duration, Instant};

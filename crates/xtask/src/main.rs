@@ -14,7 +14,7 @@ const TASKS: &[(&str, &str, Task)] = &[
     ),
     (
         "check-platform-leak",
-        "Verify no `cfg(target_os)` outside `macos/`, `linux/`, `platform/`.",
+        "Verify no `cfg(target_os)` outside `macos/`, `linux/`, `platform.rs`.",
         check_platform_leak,
     ),
     (
@@ -106,6 +106,7 @@ fn check_subprocess() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = workspace_root()?;
     let crates_dir = workspace_root.join("crates");
 
+    let src_dir = crates_dir.join("vortix/src");
     let mut violations = Vec::new();
 
     for path in rust_sources(&crates_dir) {
@@ -119,7 +120,7 @@ fn check_subprocess() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         for (idx, line) in content.lines().enumerate() {
-            if !line_contains_violation(line) {
+            if !line_contains_violation(line, path.starts_with(&src_dir)) {
                 continue;
             }
             if line.contains("// xtask:allow-subprocess") {
@@ -149,21 +150,17 @@ fn check_subprocess() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn line_contains_violation(line: &str) -> bool {
-    // Match `std::process::Command::new(` and `tokio::process::Command::new(`.
-    // Bare `Command::new(` only triggers when preceded by a `use std::process::Command`
-    // import — but rather than tracking imports, the lint catches the fully-qualified
-    // forms only; we already rewrote all bare usages. Adding a bare
-    // `Command::new(` later requires either a fully-qualified path or an annotation.
-    line.contains("std::process::Command::new") || line.contains("tokio::process::Command::new")
+fn line_contains_violation(line: &str, in_src: bool) -> bool {
+    line.contains("std::process::Command::new")
+        || line.contains("tokio::process::Command::new")
+        || (in_src && line.contains("Command::new("))
 }
 
 fn is_allowlisted_file(path: &Path, workspace_root: &Path) -> bool {
     let rel = path.strip_prefix(workspace_root).unwrap_or(path);
     let rel_str = rel.to_string_lossy();
 
-    // Allow the runner impl itself.
-    if rel_str == "crates/vortix/src/process/real.rs" {
+    if rel_str.starts_with("crates/vortix/src/process/") {
         return true;
     }
 
@@ -180,7 +177,6 @@ fn is_allowlisted_file(path: &Path, workspace_root: &Path) -> bool {
 ///
 /// Allowlist:
 /// - `crates/vortix/src/{macos,linux}/**` and `platform.rs` — platform modules.
-/// - `crates/vortix/src/platform/**` — binary-side platform aggregate.
 /// - `crates/vortix/src/constants.rs` — OS-specific compile-time constants.
 /// - `crates/xtask/src/main.rs` — this lint references the pattern.
 /// - Lines annotated with `// xtask:allow-platform-cfg: <reason>`.
@@ -239,7 +235,7 @@ fn check_platform_leak() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         eprintln!(
-            "xtask check-platform-leak: {} violation(s) — `cfg(target_os = ...)` must live in `macos`, `linux` or `platform`. Route OS-specific calls through `crate::platform::current_platform()`; for genuine compile-time gates, annotate with `// xtask:allow-platform-cfg: <reason>`.",
+            "xtask check-platform-leak: {} violation(s) — `cfg(target_os = ...)` must live in `macos`, `linux` or `platform`. Route OS-specific calls through `crate::platform`; for genuine compile-time gates, annotate with `// xtask:allow-platform-cfg: <reason>`.",
             violations.len()
         );
         for v in &violations {
@@ -343,7 +339,7 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         eprintln!(
-            "xtask check-protocol-leak: {} violation(s) — protocol-specific binaries (`wg`, `wg-quick`, `openvpn`) must only be invoked from their protocol crate. Route via `crate::tunnel::tunnel_for(...)`; for legitimate exceptions, annotate with `// xtask:allow-protocol-leak: <reason>`.",
+            "xtask check-protocol-leak: {} violation(s) — protocol-specific binaries (`wg`, `wg-quick`, `openvpn`) must only be invoked from their protocol crate. Route via the `wireguard` or `openvpn` module; for legitimate exceptions, annotate with `// xtask:allow-protocol-leak: <reason>`.",
             violations.len()
         );
         for v in &violations {

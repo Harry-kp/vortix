@@ -6,15 +6,15 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 
-use crate::core::openvpn_routes::{
+use crate::openvpn::routes::{
     OpenVpnDefaultGateway, OpenVpnDefaultGateways, OpenVpnRedirectFlag, OpenVpnRedirectGateway,
     OpenVpnRouteDefaults, OpenVpnRouteGateway,
 };
 
 use tracing::warn;
 
-use crate::core::cidr::Cidr;
-use crate::core::ports::tunnel::ParseError;
+use crate::cidr::Cidr;
+use crate::tunnel::ParseError;
 
 /// One `remote` directive entry. Port defaults to 1194 if absent; `proto`
 /// captured verbatim when present (e.g. `udp`, `tcp-client`).
@@ -73,8 +73,8 @@ pub struct OvpnParsedProfile {
 
 impl OvpnParsedProfile {
     #[must_use]
-    pub fn dns_request(&self) -> crate::core::ports::dns::DnsRequest {
-        crate::core::ports::dns::DnsRequest {
+    pub fn dns_request(&self) -> crate::control::dns::DnsRequest {
+        crate::control::dns::DnsRequest {
             servers: self.dns_servers.clone(),
             search_domains: self.dns_search_domains.clone(),
         }

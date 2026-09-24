@@ -17,7 +17,7 @@
 use std::sync::Once;
 use std::time::Instant;
 
-use vortix::core::profile::ProtocolKind;
+use vortix::profile::ProtocolKind;
 
 use vortix::app::{App, FocusedPanel, InputMode, Toast, ToastType};
 use vortix::config::profiles::VpnProfile;
@@ -51,7 +51,7 @@ fn test_app() -> App {
 fn add_wg_profiles(app: &mut App, names: &[&str]) {
     for name in names {
         app.runtime.profiles.push(VpnProfile {
-            id: vortix::core::profile::ProfileId::new(*name),
+            id: vortix::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: ProtocolKind::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -66,7 +66,7 @@ fn set_connected(app: &mut App, name: &str) {
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_wg_profiles(app, &[name]);
     }
-    let details = vortix::core::engine::DetailedConnectionInfo {
+    let details = vortix::tunnel::DetailedConnectionInfo {
         interface: "wg0".to_string(),
         interface_authoritative: true,
         pid: Some(12345),
@@ -75,18 +75,18 @@ fn set_connected(app: &mut App, name: &str) {
     set_projection(
         app,
         name,
-        &vortix::core::engine::state::Connection::Connected {
-            profile_id: vortix::core::profile::ProfileId::new(name),
+        &vortix::tunnel::Connection::Connected {
+            profile_id: vortix::profile::ProfileId::new(name),
             since: std::time::SystemTime::now(),
             details: Box::new(details),
         },
     );
 }
 
-fn set_projection(app: &mut App, name: &str, state: &vortix::core::engine::state::Connection) {
+fn set_projection(app: &mut App, name: &str, state: &vortix::tunnel::Connection) {
     use vortix::control::{Phase, TunnelView};
-    use vortix::core::engine::state::Connection;
-    use vortix::core::profile::ProfileId;
+    use vortix::profile::ProfileId;
+    use vortix::tunnel::Connection;
 
     let phase = match state {
         Connection::Connected { .. } => Phase::Up,
@@ -110,11 +110,11 @@ fn set_projection(app: &mut App, name: &str, state: &vortix::core::engine::state
         since: std::time::SystemTime::now(),
         routes: Vec::new(),
         dns: Vec::new(),
-        details: vortix::core::engine::state::DetailedConnectionInfo {
+        details: vortix::tunnel::DetailedConnectionInfo {
             interface: "wg0".into(),
             ..Default::default()
         },
-        health: vortix::core::engine::state::ConnectionHealth::default(),
+        health: vortix::tunnel::ConnectionHealth::default(),
     });
     app.apply_control_snapshot(std::sync::Arc::new(snapshot));
 }
@@ -504,19 +504,18 @@ mod message_routing {
         add_wg_profiles(&mut app, &["vpn-a"]);
 
         app.handle_message(Message::QuickConnect(99));
-        assert!(app.current_tunnel().is_none_or(|t| matches!(
-            t.state,
-            vortix::core::engine::state::Connection::Disconnected
-        )));
+        assert!(app
+            .current_tunnel()
+            .is_none_or(|t| matches!(t.state, vortix::tunnel::Connection::Disconnected)));
     }
 
     #[test]
     fn telemetry_public_ip_update() {
-        use vortix::core::telemetry::TelemetryUpdate;
+        use vortix::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
         app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
-            vortix::core::telemetry::EgressIdentity {
+            vortix::telemetry::EgressIdentity {
                 public_ip: "1.2.3.4".to_string(),
                 isp: None,
                 location: None,
@@ -527,7 +526,7 @@ mod message_routing {
 
     #[test]
     fn telemetry_network_quality_update_is_atomic() {
-        use vortix::core::telemetry::TelemetryUpdate;
+        use vortix::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
         app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
@@ -542,7 +541,7 @@ mod message_routing {
 
     #[test]
     fn telemetry_publicipv6_leak_detection() {
-        use vortix::core::telemetry::TelemetryUpdate;
+        use vortix::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
         app.runtime.scanner_first_tick_done = true;

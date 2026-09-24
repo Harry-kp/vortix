@@ -5,10 +5,14 @@
 //! ([`tunnels`]), and after every change moves the host to
 //! [`plan::plan`]'s answer through [`net`].
 
+pub mod dns;
+pub mod dns_policy;
 mod engine;
+pub mod killswitch;
 pub mod net;
 pub mod plan;
 pub mod profiles;
+pub mod scanner;
 pub mod state;
 pub mod tunnels;
 
@@ -18,15 +22,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::app::registry::{classify_route_conflict, Conflict};
+use crate::cidr::Cidr;
 use crate::config::openvpn_credentials::{
     CredentialClearOutcome, FsOpenVpnCredentialStore, RememberedOpenVpnCredentials,
 };
 use crate::config::profiles::VpnProfile;
-use crate::core::cidr::Cidr;
-use crate::core::engine::state::DetailedConnectionInfo;
-use crate::core::engine::{classify_route_conflict, Conflict};
-use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
-use crate::core::profile::ProfileId;
+use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
+use crate::profile::ProfileId;
+use crate::tunnel::DetailedConnectionInfo;
 
 pub use state::Phase;
 
@@ -95,7 +99,7 @@ pub struct TunnelView {
     pub routes: Vec<Cidr>,
     pub dns: Vec<IpAddr>,
     pub details: DetailedConnectionInfo,
-    pub health: crate::core::engine::state::ConnectionHealth,
+    pub health: crate::tunnel::ConnectionHealth,
 }
 
 impl TunnelView {
@@ -184,7 +188,7 @@ pub struct Config {
 impl Config {
     #[must_use]
     pub fn from_app(config: &crate::config::AppConfig, config_dir: &Path) -> Self {
-        use crate::core::profile::ProtocolKind;
+        use crate::profile::ProtocolKind;
         Self {
             config_dir: config_dir.to_path_buf(),
             tunnels: tunnels::Settings {
@@ -210,10 +214,10 @@ impl Config {
     }
 
     #[must_use]
-    pub const fn connect_timeout(&self, protocol: crate::core::profile::ProtocolKind) -> Duration {
+    pub const fn connect_timeout(&self, protocol: crate::profile::ProtocolKind) -> Duration {
         match protocol {
-            crate::core::profile::ProtocolKind::OpenVpn => self.openvpn_timeout,
-            crate::core::profile::ProtocolKind::WireGuard => self.wireguard_timeout,
+            crate::profile::ProtocolKind::OpenVpn => self.openvpn_timeout,
+            crate::profile::ProtocolKind::WireGuard => self.wireguard_timeout,
         }
     }
 }

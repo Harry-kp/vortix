@@ -8,11 +8,13 @@
 //! use the correct path without requiring a parameter change on every call site.
 
 pub mod hooks_config;
+pub mod import;
 pub mod migration;
 pub mod openvpn_credentials;
 pub mod owned_file;
 pub mod profile_store;
 pub mod profiles;
+pub mod secret;
 pub mod settings;
 
 pub use hooks_config::{HookConfigError, HookSpec};
@@ -181,11 +183,11 @@ impl AppConfig {
     #[must_use]
     pub const fn connect_operation_timeout_secs(
         &self,
-        protocol: crate::core::profile::ProtocolKind,
+        protocol: crate::profile::ProtocolKind,
     ) -> u64 {
         let protocol_gate = match protocol {
-            crate::core::profile::ProtocolKind::WireGuard => self.wireguard_handshake_timeout_secs,
-            crate::core::profile::ProtocolKind::OpenVpn => self.connect_timeout,
+            crate::profile::ProtocolKind::WireGuard => self.wireguard_handshake_timeout_secs,
+            crate::profile::ProtocolKind::OpenVpn => self.connect_timeout,
         };
         protocol_gate.saturating_add(crate::constants::CONTROL_COMPLETION_GRACE_SECS)
     }
@@ -201,7 +203,7 @@ impl AppConfig {
     #[must_use]
     pub const fn reconnect_operation_timeout_secs(
         &self,
-        protocol: crate::core::profile::ProtocolKind,
+        protocol: crate::profile::ProtocolKind,
     ) -> u64 {
         self.disconnect_timeout
             .saturating_add(self.connect_operation_timeout_secs(protocol))
@@ -794,20 +796,20 @@ mod tests {
         let config = AppConfig::default();
 
         assert_eq!(
-            config.connect_operation_timeout_secs(crate::core::profile::ProtocolKind::WireGuard),
+            config.connect_operation_timeout_secs(crate::profile::ProtocolKind::WireGuard),
             22
         );
         assert_eq!(
-            config.connect_operation_timeout_secs(crate::core::profile::ProtocolKind::OpenVpn),
+            config.connect_operation_timeout_secs(crate::profile::ProtocolKind::OpenVpn),
             37
         );
         assert_eq!(config.disconnect_operation_timeout_secs(), 32);
         assert_eq!(
-            config.reconnect_operation_timeout_secs(crate::core::profile::ProtocolKind::WireGuard),
+            config.reconnect_operation_timeout_secs(crate::profile::ProtocolKind::WireGuard),
             52
         );
         assert_eq!(
-            config.reconnect_operation_timeout_secs(crate::core::profile::ProtocolKind::OpenVpn),
+            config.reconnect_operation_timeout_secs(crate::profile::ProtocolKind::OpenVpn),
             67
         );
     }

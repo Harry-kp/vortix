@@ -250,8 +250,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::engine::state::ConnectionHealth;
-use crate::core::profile::ProfileId;
+use crate::profile::ProfileId;
+use crate::tunnel::ConnectionHealth;
 
 pub const SCHEMA_VERSION: u32 = 2;
 

@@ -1,8 +1,8 @@
+use crate::app::registry::TunnelSnapshot;
 use crate::app::state::QualityLevel;
 use crate::app::App;
-use crate::core::engine::state::Connection;
-use crate::core::engine::TunnelSnapshot;
-use crate::core::profile::ProfileId;
+use crate::profile::ProfileId;
+use crate::tunnel::Connection;
 use crate::ui::helpers;
 use crate::{constants, theme};
 use ratatui::{
@@ -228,7 +228,7 @@ fn format_uptime(elapsed: u64) -> String {
 fn connected_line(
     app: &App,
     primary_snap: &TunnelSnapshot,
-    details: &crate::core::engine::state::DetailedConnectionInfo,
+    details: &crate::tunnel::DetailedConnectionInfo,
     since: std::time::SystemTime,
     ks_indicator: Span<'static>,
     area_width: u16,
@@ -263,8 +263,8 @@ fn connected_line(
         .iter()
         .find(|p| p.name == profile_name)
         .map_or("", |p| match p.protocol {
-            crate::core::profile::ProtocolKind::WireGuard => "WG",
-            crate::core::profile::ProtocolKind::OpenVpn => "OVPN",
+            crate::profile::ProtocolKind::WireGuard => "WG",
+            crate::profile::ProtocolKind::OpenVpn => "OVPN",
         });
 
     let proto_suffix = if proto_tag.is_empty() {
@@ -376,7 +376,7 @@ fn render_primary_line(
                         .iter()
                         .find(|profile| profile.id == primary_snap.profile_id)
                         .is_some_and(|profile| {
-                            profile.protocol == crate::core::profile::ProtocolKind::WireGuard
+                            profile.protocol == crate::profile::ProtocolKind::WireGuard
                         }) =>
                 {
                     "HANDSHAKING"
@@ -456,7 +456,7 @@ fn append_tunnels_strip(
     app: Option<&App>,
     mut line: Line<'static>,
     snapshots: &[TunnelSnapshot],
-    primary: Option<&crate::core::profile::ProfileId>,
+    primary: Option<&crate::profile::ProfileId>,
     area_width: u16,
 ) -> Line<'static> {
     // Order: primary first (if any), then remaining stable-sorted.
@@ -706,10 +706,10 @@ fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>
 ///
 /// The variant names `Off` / `Auto` / `AlwaysOn` are the stable
 /// CLI/JSON contract — never renamed. The labels here are the UI
-/// vocabulary; see `core::killswitch` docs for
+/// vocabulary; see `control::killswitch` docs for
 /// the mapping convention.
 fn get_killswitch_indicator(app: &App) -> Span<'static> {
-    use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
+    use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 
     if let Some(mode) = app.pending_control_killswitch_mode {
         let label = match mode {
@@ -764,10 +764,10 @@ mod tests {
     //! requires driving the FSM through async tunnel ops — out of scope for
     //! the rendering smoke covered here.
     use super::*;
+    use crate::app::registry::{Role, TunnelSnapshot};
     use crate::app::App;
-    use crate::core::engine::state::{Connection, ConnectionHealth, DetailedConnectionInfo};
-    use crate::core::engine::{Role, TunnelSnapshot};
-    use crate::core::profile::ProfileId;
+    use crate::profile::ProfileId;
+    use crate::tunnel::{Connection, ConnectionHealth, DetailedConnectionInfo};
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
@@ -821,7 +821,7 @@ mod tests {
         out
     }
 
-    fn app_handshaking(protocol: crate::core::profile::ProtocolKind) -> App {
+    fn app_handshaking(protocol: crate::profile::ProtocolKind) -> App {
         let mut app = App::new_test();
         app.runtime
             .profiles
@@ -835,16 +835,16 @@ mod tests {
                 group: None,
             });
         let profile_id = ProfileId::new("corp");
-        let tunnel = crate::core::engine::TunnelSnapshot {
+        let tunnel = crate::app::registry::TunnelSnapshot {
             profile_id: profile_id.clone(),
-            state: crate::core::engine::Connection::Connecting {
+            state: crate::tunnel::Connection::Connecting {
                 profile_id: profile_id.clone(),
                 started_at: std::time::SystemTime::UNIX_EPOCH,
             },
-            role: crate::core::engine::Role::Addressable {
+            role: crate::app::registry::Role::Addressable {
                 allowed_ips: Vec::new(),
             },
-            health: crate::core::engine::ConnectionHealth::Unknown,
+            health: crate::tunnel::ConnectionHealth::Unknown,
             interface_name: None,
             started_at: Some(std::time::SystemTime::UNIX_EPOCH),
         };
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn compact_header_uses_protocol_specific_connect_label() {
         let wg = render_to_string(
-            &app_handshaking(crate::core::profile::ProtocolKind::WireGuard),
+            &app_handshaking(crate::profile::ProtocolKind::WireGuard),
             80,
             1,
         );
@@ -866,7 +866,7 @@ mod tests {
         assert!(!wg.contains("NO EXIT"), "{wg}");
 
         let ovpn = render_to_string(
-            &app_handshaking(crate::core::profile::ProtocolKind::OpenVpn),
+            &app_handshaking(crate::profile::ProtocolKind::OpenVpn),
             80,
             1,
         );
@@ -913,7 +913,7 @@ mod tests {
     fn pending_kill_switch_target_is_visible_in_the_header() {
         let mut app = App::new_test();
         app.pending_control_killswitch_mode =
-            Some(crate::core::killswitch::KillSwitchMode::AlwaysOn);
+            Some(crate::control::killswitch::KillSwitchMode::AlwaysOn);
         assert_eq!(
             get_killswitch_indicator(&app).content.as_ref(),
             " KS:VPN-only… "
@@ -945,8 +945,8 @@ mod tests {
     fn kill_switch_indicator_reads_the_snapshot() {
         let mut app = App::new_test();
         let snapshot = std::sync::Arc::make_mut(&mut app.control_snapshot);
-        snapshot.kill_switch = crate::core::killswitch::KillSwitchMode::AlwaysOn;
-        snapshot.kill_switch_state = crate::core::killswitch::KillSwitchState::Degraded;
+        snapshot.kill_switch = crate::control::killswitch::KillSwitchMode::AlwaysOn;
+        snapshot.kill_switch_state = crate::control::killswitch::KillSwitchState::Degraded;
         assert_eq!(
             get_killswitch_indicator(&app).content.as_ref(),
             " KS:DEGRADED "

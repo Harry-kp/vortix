@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::core::engine::state::Connection;
+use crate::tunnel::Connection;
 use crate::ui::helpers;
 use crate::{constants, theme, utils};
 use ratatui::{

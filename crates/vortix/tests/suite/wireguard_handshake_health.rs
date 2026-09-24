@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use vortix::core::ports::dns::DnsRequest;
-use vortix::core::ports::tunnel::{
+use vortix::control::dns::DnsRequest;
+use vortix::profile::ProfileId;
+use vortix::tunnel::{
     classify_peer_handshake_health, HandshakeAttempt, PeerHandshakeHealth, PeerTrafficExpectation,
     TunnelHandle, TunnelKindTag, TunnelPeerStatus, TunnelStatus,
 };
-use vortix::core::profile::ProfileId;
 use vortix::wireguard::tunnel::parse_wg_dump;
 
 fn at(seconds: u64) -> SystemTime {

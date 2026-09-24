@@ -1,9 +1,9 @@
+use crate::app::registry::{Role, TunnelSnapshot};
 use crate::app::state::QualityLevel;
 use crate::app::App;
-use crate::core::cidr::Cidr;
-use crate::core::engine::registry::{Role, TunnelSnapshot};
-use crate::core::engine::state::{Connection, DetailedConnectionInfo};
-use crate::core::profile::ProtocolKind;
+use crate::cidr::Cidr;
+use crate::profile::ProtocolKind;
+use crate::tunnel::{Connection, DetailedConnectionInfo};
 use crate::ui::helpers;
 use crate::{constants, theme, utils};
 use ratatui::{
@@ -344,9 +344,9 @@ fn render_connected(
         theme::current().yellow,
     ));
 
-    if let crate::core::engine::state::ConnectionHealth::Degraded {
+    if let crate::tunnel::ConnectionHealth::Degraded {
         reason:
-            crate::core::engine::state::DegradedReason::WireGuardPeerStale {
+            crate::tunnel::DegradedReason::WireGuardPeerStale {
                 allowed_routes,
                 seconds_since_last_handshake,
                 ..
@@ -669,8 +669,8 @@ fn format_cidr(c: &Cidr) -> String {
 }
 
 /// `AwaitingUserInput` call-to-action.
-fn awaiting_user_input_hint(prompt_kind: &crate::core::engine::state::PromptKind) -> Line<'static> {
-    use crate::core::engine::state::PromptKind;
+fn awaiting_user_input_hint(prompt_kind: &crate::tunnel::PromptKind) -> Line<'static> {
+    use crate::tunnel::PromptKind;
     let what = match prompt_kind {
         PromptKind::TwoFactorCode => "2FA code",
         PromptKind::Passphrase => "passphrase",
@@ -831,9 +831,9 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::config::profiles::VpnProfile;
-    use crate::core::engine::state::PromptKind;
-    use crate::core::profile::ProfileId;
-    use crate::core::profile::ProtocolKind;
+    use crate::profile::ProfileId;
+    use crate::profile::ProtocolKind;
+    use crate::tunnel::PromptKind;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -846,7 +846,7 @@ mod tests {
 
     fn make_profile(name: &str, config_path: PathBuf) -> VpnProfile {
         VpnProfile {
-            id: crate::core::profile::ProfileId::new(name),
+            id: crate::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: ProtocolKind::WireGuard,
             location: String::new(),
@@ -857,14 +857,15 @@ mod tests {
     }
 
     fn insert_connected(app: &mut App, name: &str, interface: &str, allowed_ips: Vec<Cidr>) {
-        use crate::core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
+        use crate::app::registry::{Role, TunnelSnapshot};
+        use crate::tunnel::{Connection, ConnectionHealth};
         let profile_id = ProfileId::new(name);
         app.registry.insert_for_test(TunnelSnapshot {
             profile_id: profile_id.clone(),
             state: Connection::Connected {
                 profile_id,
                 since: SystemTime::UNIX_EPOCH,
-                details: Box::new(crate::core::engine::DetailedConnectionInfo {
+                details: Box::new(crate::tunnel::DetailedConnectionInfo {
                     interface: interface.to_owned(),
                     interface_authoritative: true,
                     ..Default::default()
@@ -915,16 +916,16 @@ mod tests {
             });
             app.profile_list_state.select(Some(0));
             let profile_id = ProfileId::new("corp");
-            let tunnel = crate::core::engine::TunnelSnapshot {
+            let tunnel = crate::app::registry::TunnelSnapshot {
                 profile_id: profile_id.clone(),
-                state: crate::core::engine::Connection::Connecting {
+                state: crate::tunnel::Connection::Connecting {
                     profile_id: profile_id.clone(),
                     started_at: std::time::SystemTime::UNIX_EPOCH,
                 },
                 role: Role::Addressable {
                     allowed_ips: Vec::new(),
                 },
-                health: crate::core::engine::ConnectionHealth::Unknown,
+                health: crate::tunnel::ConnectionHealth::Unknown,
                 interface_name: None,
                 started_at: Some(std::time::SystemTime::UNIX_EPOCH),
             };

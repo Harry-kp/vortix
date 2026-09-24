@@ -17,8 +17,8 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::core::ports::route_table::DefaultRouteObservation;
 use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
+use crate::platform::DefaultRouteObservation;
 use crate::process::CommandSpec;
 
 /// Upper bound on the `ip route show default` subprocess. Netlink is

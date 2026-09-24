@@ -7,11 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use crate::core::cidr::Cidr;
-use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
-use crate::core::ports::dns::{DnsRequest, DnsTunnelIntent, DnsTunnelRole};
-use crate::core::ports::killswitch::ActiveTunnelInfo;
-use crate::core::profile::ProfileId;
+use crate::cidr::Cidr;
+use crate::control::dns::{DnsRequest, DnsTunnelIntent, DnsTunnelRole};
+use crate::control::killswitch::ActiveTunnelInfo;
+use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
+use crate::profile::ProfileId;
 
 /// One tunnel whose interface is up and carrying traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]

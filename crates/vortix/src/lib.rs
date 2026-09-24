@@ -6,13 +6,14 @@
 
 pub mod app;
 pub(crate) mod authority_lock;
+pub mod cidr;
 pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod control;
-pub mod core;
 pub mod event;
 pub mod hooks;
+pub mod journal;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod linux;
@@ -26,7 +27,10 @@ pub mod openvpn;
 pub mod platform;
 #[doc(hidden)]
 pub mod process;
+pub mod profile;
+pub mod telemetry;
 pub mod theme;
+pub mod tunnel;
 pub mod ui;
 pub mod utils;
 #[doc(hidden)]

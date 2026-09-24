@@ -9,7 +9,7 @@ mod control_scenarios;
 use vortix::app::runtime::VpnRuntime;
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
 use vortix::config::profiles::VpnProfile;
-use vortix::core::profile::ProtocolKind;
+use vortix::profile::ProtocolKind;
 
 // ============================================================================
 // VpnRuntime headless mode
@@ -33,7 +33,7 @@ fn engine_new_test_has_empty_profiles() {
 fn engine_find_profile_by_name() {
     let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
-        id: vortix::core::profile::ProfileId::new("work-vpn"),
+        id: vortix::profile::ProfileId::new("work-vpn"),
         name: "work-vpn".into(),
         protocol: ProtocolKind::WireGuard,
         config_path: "/tmp/work.conf".into(),
@@ -42,7 +42,7 @@ fn engine_find_profile_by_name() {
         group: None,
     });
     engine.profiles.push(VpnProfile {
-        id: vortix::core::profile::ProfileId::new("personal"),
+        id: vortix::profile::ProfileId::new("personal"),
         name: "personal".into(),
         protocol: ProtocolKind::OpenVpn,
         config_path: "/tmp/personal.ovpn".into(),
@@ -61,7 +61,7 @@ fn engine_sort_profiles_by_name() {
     let mut engine = VpnRuntime::new_test();
     for name in &["charlie", "alpha", "bravo"] {
         engine.profiles.push(VpnProfile {
-            id: vortix::core::profile::ProfileId::new(*name),
+            id: vortix::profile::ProfileId::new(*name),
             name: (*name).into(),
             protocol: ProtocolKind::WireGuard,
             config_path: format!("/tmp/{name}.conf").into(),
@@ -86,7 +86,7 @@ fn engine_sort_profiles_by_name() {
 fn engine_sort_profiles_by_protocol() {
     let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
-        id: vortix::core::profile::ProfileId::new("ovpn-profile"),
+        id: vortix::profile::ProfileId::new("ovpn-profile"),
         name: "ovpn-profile".into(),
         protocol: ProtocolKind::OpenVpn,
         config_path: "/tmp/a.ovpn".into(),
@@ -95,7 +95,7 @@ fn engine_sort_profiles_by_protocol() {
         group: None,
     });
     engine.profiles.push(VpnProfile {
-        id: vortix::core::profile::ProfileId::new("wg-profile"),
+        id: vortix::profile::ProfileId::new("wg-profile"),
         name: "wg-profile".into(),
         protocol: ProtocolKind::WireGuard,
         config_path: "/tmp/b.conf".into(),

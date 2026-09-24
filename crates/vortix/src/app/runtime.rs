@@ -9,9 +9,9 @@ use crate::app::state::ProfileSortOrder;
 use crate::config::profiles::VpnProfile;
 use crate::config::AppConfig;
 use crate::constants;
-use crate::core::profile::ProtocolKind;
-use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::message::Message;
+use crate::profile::ProtocolKind;
+use crate::telemetry::{self, TelemetryUpdate};
 
 use crate::utils;
 
@@ -110,8 +110,8 @@ pub struct VpnRuntime {
 fn remembered_real_addresses(config_dir: &std::path::Path) -> (Option<String>, Option<String>) {
     let max_age = Duration::from_secs(constants::REAL_IP_CACHE_MAX_AGE_SECS);
     (
-        crate::core::real_ip_cache::load_recent(config_dir, max_age).map(|cached| cached.ip),
-        crate::core::real_ip_cache::load_recent_ipv6(config_dir, max_age).map(|cached| cached.ip),
+        crate::telemetry::ip_cache::load_recent(config_dir, max_age).map(|cached| cached.ip),
+        crate::telemetry::ip_cache::load_recent_ipv6(config_dir, max_age).map(|cached| cached.ip),
     )
 }
 impl VpnRuntime {
@@ -305,7 +305,7 @@ mod remembered_address_tests {
         .expect("write v6 record");
 
         assert!(
-            crate::core::real_ip_cache::load(&dir).is_some(),
+            crate::telemetry::ip_cache::load(&dir).is_some(),
             "the record is on disk; the point is that startup declines it"
         );
         assert_eq!(
@@ -318,8 +318,8 @@ mod remembered_address_tests {
     #[test]
     fn a_recent_cache_record_is_remembered_at_startup() {
         let dir = scratch("recent");
-        crate::core::real_ip_cache::save(&dir, "203.0.113.5");
-        crate::core::real_ip_cache::save_ipv6(&dir, "2001:db8::1");
+        crate::telemetry::ip_cache::save(&dir, "203.0.113.5");
+        crate::telemetry::ip_cache::save_ipv6(&dir, "2001:db8::1");
 
         assert_eq!(
             remembered_real_addresses(&dir),

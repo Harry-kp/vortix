@@ -1,6 +1,6 @@
 //! Root-owned, boot-scoped ownership for Standard-mode kernel tunnels.
 //!
-//! This store is deliberately separate from [`super::managed_wireguard`].
+//! This store is deliberately separate from [`super::receipt`].
 //! The latter is owner-readable display evidence; this module is a private
 //! root capability used only by the short-lived local canonical authority.
 
@@ -12,12 +12,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::core::ids::AuthorityEpoch;
-use crate::core::ids::OperationId;
-use crate::core::ids::TunnelRevision;
-use crate::core::ports::tunnel::{HandshakeEvidence, ProbeReceipt, TunnelTeardownConfig};
-use crate::core::profile::{Profile, ProfileId, ProtocolKind};
-use crate::core::scanner::ActiveSession;
+use crate::control::scanner::ActiveSession;
+use crate::profile::{Profile, ProfileId, ProtocolKind};
+use crate::tunnel::AuthorityEpoch;
+use crate::tunnel::OperationId;
+use crate::tunnel::TunnelRevision;
+use crate::tunnel::{HandshakeEvidence, ProbeReceipt, TunnelTeardownConfig};
 
 const SCHEMA_VERSION: u8 = 1;
 const MAX_LEDGER_BYTES: u64 = 128 * 1024;
@@ -396,7 +396,7 @@ fn profile_wg_quick_interface(profile: &Profile) -> Result<String, StandardOwner
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or(StandardOwnershipError::Stale)?;
-    crate::core::profile::validate_wireguard_interface_name(interface)
+    crate::profile::validate_wireguard_interface_name(interface)
         .map_err(|_| StandardOwnershipError::Stale)?;
     Ok(interface.to_owned())
 }
@@ -435,7 +435,7 @@ fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, Standa
 }
 
 fn content_identity(contents: &[u8]) -> String {
-    crate::core::profile::hex(&Sha256::digest(contents))
+    crate::profile::hex(&Sha256::digest(contents))
 }
 
 fn validate_owned_file(
@@ -459,7 +459,7 @@ fn validate_owned_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ports::tunnel::TunnelPeerStatus;
+    use crate::tunnel::TunnelPeerStatus;
     use std::time::SystemTime;
 
     fn uid() -> u32 {
@@ -506,7 +506,7 @@ mod tests {
     fn session(profile: &Profile, evidence: &HandshakeEvidence) -> ActiveSession {
         ActiveSession {
             name: profile.display_name.clone(),
-            details: crate::core::engine::state::DetailedConnectionInfo {
+            details: crate::tunnel::DetailedConnectionInfo {
                 interface: "wg0".into(),
                 ..Default::default()
             },

@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::core::ports::process::{
+use crate::process::{
     CommandOutcome, CommandSpec, ExitStatusInfo, ManagedProcessId, PrivilegeReq, ProcessError,
     ProcessLifecycle, ProcessOwnership,
 };
@@ -863,7 +863,7 @@ fn redact_args(args: &[String], redact_indices: &[usize]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ports::process::ProcessCredentials;
+    use crate::process::ProcessCredentials;
 
     #[test]
     fn explicit_owner_credentials_never_resolve_to_root() {

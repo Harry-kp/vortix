@@ -11,6 +11,7 @@ pub mod tunnel;
 
 pub(crate) mod management;
 pub(crate) mod push;
+pub mod routes;
 
 pub use tunnel::{OvpnDnsEvidence, OvpnTunnel};
 

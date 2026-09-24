@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::core::profile::{
+use crate::profile::{
     unambiguous_legacy_artifact_key, Profile, ProfileId, ProfileIdError, ProtocolKind,
 };
 
@@ -1279,8 +1279,8 @@ mod tests {
             PathBuf::from("placeholder"),
         );
         assert_eq!(
-            crate::core::profile::sanitize_profile_name(&first.display_name),
-            crate::core::profile::sanitize_profile_name(&second.display_name)
+            crate::profile::sanitize_profile_name(&first.display_name),
+            crate::profile::sanitize_profile_name(&second.display_name)
         );
         store.insert(&first, b"client\ndev tun\n").unwrap();
         store.insert(&second, b"client\ndev tun\n").unwrap();

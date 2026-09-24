@@ -2,8 +2,8 @@
 
 use crate::config::profile_store::FsProfileStore;
 use crate::constants;
-use crate::core::profile::{Profile, ProfileId, ProtocolKind};
 use crate::logger::{self, LogLevel};
+use crate::profile::{Profile, ProfileId, ProtocolKind};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -117,11 +117,9 @@ pub(crate) fn prepare_profile_import(
             .file_stem()
             .and_then(|stem| stem.to_str())
             .ok_or_else(|| "WireGuard profile filename is not valid UTF-8".to_string())?;
-        crate::core::profile::validate_wireguard_interface_name(interface_name).map_err(
-            |reason| {
-                format!("{reason}. Rename the file (for example, to wg07.conf) and import it again")
-            },
-        )?;
+        crate::profile::validate_wireguard_interface_name(interface_name).map_err(|reason| {
+            format!("{reason}. Rename the file (for example, to wg07.conf) and import it again")
+        })?;
     }
 
     // Extract and validate profile info

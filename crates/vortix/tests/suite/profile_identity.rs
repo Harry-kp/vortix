@@ -1,6 +1,6 @@
 use vortix::config::migrate_legacy_profiles;
 use vortix::config::profile_store::{FsProfileStore, ProfileStoreError, Sidecar};
-use vortix::core::profile::{Profile, ProfileId, ProtocolKind};
+use vortix::profile::{Profile, ProfileId, ProtocolKind};
 
 fn id(byte: u8) -> ProfileId {
     ProfileId::parse(format!("{byte:02x}").repeat(32)).unwrap()

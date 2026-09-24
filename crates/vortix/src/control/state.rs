@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Instant, SystemTime};
 
-use crate::core::cidr::Cidr;
-use crate::core::engine::{classify_route_conflict, Conflict};
-use crate::core::killswitch::KillSwitchMode;
-use crate::core::ports::dns::DnsRequest;
-use crate::core::profile::{ProfileId, ProtocolKind};
+use crate::app::registry::{classify_route_conflict, Conflict};
+use crate::cidr::Cidr;
+use crate::control::dns::DnsRequest;
+use crate::control::killswitch::KillSwitchMode;
+use crate::profile::{ProfileId, ProtocolKind};
 
 use super::plan::{LiveTunnel, PlanInput};
 

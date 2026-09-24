@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::profiles::VpnProfile;
-use crate::core::profile::ProtocolKind;
+use crate::profile::ProtocolKind;
 
 fn init_test_env() {
     use std::sync::Once;
@@ -37,7 +37,7 @@ fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
     {
         add_profiles(app, &[name]);
     }
-    let profile_id = crate::core::profile::ProfileId::new(name);
+    let profile_id = crate::profile::ProfileId::new(name);
     let mut snapshot = (*app.control_snapshot).clone();
     snapshot
         .tunnels
@@ -50,13 +50,13 @@ fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
         since: std::time::SystemTime::UNIX_EPOCH,
         routes: Vec::new(),
         dns: Vec::new(),
-        details: crate::core::engine::state::DetailedConnectionInfo {
+        details: crate::tunnel::DetailedConnectionInfo {
             interface: "wg0".to_owned(),
             interface_authoritative: true,
             pid: Some(12_345),
             ..Default::default()
         },
-        health: crate::core::engine::state::ConnectionHealth::default(),
+        health: crate::tunnel::ConnectionHealth::default(),
     });
     snapshot
         .tunnels
@@ -87,7 +87,7 @@ fn u1_multi_tunnel_no_primary_projection_is_stable_and_sorted() {
         .expect("with no primary the first active tunnel is current");
     assert!(matches!(
         current.state,
-        crate::core::engine::state::Connection::Connected { .. }
+        crate::tunnel::Connection::Connected { .. }
     ));
     assert_eq!(app.profile_display_name(&current.profile_id), "alpha");
 }
@@ -110,10 +110,9 @@ fn set_disconnecting(app: &mut App, name: &str) {
 fn test_d_while_disconnected_is_noop() {
     let mut app = test_app();
     app.handle_message(Message::Disconnect);
-    assert!(app.current_tunnel().is_none_or(|t| matches!(
-        t.state,
-        crate::core::engine::state::Connection::Disconnected
-    )));
+    assert!(app
+        .current_tunnel()
+        .is_none_or(|t| matches!(t.state, crate::tunnel::Connection::Disconnected)));
 }
 
 // ====================================================================
@@ -127,7 +126,7 @@ fn set_connecting(app: &mut App, name: &str) {
 fn add_profiles(app: &mut App, names: &[&str]) {
     for name in names {
         app.runtime.profiles.push(VpnProfile {
-            id: crate::core::profile::ProfileId::new(*name),
+            id: crate::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: ProtocolKind::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -143,17 +142,17 @@ fn add_stored_profile(
     store: &crate::config::profile_store::FsProfileStore,
     directory: &std::path::Path,
     name: &str,
-) -> crate::core::profile::ProfileId {
+) -> crate::profile::ProfileId {
     static NEXT_TEST_PROFILE_ID: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(1);
     let sequence = NEXT_TEST_PROFILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let profile_id = crate::core::profile::ProfileId::parse(format!("{sequence:064x}"))
+    let profile_id = crate::profile::ProfileId::parse(format!("{sequence:064x}"))
         .expect("test profile ID must be valid");
     let config_path = directory.join(format!("{name}.conf"));
-    let profile = crate::core::profile::Profile::new(
+    let profile = crate::profile::Profile::new(
         profile_id.clone(),
         name,
-        crate::core::profile::ProtocolKind::WireGuard,
+        crate::profile::ProtocolKind::WireGuard,
         config_path.clone(),
     );
     store.insert(&profile, b"dummy").unwrap();
@@ -174,7 +173,7 @@ fn add_stored_profile(
 fn takeover_overlay(to: &str) -> InputMode {
     InputMode::ConfirmDefaultRouteTakeover {
         from: "vpn-a".to_string(),
-        to_profile_id: crate::core::profile::ProfileId::new(to),
+        to_profile_id: crate::profile::ProfileId::new(to),
         to_name: to.to_string(),
         confirm_selected: true,
     }
@@ -225,9 +224,9 @@ fn test_toggle_while_connecting_is_rejected() {
 
     assert!(app.current_tunnel().is_some_and(|t| matches!(
         t.state,
-        crate::core::engine::state::Connection::Connecting { .. }
-            | crate::core::engine::state::Connection::Reconnecting { .. }
-            | crate::core::engine::state::Connection::AwaitingUserInput { .. }
+        crate::tunnel::Connection::Connecting { .. }
+            | crate::tunnel::Connection::Reconnecting { .. }
+            | crate::tunnel::Connection::AwaitingUserInput { .. }
     )));
 }
 
@@ -256,7 +255,7 @@ fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::core::profile::ProfileId::new("mfa"),
+        profile_id: crate::profile::ProfileId::new("mfa"),
         profile_name: "mfa".to_string(),
         username: String::new().into(),
         username_cursor: 0,
@@ -294,7 +293,7 @@ fn test_auth_field_switching() {
 
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::core::profile::ProfileId::new("test"),
+        profile_id: crate::profile::ProfileId::new("test"),
         profile_name: "test".to_string(),
         username: String::new().into(),
         username_cursor: 0,
@@ -345,14 +344,14 @@ fn test_auth_field_switching() {
 /// carries its own timestamp and only its own probe advances it.
 #[test]
 fn each_telemetry_observation_carries_its_own_timestamp() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     assert!(app.runtime.last_egress_check.is_none());
     assert!(app.runtime.last_dns_check.is_none());
     assert!(app.runtime.last_ipv6_check.is_none());
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
-        crate::core::telemetry::EgressIdentity {
+        crate::telemetry::EgressIdentity {
             public_ip: "1.2.3.4".to_string(),
             isp: None,
             location: None,
@@ -401,14 +400,14 @@ fn a_stale_observation_is_never_presented_as_current() {
 /// has just seen. Only an unprotected observation may promote it.
 #[test]
 fn a_remembered_real_address_is_promoted_only_by_a_live_observation() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     app.runtime.real_ip = Some("203.0.113.5".to_string());
     app.runtime.real_ip_from_cache = true;
 
     // Nothing has proved the host is unprotected yet, so the flag stands.
     app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
-        crate::core::telemetry::EgressIdentity {
+        crate::telemetry::EgressIdentity {
             public_ip: "203.0.113.5".to_string(),
             isp: None,
             location: None,
@@ -422,7 +421,7 @@ fn a_remembered_real_address_is_promoted_only_by_a_live_observation() {
     app.runtime.scanner_first_tick_done = true;
     app.runtime.last_kernel_session_count = 0;
     app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
-        crate::core::telemetry::EgressIdentity {
+        crate::telemetry::EgressIdentity {
             public_ip: "203.0.113.5".to_string(),
             isp: None,
             location: None,
@@ -436,12 +435,12 @@ fn a_remembered_real_address_is_promoted_only_by_a_live_observation() {
 
 #[test]
 fn test_last_security_check_updated_on_ip_telemetry() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     assert!(app.runtime.last_security_check.is_none());
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
-        crate::core::telemetry::EgressIdentity {
+        crate::telemetry::EgressIdentity {
             public_ip: "1.2.3.4".to_string(),
             isp: None,
             location: None,
@@ -453,7 +452,7 @@ fn test_last_security_check_updated_on_ip_telemetry() {
 
 #[test]
 fn test_last_security_check_updated_on_dns_telemetry() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     assert!(app.runtime.last_security_check.is_none());
 
@@ -466,7 +465,7 @@ fn test_last_security_check_updated_on_dns_telemetry() {
 
 #[test]
 fn test_last_security_check_updated_on_ipv6_telemetry() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     assert!(app.runtime.last_security_check.is_none());
 
@@ -478,7 +477,7 @@ fn test_last_security_check_updated_on_ipv6_telemetry() {
 
 #[test]
 fn test_publicipv6_caches_real_ipv6_when_safe_to_cache() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     app.runtime.scanner_first_tick_done = true;
     app.runtime.last_kernel_session_count = 0;
@@ -501,7 +500,7 @@ fn test_publicipv6_caches_real_ipv6_when_safe_to_cache() {
 
 #[test]
 fn test_publicipv6_clears_when_probe_returns_none() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     app.runtime.public_ipv6 = Some("2401:4900::1".to_string());
 
@@ -523,10 +522,8 @@ fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
     app.reconnect();
 
     assert!(
-        app.current_tunnel().is_none_or(|t| matches!(
-            t.state,
-            crate::core::engine::state::Connection::Disconnected
-        )),
+        app.current_tunnel()
+            .is_none_or(|t| matches!(t.state, crate::tunnel::Connection::Disconnected)),
         "Should stay disconnected when no last_connected_profile"
     );
 }
@@ -646,7 +643,7 @@ fn test_open_config_caches_content_and_close_clears() {
     let tmp = tempfile::Builder::new().suffix(".conf").tempfile().unwrap();
     std::fs::write(tmp.path(), "[Interface]\nAddress = 10.0.0.1/24").unwrap();
     app.runtime.profiles.push(VpnProfile {
-        id: crate::core::profile::ProfileId::new("test-vpn"),
+        id: crate::profile::ProfileId::new("test-vpn"),
         name: "test-vpn".to_string(),
         protocol: ProtocolKind::WireGuard,
         config_path: tmp.path().to_path_buf(),
@@ -1160,7 +1157,7 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
     let conf_path = dir.path().join("active-vpn.conf");
     std::fs::write(&conf_path, "dummy").unwrap();
     app.runtime.profiles.push(VpnProfile {
-        id: crate::core::profile::ProfileId::new("active-vpn"),
+        id: crate::profile::ProfileId::new("active-vpn"),
         name: "active-vpn".to_string(),
         protocol: ProtocolKind::WireGuard,
         config_path: conf_path,
@@ -1179,14 +1176,14 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
 }
 #[test]
 fn repeated_vpn_exit_ip_does_not_report_a_leak() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     set_connected(&mut app, "test");
     app.runtime.real_ip = Some("1.2.3.4".to_string());
     app.runtime.public_ip = "5.6.7.8".to_string();
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
-        crate::core::telemetry::EgressIdentity {
+        crate::telemetry::EgressIdentity {
             public_ip: "5.6.7.8".to_string(),
             isp: None,
             location: None,
@@ -1200,14 +1197,14 @@ fn repeated_vpn_exit_ip_does_not_report_a_leak() {
 
 #[test]
 fn public_ip_matching_pre_vpn_ip_reports_a_leak() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     set_connected(&mut app, "test");
     app.runtime.real_ip = Some("1.2.3.4".to_string());
     app.runtime.public_ip = "5.6.7.8".to_string();
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
-        crate::core::telemetry::EgressIdentity {
+        crate::telemetry::EgressIdentity {
             public_ip: "1.2.3.4".to_string(),
             isp: None,
             location: None,
@@ -1539,10 +1536,8 @@ fn u19_disconnect_profile_idempotent_for_inactive_row() {
     app.handle_message(Message::DisconnectProfile { idx: 1 });
 
     assert!(
-        app.current_tunnel().is_some_and(|t| matches!(
-            t.state,
-            crate::core::engine::state::Connection::Connected { .. }
-        )),
+        app.current_tunnel()
+            .is_some_and(|t| matches!(t.state, crate::tunnel::Connection::Connected { .. })),
         "DisconnectProfile on inactive row must leave Connected state intact, got {:?}",
         app.current_tunnel().map(|t| t.state),
     );
@@ -1561,10 +1556,10 @@ fn sidebar_d_on_inactive_row_never_disconnects_another_tunnel() {
     assert!(app.toast.is_none(), "inactive-row d must be a quiet no-op");
     assert!(matches!(
         app.registry
-            .snapshot(&crate::core::profile::ProfileId::new("active"))
+            .snapshot(&crate::profile::ProfileId::new("active"))
             .unwrap()
             .state,
-        crate::core::engine::state::Connection::Connected { .. }
+        crate::tunnel::Connection::Connected { .. }
     ));
 }
 
@@ -1731,10 +1726,9 @@ fn u19_confirm_disconnect_all_overlay_n_key_cancels() {
 
     assert!(matches!(app.input_mode, InputMode::Normal));
     // Connection state untouched.
-    assert!(app.current_tunnel().is_some_and(|t| matches!(
-        t.state,
-        crate::core::engine::state::Connection::Connected { .. }
-    )));
+    assert!(app
+        .current_tunnel()
+        .is_some_and(|t| matches!(t.state, crate::tunnel::Connection::Connected { .. })));
 }
 
 /// `CachedConfigView::from_content` pre-counts lines and pre-highlights
@@ -1807,13 +1801,13 @@ fn real_ip_not_cached_when_scanner_has_not_ticked_yet() {
     // Telemetry fires before scanner. The bug: this used to cache
     // the IP unconditionally because `!is_connected` was true.
     // Fix: scanner_first_tick_done starts false → cache withheld.
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     assert!(!app.runtime.scanner_first_tick_done);
     assert!(app.runtime.real_ip.is_none());
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
-        crate::core::telemetry::EgressIdentity {
+        crate::telemetry::EgressIdentity {
             public_ip: "46.101.235.146".to_string(),
             isp: None,
             location: None,
@@ -1828,7 +1822,7 @@ fn real_ip_not_cached_when_scanner_has_not_ticked_yet() {
 
 #[test]
 fn routine_packet_loss_and_jitter_samples_do_not_flood_the_event_log() {
-    use crate::core::telemetry::TelemetryUpdate;
+    use crate::telemetry::TelemetryUpdate;
 
     crate::logger::clear_logs();
     let mut app = test_app();
@@ -2024,13 +2018,11 @@ fn ip_only_refresh_for_same_exit_keeps_known_location() {
     app.runtime.location = "Agra, IN".to_string();
 
     app.handle_message(Message::Telemetry(
-        crate::core::telemetry::TelemetryUpdate::EgressIdentity(
-            crate::core::telemetry::EgressIdentity {
-                public_ip: "203.0.113.7".to_string(),
-                isp: None,
-                location: None,
-            },
-        ),
+        crate::telemetry::TelemetryUpdate::EgressIdentity(crate::telemetry::EgressIdentity {
+            public_ip: "203.0.113.7".to_string(),
+            isp: None,
+            location: None,
+        }),
     ));
 
     assert_eq!(app.runtime.isp, "Example ISP");
@@ -2045,13 +2037,11 @@ fn ip_only_refresh_for_changed_exit_clears_stale_location() {
     app.runtime.location = "Agra, IN".to_string();
 
     app.handle_message(Message::Telemetry(
-        crate::core::telemetry::TelemetryUpdate::EgressIdentity(
-            crate::core::telemetry::EgressIdentity {
-                public_ip: "198.51.100.9".to_string(),
-                isp: None,
-                location: None,
-            },
-        ),
+        crate::telemetry::TelemetryUpdate::EgressIdentity(crate::telemetry::EgressIdentity {
+            public_ip: "198.51.100.9".to_string(),
+            isp: None,
+            location: None,
+        }),
     ));
 
     assert_eq!(app.runtime.isp, "Unknown");
@@ -2066,7 +2056,7 @@ fn unavailable_egress_probe_never_replaces_the_real_ip_cache() {
     app.runtime.real_ip = Some("203.0.113.7".to_string());
 
     app.handle_message(Message::Telemetry(
-        crate::core::telemetry::TelemetryUpdate::EgressUnavailable,
+        crate::telemetry::TelemetryUpdate::EgressUnavailable,
     ));
 
     assert_eq!(app.runtime.public_ip, constants::MSG_UNAVAILABLE);
@@ -2079,7 +2069,7 @@ fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
 
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_id: crate::core::profile::ProfileId::new("reveal-profile"),
+        profile_id: crate::profile::ProfileId::new("reveal-profile"),
         profile_name: "reveal".into(),
         username: "vortix".into(),
         username_cursor: 6,
@@ -2169,12 +2159,12 @@ fn test_auth_delete_profile_cleans_auth_file() {
         .unwrap();
     let profiles_dir = tmp.path().join(crate::constants::PROFILES_DIR_NAME);
     std::fs::create_dir(&profiles_dir).unwrap();
-    let stable_id = crate::core::profile::ProfileId::parse("11".repeat(32)).unwrap();
+    let stable_id = crate::profile::ProfileId::parse("11".repeat(32)).unwrap();
     let config_path = profiles_dir.join("del-vpn.ovpn");
-    let stored = crate::core::profile::Profile::new(
+    let stored = crate::profile::Profile::new(
         stable_id.clone(),
         "del-vpn",
-        crate::core::profile::ProtocolKind::OpenVpn,
+        crate::profile::ProtocolKind::OpenVpn,
         config_path.clone(),
     );
     crate::config::profile_store::FsProfileStore::new(profiles_dir)
@@ -2213,8 +2203,8 @@ fn test_auth_delete_profile_cleans_auth_file() {
 #[test]
 fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
     use crate::app::{focused_tunnel_action, FocusedTunnelAction};
-    use crate::core::engine::state::{Connection, PromptKind};
-    use crate::core::profile::ProfileId;
+    use crate::profile::ProfileId;
+    use crate::tunnel::{Connection, PromptKind};
     use std::time::SystemTime;
 
     let profile_id = ProfileId::new("focused");
@@ -2263,7 +2253,7 @@ fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
 
 #[test]
 fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
-    use crate::core::engine::Connection;
+    use crate::tunnel::Connection;
     use std::sync::mpsc;
 
     let mut app = test_app();
@@ -2274,7 +2264,7 @@ fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
         .try_recv()
         .expect("initial connection must refresh egress telemetry");
 
-    let profile_id = crate::core::profile::ProfileId::new("primary");
+    let profile_id = crate::profile::ProfileId::new("primary");
     let edit = |app: &App, change: &dyn Fn(&mut crate::control::Snapshot)| {
         let mut next = (*app.control_snapshot).clone();
         change(&mut next);
@@ -2389,7 +2379,7 @@ fn a_control_snapshot_feeds_the_registry_default_route() {
 
 #[test]
 fn a_stale_wireguard_handshake_reaches_the_dashboard() {
-    use crate::core::engine::state::{ConnectionHealth, DegradedReason};
+    use crate::tunnel::{ConnectionHealth, DegradedReason};
     let mut app = test_app();
     add_profiles(&mut app, &["corp"]);
     set_connected(&mut app, "corp");
@@ -2410,7 +2400,7 @@ fn a_stale_wireguard_handshake_reaches_the_dashboard() {
 
 #[test]
 fn an_egress_sample_from_before_a_tunnel_change_is_dropped() {
-    use crate::core::telemetry::{EgressIdentity, TelemetryUpdate};
+    use crate::telemetry::{EgressIdentity, TelemetryUpdate};
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
     app.runtime.telemetry_rx = Some(rx);
@@ -2445,8 +2435,8 @@ fn an_unexpected_drop_counts_once() {
         since: std::time::SystemTime::UNIX_EPOCH,
         routes: Vec::new(),
         dns: Vec::new(),
-        details: crate::core::engine::state::DetailedConnectionInfo::default(),
-        health: crate::core::engine::state::ConnectionHealth::default(),
+        details: crate::tunnel::DetailedConnectionInfo::default(),
+        health: crate::tunnel::ConnectionHealth::default(),
     };
     for phase in [
         Phase::Up,

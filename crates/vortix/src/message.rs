@@ -7,7 +7,7 @@
 //! - Testable update logic
 
 use crate::app::state::{FocusedPanel, ToastType};
-use crate::core::telemetry::TelemetryUpdate;
+use crate::telemetry::TelemetryUpdate;
 
 /// All messages that can modify application state.
 ///
@@ -143,7 +143,7 @@ pub enum Message {
     /// Submit credentials from the auth prompt overlay
     AuthSubmit {
         /// Stable profile identity captured when the prompt opened.
-        profile_id: crate::core::profile::ProfileId,
+        profile_id: crate::profile::ProfileId,
         /// Username entered by the user
         username: crate::app::state::SecretText,
         /// Password entered by the user
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn auth_submit_debug_redacts_all_credential_fields() {
         let message = Message::AuthSubmit {
-            profile_id: crate::core::profile::ProfileId::new("debug-redaction"),
+            profile_id: crate::profile::ProfileId::new("debug-redaction"),
             username: "private-user".into(),
             password: "private-password".into(),
             otp: Some("private-otp".into()),

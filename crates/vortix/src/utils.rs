@@ -285,8 +285,8 @@ pub struct TempSessionLease {
 /// files, including when journal disk persistence is disabled.
 #[must_use]
 pub fn temp_session_id() -> String {
-    crate::core::journal::global_journal()
-        .and_then(crate::core::journal::Journal::session_id)
+    crate::journal::global_journal()
+        .and_then(crate::journal::Journal::session_id)
         .unwrap_or_else(|| format!("nojournal-{}", std::process::id()))
 }
 
@@ -442,8 +442,8 @@ fn remove_swept_session(path: &std::path::Path) {
 
 /// Strip a profile name down to ASCII `[A-Za-z0-9_-]` for safe use in
 /// daemon names, filenames, and process-match patterns.
-pub use crate::core::profile::sanitize_profile_name;
-use crate::core::profile::unambiguous_legacy_artifact_key;
+pub use crate::profile::sanitize_profile_name;
+use crate::profile::unambiguous_legacy_artifact_key;
 
 pub(crate) fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
     if !key.is_empty()
@@ -462,7 +462,7 @@ pub(crate) fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
 
 /// Returns `(pid_path, log_path)` for an opaque profile artifact key.
 ///
-/// Production callers pass [`crate::core::profile::ProfileId::as_str`].
+/// Production callers pass [`crate::profile::ProfileId::as_str`].
 /// Display names are accepted only by explicit legacy compatibility helpers.
 ///
 /// # Errors

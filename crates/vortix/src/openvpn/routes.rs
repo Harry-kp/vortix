@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use thiserror::Error;
 
-use crate::core::cidr::Cidr;
+use crate::cidr::Cidr;
 
 /// Upper bound on routes one tunnel may carry.
 pub const MAX_ROUTES: usize = 256;

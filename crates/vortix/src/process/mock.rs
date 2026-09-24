@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crate::core::ports::process::{
+use crate::process::{
     CommandOutcome, CommandSpec, ExitStatusInfo, ProcessCredentials, ProcessError,
 };
 
@@ -261,7 +261,7 @@ impl MockRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ports::process::PrivilegeReq;
+    use crate::process::PrivilegeReq;
 
     #[tokio::test]
     async fn default_success_works() {

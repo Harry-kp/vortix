@@ -23,7 +23,7 @@ use system_configuration::sys::schema_definitions::{
     kSCPropNetDNSServerAddresses,
 };
 
-use crate::core::ports::dns::{
+use crate::control::dns::{
     DnsAssignment, DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource,
     DnsPlatformCapabilities, DnsPolicy, DnsPolicyAdapter, DnsScope,
 };
@@ -197,20 +197,16 @@ impl MacDynamicStore {
 
     fn flush_dns_cache(&self) -> Result<(), String> {
         match self {
-            Self::System => {
-                let output = crate::platform::fixed_root_command::run(
-                    &["/usr/bin/dscacheutil"],
-                    &["-flushcache"],
-                    None,
-                    0,
+            Self::System => crate::process::run(
+                crate::process::CommandSpec::oneshot(
+                    "/usr/bin/dscacheutil",
+                    vec!["-flushcache".into()],
                 )
-                .map_err(|_| "cannot run the macOS DNS cache flush".to_string())?;
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    Err("macOS DNS cache flush failed".to_string())
-                }
-            }
+                .timeout(std::time::Duration::from_secs(5))
+                .contain_process_group(),
+            )
+            .map(drop)
+            .map_err(|error| format!("macOS DNS cache flush failed: {error}")),
             #[cfg(test)]
             Self::Memory(_) => Ok(()),
         }
@@ -1607,8 +1603,8 @@ fn first_server_address(store: &SCDynamicStore, key: &str) -> Option<String> {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
-    use crate::core::ports::dns::{DnsRequest, DnsTunnelIntent, DnsTunnelRole};
-    use crate::core::profile::ProfileId;
+    use crate::control::dns::{DnsRequest, DnsTunnelIntent, DnsTunnelRole};
+    use crate::profile::ProfileId;
 
     fn policy(generation: u64, server: &str) -> DnsPolicy {
         DnsPolicy::compute(

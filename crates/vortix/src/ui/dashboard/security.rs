@@ -1,7 +1,7 @@
+use crate::app::registry::TunnelSnapshot;
 use crate::app::App;
-use crate::core::engine::registry::TunnelSnapshot;
-use crate::core::engine::state::Connection;
-use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
+use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
+use crate::tunnel::Connection;
 use crate::{constants, theme};
 use ratatui::{
     layout::Rect,
@@ -679,10 +679,10 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
             app.control_snapshot.kill_switch_state
         ),
         (
-            crate::core::killswitch::KillSwitchMode::Auto,
-            crate::core::killswitch::KillSwitchState::Blocking
-        ) | (_, crate::core::killswitch::KillSwitchState::Degraded)
-            | (crate::core::killswitch::KillSwitchMode::Off, _)
+            crate::control::killswitch::KillSwitchMode::Auto,
+            crate::control::killswitch::KillSwitchState::Blocking
+        ) | (_, crate::control::killswitch::KillSwitchState::Degraded)
+            | (crate::control::killswitch::KillSwitchMode::Off, _)
     );
     // Insecure cipher = effective wire plaintext. Demote to Partial so
     // the title doesn't claim full protection while crypto is broken.
@@ -1364,14 +1364,15 @@ mod tests {
     //! registry test helpers).
     use super::*;
     use crate::app::App;
-    use crate::core::killswitch::KillSwitchMode;
-    use crate::core::profile::ProfileId;
+    use crate::control::killswitch::KillSwitchMode;
+    use crate::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::Instant;
 
     fn insert_idle_tunnel(app: &mut App, name: &str) {
-        use crate::core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
+        use crate::app::registry::{Role, TunnelSnapshot};
+        use crate::tunnel::{Connection, ConnectionHealth};
         app.registry.insert_for_test(TunnelSnapshot {
             profile_id: ProfileId::new(name),
             state: Connection::Disconnected,
@@ -2243,7 +2244,7 @@ mod tests {
         state.location = Some("Frankfurt am Main, DE".to_string());
         state.ip_status = IpStatus::Masked;
         state.killswitch_mode = KillSwitchMode::Off;
-        state.killswitch_state = crate::core::killswitch::KillSwitchState::Disabled;
+        state.killswitch_state = crate::control::killswitch::KillSwitchState::Disabled;
 
         let lines = build_partial_audit(&state);
         let body: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");

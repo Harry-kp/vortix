@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::{App, InputMode, ToastType};
+use crate::app::registry::Conflict;
+use crate::app::registry::{Role, TunnelSnapshot};
 use crate::control::{Command, Level, Phase, Snapshot, TunnelView};
-use crate::core::engine::registry::{Role, TunnelSnapshot};
-use crate::core::engine::state::{Connection, PromptKind};
-use crate::core::engine::Conflict;
-use crate::core::profile::ProfileId;
+use crate::profile::ProfileId;
+use crate::tunnel::{Connection, PromptKind};
 use crate::utils;
 
 pub(super) const CONTROL_STARTING_MESSAGE: &str =

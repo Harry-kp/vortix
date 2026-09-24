@@ -13,14 +13,14 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
-use crate::core::ids::OperationId;
-use crate::core::ports::process::ManagedProcessId;
-use crate::core::ports::tunnel::{
+use crate::config::secret::Secret;
+use crate::process::ManagedProcessId;
+use crate::process::{CommandSpec, PrivilegeReq};
+use crate::profile::{unambiguous_legacy_artifact_key, Profile, ProfileId};
+use crate::tunnel::OperationId;
+use crate::tunnel::{
     TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelStatus,
 };
-use crate::core::profile::{unambiguous_legacy_artifact_key, Profile, ProfileId};
-use crate::core::secret::Secret;
-use crate::process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
 use crate::openvpn::parser::{forbidden_effective_directive, parse_ovpn_conf};
@@ -30,14 +30,14 @@ use crate::openvpn::push::{latest_completed_push_reply, PushReplySelectionError}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OvpnDnsEvidence {
     /// A complete negotiation contained pushed DNS settings.
-    Observed(crate::core::ports::dns::DnsRequest),
+    Observed(crate::control::dns::DnsRequest),
     /// A complete negotiation contained no pushed DNS settings. Statically
     /// configured settings, if any, remain in the request.
-    ExplicitlyEmpty(crate::core::ports::dns::DnsRequest),
+    ExplicitlyEmpty(crate::control::dns::DnsRequest),
     /// The runtime log was missing or did not prove a completed negotiation.
     /// The configured request is returned separately from runtime evidence.
     Unavailable {
-        configured: crate::core::ports::dns::DnsRequest,
+        configured: crate::control::dns::DnsRequest,
         reason: String,
     },
 }
@@ -46,7 +46,7 @@ pub enum OvpnDnsEvidence {
 /// snapshot, so a renegotiation cannot mix evidence from different sessions.
 pub(crate) struct OvpnRuntimeEvidence {
     pub(crate) dns: OvpnDnsEvidence,
-    pub(crate) routes: crate::core::openvpn_routes::OpenVpnRouteEvidence,
+    pub(crate) routes: crate::openvpn::routes::OpenVpnRouteEvidence,
 }
 
 /// Maximum wall-clock to wait for openvpn to create the unix
@@ -178,9 +178,9 @@ fn write_managed_config(
     // were only removed on a clean teardown, so a crash or a kill left them
     // beside the profiles for good.
     remove_stale_managed_configs(parent, profile, &path);
-    crate::core::secret_file::write_secret_file(&path, managed_body.as_bytes()).map_err(
-        |error| TunnelError::Subprocess(format!("write managed OpenVPN config: {error}")),
-    )?;
+    crate::config::secret::write_secret_file(&path, managed_body.as_bytes()).map_err(|error| {
+        TunnelError::Subprocess(format!("write managed OpenVPN config: {error}"))
+    })?;
     Ok(path)
 }
 
@@ -246,7 +246,7 @@ fn drive_mgmt_auth(
     timeout: Duration,
 ) -> Result<(), TunnelError> {
     let challenge =
-        (!answer.is_empty()).then_some(crate::core::openvpn_routes::OpenVpnChallengeKind::Static);
+        (!answer.is_empty()).then_some(crate::openvpn::routes::OpenVpnChallengeKind::Static);
     crate::openvpn::management::authenticate(stream, user, pass, answer, challenge, timeout)
         .map_err(|error| match error {
             crate::openvpn::management::ManagementAuthError::AuthenticationRejected
@@ -582,7 +582,7 @@ impl OvpnTunnel {
     }
 
     fn management_socket_path(&self, profile_id: &str) -> PathBuf {
-        let key = crate::core::profile::hex(&Sha256::digest(profile_id.as_bytes())[..16]);
+        let key = crate::profile::hex(&Sha256::digest(profile_id.as_bytes())[..16]);
         self.run_dir.join(format!("{key}.mgmt.sock"))
     }
 
@@ -847,10 +847,7 @@ fn process_exists(pid: u32) -> bool {
 /// Missing, incomplete, or malformed runtime evidence is never interpreted
 /// as an authoritative empty request. The corresponding options are filtered
 /// from `OpenVPN` itself, so this is intent capture only.
-fn pushed_dns_evidence(
-    mut request: crate::core::ports::dns::DnsRequest,
-    log: &str,
-) -> OvpnDnsEvidence {
+fn pushed_dns_evidence(mut request: crate::control::dns::DnsRequest, log: &str) -> OvpnDnsEvidence {
     let push_reply = match latest_completed_push_reply(log) {
         Ok(Some(push_reply)) => push_reply,
         Ok(None) => return OvpnDnsEvidence::ExplicitlyEmpty(request),
@@ -1281,7 +1278,7 @@ mod tests {
     #[test]
     fn canonical_execution_context_bounds_and_cancels_openvpn_waits() {
         let expired = OvpnTunnel::default().with_execution_context(TunnelExecutionContext {
-            cancellation: crate::core::ports::tunnel::TunnelCancellation::default(),
+            cancellation: crate::tunnel::TunnelCancellation::default(),
             deadline: Instant::now(),
         });
         assert!(matches!(
@@ -1289,7 +1286,7 @@ mod tests {
             Err(TunnelError::Timeout(_))
         ));
 
-        let cancellation = crate::core::ports::tunnel::TunnelCancellation::default();
+        let cancellation = crate::tunnel::TunnelCancellation::default();
         cancellation.cancel();
         let cancelled = OvpnTunnel::default().with_execution_context(TunnelExecutionContext {
             cancellation,
@@ -1304,7 +1301,7 @@ mod tests {
     #[test]
     fn sanitize_replaces_unsafe_chars() {
         assert_eq!(
-            crate::core::profile::sanitize_profile_name("hello world"),
+            crate::profile::sanitize_profile_name("hello world"),
             "hello_world"
         );
     }
@@ -1314,12 +1311,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let auth = temp.path().join("auth");
         let tunnel = OvpnTunnel::new(temp.path().to_path_buf()).with_auth_dir(auth);
-        let first = "1".repeat(crate::core::profile::ProfileId::HEX_LEN);
-        let second = "2".repeat(crate::core::profile::ProfileId::HEX_LEN);
+        let first = "1".repeat(crate::profile::ProfileId::HEX_LEN);
+        let second = "2".repeat(crate::profile::ProfileId::HEX_LEN);
 
         assert_eq!(
-            crate::core::profile::sanitize_profile_name("team/a"),
-            crate::core::profile::sanitize_profile_name("team?a")
+            crate::profile::sanitize_profile_name("team/a"),
+            crate::profile::sanitize_profile_name("team?a")
         );
         assert_ne!(tunnel.pid_path(&first), tunnel.pid_path(&second));
         assert_ne!(tunnel.log_path(&first), tunnel.log_path(&second));
@@ -1352,7 +1349,7 @@ mod tests {
     #[test]
     fn canonical_profile_id_keeps_management_socket_within_unix_path_limit() {
         let tunnel = OvpnTunnel::new(PathBuf::from("/Users/vortix/.config/vortix/run"));
-        let profile_id = "a".repeat(crate::core::profile::ProfileId::HEX_LEN);
+        let profile_id = "a".repeat(crate::profile::ProfileId::HEX_LEN);
         let socket = tunnel.management_socket_path(&profile_id);
 
         assert!(
@@ -1511,9 +1508,9 @@ mod tests {
         let path = temp.path().join("corp.ovpn");
         std::fs::write(&path, "client\ndhcp-option DNS 1.1.1.1\n").unwrap();
         let profile = Profile::new(
-            crate::core::profile::ProfileId::new("corp"),
+            crate::profile::ProfileId::new("corp"),
             "corp",
-            crate::core::profile::ProtocolKind::OpenVpn,
+            crate::profile::ProtocolKind::OpenVpn,
             path,
         );
         let identity = ManagedProcessId {
@@ -1535,12 +1532,12 @@ mod tests {
         let path = temp.path().join("corp.ovpn");
         std::fs::write(&path, "client\nremote vpn.example 1194 udp\n").unwrap();
         let profile = Profile::new(
-            crate::core::profile::ProfileId::new("corp"),
+            crate::profile::ProfileId::new("corp"),
             "corp",
-            crate::core::profile::ProtocolKind::OpenVpn,
+            crate::profile::ProtocolKind::OpenVpn,
             path,
         )
-        .with_endpoint_resolutions([crate::core::profile::ResolvedEndpoint::new(
+        .with_endpoint_resolutions([crate::profile::ResolvedEndpoint::new(
             "vpn.example",
             1194,
             "203.0.113.19".parse().unwrap(),
@@ -1563,9 +1560,9 @@ mod tests {
         let path = temp.path().join("corp.ovpn");
         std::fs::write(&path, "client\nremote vpn.example 1194 udp\n").unwrap();
         let profile = Profile::new(
-            crate::core::profile::ProfileId::new("corp"),
+            crate::profile::ProfileId::new("corp"),
             "corp",
-            crate::core::profile::ProtocolKind::OpenVpn,
+            crate::profile::ProtocolKind::OpenVpn,
             path,
         )
         .require_managed_endpoint_resolution();
@@ -1680,7 +1677,7 @@ mod tests {
     #[test]
     fn pushed_dns_is_captured_without_platform_mutation() {
         let evidence = pushed_dns_evidence(
-            crate::core::ports::dns::DnsRequest::default(),
+            crate::control::dns::DnsRequest::default(),
             "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example'\nInitialization Sequence Completed\n",
         );
         let OvpnDnsEvidence::Observed(request) = evidence else {
@@ -1699,9 +1696,9 @@ mod tests {
         let profile_path = temp.path().join("corp.ovpn");
         std::fs::write(&profile_path, "client\ndhcp-option DNS 1.1.1.1\n").unwrap();
         let profile = Profile::new(
-            crate::core::profile::ProfileId::new("corp"),
+            crate::profile::ProfileId::new("corp"),
             "corp",
-            crate::core::profile::ProtocolKind::OpenVpn,
+            crate::profile::ProtocolKind::OpenVpn,
             profile_path,
         );
         std::fs::write(
@@ -1729,9 +1726,9 @@ mod tests {
         )
         .unwrap();
         let profile = Profile::new(
-            crate::core::profile::ProfileId::new("corp"),
+            crate::profile::ProfileId::new("corp"),
             "corp",
-            crate::core::profile::ProtocolKind::OpenVpn,
+            crate::profile::ProtocolKind::OpenVpn,
             profile_path,
         );
         std::fs::write(
@@ -1751,12 +1748,12 @@ mod tests {
         assert!(redirect.ipv4());
         assert!(redirect
             .flags()
-            .contains(&crate::core::openvpn_routes::OpenVpnRedirectFlag::Def1));
+            .contains(&crate::openvpn::routes::OpenVpnRedirectFlag::Def1));
     }
 
     #[test]
     fn completed_negotiation_without_pushed_dns_is_explicitly_empty() {
-        let configured = crate::core::ports::dns::DnsRequest {
+        let configured = crate::control::dns::DnsRequest {
             servers: vec!["1.1.1.1".parse().unwrap()],
             search_domains: Vec::new(),
         };
@@ -1769,7 +1766,7 @@ mod tests {
 
     #[test]
     fn truncated_negotiation_is_unavailable_not_explicitly_empty() {
-        let configured = crate::core::ports::dns::DnsRequest::default();
+        let configured = crate::control::dns::DnsRequest::default();
         let evidence = pushed_dns_evidence(
             configured.clone(),
             "PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1\n",
@@ -1786,7 +1783,7 @@ mod tests {
     #[test]
     fn newer_incomplete_negotiation_does_not_reuse_old_pushed_dns() {
         let evidence = pushed_dns_evidence(
-            crate::core::ports::dns::DnsRequest::default(),
+            crate::control::dns::DnsRequest::default(),
             "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,redirect-gateway def1\n",
         );
         assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
@@ -1795,7 +1792,7 @@ mod tests {
     #[test]
     fn latest_completed_negotiation_replaces_older_pushed_dns() {
         let evidence = pushed_dns_evidence(
-            crate::core::ports::dns::DnsRequest::default(),
+            crate::control::dns::DnsRequest::default(),
             "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,dhcp-option DNS 10.9.0.1\nInitialization Sequence Completed\n",
         );
         let OvpnDnsEvidence::Observed(request) = evidence else {
@@ -1809,7 +1806,7 @@ mod tests {
 
     #[test]
     fn malformed_pushed_dns_is_unavailable_not_explicitly_empty() {
-        let configured = crate::core::ports::dns::DnsRequest::default();
+        let configured = crate::control::dns::DnsRequest::default();
         let evidence = pushed_dns_evidence(
             configured,
             "PUSH_REPLY,dhcp-option DNS not-an-address\nInitialization Sequence Completed\n",
@@ -1823,9 +1820,9 @@ mod tests {
         let profile_path = temp.path().join("corp.ovpn");
         std::fs::write(&profile_path, "client\ndhcp-option DNS 1.1.1.1\n").unwrap();
         let profile = Profile::new(
-            crate::core::profile::ProfileId::new("corp"),
+            crate::profile::ProfileId::new("corp"),
             "corp",
-            crate::core::profile::ProtocolKind::OpenVpn,
+            crate::profile::ProtocolKind::OpenVpn,
             profile_path,
         );
 

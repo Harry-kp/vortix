@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use crate::core::profile::ProtocolKind;
-use crate::core::scanner;
+use crate::control::scanner;
+use crate::profile::ProtocolKind;
 
 use crate::config::profiles::VpnProfile;
 use crate::config::AppConfig;
@@ -14,7 +14,7 @@ pub struct StatusSnapshot {
     pub connection_state: String,
     /// Typed health for a Vortix-issued connected generation. Scanner-only
     /// observations intentionally leave this absent.
-    pub health: Option<crate::core::engine::state::ConnectionHealth>,
+    pub health: Option<crate::tunnel::ConnectionHealth>,
     /// Exact successful attempt generation when durable managed evidence is
     /// available.
     pub generation: Option<u64>,
@@ -27,16 +27,16 @@ pub struct StatusSnapshot {
     pub download_bytes: Option<String>,
     pub upload_bytes: Option<String>,
     /// Kill switch mode — the typed enum. Call sites format it via
-    /// [`crate::core::killswitch::KillSwitchMode::display_name`] (prose for humans:
+    /// [`crate::control::killswitch::KillSwitchMode::display_name`] (prose for humans:
     /// `Off` / `Block on drop` / `VPN-only`) or
-    /// [`crate::core::killswitch::KillSwitchMode::cli_verb`] (slug for the CLI verb +
+    /// [`crate::control::killswitch::KillSwitchMode::cli_verb`] (slug for the CLI verb +
     /// JSON envelope: `off` / `block-on-drop` / `vpn-only`). One
     /// vocabulary, two casings, no duplicated string fields.
-    pub killswitch_mode: crate::core::killswitch::KillSwitchMode,
+    pub killswitch_mode: crate::control::killswitch::KillSwitchMode,
     /// Kill switch state — typed enum. See the helpers
-    /// [`crate::core::killswitch::KillSwitchState::display_status`] (prose) and
-    /// [`crate::core::killswitch::KillSwitchState::cli_verb`] (slug).
-    pub killswitch_state: crate::core::killswitch::KillSwitchState,
+    /// [`crate::control::killswitch::KillSwitchState::display_status`] (prose) and
+    /// [`crate::control::killswitch::KillSwitchState::cli_verb`] (slug).
+    pub killswitch_state: crate::control::killswitch::KillSwitchState,
 }
 
 /// One-shot status scan for CLI.
@@ -47,7 +47,7 @@ pub fn scan_status(
     config: &AppConfig,
     config_dir: &std::path::Path,
 ) -> StatusSnapshot {
-    let (killswitch_mode, killswitch_state) = crate::core::killswitch::persisted();
+    let (killswitch_mode, killswitch_state) = crate::control::killswitch::persisted();
     let active = scanner::get_active_profiles(profiles);
     let session = active.first();
     let (mut state, profile, protocol, uptime, server, interface, internal_ip, dl, ul) =
@@ -124,29 +124,28 @@ pub fn scan_status(
         if let Some(profile) = profiles.iter().find(|profile| {
             profile.name == session.name && profile.protocol == ProtocolKind::WireGuard
         }) {
-            if let Some(mut receipt) = crate::core::managed_wireguard::load(config_dir, &profile.id)
+            if let Some(mut receipt) = crate::wireguard::receipt::load(config_dir, &profile.id)
                 .filter(|receipt| receipt.validates(&profile.id, session))
             {
-                let mut activity = crate::core::managed_wireguard::PeerActivity::new();
-                let current = crate::core::managed_wireguard::health_from_peers(
+                let mut activity = crate::wireguard::receipt::PeerActivity::new();
+                let current = crate::wireguard::receipt::health_from_peers(
                     &session.wireguard_peers,
                     &mut activity,
                     &receipt.probe_receipts,
                     Duration::from_secs(config.wireguard_handshake_stale_secs),
                 );
-                if let Ok(Some(old)) = crate::core::managed_wireguard::update_health(
+                if let Ok(Some(old)) = crate::wireguard::receipt::update_health(
                     config_dir,
                     &mut receipt,
                     current.clone(),
                 ) {
-                    if let Some(journal) = crate::core::journal::global_journal() {
-                        let _ = journal.append(
-                            crate::core::journal::JournalEvent::ConnectionHealthChanged {
+                    if let Some(journal) = crate::journal::global_journal() {
+                        let _ =
+                            journal.append(crate::journal::JournalEvent::ConnectionHealthChanged {
                                 profile_id: profile.id.clone(),
                                 old,
                                 new: current.clone(),
-                            },
-                        );
+                            });
                     }
                 }
                 state = "connected".into();

@@ -8,21 +8,19 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::core::cidr::Cidr;
-use crate::core::ids::TunnelRevision;
-use crate::core::ids::{AuthorityEpoch, OperationId};
-use crate::core::openvpn_routes::OpenVpnRouteEvidence;
-use crate::core::ports::dns::DnsRequest;
-use crate::core::ports::tunnel::{
-    TunnelCancellation, TunnelExecutionContext, TunnelHandle, TunnelKindTag,
-};
-use crate::core::profile::{Profile, ProfileId, ProtocolKind};
-use crate::core::scanner::ActiveSession;
-use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
+use crate::cidr::Cidr;
+use crate::control::dns::DnsRequest;
+use crate::control::scanner::ActiveSession;
+use crate::openvpn::routes::OpenVpnRouteEvidence;
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
+use crate::profile::{Profile, ProfileId, ProtocolKind};
+use crate::tunnel::TunnelRevision;
+use crate::tunnel::{AuthorityEpoch, OperationId};
+use crate::tunnel::{TunnelCancellation, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
+use crate::wireguard::ownership::StandardTunnelOwnershipStore;
 
-use crate::core::ports::tunnel::{TunnelError, TunnelStatus};
 use crate::openvpn::OvpnTunnel;
+use crate::tunnel::{TunnelError, TunnelStatus};
 use crate::wireguard::WgTunnel;
 
 const EPOCH: AuthorityEpoch = AuthorityEpoch(1);
@@ -161,7 +159,7 @@ pub fn stop(
     kind.down(&handle).map_err(|error| error.to_string())?;
     if wireguard {
         let _ = ownership.remove_after_confirmed_absence(&profile_id, &[]);
-        let _ = crate::core::managed_wireguard::remove_after_confirmed_absence(
+        let _ = crate::wireguard::receipt::remove_after_confirmed_absence(
             &settings.config_dir,
             &profile_id,
         );
@@ -285,7 +283,7 @@ fn record_wireguard(
         let _ = std::fs::remove_file(&teardown.path);
     }
     handle.teardown_config = Some(owned.teardown_config);
-    crate::core::managed_wireguard::issue(
+    crate::wireguard::receipt::issue(
         &settings.config_dir,
         &profile.id,
         handle.interface_name.clone(),
@@ -341,7 +339,7 @@ impl TunnelKind {
     }
 
     #[must_use]
-    pub fn for_operation(self, operation_id: crate::core::ids::OperationId) -> Self {
+    pub fn for_operation(self, operation_id: crate::tunnel::OperationId) -> Self {
         match self {
             Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.for_operation(operation_id)),
             tunnel @ Self::WireGuard(_) => tunnel,
@@ -417,14 +415,14 @@ impl StandardOpenVpnOwner {
     }
 
     #[must_use]
-    pub(crate) fn identity(&self) -> crate::core::ports::process::ManagedProcessId {
+    pub(crate) fn identity(&self) -> crate::process::ManagedProcessId {
         self.custody.identity.clone()
     }
 }
 
 pub(crate) fn standard_openvpn_owner(
     profile_id: &ProfileId,
-    session: &crate::core::scanner::ActiveSession,
+    session: &crate::control::scanner::ActiveSession,
 ) -> Result<Option<StandardOpenVpnOwner>, String> {
     let Some(custody) = crate::process::custodian::load_handshake(profile_id)
         .map_err(|error| format!("OpenVPN ownership receipt rejected: {error}"))?

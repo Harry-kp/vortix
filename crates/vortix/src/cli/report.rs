@@ -156,7 +156,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
     let profile_counts = super::commands::count_profiles(&profiles_dir);
 
-    let ks_state = loaded_killswitch_summary(crate::core::killswitch::load_state_checked());
+    let ks_state = loaded_killswitch_summary(crate::control::killswitch::load_state_checked());
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((0, 0));
     let terminal_size = if term_cols > 0 {
@@ -185,15 +185,15 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
 
 fn loaded_killswitch_summary(
     loaded: Result<
-        Option<crate::core::killswitch::PersistedState>,
-        crate::core::killswitch::PersistedStateLoadError,
+        Option<crate::control::killswitch::PersistedState>,
+        crate::control::killswitch::PersistedStateLoadError,
     >,
 ) -> String {
     match loaded {
         Ok(Some(persisted)) => {
             persisted_killswitch_summary(persisted.mode, persisted.recovered_state())
         }
-        Ok(None) => crate::core::killswitch::KillSwitchMode::Off
+        Ok(None) => crate::control::killswitch::KillSwitchMode::Off
             .display_name()
             .to_string(),
         Err(error) => format!("Unknown — state could not be verified ({error})"),
@@ -201,8 +201,8 @@ fn loaded_killswitch_summary(
 }
 
 fn persisted_killswitch_summary(
-    mode: crate::core::killswitch::KillSwitchMode,
-    state: crate::core::killswitch::KillSwitchState,
+    mode: crate::control::killswitch::KillSwitchMode,
+    state: crate::control::killswitch::KillSwitchState,
 ) -> String {
     format!("{} ({})", mode.display_name(), state.display_status())
 }
@@ -589,7 +589,7 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
 
     // Diagnostic Journal — surface the JSONL session path
     // and the in-memory tail so triagers can replay locally.
-    if let Some(journal) = crate::core::journal::global_journal() {
+    if let Some(journal) = crate::journal::global_journal() {
         let _ = writeln!(body, "## Diagnostic Journal\n");
         let _ = writeln!(body, "```");
         if let Some(path) = &journal.session_path {
@@ -738,20 +738,20 @@ mod tests {
     use super::*;
 
     /// `recovered_state` owns the "a durable request is not kernel proof"
-    /// rule (see `core::killswitch`); this pins the rendering around it.
+    /// rule (see `control::killswitch`); this pins the rendering around it.
     #[test]
     fn persisted_state_renders_mode_and_recovered_state() {
         assert_eq!(
             persisted_killswitch_summary(
-                crate::core::killswitch::KillSwitchMode::AlwaysOn,
-                crate::core::killswitch::KillSwitchState::Degraded,
+                crate::control::killswitch::KillSwitchMode::AlwaysOn,
+                crate::control::killswitch::KillSwitchState::Degraded,
             ),
             "VPN-only (Degraded)"
         );
         assert_eq!(
             persisted_killswitch_summary(
-                crate::core::killswitch::KillSwitchMode::Auto,
-                crate::core::killswitch::KillSwitchState::Armed,
+                crate::control::killswitch::KillSwitchMode::Auto,
+                crate::control::killswitch::KillSwitchState::Armed,
             ),
             "Block on drop (Watching)"
         );
@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn unsupported_persisted_state_is_never_reported_as_off() {
         let summary = loaded_killswitch_summary(Err(
-            crate::core::killswitch::PersistedStateLoadError::UnsupportedSchema(99),
+            crate::control::killswitch::PersistedStateLoadError::UnsupportedSchema(99),
         ));
         assert!(summary.starts_with("Unknown"));
         assert!(!summary.starts_with("Off"));
