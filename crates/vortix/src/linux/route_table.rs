@@ -26,7 +26,6 @@ use crate::process::CommandSpec;
 /// routing-policy rules, contention during a tunnel transition) can
 /// stall the query. 1s is generous for any healthy run.
 const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
-const INTERNET_ROUTE_PROBE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
 
 /// Process-wide backoff for the route-default probe. See the macOS
 /// `route_table.rs` for the full rationale; same shape applies here so
@@ -87,23 +86,14 @@ impl LinuxRouteTable {
 
     #[must_use]
     pub fn default_route_observation() -> DefaultRouteObservation {
-        Self::route_interface_for(INTERNET_ROUTE_PROBE)
+        Self::route_interface_for(crate::platform::INTERNET_ROUTE_PROBE)
     }
 
     #[must_use]
     pub fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
-        let spec =
-            // xtask:allow-shell-regression: `ip route get <target>` is the supported Linux route-selection proof; no existing libc port exposes policy-routing resolution.
-            CommandSpec::oneshot("ip", vec!["route".into(), "get".into(), target.to_string()])
-                .timeout(ROUTE_QUERY_TIMEOUT)
-                .output_limit(64 * 1024);
-        let Ok(output) = crate::process::run(spec) else {
+        let Some(text) = route_get(target) else {
             return DefaultRouteObservation::ProbeFailed;
         };
-        if !output.success() {
-            return DefaultRouteObservation::ProbeFailed;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
         parse_interface(&text).map_or(
             DefaultRouteObservation::NoDefaultRoute,
             DefaultRouteObservation::Interface,
@@ -126,7 +116,8 @@ fn run_ip_route_delete(args: Vec<String>, description: &str) -> Result<(), Strin
     }
 }
 
-fn selected_gateway(target: IpAddr) -> Option<String> {
+/// `ip route get <target>` output, or `None` when the query fails.
+fn route_get(target: IpAddr) -> Option<String> {
     // xtask:allow-shell-regression: `ip route get <target>` is the supported Linux route-selection proof; no existing libc port exposes policy-routing resolution.
     let spec = CommandSpec::oneshot("ip", vec!["route".into(), "get".into(), target.to_string()])
         .timeout(ROUTE_QUERY_TIMEOUT)
@@ -134,8 +125,11 @@ fn selected_gateway(target: IpAddr) -> Option<String> {
     let output = crate::process::run(spec).ok()?;
     output
         .success()
-        .then(|| parse_gateway(&String::from_utf8_lossy(&output.stdout)))
-        .flatten()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn selected_gateway(target: IpAddr) -> Option<String> {
+    parse_gateway(&route_get(target)?)
 }
 
 pub(crate) fn bind_route_args(cidr: &str, interface: &str) -> Vec<String> {

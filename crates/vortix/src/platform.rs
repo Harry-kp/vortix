@@ -683,6 +683,10 @@ mod ipv6_gate_tests {
     }
 }
 
+/// The address whose route stands for "the internet" when probing the default route.
+pub(crate) const INTERNET_ROUTE_PROBE: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
+
 /// Result of probing the route used for public-internet traffic.
 ///
 /// `NoDefaultRoute` is an observed kernel state. `ProbeFailed` means the
