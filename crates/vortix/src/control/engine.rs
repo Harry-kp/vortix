@@ -398,6 +398,14 @@ impl Engine {
                 self.up_at.insert(profile_id.clone(), Instant::now());
                 self.last_connected
                     .insert(profile_id.clone(), SystemTime::now());
+                let store = crate::config::profile_store::FsProfileStore::new(
+                    self.config
+                        .config_dir
+                        .join(crate::constants::PROFILES_DIR_NAME),
+                );
+                if let Err(error) = crate::config::ProfileStore::touch(&store, profile_id) {
+                    tracing::warn!(%error, "could not record last-used time");
+                }
                 for peer in replaced {
                     self.begin_stop(&peer);
                 }

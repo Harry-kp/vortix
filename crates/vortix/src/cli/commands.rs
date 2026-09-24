@@ -469,7 +469,6 @@ fn handle_up(
     ) {
         engine_failure_or_exit(mode, "up", error);
     }
-    let _ = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME)).touch(&target.id);
     let data = UpData {
         state: "connected".into(),
         profile: target.name.clone(),
@@ -901,8 +900,6 @@ fn handle_reconnect(
             .iter()
             .find(|profile| &profile.name == name)
             .expect("reconnect target exists");
-        let _ =
-            FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME)).touch(&profile.id);
         let data = UpData {
             state: "connected".into(),
             profile: profile.name.clone(),
