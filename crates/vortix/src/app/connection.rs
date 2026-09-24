@@ -47,12 +47,9 @@ fn tunnel_snapshot(snapshot: &Snapshot, tunnel: &TunnelView) -> TunnelSnapshot {
         Phase::Starting => Connection::Connecting {
             profile_id,
             started_at: tunnel.since,
-            attempt: 1,
-            retry_budget_remaining: std::time::Duration::ZERO,
         },
         Phase::AwaitingCredentials => Connection::AwaitingUserInput {
             profile_id,
-            prompt_id: String::new(),
             prompt_kind: PromptKind::Generic {
                 label: "OpenVPN credentials".into(),
             },
@@ -61,15 +58,11 @@ fn tunnel_snapshot(snapshot: &Snapshot, tunnel: &TunnelView) -> TunnelSnapshot {
         Phase::Up => Connection::Connected {
             profile_id,
             since: tunnel.since,
-            health: ConnectionHealth::default(),
             details: Box::new(tunnel.details.clone()),
         },
         Phase::Waiting { .. } => Connection::Reconnecting {
             profile_id,
             started_at: tunnel.since,
-            attempt: 1,
-            retry_budget_remaining: std::time::Duration::ZERO,
-            last_error: None,
         },
         Phase::Stopping => Connection::Disconnecting {
             profile_id,

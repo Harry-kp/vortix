@@ -34,7 +34,7 @@ pub(crate) const fn focused_tunnel_action(state: Option<&Connection>) -> Focused
             | Connection::AwaitingUserInput { .. },
         ) => FocusedTunnelAction::Cancel,
         Some(Connection::Connected { .. }) => FocusedTunnelAction::Disconnect,
-        Some(Connection::Disconnected { .. }) | None => FocusedTunnelAction::Connect,
+        Some(Connection::Disconnected) | None => FocusedTunnelAction::Connect,
     }
 }
 

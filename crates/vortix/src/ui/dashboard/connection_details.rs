@@ -81,7 +81,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 render_transitional(frame, app, inner, snap);
                 return;
             }
-            Connection::Disconnected { .. } => {
+            Connection::Disconnected => {
                 // Fall through to disconnected placeholder below.
             }
         }
@@ -391,7 +391,7 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
     let mut text: Vec<Line> = Vec::new();
 
     let (headline, headline_color) = match &snap.state {
-        Connection::Connecting { attempt, .. } => {
+        Connection::Connecting { .. } => {
             let wireguard = app
                 .runtime
                 .profiles
@@ -399,21 +399,16 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
                 .find(|profile| profile.id == snap.profile_id)
                 .is_some_and(|profile| profile.protocol == ProtocolKind::WireGuard);
             (
-                format!(
-                    "{} (attempt {attempt})",
-                    if wireguard {
-                        "Handshaking"
-                    } else {
-                        "Connecting"
-                    }
-                ),
+                if wireguard {
+                    "Handshaking"
+                } else {
+                    "Connecting"
+                }
+                .to_string(),
                 theme::current().yellow,
             )
         }
-        Connection::Reconnecting { attempt, .. } => (
-            format!("Reconnecting (attempt {attempt})"),
-            theme::current().yellow,
-        ),
+        Connection::Reconnecting { .. } => ("Reconnecting".to_string(), theme::current().yellow),
         Connection::Disconnecting { .. } => {
             ("Disconnecting".to_string(), theme::current().text_secondary)
         }
@@ -868,7 +863,6 @@ mod tests {
             state: Connection::Connected {
                 profile_id,
                 since: SystemTime::UNIX_EPOCH,
-                health: ConnectionHealth::default(),
                 details: Box::new(crate::core::engine::DetailedConnectionInfo {
                     interface: interface.to_owned(),
                     interface_authoritative: true,
@@ -924,8 +918,6 @@ mod tests {
                 state: crate::core::engine::Connection::Connecting {
                     profile_id: profile_id.clone(),
                     started_at: std::time::SystemTime::UNIX_EPOCH,
-                    attempt: 1,
-                    retry_budget_remaining: std::time::Duration::ZERO,
                 },
                 role: Role::Addressable {
                     allowed_ips: Vec::new(),

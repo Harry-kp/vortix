@@ -350,7 +350,7 @@ fn render_primary_line(
     area_width: u16,
 ) -> Line<'static> {
     match &primary_snap.state {
-        Connection::Disconnected { .. } => {
+        Connection::Disconnected => {
             // count >= 1 with a primary snapshot but state==Disconnected
             // is a transient window (registry entry survives a brief
             // disconnect for journal purposes). Use the NO EXIT title —
@@ -429,7 +429,7 @@ fn strip_badge(state: &Connection) -> Option<(&'static str, Color)> {
         Connection::Reconnecting { .. } => Some(("↻", theme::current().warning)),
         Connection::Disconnecting { .. } => Some(("⏻", theme::current().warning)),
         Connection::AwaitingUserInput { .. } => Some(("?", theme::current().warning)),
-        Connection::Disconnected { .. } => None,
+        Connection::Disconnected => None,
     }
 }
 
@@ -796,7 +796,6 @@ mod tests {
             Connection::Connected {
                 profile_id: ProfileId::new(name),
                 since: SystemTime::now(),
-                health: ConnectionHealth::Healthy,
                 details: Box::new(details),
             },
         )
@@ -840,8 +839,6 @@ mod tests {
             state: crate::core::engine::Connection::Connecting {
                 profile_id: profile_id.clone(),
                 started_at: std::time::SystemTime::UNIX_EPOCH,
-                attempt: 1,
-                retry_budget_remaining: std::time::Duration::ZERO,
             },
             role: crate::core::engine::Role::Addressable {
                 allowed_ips: Vec::new(),
@@ -1141,7 +1138,7 @@ mod tests {
     #[test]
     fn append_strip_drops_disconnected_entries() {
         let mut disc = connected("ghost");
-        disc.state = Connection::Disconnected { last_failure: None };
+        disc.state = Connection::Disconnected;
         let snaps = vec![connected("alpha"), disc];
         let pid = ProfileId::new("alpha");
         let out = append_tunnels_strip(

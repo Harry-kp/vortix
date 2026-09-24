@@ -80,14 +80,14 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
     let active_state = snapshots
         .iter()
         .map(|snapshot| &snapshot.state)
-        .filter(|st| !matches!(st, Connection::Disconnected { .. }))
+        .filter(|st| !matches!(st, Connection::Disconnected))
         .min_by_key(|st| match st {
             Connection::Disconnecting { .. } => 0,
             Connection::Connecting { .. }
             | Connection::Reconnecting { .. }
             | Connection::AwaitingUserInput { .. } => 1,
             Connection::Connected { .. } => 2,
-            Connection::Disconnected { .. } => 3,
+            Connection::Disconnected => 3,
         });
     let disconnect_hint = if app.focused_panel == crate::app::FocusedPanel::Sidebar {
         focused_disconnect_hint(focused_state)
@@ -341,22 +341,19 @@ mod tests {
 
     #[test]
     fn focused_footer_labels_match_profile_scoped_shortcuts() {
-        use crate::core::engine::state::{ConnectionHealth, DetailedConnectionInfo};
+        use crate::core::engine::state::DetailedConnectionInfo;
         use crate::core::profile::ProfileId;
-        use std::time::{Duration, SystemTime};
+        use std::time::SystemTime;
 
         let profile_id = ProfileId::new("focused");
         let now = SystemTime::UNIX_EPOCH;
         let connecting = Connection::Connecting {
             profile_id: profile_id.clone(),
             started_at: now,
-            attempt: 1,
-            retry_budget_remaining: Duration::ZERO,
         };
         let connected = Connection::Connected {
             profile_id: profile_id.clone(),
             since: now,
-            health: ConnectionHealth::Healthy,
             details: Box::new(DetailedConnectionInfo::default()),
         };
         let disconnecting = Connection::Disconnecting {

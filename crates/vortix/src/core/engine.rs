@@ -172,35 +172,11 @@ pub mod state {
     //! enums. Matches the brainstorm shape: `Failed` collapses into
     //! `Disconnected { last_failure }` rather than being a sixth variant.
 
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     use serde::{Deserialize, Serialize};
 
     use crate::core::profile::ProfileId;
-
-    /// Why a previous connect or reconnect attempt ended in `Disconnected`.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    #[non_exhaustive]
-    pub enum FailureReason {
-        /// The retry budget expired with no successful connection.
-        RetryBudgetExhausted { attempts: u32, elapsed: Duration },
-        /// the protocol `up` reported `HandshakeFailed`.
-        HandshakeFailed(String),
-        /// the protocol `up` reported `AuthFailed`.
-        AuthFailed(String),
-        /// Profile parsing surfaced an unrecoverable error.
-        ConfigInvalid(String),
-        /// the protocol `up` exceeded its configured timeout with no progress.
-        Timeout(Duration),
-        /// The network link went down and never came back during the retry budget.
-        NoNetworkLink,
-        /// The profile referenced by the in-flight connect was deleted or renamed
-        /// out from under the engine. `ProfileRenamed` updates the FSM in place
-        /// when possible; this variant covers the unrecoverable cases.
-        ProfileGone(ProfileId),
-        /// Anything else surfaced as `TunnelError::Other`.
-        Other(String),
-    }
 
     /// Cause for `ConnectionHealth::Degraded`.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -340,56 +316,39 @@ pub mod state {
     }
 
     /// The connection state machine.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
     #[non_exhaustive]
     pub enum Connection {
-        /// No active VPN connection. Optionally remembers why the previous attempt
-        /// failed so the TUI can surface a "Last error: …" hint.
-        Disconnected { last_failure: Option<FailureReason> },
+        /// No active VPN connection.
+        #[default]
+        Disconnected,
         /// Initial connect in progress.
         Connecting {
             profile_id: ProfileId,
             started_at: SystemTime,
-            /// 1-based attempt counter for the current connect operation.
-            attempt: u32,
-            retry_budget_remaining: Duration,
         },
         /// Active VPN connection.
         Connected {
             profile_id: ProfileId,
             since: SystemTime,
-            health: ConnectionHealth,
             details: Box<DetailedConnectionInfo>,
         },
         /// Lost the tunnel; trying to bring it back without involving the user.
         Reconnecting {
             profile_id: ProfileId,
             started_at: SystemTime,
-            attempt: u32,
-            retry_budget_remaining: Duration,
-            last_error: Option<String>,
         },
         /// User-initiated disconnect in progress.
         Disconnecting {
             profile_id: ProfileId,
             started_at: SystemTime,
         },
-        /// Mid-connect prompt waiting for the user to supply input
-        /// (2FA challenge, certificate passphrase, etc.). The slot
-        /// reserves the slot for issue #191 (Interactive 2FA/MFA);
-        /// no consumer is wired in v0.3.0.
+        /// Waiting for the user to supply credentials.
         AwaitingUserInput {
             profile_id: ProfileId,
-            prompt_id: String,
             prompt_kind: PromptKind,
             since: SystemTime,
         },
-    }
-
-    impl Default for Connection {
-        fn default() -> Self {
-            Self::Disconnected { last_failure: None }
-        }
     }
 
     impl Connection {
@@ -424,9 +383,9 @@ pub mod state {
         use super::*;
 
         #[test]
-        fn default_is_disconnected_with_no_failure() {
+        fn default_is_disconnected() {
             let s = Connection::default();
-            assert!(matches!(s, Connection::Disconnected { last_failure: None }));
+            assert!(matches!(s, Connection::Disconnected));
         }
 
         #[test]
@@ -441,8 +400,6 @@ pub mod state {
             let s = Connection::Connecting {
                 profile_id: p.clone(),
                 started_at: SystemTime::now(),
-                attempt: 1,
-                retry_budget_remaining: Duration::from_secs(300),
             };
             assert_eq!(s.profile_id(), Some(&p));
         }
@@ -454,8 +411,6 @@ pub mod state {
             assert!(!Connection::Connecting {
                 profile_id: p.clone(),
                 started_at: SystemTime::now(),
-                attempt: 1,
-                retry_budget_remaining: Duration::from_secs(300),
             }
             .is_steady());
         }
@@ -464,7 +419,6 @@ pub mod state {
             let p = ProfileId::new("corp");
             let s = Connection::AwaitingUserInput {
                 profile_id: p.clone(),
-                prompt_id: "2fa".into(),
                 prompt_kind: PromptKind::TwoFactorCode,
                 since: SystemTime::now(),
             };
@@ -476,7 +430,6 @@ pub mod state {
             // Like Connecting/Disconnecting, it's a transitional state.
             let s = Connection::AwaitingUserInput {
                 profile_id: ProfileId::new("corp"),
-                prompt_id: "2fa".into(),
                 prompt_kind: PromptKind::TwoFactorCode,
                 since: SystemTime::now(),
             };
@@ -503,6 +456,4 @@ pub mod state {
 }
 
 pub use registry::{classify_route_conflict, Conflict, Role, TunnelRegistry, TunnelSnapshot};
-pub use state::{
-    Connection, ConnectionHealth, DegradedReason, DetailedConnectionInfo, FailureReason,
-};
+pub use state::{Connection, ConnectionHealth, DegradedReason, DetailedConnectionInfo};

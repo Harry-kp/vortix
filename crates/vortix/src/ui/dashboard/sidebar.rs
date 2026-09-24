@@ -115,10 +115,7 @@ fn status_sigil_id(
         Connection::Reconnecting { .. } => SigilId::Reconnecting,
         Connection::Disconnecting { .. } => SigilId::Disconnecting,
         Connection::AwaitingUserInput { .. } => SigilId::AwaitingInput,
-        Connection::Disconnected {
-            last_failure: Some(_),
-        } => SigilId::Failed,
-        Connection::Disconnected { last_failure: None } => return None,
+        Connection::Disconnected => return None,
     })
 }
 
@@ -467,7 +464,6 @@ mod tests {
             state: Connection::Connected {
                 profile_id: ProfileId::new(name),
                 since: SystemTime::now(),
-                health: ConnectionHealth::default(),
                 details: Box::default(),
             },
             role,
@@ -483,8 +479,6 @@ mod tests {
             state: Connection::Connecting {
                 profile_id: ProfileId::new(name),
                 started_at: SystemTime::now(),
-                attempt: 1,
-                retry_budget_remaining: std::time::Duration::from_secs(30),
             },
             role: Role::AwaitingInput,
             health: ConnectionHealth::default(),
@@ -499,9 +493,6 @@ mod tests {
             state: Connection::Reconnecting {
                 profile_id: ProfileId::new(name),
                 started_at: SystemTime::now(),
-                attempt: 1,
-                retry_budget_remaining: std::time::Duration::from_secs(30),
-                last_error: None,
             },
             role: Role::Reconnecting {
                 prior_role: Box::new(Role::Primary {
@@ -725,7 +716,7 @@ mod tests {
     fn disconnected_no_failure_renders_no_badge() {
         let snap = TunnelSnapshot {
             profile_id: ProfileId::new("vpn1"),
-            state: Connection::Disconnected { last_failure: None },
+            state: Connection::Disconnected,
             role: Role::Addressable {
                 allowed_ips: vec![],
             },
@@ -734,27 +725,6 @@ mod tests {
             started_at: None,
         };
         assert!(status_badge_for(&snap, Some(ProtocolKind::WireGuard)).is_none());
-    }
-
-    #[test]
-    fn disconnected_with_failure_renders_x_glyph_error() {
-        use crate::core::engine::state::FailureReason;
-        let snap = TunnelSnapshot {
-            profile_id: ProfileId::new("vpn1"),
-            state: Connection::Disconnected {
-                last_failure: Some(FailureReason::HandshakeFailed("test".to_string())),
-            },
-            role: Role::Addressable {
-                allowed_ips: vec![],
-            },
-            health: ConnectionHealth::default(),
-            interface_name: None,
-            started_at: None,
-        };
-        let (glyph, style) =
-            status_badge_for(&snap, Some(ProtocolKind::WireGuard)).expect("failure → badge");
-        assert_eq!(glyph, "✗");
-        assert_eq!(style.fg, Some(theme::current().error));
     }
 
     // ── width discipline ──────────────────────────────────────────────

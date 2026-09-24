@@ -1374,7 +1374,7 @@ mod tests {
         use crate::core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
         app.registry.insert_for_test(TunnelSnapshot {
             profile_id: ProfileId::new(name),
-            state: Connection::Disconnected { last_failure: None },
+            state: Connection::Disconnected,
             role: Role::Addressable {
                 allowed_ips: Vec::new(),
             },

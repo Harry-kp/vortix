@@ -40,7 +40,7 @@ impl App {
                 self.registry
                     .snapshot_all()
                     .into_iter()
-                    .find(|s| !matches!(s.state, Connection::Disconnected { .. }))
+                    .find(|s| !matches!(s.state, Connection::Disconnected))
             })
     }
 
@@ -112,7 +112,7 @@ impl App {
         self.registry
             .snapshot_all()
             .iter()
-            .filter(|s| !matches!(s.state, Connection::Disconnected { .. }))
+            .filter(|s| !matches!(s.state, Connection::Disconnected))
             .count()
     }
     /// Resolve a user/scanner-facing display name at the App boundary.
@@ -139,7 +139,7 @@ impl App {
         use crate::core::engine::state::Connection;
         self.profile_id_for_name(profile_name)
             .and_then(|id| self.registry.snapshot(&id))
-            .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected { .. }))
+            .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected))
     }
 
     /// Whether the profile at `idx` is currently Connecting (in-flight).

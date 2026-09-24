@@ -77,7 +77,6 @@ fn set_connected(app: &mut App, name: &str) {
         &vortix::core::engine::state::Connection::Connected {
             profile_id: vortix::core::profile::ProfileId::new(name),
             since: std::time::SystemTime::now(),
-            health: vortix::core::engine::state::ConnectionHealth::Healthy,
             details: Box::new(details),
         },
     );
@@ -505,7 +504,7 @@ mod message_routing {
         app.handle_message(Message::QuickConnect(99));
         assert!(app.current_tunnel().is_none_or(|t| matches!(
             t.state,
-            vortix::core::engine::state::Connection::Disconnected { .. }
+            vortix::core::engine::state::Connection::Disconnected
         )));
     }
 

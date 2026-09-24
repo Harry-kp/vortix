@@ -111,7 +111,7 @@ fn test_d_while_disconnected_is_noop() {
     app.handle_message(Message::Disconnect);
     assert!(app.current_tunnel().is_none_or(|t| matches!(
         t.state,
-        crate::core::engine::state::Connection::Disconnected { .. }
+        crate::core::engine::state::Connection::Disconnected
     )));
 }
 
@@ -522,7 +522,7 @@ fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
     assert!(
         app.current_tunnel().is_none_or(|t| matches!(
             t.state,
-            crate::core::engine::state::Connection::Disconnected { .. }
+            crate::core::engine::state::Connection::Disconnected
         )),
         "Should stay disconnected when no last_connected_profile"
     );
@@ -2207,9 +2207,9 @@ fn test_auth_delete_profile_cleans_auth_file() {
 #[test]
 fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
     use crate::app::{focused_tunnel_action, FocusedTunnelAction};
-    use crate::core::engine::state::{Connection, ConnectionHealth, PromptKind};
+    use crate::core::engine::state::{Connection, PromptKind};
     use crate::core::profile::ProfileId;
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     let profile_id = ProfileId::new("focused");
     let now = SystemTime::UNIX_EPOCH;
@@ -2217,19 +2217,13 @@ fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
         Connection::Connecting {
             profile_id: profile_id.clone(),
             started_at: now,
-            attempt: 1,
-            retry_budget_remaining: Duration::ZERO,
         },
         Connection::Reconnecting {
             profile_id: profile_id.clone(),
             started_at: now,
-            attempt: 2,
-            retry_budget_remaining: Duration::ZERO,
-            last_error: None,
         },
         Connection::AwaitingUserInput {
             profile_id: profile_id.clone(),
-            prompt_id: "prompt".to_string(),
             prompt_kind: PromptKind::TwoFactorCode,
             since: now,
         },
@@ -2244,7 +2238,6 @@ fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
     let connected = Connection::Connected {
         profile_id: profile_id.clone(),
         since: now,
-        health: ConnectionHealth::Healthy,
         details: Box::default(),
     };
     assert_eq!(
