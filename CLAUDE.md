@@ -161,7 +161,7 @@ build-time numbers live in [`docs/performance.md`](docs/performance.md).
   `archive/background-mode`; needs a product decision to revive).
 - The `vortix secrets` command, `metadata.json`, the iptables backend (nftables
   only; legacy chains are just cleaned up), `core/`, `utils.rs`, the TUI's
-  separate tunnel registry.
+  separate tunnel registry and its `Connection`/`TunnelSnapshot` render model.
 
 ## Lessons that cost a CI cycle or a bug
 
@@ -174,4 +174,7 @@ build-time numbers live in [`docs/performance.md`](docs/performance.md).
 - Async results that arrive after the state they describe must be dropped: the
   telemetry worker tags results with an epoch so a pre-disconnect lookup cannot
   overwrite the real IP.
+- `process::run` returns `Ok` for a command that exits non-zero; check
+  `CommandOutcome::success()`. Treating `Ok` as success shipped a DNS flush
+  that silently ignored failures.
 - `vortix status` (CLI) reports a single tunnel; the TUI shows all of them.
