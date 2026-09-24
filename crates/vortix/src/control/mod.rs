@@ -6,13 +6,12 @@
 //! [`plan::plan`]'s answer through [`net`].
 
 pub mod dns;
-pub mod dns_policy;
 mod engine;
 pub mod killswitch;
 pub mod net;
 pub mod plan;
-pub mod profiles;
 pub mod scanner;
+pub mod specs;
 pub mod state;
 pub mod tunnels;
 

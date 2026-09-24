@@ -20,7 +20,6 @@
 //! - `update` — Message dispatching (TEA-style update function)
 //! - `connection` — VPN connection lifecycle management
 //! - `profile` — Profile CRUD and import operations
-//! - `telemetry_poll` — Background telemetry and scanner polling
 //! - `helpers` — Logging, scrolling, toast notifications, and utilities
 
 pub(crate) mod connection;
@@ -30,7 +29,6 @@ mod input;
 mod profile;
 pub mod runtime;
 pub mod state;
-mod telemetry_poll;
 mod update;
 
 pub(crate) use input::{focused_tunnel_action, FocusedTunnelAction};

@@ -47,7 +47,7 @@ builds only when asked.
 | Connect, disconnect, switch, reconnect, retries | `control/engine.rs` (one thread), `control/state.rs` (tunnel state, route-conflict rule) |
 | Which routes / DNS / firewall the host should have | `control/plan.rs` (pure), applied by `control/net.rs` |
 | Kill switch modes and persisted state | `control/killswitch.rs`; firewalls in `macos/firewall.rs` (pf), `linux/firewall.rs` (nftables) |
-| DNS | `control/dns.rs` (policy), `control/dns_policy.rs` (receipt), `macos/dns.rs`, `linux/dns.rs` |
+| DNS | `control/dns.rs` (policy and its persisted receipt), `macos/dns.rs`, `linux/dns.rs` |
 | Detecting running tunnels | `control/scanner.rs` |
 | Starting protocol processes | `control/tunnels.rs` → `wireguard/tunnel.rs`, `openvpn/tunnel.rs`; supervision in `process/custodian.rs` |
 | Config parsing | `wireguard/parser.rs`, `openvpn/parser.rs` (the only readers of profile files) |

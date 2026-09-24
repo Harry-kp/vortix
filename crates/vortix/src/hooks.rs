@@ -1,105 +1,102 @@
 //! Owner-run observational hooks fired on tunnel lifecycle events.
 
-mod event {
-    //! Typed lifecycle facts consumed by unprivileged observational hooks.
-    //!
-    //! This module deliberately contains no subprocess vocabulary.  The control
-    //! owner publishes committed facts; an outer adapter may attempt bounded
-    //! delivery without gaining any lifecycle veto or privileged capability.
+use crate::profile::{ProfileId, ProtocolKind};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
-    use serde::{Deserialize, Serialize};
+pub use runner::{
+    HookAttemptId, HookDiagnostic, HookDiagnosticKind, HookDiagnostics, HookDispatcher,
+    HookFailure, HookOwnerError, HookRunner, VerifiedHookOwner,
+};
 
-    use crate::profile::{ProfileId, ProtocolKind};
+/// Lifecycle transitions available to global hook specifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    ConnectStarted,
+    Connected,
+    DisconnectStarted,
+    Disconnected,
+    ConnectFailed,
+    Reconnecting,
+}
 
-    /// Lifecycle transitions available to global hook specifications.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum HookEvent {
-        ConnectStarted,
-        Connected,
-        DisconnectStarted,
-        Disconnected,
-        ConnectFailed,
-        Reconnecting,
-    }
-
-    impl HookEvent {
-        #[must_use]
-        pub const fn as_str(self) -> &'static str {
-            match self {
-                Self::ConnectStarted => "connect_started",
-                Self::Connected => "connected",
-                Self::DisconnectStarted => "disconnect_started",
-                Self::Disconnected => "disconnected",
-                Self::ConnectFailed => "connect_failed",
-                Self::Reconnecting => "reconnecting",
-            }
+impl HookEvent {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectStarted => "connect_started",
+            Self::Connected => "connected",
+            Self::DisconnectStarted => "disconnect_started",
+            Self::Disconnected => "disconnected",
+            Self::ConnectFailed => "connect_failed",
+            Self::Reconnecting => "reconnecting",
         }
     }
+}
 
-    /// Stable identity for one committed lifecycle fact.
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-    #[serde(transparent)]
-    pub struct HookEventId(String);
+/// Stable identity for one committed lifecycle fact.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HookEventId(String);
 
-    impl HookEventId {
-        pub(crate) fn from_parts(authority_epoch: u64, sequence: u64) -> Self {
-            Self(format!("hook-{authority_epoch:016x}-{sequence:016x}"))
-        }
-
-        #[must_use]
-        pub fn as_str(&self) -> &str {
-            &self.0
-        }
+impl HookEventId {
+    pub(crate) fn from_parts(authority_epoch: u64, sequence: u64) -> Self {
+        Self(format!("hook-{authority_epoch:016x}-{sequence:016x}"))
     }
 
-    impl std::fmt::Display for HookEventId {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(&self.0)
-        }
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
+}
 
-    /// A committed lifecycle transition safe to expose to an owner-run hook.
-    ///
-    /// Endpoint, address, DNS, credential, and profile-body data are
-    /// intentionally absent.
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct LifecycleFact {
-        pub event_id: HookEventId,
-        pub event: HookEvent,
-        pub profile_id: ProfileId,
-        pub display_name: String,
-        pub protocol: ProtocolKind,
-        pub occurred_at_millis: u64,
+impl std::fmt::Display for HookEventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+/// A committed lifecycle transition safe to expose to an owner-run hook.
+///
+/// Endpoint, address, DNS, credential, and profile-body data are
+/// intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleFact {
+    pub event_id: HookEventId,
+    pub event: HookEvent,
+    pub profile_id: ProfileId,
+    pub display_name: String,
+    pub protocol: ProtocolKind,
+    pub occurred_at_millis: u64,
+}
 
-        #[test]
-        fn lifecycle_fact_schema_excludes_network_and_secret_material() {
-            let fact = LifecycleFact {
-                event_id: HookEventId::from_parts(4, 9),
-                event: HookEvent::Connected,
-                profile_id: ProfileId::new("corp"),
-                display_name: "Corporate".into(),
-                protocol: ProtocolKind::WireGuard,
-                occurred_at_millis: 42,
-            };
-            let json = serde_json::to_value(fact).unwrap();
-            let object = json.as_object().unwrap();
-            assert_eq!(object.len(), 6);
-            for forbidden in [
-                "endpoint",
-                "address",
-                "dns",
-                "credential",
-                "secret",
-                "profile_body",
-            ] {
-                assert!(!object.contains_key(forbidden));
-            }
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_fact_schema_excludes_network_and_secret_material() {
+        let fact = LifecycleFact {
+            event_id: HookEventId::from_parts(4, 9),
+            event: HookEvent::Connected,
+            profile_id: ProfileId::new("corp"),
+            display_name: "Corporate".into(),
+            protocol: ProtocolKind::WireGuard,
+            occurred_at_millis: 42,
+        };
+        let json = serde_json::to_value(fact).unwrap();
+        let object = json.as_object().unwrap();
+        assert_eq!(object.len(), 6);
+        for forbidden in [
+            "endpoint",
+            "address",
+            "dns",
+            "credential",
+            "secret",
+            "profile_body",
+        ] {
+            assert!(!object.contains_key(forbidden));
         }
     }
 }
@@ -117,7 +114,7 @@ mod runner {
     use tokio::sync::{broadcast, mpsc};
     use tokio::task::{JoinHandle, JoinSet};
 
-    use crate::config::hooks_config::{validate_hooks, HookConfigError, HookSpec};
+    use crate::config::settings::{validate_hooks, HookConfigError, HookSpec};
     use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
     use crate::process::{CommandRunner, CommandSpec};
     use crate::process::{ProcessCredentials, ProcessError};
@@ -832,14 +829,6 @@ mod runner {
         }
     }
 }
-
-use std::path::Path;
-
-pub use event::{HookEvent, HookEventId, LifecycleFact};
-pub use runner::{
-    HookAttemptId, HookDiagnostic, HookDiagnosticKind, HookDiagnostics, HookDispatcher,
-    HookFailure, HookOwnerError, HookRunner, VerifiedHookOwner,
-};
 
 /// Start the configured hooks, or `None` when there are none or they cannot
 /// run. Hooks never affect lifecycle correctness. Must run inside a tokio

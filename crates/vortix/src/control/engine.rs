@@ -19,7 +19,7 @@ use crate::wireguard::ownership::TunnelOwnershipStore;
 
 use super::net::Net;
 use super::plan::{plan, NetworkPlan};
-use super::profiles::{self, Entry};
+use super::specs::{self, Entry};
 use super::state::{Phase, Refusal, State};
 use super::tunnels::{self, Live, StartError};
 use super::{
@@ -114,7 +114,7 @@ impl Engine {
             .iter()
             .filter_map(|profile| Some((profile.id.clone(), profile.last_used?)))
             .collect();
-        let entries = profiles::load(&config.config_dir, profiles);
+        let entries = specs::load(&config.config_dir, profiles);
         let ownership =
             Arc::new(TunnelOwnershipStore::production(uid).map_err(|error| error.to_string())?);
         let kill_switch = crate::control::killswitch::load_state_checked()
@@ -264,7 +264,7 @@ impl Engine {
                 self.waits.insert(ticket, Wait::Net);
             }
             Command::Profiles(profiles) => {
-                self.entries = profiles::load(&self.config.config_dir, profiles);
+                self.entries = specs::load(&self.config.config_dir, profiles);
                 self.outcomes.insert(ticket, Outcome::Done);
             }
         }

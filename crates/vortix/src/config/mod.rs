@@ -7,7 +7,6 @@
 //! at startup, so that all utility functions (profile loading, auth, metadata, killswitch)
 //! use the correct path without requiring a parameter change on every call site.
 
-pub mod hooks_config;
 pub mod import;
 pub mod migration;
 pub mod openvpn_credentials;
@@ -17,10 +16,10 @@ pub mod profiles;
 pub mod secret;
 pub mod settings;
 
-pub use hooks_config::{HookConfigError, HookSpec};
 pub use migration::{migrate_legacy_profiles, MigrationStats};
 pub use profile_store::{ProfileStoreError, ProfileSummary};
 pub use settings::{EngineSettings, JournalSettings, Settings, SettingsError};
+pub use settings::{HookConfigError, HookSpec};
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

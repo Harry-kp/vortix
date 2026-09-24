@@ -320,7 +320,7 @@ fn detect_conflict_for_cli(
     target_name: &str,
 ) -> Option<crate::control::Conflict> {
     let target_profile = profiles.iter().find(|p| p.name == target_name)?;
-    let specs = crate::control::profiles::load(config_dir, profiles.to_vec());
+    let specs = crate::control::specs::load(config_dir, profiles.to_vec());
     let routes = |id: &crate::profile::ProfileId| {
         specs
             .get(id)

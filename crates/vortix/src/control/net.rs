@@ -22,7 +22,7 @@ impl Net {
     #[must_use]
     pub fn new(config_dir: PathBuf, applied: NetworkPlan) -> Self {
         Self {
-            dns: crate::control::dns_policy::load(&config_dir).unwrap_or_default(),
+            dns: crate::control::dns::load_policy(&config_dir).unwrap_or_default(),
             config_dir,
             applied,
             saved_mode: None,
@@ -108,13 +108,13 @@ impl Net {
     }
 
     fn apply_dns(&mut self, target: &NetworkPlan) -> Result<(), String> {
-        let _lock = crate::control::dns_policy::acquire_policy_lock(&self.config_dir)
+        let _lock = crate::control::dns::acquire_policy_lock(&self.config_dir)
             .map_err(|error| format!("DNS policy lock failed: {error}"))?;
         let config_dir = &self.config_dir;
         let effective = self
             .dns
             .reconcile_durable(&target.dns, &crate::platform::Dns, |state| {
-                crate::control::dns_policy::save(config_dir, state)
+                crate::control::dns::save_policy(config_dir, state)
             })
             .map_err(|error| error.to_string())?;
         match effective.status {
