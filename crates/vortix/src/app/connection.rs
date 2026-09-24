@@ -16,11 +16,11 @@ pub(super) const CONTROL_STARTING_MESSAGE: &str =
 
 /// Where the cursor starts in the credential overlay: the one-time code when
 /// the pair above it is already filled in, otherwise the username.
-fn initial_auth_focus(otp: bool, credentials_prefilled: bool) -> crate::state::AuthField {
+fn initial_auth_focus(otp: bool, credentials_prefilled: bool) -> crate::app::state::AuthField {
     if otp && credentials_prefilled {
-        crate::state::AuthField::Otp
+        crate::app::state::AuthField::Otp
     } else {
-        crate::state::AuthField::Username
+        crate::app::state::AuthField::Username
     }
 }
 
@@ -212,7 +212,7 @@ impl App {
                 }
             }
         }
-        if resort && self.runtime.sort_order == crate::state::ProfileSortOrder::LastUsed {
+        if resort && self.runtime.sort_order == crate::app::state::ProfileSortOrder::LastUsed {
             let selected = self.selected_profile_id();
             self.runtime.sort_profiles();
             self.profile_list_state
@@ -246,8 +246,8 @@ impl App {
                     .map(|control| control.load_credentials(&prompt.profile_id, &prompt.name))
                 {
                     Some(Ok(Some(saved))) => (
-                        crate::state::SecretText::from(saved.username()),
-                        crate::state::SecretText::from(saved.password()),
+                        crate::app::state::SecretText::from(saved.username()),
+                        crate::app::state::SecretText::from(saved.password()),
                     ),
                     _ => Default::default(),
                 };
@@ -259,7 +259,7 @@ impl App {
                     password_cursor: password.chars().count(),
                     username,
                     password,
-                    otp: crate::state::SecretText::default(),
+                    otp: crate::app::state::SecretText::default(),
                     otp_cursor: 0,
                     focused_field: initial_auth_focus(prompt.otp_label.is_some(), prefilled),
                     save_credentials: true,
@@ -438,7 +438,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::initial_auth_focus;
-    use crate::state::AuthField;
+    use crate::app::state::AuthField;
 
     #[test]
     fn an_empty_two_factor_form_starts_at_the_username() {

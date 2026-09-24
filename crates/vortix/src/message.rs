@@ -6,8 +6,8 @@
 //! - Predictable state changes
 //! - Testable update logic
 
+use crate::app::state::{FocusedPanel, ToastType};
 use crate::core::telemetry::TelemetryUpdate;
-use crate::state::{FocusedPanel, ToastType};
 
 /// All messages that can modify application state.
 ///
@@ -146,14 +146,14 @@ pub enum Message {
         /// Stable profile identity captured when the prompt opened.
         profile_id: crate::core::profile::ProfileId,
         /// Username entered by the user
-        username: crate::state::SecretText,
+        username: crate::app::state::SecretText,
         /// Password entered by the user
-        password: crate::state::SecretText,
+        password: crate::app::state::SecretText,
         /// 2FA code from the static-challenge OTP field, when the profile
         /// declares a `static-challenge` directive.
         /// `None` for non-MFA profiles; the connect path embeds `Some(otp)`
         /// in the SCRV1 envelope and the save path always writes plain.
-        otp: Option<crate::state::SecretText>,
+        otp: Option<crate::app::state::SecretText>,
         /// Whether to persist credentials for future sessions
         save: bool,
         /// Whether to auto-connect after saving (false = save-only from manage flow)

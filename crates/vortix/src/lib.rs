@@ -26,10 +26,8 @@ pub mod openvpn;
 pub mod platform;
 #[doc(hidden)]
 pub mod process;
-pub mod state;
 pub mod theme;
 pub mod ui;
 pub mod utils;
-pub mod vpn;
 #[doc(hidden)]
 pub mod wireguard;

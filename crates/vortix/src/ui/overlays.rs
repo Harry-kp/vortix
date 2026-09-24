@@ -719,8 +719,9 @@ pub mod help {
     //!   checks. Complements the Sigils tab — sigils explain the glyphs,
     //!   Guard explains the semantics.
 
+    use crate::app::{state, state::HelpTab};
+    use crate::theme;
     use crate::ui::sigils::{Sigil, SigilCategory, CATALOG};
-    use crate::{state, state::HelpTab, theme};
     use ratatui::{
         layout::{Constraint, Direction, Layout, Rect},
         style::{Modifier, Style},
@@ -1755,10 +1756,14 @@ pub mod toast {
 
             let t = crate::theme::current();
             let (title, bg_color, border_color) = match toast.toast_type {
-                crate::state::ToastType::Info => (" INFO ", t.toast_info, t.toast_info),
-                crate::state::ToastType::Success => (" SUCCESS ", t.toast_success, t.toast_success),
-                crate::state::ToastType::Warning => (" WARNING ", t.toast_warning, t.toast_warning),
-                crate::state::ToastType::Error => (" ERROR ", t.toast_error, t.toast_error),
+                crate::app::state::ToastType::Info => (" INFO ", t.toast_info, t.toast_info),
+                crate::app::state::ToastType::Success => {
+                    (" SUCCESS ", t.toast_success, t.toast_success)
+                }
+                crate::app::state::ToastType::Warning => {
+                    (" WARNING ", t.toast_warning, t.toast_warning)
+                }
+                crate::app::state::ToastType::Error => (" ERROR ", t.toast_error, t.toast_error),
             };
 
             let block = Block::default()

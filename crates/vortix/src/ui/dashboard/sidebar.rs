@@ -200,7 +200,7 @@ fn signal_for(
 /// One profile row: status badge, name (with the primary `*`), protocol
 /// tag and last-used time. Selection owns the foreground of every cell.
 fn profile_row(
-    profile: &crate::state::VpnProfile,
+    profile: &crate::config::profiles::VpnProfile,
     idx: usize,
     is_selected: bool,
     signal: &RowSignal,
@@ -438,12 +438,12 @@ mod tests {
     //! Earlier smoke tests (empty-state, row rendering) remain.
     use super::*;
     use crate::app::App;
+    use crate::config::profiles::VpnProfile;
     use crate::core::cidr::Cidr;
     use crate::core::engine::registry::Role;
     use crate::core::engine::state::ConnectionHealth;
     use crate::core::profile::ProfileId;
     use crate::core::profile::ProtocolKind;
-    use crate::state::VpnProfile;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;

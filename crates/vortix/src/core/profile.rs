@@ -138,7 +138,7 @@ impl std::fmt::Display for ProfileId {
 
 /// Which tunnel protocol a profile uses.
 ///
-/// Mirrors `vortix::state::Protocol` — the binary-side type stays put until
+/// Mirrors `vortix::app::state::Protocol` — the binary-side type stays put until
 /// profile storage is consolidated. Keeping a separate `ProtocolKind`
 /// here lets `vortix-core` declare the Tunnel-trait vocabulary without
 /// pulling in the richer profile types.

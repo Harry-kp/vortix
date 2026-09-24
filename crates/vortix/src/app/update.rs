@@ -279,7 +279,7 @@ impl App {
             Message::OpenHelp => {
                 self.input_mode = InputMode::Help {
                     scroll: 0,
-                    tab: crate::state::HelpTab::default(),
+                    tab: crate::app::state::HelpTab::default(),
                 };
             }
             Message::CycleLogFilter => self.handle_cycle_log_filter(),
@@ -440,8 +440,8 @@ impl App {
                         .load_credentials(&profile_id, &profile_name)
                     {
                         Ok(Some(credentials)) => (
-                            crate::state::SecretText::from(credentials.username()),
-                            crate::state::SecretText::from(credentials.password()),
+                            crate::app::state::SecretText::from(credentials.username()),
+                            crate::app::state::SecretText::from(credentials.password()),
                         ),
                         Ok(None) => Default::default(),
                         Err(error) => {
@@ -465,9 +465,9 @@ impl App {
                         username_cursor,
                         password,
                         password_cursor,
-                        otp: crate::state::SecretText::default(),
+                        otp: crate::app::state::SecretText::default(),
                         otp_cursor: 0,
-                        focused_field: crate::state::AuthField::Username,
+                        focused_field: crate::app::state::AuthField::Username,
                         save_credentials: true,
                         connect_after: false,
                         static_challenge_prompt: None,
@@ -535,9 +535,9 @@ impl App {
     fn handle_auth_submit(
         &mut self,
         profile_id: crate::core::profile::ProfileId,
-        username: crate::state::SecretText,
-        password: crate::state::SecretText,
-        otp: Option<crate::state::SecretText>,
+        username: crate::app::state::SecretText,
+        password: crate::app::state::SecretText,
+        otp: Option<crate::app::state::SecretText>,
         save: bool,
         connect_after: bool,
     ) {
@@ -810,7 +810,7 @@ impl App {
     }
 
     fn log_network_quality_transition(&mut self) {
-        use crate::state::QualityLevel;
+        use crate::app::state::QualityLevel;
 
         let quality = QualityLevel::from_metrics(
             self.runtime.latency_ms,
@@ -845,7 +845,7 @@ impl App {
         if self
             .toast
             .as_ref()
-            .is_some_and(crate::state::Toast::is_expired)
+            .is_some_and(crate::app::state::Toast::is_expired)
         {
             self.toast = None;
         }

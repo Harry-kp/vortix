@@ -99,7 +99,7 @@ impl Engine {
     pub(super) fn start(
         config: Config,
         uid: u32,
-        profiles: Vec<crate::state::VpnProfile>,
+        profiles: Vec<crate::config::profiles::VpnProfile>,
         credentials: Arc<Mutex<FsOpenVpnCredentialStore>>,
         tx: mpsc::Sender<Msg>,
         shared: Arc<Mutex<Arc<Snapshot>>>,

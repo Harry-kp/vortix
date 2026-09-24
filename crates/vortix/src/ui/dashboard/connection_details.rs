@@ -1,9 +1,9 @@
+use crate::app::state::QualityLevel;
 use crate::app::App;
 use crate::core::cidr::Cidr;
 use crate::core::engine::registry::{Role, TunnelSnapshot};
 use crate::core::engine::state::{Connection, DetailedConnectionInfo};
 use crate::core::profile::ProtocolKind;
-use crate::state::QualityLevel;
 use crate::ui::helpers;
 use crate::{constants, theme, utils};
 use ratatui::{
@@ -835,10 +835,10 @@ mod tests {
     //! unknown focused profiles surface the "no longer available" hint.
     use super::*;
     use crate::app::App;
+    use crate::config::profiles::VpnProfile;
     use crate::core::engine::state::PromptKind;
     use crate::core::profile::ProfileId;
     use crate::core::profile::ProtocolKind;
-    use crate::state::VpnProfile;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;

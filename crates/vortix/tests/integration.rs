@@ -19,7 +19,8 @@ use std::time::Instant;
 
 use vortix::core::profile::ProtocolKind;
 
-use vortix::app::{App, FocusedPanel, InputMode, Toast, ToastType, VpnProfile};
+use vortix::app::{App, FocusedPanel, InputMode, Toast, ToastType};
+use vortix::config::profiles::VpnProfile;
 use vortix::message::{Message, ScrollMove, SelectionMove};
 
 static INIT: Once = Once::new();
@@ -131,11 +132,13 @@ mod profile_import {
     /// "profile storage is busy". Serialising them removes the contention.
     static IMPORT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn import_serialised(path: &std::path::Path) -> Result<vortix::state::VpnProfile, String> {
+    fn import_serialised(
+        path: &std::path::Path,
+    ) -> Result<vortix::config::profiles::VpnProfile, String> {
         let _guard = IMPORT_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        vortix::vpn::import_profile(path)
+        vortix::config::profiles::import_profile(path)
     }
 
     fn create_temp_profile(

@@ -317,7 +317,7 @@ fn handle_up(
 ) -> i32 {
     // `--yes` explicitly bypasses the shared route-conflict admission check.
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "up");
-    let profiles = crate::vpn::load_profiles();
+    let profiles = crate::config::profiles::load_profiles();
 
     let profile_name = if let Some(name) = profile {
         name.to_string()
@@ -484,7 +484,7 @@ fn handle_up(
 fn run_engine_command(
     config: &AppConfig,
     config_dir: &Path,
-    profiles: Vec<crate::state::VpnProfile>,
+    profiles: Vec<crate::config::profiles::VpnProfile>,
     command: crate::control::Command,
     timeout: Duration,
 ) -> Result<std::sync::Arc<crate::control::Snapshot>, String> {
@@ -586,7 +586,7 @@ fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::uti
 }
 
 fn detect_conflict_for_cli(
-    profiles: &[crate::state::VpnProfile],
+    profiles: &[crate::config::profiles::VpnProfile],
     config_dir: &Path,
     target_name: &str,
 ) -> Option<crate::core::engine::Conflict> {
@@ -643,7 +643,7 @@ fn handle_down(
 ) -> i32 {
     let _ = all; // `--all` is the explicit form of the no-profile case (already the default).
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "down");
-    let profiles = crate::vpn::load_profiles();
+    let profiles = crate::config::profiles::load_profiles();
 
     // NotFound (exit 3) takes precedence over idempotence: a typo'd
     // profile is a script error, not "already disconnected".
@@ -754,7 +754,7 @@ fn handle_reconnect(
     mode: OutputMode,
 ) -> i32 {
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "reconnect");
-    let profiles = crate::vpn::load_profiles();
+    let profiles = crate::config::profiles::load_profiles();
 
     // Validate the requested profile exists in the catalog before we
     // poke the system. NotFound (exit 3) > "no active" idempotency.
@@ -968,7 +968,7 @@ fn handle_status(
         return run_watch(interval, config, config_dir, mode);
     }
 
-    let profiles = crate::vpn::load_profiles();
+    let profiles = crate::config::profiles::load_profiles();
     let snap = crate::cli::status::scan_status(&profiles, config, config_dir);
     let is_connected = snap.connection_state == "connected";
     let is_present = snap.connection_state != "disconnected";
@@ -1091,7 +1091,7 @@ fn handle_status(
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
     loop {
-        let profiles = crate::vpn::load_profiles();
+        let profiles = crate::config::profiles::load_profiles();
         let snap = crate::cli::status::scan_status(&profiles, config, config_dir);
 
         match mode {
@@ -1428,13 +1428,13 @@ fn handle_list(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut all = crate::vpn::load_profiles();
+    let mut all = crate::config::profiles::load_profiles();
 
     // Sort
     let order = match sort.unwrap_or("name") {
-        "protocol" => crate::state::ProfileSortOrder::Protocol,
-        "last-used" => crate::state::ProfileSortOrder::LastUsed,
-        _ => crate::state::ProfileSortOrder::NameAsc,
+        "protocol" => crate::app::state::ProfileSortOrder::Protocol,
+        "last-used" => crate::app::state::ProfileSortOrder::LastUsed,
+        _ => crate::app::state::ProfileSortOrder::NameAsc,
     };
     order.sort(&mut all);
 
@@ -1583,7 +1583,7 @@ fn format_elapsed(secs: u64) -> String {
 /// every active tunnel after the first — that's the bug this test
 /// guards against.
 fn build_profile_entry(
-    profile: &crate::state::VpnProfile,
+    profile: &crate::config::profiles::VpnProfile,
     active_names: &std::collections::HashSet<String>,
     sidecar: Option<&crate::config::profile_store::ProfileSummary>,
 ) -> ProfileEntry {
@@ -1622,8 +1622,8 @@ mod list_tests {
     //! sidecar filesystem read + scanner subprocess, but the policy
     //! decision (per-row connected flag) lives in this helper.
     use super::*;
+    use crate::config::profiles::VpnProfile;
     use crate::core::profile::ProtocolKind;
-    use crate::state::VpnProfile;
     use std::collections::HashSet;
 
     fn profile(name: &str) -> VpnProfile {
@@ -1795,11 +1795,11 @@ fn import_profile_via_control(
     path: &Path,
     config: &AppConfig,
     config_dir: &Path,
-) -> Result<crate::state::VpnProfile, String> {
+) -> Result<crate::config::profiles::VpnProfile, String> {
     let _ = config;
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let prepared = crate::vpn::prepare_profile_import(path, &profiles_dir)?;
-    crate::vpn::commit_profile_import(prepared, &profiles_dir)
+    let prepared = crate::config::profiles::prepare_profile_import(path, &profiles_dir)?;
+    crate::config::profiles::commit_profile_import(prepared, &profiles_dir)
 }
 
 #[derive(Serialize)]
@@ -1810,7 +1810,7 @@ struct ImportData {
     config_path: String,
 }
 
-fn print_import_success(profile: &crate::state::VpnProfile, mode: OutputMode) {
+fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: OutputMode) {
     let data = ImportData {
         name: profile.name.clone(),
         protocol: format!("{}", profile.protocol),
@@ -1936,7 +1936,7 @@ struct ShowData {
 }
 
 fn handle_show(profile_name: &str, raw: bool, mode: OutputMode) -> i32 {
-    let profiles = crate::vpn::load_profiles();
+    let profiles = crate::config::profiles::load_profiles();
     let Some(profile) = profiles.iter().find(|p| p.name == profile_name) else {
         print_error_and_exit(
             mode,
@@ -2001,7 +2001,7 @@ struct DeleteData {
 }
 
 fn require_profile_inactive(
-    profiles: &[crate::state::VpnProfile],
+    profiles: &[crate::config::profiles::VpnProfile],
     active_name: &str,
     requested_name: &str,
     command: &str,
@@ -2026,7 +2026,7 @@ fn require_profile_inactive(
 }
 
 fn handle_delete(profile_name: &str, yes: bool, config_dir: &Path, mode: OutputMode) -> i32 {
-    let profiles = crate::vpn::load_profiles();
+    let profiles = crate::config::profiles::load_profiles();
 
     let Some(idx) = profiles.iter().position(|p| p.name == profile_name) else {
         print_error_and_exit(
@@ -2065,7 +2065,7 @@ fn handle_delete(profile_name: &str, yes: bool, config_dir: &Path, mode: OutputM
     // before deleting so a tunnel started while the prompt was open cannot
     // lose its profile.
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "delete");
-    let fresh_profiles = crate::vpn::load_profiles();
+    let fresh_profiles = crate::config::profiles::load_profiles();
     let Some(fresh_profile) = fresh_profiles
         .iter()
         .find(|profile| profile.id == profile_id)
@@ -2128,7 +2128,7 @@ struct RenameData {
     reason = "rename preserves validation, active-state recheck, typed mutation, and output contracts"
 )]
 fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: OutputMode) -> i32 {
-    let profiles = crate::vpn::load_profiles();
+    let profiles = crate::config::profiles::load_profiles();
 
     let Some(idx) = profiles.iter().position(|p| p.name == old) else {
         print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
@@ -2179,7 +2179,7 @@ fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: OutputMode) -> i
     }
 
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "rename");
-    let fresh_profiles = crate::vpn::load_profiles();
+    let fresh_profiles = crate::config::profiles::load_profiles();
     let Some(fresh_profile) = fresh_profiles
         .iter()
         .find(|profile| profile.id == profile_id)
@@ -2322,7 +2322,7 @@ fn handle_killswitch(
     config_dir: &Path,
     output_mode: OutputMode,
 ) -> i32 {
-    let profiles = crate::vpn::load_profiles();
+    let profiles = crate::config::profiles::load_profiles();
     let (mut mode, mut state) = crate::core::killswitch::persisted();
 
     if let Some(new_mode) = mode_arg {

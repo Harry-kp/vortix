@@ -5,7 +5,7 @@
 
 use crate::core::profile::ProtocolKind;
 
-use crate::app::VpnProfile;
+use crate::config::profiles::VpnProfile;
 use crate::process::simple_output as cmd_output;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

@@ -5,12 +5,13 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::app::state::ProfileSortOrder;
+use crate::config::profiles::VpnProfile;
 use crate::config::AppConfig;
 use crate::constants;
 use crate::core::profile::ProtocolKind;
 use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::message::Message;
-use crate::state::{ProfileSortOrder, VpnProfile};
 
 use crate::utils;
 
@@ -186,7 +187,7 @@ impl VpnRuntime {
             engine.real_ipv6_from_cache = true;
         }
 
-        engine.profiles = crate::vpn::load_profiles();
+        engine.profiles = crate::config::profiles::load_profiles();
         engine.start_background_workers();
         engine
     }
@@ -222,7 +223,7 @@ impl VpnRuntime {
     }
 }
 
-impl crate::state::ProfileSortOrder {
+impl crate::app::state::ProfileSortOrder {
     /// Order `profiles` in place.
     pub fn sort(self, profiles: &mut [VpnProfile]) {
         match self {

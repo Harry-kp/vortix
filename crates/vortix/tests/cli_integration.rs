@@ -8,8 +8,8 @@ mod control_scenarios;
 
 use vortix::app::runtime::VpnRuntime;
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
+use vortix::config::profiles::VpnProfile;
 use vortix::core::profile::ProtocolKind;
-use vortix::state::VpnProfile;
 
 // ============================================================================
 // VpnRuntime headless mode
@@ -68,13 +68,13 @@ fn engine_sort_profiles_by_name() {
         });
     }
 
-    engine.sort_order = vortix::state::ProfileSortOrder::NameAsc;
+    engine.sort_order = vortix::app::state::ProfileSortOrder::NameAsc;
     engine.sort_profiles();
     assert_eq!(engine.profiles[0].name, "alpha");
     assert_eq!(engine.profiles[1].name, "bravo");
     assert_eq!(engine.profiles[2].name, "charlie");
 
-    engine.sort_order = vortix::state::ProfileSortOrder::NameDesc;
+    engine.sort_order = vortix::app::state::ProfileSortOrder::NameDesc;
     engine.sort_profiles();
     assert_eq!(engine.profiles[0].name, "charlie");
 }
@@ -99,7 +99,7 @@ fn engine_sort_profiles_by_protocol() {
         last_used: None,
     });
 
-    engine.sort_order = vortix::state::ProfileSortOrder::Protocol;
+    engine.sort_order = vortix::app::state::ProfileSortOrder::Protocol;
     engine.sort_profiles();
     assert_eq!(engine.profiles[0].protocol, ProtocolKind::WireGuard);
     assert_eq!(engine.profiles[1].protocol, ProtocolKind::OpenVpn);

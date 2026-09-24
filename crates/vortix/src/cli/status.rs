@@ -5,8 +5,8 @@ use std::time::Duration;
 use crate::core::profile::ProtocolKind;
 use crate::core::scanner;
 
+use crate::config::profiles::VpnProfile;
 use crate::config::AppConfig;
-use crate::state::VpnProfile;
 
 fn wireguard_health_from_session(
     peers: &[crate::core::ports::tunnel::TunnelPeerStatus],

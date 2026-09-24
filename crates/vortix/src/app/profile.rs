@@ -284,7 +284,7 @@ impl App {
 
     /// Import a single VPN profile file
     fn import_single_file(&mut self, path: &Path) -> Option<String> {
-        match crate::vpn::import_profile(path) {
+        match crate::config::profiles::import_profile(path) {
             Ok(profile) => {
                 let name = profile.name.clone();
                 self.runtime.profiles.push(profile);

@@ -3,10 +3,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, AuthField, FocusedPanel, InputMode, ToastType};
+use crate::app::state::help_max_scroll_for_terminal_height;
 use crate::constants;
 use crate::core::engine::state::Connection;
 use crate::message::{self, Message, ScrollMove, SelectionMove};
-use crate::state::help_max_scroll_for_terminal_height;
 
 enum ConfirmAction {
     Confirmed,
@@ -533,11 +533,11 @@ impl crate::app::App {
         key: KeyEvent,
         profile_id: &crate::core::profile::ProfileId,
         _profile_name: &str,
-        username: &mut crate::state::SecretText,
+        username: &mut crate::app::state::SecretText,
         username_cursor: &mut usize,
-        password: &mut crate::state::SecretText,
+        password: &mut crate::app::state::SecretText,
         password_cursor: &mut usize,
-        otp: &mut crate::state::SecretText,
+        otp: &mut crate::app::state::SecretText,
         otp_cursor: &mut usize,
         focused_field: &mut AuthField,
         save_credentials: &mut bool,
@@ -578,7 +578,7 @@ impl crate::app::App {
                 }
                 // When this profile declares static-challenge, require OTP.
                 // Trim the OTP at submit (covers paste-with-newline).
-                let trimmed_otp = crate::state::SecretText::from(otp.trim());
+                let trimmed_otp = crate::app::state::SecretText::from(otp.trim());
                 if has_otp_field && trimmed_otp.is_empty() {
                     self.show_toast("OTP required".to_string(), ToastType::Warning);
                     return;

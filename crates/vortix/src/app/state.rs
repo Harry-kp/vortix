@@ -1,32 +1,5 @@
-//! TUI state: profiles, focus, input modes, toasts.
+//! TUI state: focus, input modes, toasts.
 
-mod profile {
-    //! VPN profile and protocol types.
-
-    use std::path::PathBuf;
-    use std::time::SystemTime;
-
-    use crate::core::profile::{ProfileId, ProtocolKind};
-
-    /// VPN profile configuration.
-    ///
-    /// Represents a saved VPN configuration file that can be used to establish connections.
-    #[derive(Clone, Debug)]
-    pub struct VpnProfile {
-        /// Stable identity loaded from the profile's sidecar.
-        pub id: ProfileId,
-        /// Display name for the profile.
-        pub name: String,
-        /// VPN protocol type (`WireGuard` or `OpenVPN`).
-        pub protocol: ProtocolKind,
-        /// Geographic location or server identifier.
-        pub location: String,
-        /// Path to the configuration file on disk.
-        pub config_path: PathBuf,
-        /// Last time this profile was used.
-        pub last_used: Option<SystemTime>,
-    }
-}
 mod ui {
     //! UI state types.
 
@@ -504,7 +477,6 @@ mod ui {
 }
 
 // Re-export all types for easy access
-pub use profile::VpnProfile;
 pub use ui::{
     help_max_scroll_for_terminal_height, AuthField, FlipState, FocusedPanel, HelpTab, InputMode,
     ProfileSortOrder, QualityLevel, SecretText, Toast, ToastType, DISMISS_DURATION,

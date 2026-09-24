@@ -12,6 +12,7 @@ pub mod migration;
 pub mod openvpn_credentials;
 pub mod owned_file;
 pub mod profile_store;
+pub mod profiles;
 pub mod settings;
 
 pub use hooks_config::{HookConfigError, HookSpec};

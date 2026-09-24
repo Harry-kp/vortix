@@ -28,6 +28,7 @@ mod helpers;
 mod input;
 mod profile;
 pub mod runtime;
+pub mod state;
 mod telemetry_poll;
 mod update;
 
@@ -100,8 +101,8 @@ use crate::message::Message;
 use runtime::VpnRuntime;
 
 // Re-export state types for convenient access
-pub use crate::state::{
-    AuthField, FlipState, FocusedPanel, InputMode, ProfileSortOrder, Toast, ToastType, VpnProfile,
+pub use state::{
+    AuthField, FlipState, FocusedPanel, InputMode, ProfileSortOrder, Toast, ToastType,
     DISMISS_DURATION,
 };
 
@@ -148,7 +149,7 @@ pub struct App {
     pub log_level_filter: Option<crate::logger::LogLevel>,
     /// Last network-quality category emitted to the Event Log. Raw telemetry
     /// remains dashboard state and only semantic transitions are logged.
-    pub(crate) last_logged_network_quality: crate::state::QualityLevel,
+    pub(crate) last_logged_network_quality: crate::app::state::QualityLevel,
 
     // === UI State (Panel-based) ===
     pub focused_panel: FocusedPanel,
@@ -221,7 +222,7 @@ impl App {
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
-            last_logged_network_quality: crate::state::QualityLevel::Unknown,
+            last_logged_network_quality: crate::app::state::QualityLevel::Unknown,
 
             focused_panel: FocusedPanel::Sidebar,
             zoomed_panel: None,
@@ -366,7 +367,7 @@ impl App {
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
-            last_logged_network_quality: crate::state::QualityLevel::Unknown,
+            last_logged_network_quality: crate::app::state::QualityLevel::Unknown,
 
             focused_panel: FocusedPanel::Sidebar,
             zoomed_panel: None,

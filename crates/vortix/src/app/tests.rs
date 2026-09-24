@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::profiles::VpnProfile;
 use crate::core::profile::ProtocolKind;
 
 fn init_test_env() {
@@ -572,7 +573,7 @@ fn test_help_mode_opens_and_closes() {
 
     app.input_mode = InputMode::Help {
         scroll: 0,
-        tab: crate::state::HelpTab::Keys,
+        tab: crate::app::state::HelpTab::Keys,
     };
     assert!(matches!(app.input_mode, InputMode::Help { .. }));
 
@@ -707,7 +708,7 @@ fn test_search_match_count_updated() {
 }
 #[test]
 fn test_cycle_sort_order() {
-    use crate::state::ProfileSortOrder;
+    use crate::app::state::ProfileSortOrder;
 
     let mut app = test_app();
     add_profiles(&mut app, &["charlie", "alpha", "bravo"]);
@@ -872,13 +873,13 @@ fn test_help_scroll_down_clamps_at_max() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let mut app = test_app();
-    let max_scroll = crate::state::help_max_scroll_for_terminal_height(
+    let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
-        tab: crate::state::HelpTab::Keys,
+        tab: crate::app::state::HelpTab::Keys,
     };
 
     for _ in 0..(usize::from(max_scroll) + 10) {
@@ -899,7 +900,7 @@ fn test_help_scroll_does_not_move_when_terminal_size_unknown() {
     app.terminal_size = (0, 0);
     app.input_mode = InputMode::Help {
         scroll: 0,
-        tab: crate::state::HelpTab::Keys,
+        tab: crate::app::state::HelpTab::Keys,
     };
 
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -908,7 +909,7 @@ fn test_help_scroll_does_not_move_when_terminal_size_unknown() {
         app.input_mode,
         InputMode::Help {
             scroll: 0,
-            tab: crate::state::HelpTab::Keys
+            tab: crate::app::state::HelpTab::Keys
         }
     ));
 }
@@ -918,13 +919,13 @@ fn test_help_scroll_clamps_after_resize_before_key_handling() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let mut app = test_app();
-    let max_scroll = crate::state::help_max_scroll_for_terminal_height(
+    let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
     );
     app.input_mode = InputMode::Help {
         scroll: max_scroll.saturating_add(10),
-        tab: crate::state::HelpTab::Keys,
+        tab: crate::app::state::HelpTab::Keys,
     };
 
     app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
@@ -940,13 +941,13 @@ fn test_help_end_jumps_to_max_scroll() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let mut app = test_app();
-    let max_scroll = crate::state::help_max_scroll_for_terminal_height(
+    let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
-        tab: crate::state::HelpTab::Keys,
+        tab: crate::app::state::HelpTab::Keys,
     };
 
     app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
@@ -962,13 +963,13 @@ fn test_help_mouse_scroll_down_clamps_at_max() {
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 
     let mut app = test_app();
-    let max_scroll = crate::state::help_max_scroll_for_terminal_height(
+    let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
-        tab: crate::state::HelpTab::Keys,
+        tab: crate::app::state::HelpTab::Keys,
     };
 
     for _ in 0..20 {
@@ -991,13 +992,13 @@ fn test_help_mouse_scroll_up_clamps_after_resize() {
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 
     let mut app = test_app();
-    let max_scroll = crate::state::help_max_scroll_for_terminal_height(
+    let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
     );
     app.input_mode = InputMode::Help {
         scroll: max_scroll.saturating_add(9),
-        tab: crate::state::HelpTab::Keys,
+        tab: crate::app::state::HelpTab::Keys,
     };
 
     app.handle_mouse(MouseEvent {
@@ -1457,7 +1458,7 @@ fn flip_effective_state_at_midpoint() {
 fn advance_animation_completes_to_back() {
     use std::time::Duration;
     let mut app = test_app();
-    let mut state = crate::state::FlipState::new(Duration::from_millis(20));
+    let mut state = crate::app::state::FlipState::new(Duration::from_millis(20));
     state.flip();
     app.flip_states.insert(FocusedPanel::Chart, state);
     std::thread::sleep(Duration::from_millis(80));
@@ -1470,7 +1471,7 @@ fn advance_animation_completes_to_back() {
 fn advance_animation_completes_to_front() {
     use std::time::Duration;
     let mut app = test_app();
-    let mut state = crate::state::FlipState::new(Duration::from_millis(20));
+    let mut state = crate::app::state::FlipState::new(Duration::from_millis(20));
     state.set_showing_back(true);
     state.flip();
     app.flip_states.insert(FocusedPanel::Security, state);
@@ -1494,7 +1495,7 @@ fn advance_animation_noop_when_still_running() {
 fn effective_flipped_shows_target_after_midpoint() {
     use std::time::Duration;
     let mut app = test_app();
-    let mut state = crate::state::FlipState::new(Duration::from_millis(100));
+    let mut state = crate::app::state::FlipState::new(Duration::from_millis(100));
     state.flip();
     app.flip_states.insert(FocusedPanel::Chart, state);
     std::thread::sleep(Duration::from_millis(75));
@@ -2080,7 +2081,7 @@ fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
         username_cursor: 6,
         password: "secret".into(),
         password_cursor: 6,
-        otp: crate::state::SecretText::default(),
+        otp: crate::app::state::SecretText::default(),
         otp_cursor: 0,
         focused_field: AuthField::Password,
         save_credentials: true,

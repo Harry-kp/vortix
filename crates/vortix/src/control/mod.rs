@@ -21,12 +21,12 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::openvpn_credentials::{
     CredentialClearOutcome, FsOpenVpnCredentialStore, RememberedOpenVpnCredentials,
 };
+use crate::config::profiles::VpnProfile;
 use crate::core::cidr::Cidr;
 use crate::core::engine::state::DetailedConnectionInfo;
 use crate::core::engine::{classify_route_conflict, Conflict};
 use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::core::profile::ProfileId;
-use crate::state::VpnProfile;
 
 pub use state::Phase;
 

@@ -1,8 +1,8 @@
+use crate::app::state::QualityLevel;
 use crate::app::App;
 use crate::core::engine::state::Connection;
 use crate::core::engine::TunnelSnapshot;
 use crate::core::profile::ProfileId;
-use crate::state::QualityLevel;
 use crate::ui::helpers;
 use crate::{constants, theme, utils};
 use ratatui::{
@@ -828,14 +828,16 @@ mod tests {
 
     fn app_handshaking(protocol: crate::core::profile::ProtocolKind) -> App {
         let mut app = App::new_test();
-        app.runtime.profiles.push(crate::state::VpnProfile {
-            id: ProfileId::new("corp"),
-            name: "corp".into(),
-            protocol,
-            config_path: "/tmp/corp.conf".into(),
-            location: String::new(),
-            last_used: None,
-        });
+        app.runtime
+            .profiles
+            .push(crate::config::profiles::VpnProfile {
+                id: ProfileId::new("corp"),
+                name: "corp".into(),
+                protocol,
+                config_path: "/tmp/corp.conf".into(),
+                location: String::new(),
+                last_used: None,
+            });
         let profile_id = ProfileId::new("corp");
         let tunnel = crate::core::engine::TunnelSnapshot {
             profile_id: profile_id.clone(),

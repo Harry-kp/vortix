@@ -21,9 +21,9 @@ use crate::core::scanner::ActiveSession;
 use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 
+use crate::config::profiles::VpnProfile;
 use crate::core::ports::tunnel::{TunnelError, TunnelStatus};
 use crate::openvpn::OvpnTunnel;
-use crate::state::VpnProfile;
 use crate::wireguard::WgTunnel;
 
 const EPOCH: AuthorityEpoch = AuthorityEpoch(1);
