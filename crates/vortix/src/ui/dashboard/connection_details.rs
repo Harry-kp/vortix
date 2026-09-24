@@ -525,11 +525,7 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
                     Span::styled(value.to_string(), Style::default().fg(colour)),
                 ]));
             }
-            if !egress_stale
-                && !app.runtime.isp.is_empty()
-                && app.runtime.isp != "Unknown"
-                && app.runtime.isp != constants::MSG_DETECTING
-            {
+            if !egress_stale && !constants::is_unknown(&app.runtime.isp) {
                 text.push(Line::from(vec![
                     Span::styled("ISP     : ", Style::default().fg(palette.text_secondary)),
                     Span::styled(&app.runtime.isp, Style::default().fg(palette.text_primary)),

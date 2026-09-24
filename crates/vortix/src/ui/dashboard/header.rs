@@ -288,11 +288,7 @@ fn connected_line(
         ),
     ];
 
-    if !compact
-        && !app.runtime.location.is_empty()
-        && app.runtime.location != "Unknown"
-        && app.runtime.location != constants::MSG_DETECTING
-    {
+    if !compact && !constants::is_unknown(&app.runtime.location) {
         let loc_budget = (area_width as usize / 4).max(10);
         header_spans.push(Span::styled(
             " @ ",

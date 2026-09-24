@@ -233,8 +233,14 @@ impl IpSuccessLog {
         let message = format!(
             "✓ Public address: IP={}, network={}, location={}",
             identity.public_ip,
-            identity.isp.as_deref().unwrap_or("Unknown"),
-            identity.location.as_deref().unwrap_or("Unknown")
+            identity
+                .isp
+                .as_deref()
+                .unwrap_or(crate::constants::MSG_UNKNOWN),
+            identity
+                .location
+                .as_deref()
+                .unwrap_or(crate::constants::MSG_UNKNOWN)
         );
         if tx
             .send(TelemetryUpdate::Log(LogLevel::Info, message))

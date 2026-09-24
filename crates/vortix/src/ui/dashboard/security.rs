@@ -830,10 +830,7 @@ fn collect_protected_state(
     let dns_provider = dns_provider_label(&dns_server);
     let encryption = derive_encryption(primary_snap);
 
-    let location = if app.runtime.location.is_empty()
-        || app.runtime.location == constants::MSG_DETECTING
-        || app.runtime.location == constants::MSG_FETCHING
-    {
+    let location = if constants::is_pending(&app.runtime.location) {
         None
     } else {
         Some(app.runtime.location.clone())
@@ -898,10 +895,7 @@ fn collect_partial_state(
     let has_primary = primary_snap.is_some();
     let (public_ip, location, ip_status) = if has_primary {
         let ip_status = derive_ip_status(app);
-        let location = if app.runtime.location.is_empty()
-            || app.runtime.location == constants::MSG_DETECTING
-            || app.runtime.location == constants::MSG_FETCHING
-        {
+        let location = if constants::is_pending(&app.runtime.location) {
             None
         } else {
             Some(app.runtime.location.clone())
@@ -1118,10 +1112,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     // (no tunnel masking anything). Showing both rows side-by-side
     // with the same IP IS the alarm visualization: "your exit IP IS
     // your real IP".
-    let exposed_ip = if app.runtime.public_ip.is_empty()
-        || app.runtime.public_ip == constants::MSG_DETECTING
-        || app.runtime.public_ip == constants::MSG_FETCHING
-    {
+    let exposed_ip = if constants::is_pending(&app.runtime.public_ip) {
         "checking…".to_string()
     } else {
         app.runtime.public_ip.clone()
@@ -1168,10 +1159,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     };
     lines.push(alarm_subline(alarm, w));
 
-    let location = if app.runtime.location.is_empty()
-        || app.runtime.location == constants::MSG_DETECTING
-        || app.runtime.location == constants::MSG_FETCHING
-    {
+    let location = if constants::is_pending(&app.runtime.location) {
         "detecting…".to_string()
     } else {
         app.runtime.location.clone()

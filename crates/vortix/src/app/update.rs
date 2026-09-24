@@ -19,13 +19,6 @@ use crate::telemetry::TelemetryUpdate;
 /// threshold via `RUST_LOG=vortix::app=warn`; the value is silent otherwise.
 const UI_HANDLER_SLOW_THRESHOLD: Duration = Duration::from_millis(50);
 
-fn is_unknown_identity_value(value: &str) -> bool {
-    value.is_empty()
-        || value == "Unknown"
-        || value == constants::MSG_DETECTING
-        || value == constants::MSG_FETCHING
-}
-
 /// Extract the variant name (without the payload) from a `Message` for
 /// observability. `format!("{msg:?}")` produces `"NextPanel"` for unit
 /// variants, `"ConnectResult { ... }"` for struct variants, etc. — we
@@ -725,7 +718,7 @@ impl App {
         self.apply_public_ipv4(identity.public_ip);
 
         let next_isp = identity.isp.unwrap_or_else(|| {
-            if same_exit && !is_unknown_identity_value(&self.runtime.isp) {
+            if same_exit && !constants::is_unknown(&self.runtime.isp) {
                 self.runtime.isp.clone()
             } else {
                 "Unknown".to_string()
@@ -737,7 +730,7 @@ impl App {
         self.runtime.isp = next_isp;
 
         let next_location = identity.location.unwrap_or_else(|| {
-            if same_exit && !is_unknown_identity_value(&self.runtime.location) {
+            if same_exit && !constants::is_unknown(&self.runtime.location) {
                 self.runtime.location.clone()
             } else {
                 "Unknown".to_string()
@@ -752,15 +745,15 @@ impl App {
     }
 
     fn apply_egress_unavailable(&mut self) {
-        if !is_unknown_identity_value(&self.runtime.isp) {
+        if !constants::is_unknown(&self.runtime.isp) {
             self.log("NET: Exit node: Unknown");
         }
-        if !is_unknown_identity_value(&self.runtime.location) {
+        if !constants::is_unknown(&self.runtime.location) {
             self.log("NET: Location: Unknown");
         }
         self.runtime.public_ip = constants::MSG_UNAVAILABLE.to_string();
-        self.runtime.isp = "Unknown".to_string();
-        self.runtime.location = "Unknown".to_string();
+        self.runtime.isp = constants::MSG_UNKNOWN.to_string();
+        self.runtime.location = constants::MSG_UNKNOWN.to_string();
         let checked_at = Instant::now();
         self.runtime.last_egress_check = Some(checked_at);
         self.runtime.last_security_check = Some(checked_at);

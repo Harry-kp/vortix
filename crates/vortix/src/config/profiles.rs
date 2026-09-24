@@ -407,7 +407,7 @@ fn derive_location_from_name(name: &str) -> String {
     }
 
     // Default: Cannot reliably determine location from filename
-    "Unknown".to_string()
+    crate::constants::MSG_UNKNOWN.to_string()
 }
 
 /// Load all profiles from the profiles directory

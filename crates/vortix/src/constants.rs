@@ -184,6 +184,21 @@ pub const MSG_BACKEND_INIT: &str = "IO: Initializing VPN backend...";
 pub const MSG_DETECTING: &str = "Detecting...";
 /// Data fetching placeholder.
 pub const MSG_FETCHING: &str = "Fetching...";
+/// What ISP and location read when the lookup answered without them.
+pub const MSG_UNKNOWN: &str = "Unknown";
+
+/// A telemetry field whose lookup has not answered yet.
+#[must_use]
+pub fn is_pending(value: &str) -> bool {
+    value.is_empty() || value == MSG_DETECTING || value == MSG_FETCHING
+}
+
+/// A telemetry field with no real value: pending, or answered as unknown.
+#[must_use]
+pub fn is_unknown(value: &str) -> bool {
+    is_pending(value) || value == MSG_UNKNOWN
+}
+
 /// No data available placeholder.
 pub const MSG_NO_DATA: &str = "---";
 /// What a field reads when its value cannot be obtained, or when the reading
