@@ -130,6 +130,15 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
         };
         let directive = directive.trim_start_matches('-').to_ascii_lowercase();
         let mut tokens = arguments.iter().map(String::as_str);
+        if matches!(directive.as_str(), "dev" | "dev-type")
+            && arguments
+                .first()
+                .is_some_and(|device| device.to_ascii_lowercase().starts_with("tap"))
+        {
+            return Err(ParseError::Unsupported(
+                "OpenVPN TAP (`dev tap`) is not supported: Vortix routes on a layer-3 tunnel device. Use `dev tun`.".into(),
+            ));
+        }
 
         match directive.as_str() {
             "auth-user-pass" => {
@@ -909,5 +918,20 @@ mod tests {
     fn the_first_cipher_directive_is_reported() {
         let parsed = parse_ovpn_conf("client\ncipher AES-128-CBC\ncipher BF-CBC\n").unwrap();
         assert_eq!(parsed.cipher.as_deref(), Some("AES-128-CBC"));
+    }
+
+    /// Vortix routes on the tunnel device, which is wrong for a layer-2 TAP
+    /// (the host would ARP for every destination), so TAP is refused.
+    #[test]
+    fn tap_profiles_are_refused_with_a_reason() {
+        for body in [
+            "client\ndev tap\n",
+            "client\ndev tap0\n",
+            "client\ndev vpn0\ndev-type tap\n",
+        ] {
+            let error = parse_ovpn_conf(body).unwrap_err().to_string();
+            assert!(error.contains("TAP"), "{body}: {error}");
+        }
+        assert!(parse_ovpn_conf("client\ndev tun\n").is_ok());
     }
 }

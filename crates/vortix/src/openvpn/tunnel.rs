@@ -1360,13 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_kernel_interface_extracts_tap_device() {
-        // OpenVPN TAP (layer-2) mode produces `tap0`, not `tun0`.
-        let log = "TUN/TAP device tap0 opened\n";
-        assert_eq!(parse_kernel_interface(log), Some("tap0".to_string()));
-    }
-
-    #[test]
     fn parse_kernel_interface_extracts_renamed_linux_device() {
         // Linux profile with `dev mycorp` produces a kernel iface named
         // `mycorp` — nothing to do with `tun`/`utun`. The pattern-based

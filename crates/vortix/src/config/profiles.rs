@@ -230,7 +230,7 @@ fn parse_openvpn_config(content: &str, path: &Path) -> Result<(String, String), 
         .unwrap_or("unknown")
         .to_string();
 
-    let mut server = String::new();
+    let parsed = crate::openvpn::parser::parse_ovpn_conf(content).map_err(|e| e.to_string())?;
     let mut has_openvpn_structure = false;
 
     // Known OpenVPN directives (presence of any confirms this is an OpenVPN config)
@@ -262,14 +262,6 @@ fn parse_openvpn_config(content: &str, path: &Path) -> Result<(String, String), 
         let trimmed = line.trim();
         let lower_line = trimmed.to_lowercase();
 
-        // Check for remote directive
-        if server.is_empty() && lower_line.starts_with("remote ") {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                server = parts[1].to_string();
-            }
-        }
-
         // Check for any OpenVPN directive
         if !has_openvpn_structure
             && (lower_line == "client"
@@ -280,7 +272,7 @@ fn parse_openvpn_config(content: &str, path: &Path) -> Result<(String, String), 
         }
     }
 
-    if server.is_empty() {
+    if parsed.remotes.is_empty() {
         return Err("No 'remote' directive found in OpenVPN config".to_string());
     }
 
@@ -965,5 +957,13 @@ MIIDqzCCApOgAwIB...
         std::fs::write(dir.path().join("test_1.conf"), "also existing").unwrap();
         let path2 = get_unique_path(dir.path(), "test.conf");
         assert_eq!(path2.file_name().unwrap(), "test_2.conf");
+    }
+
+    #[test]
+    fn import_refuses_what_the_openvpn_parser_refuses() {
+        let path = std::path::Path::new("/tmp/tap.ovpn");
+        let error =
+            parse_openvpn_config("client\ndev tap\nremote 192.0.2.1 1194\n", path).unwrap_err();
+        assert!(error.contains("TAP"), "{error}");
     }
 }
