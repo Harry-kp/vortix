@@ -23,7 +23,7 @@ use std::path::Path;
 
 use crate::platform::{SocketAuditResult, SocketProtocol, SocketSnapshot};
 
-/// Marker type implementing the [`SocketAudit`] trait for Linux.
+/// Linux socket audit read from `/proc/net`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcSocketAudit;
 

@@ -19,11 +19,13 @@ step "xtask";     for check in check-subprocess check-platform-leak check-protoc
                   done
 
 if [[ "$(uname)" == "Darwin" ]] && rustup target list --installed | grep -q x86_64-unknown-linux-gnu; then
-  step "clippy (linux target)"
   sdk=$(xcrun --show-sdk-path)
-  CC_x86_64_unknown_linux_gnu=clang AR_x86_64_unknown_linux_gnu=ar \
-  CFLAGS_x86_64_unknown_linux_gnu="--target=x86_64-unknown-linux-gnu -isystem $sdk/usr/include" \
-    cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+  export CC_x86_64_unknown_linux_gnu=clang AR_x86_64_unknown_linux_gnu=ar
+  export CFLAGS_x86_64_unknown_linux_gnu="--target=x86_64-unknown-linux-gnu -isystem $sdk/usr/include"
+  step "clippy (linux target)"
+  cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+  step "doc (linux target)"
+  RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --target x86_64-unknown-linux-gnu
 else
   step "clippy (linux target) skipped: run 'rustup target add x86_64-unknown-linux-gnu' on macOS"
 fi

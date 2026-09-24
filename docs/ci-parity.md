@@ -13,11 +13,11 @@ If your PR mixes a doc change with anything else (any `.rs`, `Cargo.toml`, `Carg
 ## One command
 
 ```bash
-scripts/ci-local.sh           # full set, including the Linux cross-clippy on macOS
+scripts/ci-local.sh           # full set, including Linux cross-clippy and rustdoc on macOS
 scripts/ci-local.sh --quick   # skips the release build
 ```
 
-The script runs steps 1 and 3–6 below, the Linux cross-clippy (Trap 2) and the release build from step 7; run `release_smoke.sh` by hand when step 7 applies. Steps are listed so a failure can be re-run on its own.
+The script runs steps 1 and 3–6 below, then clippy and rustdoc for the Linux target (Trap 2; CI builds docs on Linux, so a doc link to a macOS-only item fails only there), and without `--quick` the release build and `release_smoke.sh` from step 7. Steps are listed so a failure can be re-run on its own.
 
 ## The full set
 
@@ -118,7 +118,7 @@ cargo fmt --all -- --check
 | Tight edit loop on a single function | `cargo check -p vortix --lib` |
 | Before opening a PR or pushing | `scripts/ci-local.sh` |
 | After dependency bumps (rand, sha2, libc, tokio) | Full set above + manual smoke per `docs/manual-testing/<feature>.md` |
-| After cross-platform code touches | `scripts/ci-local.sh` (includes the Linux cross-clippy on macOS) |
+| After cross-platform code touches | `scripts/ci-local.sh` (includes Linux cross-clippy and rustdoc on macOS) |
 | Checking a build-time or binary-size regression | `scripts/bench-build.sh` — see [`docs/performance.md`](performance.md) |
 | After touching a cargo profile, a dependency feature, or CLI output | Full set **including step 7** |
 
