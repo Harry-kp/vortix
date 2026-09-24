@@ -171,9 +171,14 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
         format!("Extracted filename: {filename}"),
     );
 
-    // Create target path in temp directory
-    let profiles_dir = std::env::temp_dir();
-    let target_path = crate::config::profiles::get_unique_path(&profiles_dir, &filename);
+    // A private directory: the shared temp dir let other local users read
+    // the downloaded keys and plant a symlink at the predictable name.
+    let download_dir = crate::config::get_config_dir()
+        .map_err(|error| format!("cannot resolve the download directory: {error}"))?
+        .join("downloads");
+    crate::config::owned_file::create_private_dir_all(&download_dir)
+        .map_err(|error| format!("cannot create the download directory: {error}"))?;
+    let target_path = crate::config::profiles::get_unique_path(&download_dir, &filename);
 
     // Use curl to download directly to file
     // -f: Fail silently on HTTP errors (returns exit code)
@@ -301,7 +306,8 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
 /// Remove a temp file left over from a URL download.
 /// Logs on failure but never propagates errors — the import already succeeded.
 pub fn cleanup_temp_download(path: &std::path::Path) {
-    if path.exists() && path.starts_with(std::env::temp_dir()) {
+    let downloads = crate::config::get_config_dir().map(|dir| dir.join("downloads"));
+    if path.exists() && downloads.is_ok_and(|dir| path.starts_with(dir)) {
         if let Err(e) = std::fs::remove_file(path) {
             logger::log(
                 LogLevel::Warning,
@@ -417,8 +423,10 @@ mod more_tests {
     }
 
     #[test]
-    fn cleanup_removes_temp_file() {
-        let dir = std::env::temp_dir();
+    fn cleanup_removes_a_downloaded_file() {
+        let (_config, _guard) = crate::config::set_temp_config_dir();
+        let dir = crate::config::get_config_dir().unwrap().join("downloads");
+        crate::config::owned_file::create_private_dir_all(&dir).unwrap();
         let path = dir.join("vortix-test-cleanup.ovpn");
         std::fs::write(&path, "test").unwrap();
         assert!(path.exists());
@@ -427,13 +435,16 @@ mod more_tests {
     }
 
     #[test]
-    fn cleanup_ignores_non_temp_path() {
+    fn cleanup_ignores_files_outside_the_download_dir() {
         let dir = std::env::current_dir().unwrap();
         let path = dir.join("vortix-test-cleanup-nontmp.ovpn");
         std::fs::write(&path, "test").unwrap();
         assert!(path.exists());
         cleanup_temp_download(&path);
-        assert!(path.exists(), "file outside temp dir must not be deleted");
+        assert!(
+            path.exists(),
+            "file outside the download dir must not be deleted"
+        );
         std::fs::remove_file(&path).unwrap();
     }
 
