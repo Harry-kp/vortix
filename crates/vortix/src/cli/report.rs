@@ -190,9 +190,7 @@ fn loaded_killswitch_summary(
     >,
 ) -> String {
     match loaded {
-        Ok(Some(persisted)) => {
-            persisted_killswitch_summary(persisted.mode, persisted.recovered_state())
-        }
+        Ok(Some(persisted)) => persisted_killswitch_summary(persisted.mode, persisted.live_state()),
         Ok(None) => crate::control::killswitch::KillSwitchMode::Off
             .display_name()
             .to_string(),

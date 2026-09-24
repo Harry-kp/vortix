@@ -720,6 +720,25 @@ impl PersistedState {
             KillSwitchState::Degraded
         }
     }
+
+    /// [`Self::recovered_state`], except that a `Blocking` record without
+    /// in-process proof is re-proved by reading the firewall back, so another
+    /// process does not report a working kill switch as degraded.
+    #[must_use]
+    pub fn live_state(&self) -> KillSwitchState {
+        let recovered = self.recovered_state();
+        let claims_blocking =
+            self.effective_state.unwrap_or(self.state) == KillSwitchState::Blocking;
+        if recovered == KillSwitchState::Degraded
+            && claims_blocking
+            && active_from_persisted(&self.active_tunnels)
+                .is_some_and(|active| crate::platform::Firewall::verify_blocking(&active).is_ok())
+        {
+            KillSwitchState::Blocking
+        } else {
+            recovered
+        }
+    }
 }
 
 /// Why persisted kill-switch truth could not be loaded safely.
@@ -1022,7 +1041,11 @@ fn save_state_with_options_at(
 }
 
 fn policy_digest_from_persisted(active: &[PersistedTunnelInfo]) -> Option<String> {
-    let parsed: Option<Vec<ActiveTunnelInfo>> = active
+    active_from_persisted(active).map(|active| policy_digest(&active))
+}
+
+fn active_from_persisted(active: &[PersistedTunnelInfo]) -> Option<Vec<ActiveTunnelInfo>> {
+    active
         .iter()
         .map(|tunnel| {
             Some(ActiveTunnelInfo {
@@ -1040,8 +1063,7 @@ fn policy_digest_from_persisted(active: &[PersistedTunnelInfo]) -> Option<String
                 is_primary: tunnel.is_primary,
             })
         })
-        .collect();
-    parsed.map(|active| policy_digest(&active))
+        .collect()
 }
 
 /// Convenience helper: build a `PersistedTunnelInfo` slice from
@@ -1099,7 +1121,7 @@ fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
 #[must_use]
 pub fn persisted() -> (KillSwitchMode, KillSwitchState) {
     match load_state_checked() {
-        Ok(Some(persisted)) => (persisted.mode, persisted.recovered_state()),
+        Ok(Some(persisted)) => (persisted.mode, persisted.live_state()),
         Ok(None) => (KillSwitchMode::default(), KillSwitchState::default()),
         Err(error) => {
             tracing::warn!(%error, "kill-switch state could not be verified");
