@@ -56,6 +56,7 @@ fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
             pid: Some(12_345),
             ..Default::default()
         },
+        health: crate::core::engine::state::ConnectionHealth::default(),
     });
     snapshot
         .tunnels
@@ -2382,6 +2383,27 @@ fn a_control_snapshot_feeds_the_registry_default_route() {
 }
 
 #[test]
+fn a_stale_wireguard_handshake_reaches_the_dashboard() {
+    use crate::core::engine::state::{ConnectionHealth, DegradedReason};
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    set_connected(&mut app, "corp");
+    let mut snapshot = (*app.control_snapshot).clone();
+    let stale = ConnectionHealth::Degraded {
+        reason: DegradedReason::WireGuardPeerStale {
+            peer_public_key: "peer".into(),
+            allowed_routes: vec!["10.0.0.0/24".into()],
+            seconds_since_last_handshake: 300,
+        },
+    };
+    snapshot.tunnels[0].health = stale.clone();
+    snapshot.version += 1;
+    let profile_id = snapshot.tunnels[0].profile_id.clone();
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
+    assert_eq!(app.registry.snapshot(&profile_id).unwrap().health, stale);
+}
+
+#[test]
 fn an_unexpected_drop_counts_once() {
     use crate::control::state::Phase;
     use crate::control::{Snapshot, TunnelView};
@@ -2397,6 +2419,7 @@ fn an_unexpected_drop_counts_once() {
         routes: Vec::new(),
         dns: Vec::new(),
         details: crate::core::engine::state::DetailedConnectionInfo::default(),
+        health: crate::core::engine::state::ConnectionHealth::default(),
     };
     for phase in [
         Phase::Up,

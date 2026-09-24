@@ -338,6 +338,111 @@ fn receipt_path(config_dir: &Path, profile_id: &ProfileId) -> PathBuf {
     config_dir.join(DIRECTORY).join(format!("{key}.json"))
 }
 
+/// Last accepted counter sample for one `WireGuard` peer. Cumulative byte
+/// totals are not activity by themselves: only a positive delta between two
+/// ordered observations advances `last_transfer_at`.
+#[derive(Debug, Clone)]
+pub struct WireGuardPeerActivity {
+    pub bytes_rx: u64,
+    pub bytes_tx: u64,
+    pub observed_at: std::time::SystemTime,
+    pub last_transfer_at: Option<std::time::SystemTime>,
+}
+
+/// Per-peer counter history, keyed by public key.
+pub type PeerActivity = std::collections::HashMap<String, WireGuardPeerActivity>;
+
+/// Classify a `WireGuard` tunnel from its peers. `activity` carries byte
+/// counters between observations so a transfer counts as traffic.
+pub fn health_from_peers(
+    peers: &[crate::core::ports::tunnel::TunnelPeerStatus],
+    activity: &mut PeerActivity,
+    probe_receipts: &[crate::core::ports::tunnel::ProbeReceipt],
+    stale_after: std::time::Duration,
+) -> crate::core::engine::state::ConnectionHealth {
+    use crate::core::engine::state::{ConnectionHealth, DegradedReason};
+    use crate::core::ports::tunnel::{
+        classify_peer_handshake_health, PeerHandshakeHealth, PeerTrafficExpectation,
+    };
+
+    let now = std::time::SystemTime::now();
+    let expectation_window = stale_after.saturating_mul(2);
+    let mut expected_peers = 0_usize;
+    for peer in peers {
+        let peer_activity =
+            activity
+                .entry(peer.public_key.clone())
+                .or_insert(WireGuardPeerActivity {
+                    bytes_rx: peer.bytes_rx,
+                    bytes_tx: peer.bytes_tx,
+                    observed_at: peer.evidence_observed_at,
+                    last_transfer_at: None,
+                });
+        if peer.evidence_observed_at > peer_activity.observed_at {
+            if peer.bytes_rx > peer_activity.bytes_rx || peer.bytes_tx > peer_activity.bytes_tx {
+                peer_activity.last_transfer_at = Some(peer.evidence_observed_at);
+            }
+            peer_activity.bytes_rx = peer.bytes_rx;
+            peer_activity.bytes_tx = peer.bytes_tx;
+            peer_activity.observed_at = peer.evidence_observed_at;
+        }
+
+        let recent_transfer = peer_activity.last_transfer_at.is_some_and(|at| {
+            now.duration_since(at)
+                .is_ok_and(|age| age <= expectation_window)
+        });
+        // An actually-issued probe is durable connection metadata. Aging the
+        // issue timestamp out would silently turn a stale expected peer into
+        // Unknown even though the connection policy still expects that peer
+        // to remain fresh. Absence/explicit replacement removes the receipt;
+        // a fresh handshake clears the degraded result naturally.
+        let configured_probe = probe_receipts.iter().find(|record| {
+            record.peer_public_key == peer.public_key
+                && record.allowed_routes == peer.allowed_routes
+        });
+        let expectation = if peer.keepalive_expected() {
+            PeerTrafficExpectation::PersistentKeepalive
+        } else if recent_transfer {
+            PeerTrafficExpectation::RoutedTraffic
+        } else if let Some(record) = configured_probe {
+            PeerTrafficExpectation::ConfiguredProbe {
+                target: record.target,
+            }
+        } else {
+            PeerTrafficExpectation::Idle
+        };
+        if !matches!(expectation, PeerTrafficExpectation::Idle) {
+            expected_peers += 1;
+        }
+        match classify_peer_handshake_health(peer, now, &expectation, stale_after) {
+            PeerHandshakeHealth::Stale { age } => {
+                return ConnectionHealth::Degraded {
+                    reason: DegradedReason::WireGuardPeerStale {
+                        peer_public_key: peer.public_key.clone(),
+                        allowed_routes: peer.allowed_routes.clone(),
+                        seconds_since_last_handshake: age.as_secs(),
+                    },
+                };
+            }
+            PeerHandshakeHealth::NeverObserved => {
+                return ConnectionHealth::Degraded {
+                    reason: DegradedReason::WireGuardPeerNeverObserved {
+                        peer_public_key: peer.public_key.clone(),
+                        allowed_routes: peer.allowed_routes.clone(),
+                    },
+                };
+            }
+            PeerHandshakeHealth::Healthy { .. } | PeerHandshakeHealth::InformationalIdle { .. } => {
+            }
+        }
+    }
+    if expected_peers > 0 {
+        ConnectionHealth::Healthy
+    } else {
+        ConnectionHealth::Unknown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

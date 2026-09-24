@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::{App, InputMode, ToastType};
 use crate::control::{Command, Level, Phase, Snapshot, TunnelView};
 use crate::core::engine::registry::{Role, TunnelSnapshot};
-use crate::core::engine::state::{Connection, ConnectionHealth, PromptKind};
+use crate::core::engine::state::{Connection, PromptKind};
 use crate::core::engine::Conflict;
 use crate::core::profile::ProfileId;
 use crate::utils;
@@ -80,7 +80,7 @@ fn tunnel_snapshot(snapshot: &Snapshot, tunnel: &TunnelView) -> TunnelSnapshot {
         profile_id: tunnel.profile_id.clone(),
         state,
         role,
-        health: ConnectionHealth::default(),
+        health: tunnel.health.clone(),
         interface_name: tunnel.interface.clone(),
         started_at: Some(tunnel.since),
     }

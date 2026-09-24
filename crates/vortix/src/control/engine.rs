@@ -93,6 +93,13 @@ pub(super) struct Engine {
     last_connected: BTreeMap<ProfileId, SystemTime>,
     last_generation: u64,
     hooks: Option<(tokio::runtime::Runtime, crate::hooks::HookRunner)>,
+    health: BTreeMap<
+        ProfileId,
+        (
+            crate::core::engine::state::ConnectionHealth,
+            crate::core::managed_wireguard::PeerActivity,
+        ),
+    >,
 }
 
 impl Engine {
@@ -131,6 +138,7 @@ impl Engine {
         let mut engine = Self {
             net: Net::new(config.config_dir.clone(), NetworkPlan::default()),
             hooks: start_hooks(&config.config_dir),
+            health: BTreeMap::new(),
             config,
             state: State::new(kill_switch),
             entries,
@@ -499,8 +507,58 @@ impl Engine {
                 })
                 .map(|session| session.name.clone())
                 .collect();
+            self.observe_wireguard_health(&result.sessions);
         }
         self.scan = Some(result);
+    }
+
+    /// Track handshake health of each up `WireGuard` tunnel Vortix manages,
+    /// recording changes in its receipt and the journal.
+    fn observe_wireguard_health(&mut self, sessions: &[ActiveSession]) {
+        let up = self
+            .state
+            .tunnels()
+            .filter(|tunnel| {
+                tunnel.phase == Phase::Up && tunnel.spec.protocol == ProtocolKind::WireGuard
+            })
+            .map(|tunnel| (tunnel.spec.profile_id.clone(), tunnel.spec.name.clone()))
+            .collect::<Vec<_>>();
+        self.health
+            .retain(|profile_id, _| up.iter().any(|(id, _)| id == profile_id));
+        for (profile_id, name) in up {
+            let Some(session) = session(sessions, &name) else {
+                continue;
+            };
+            let Some(mut receipt) =
+                crate::core::managed_wireguard::load(&self.config.config_dir, &profile_id)
+                    .filter(|receipt| receipt.validates(&profile_id, session))
+            else {
+                continue;
+            };
+            let (health, activity) = self.health.entry(profile_id.clone()).or_default();
+            let current = crate::core::managed_wireguard::health_from_peers(
+                &session.wireguard_peers,
+                activity,
+                &receipt.probe_receipts,
+                self.config.wireguard_stale_after,
+            );
+            if let Ok(Some(old)) = crate::core::managed_wireguard::update_health(
+                &self.config.config_dir,
+                &mut receipt,
+                current.clone(),
+            ) {
+                if let Some(journal) = crate::core::journal::global_journal() {
+                    let _ = journal.append(
+                        crate::core::journal::JournalEvent::ConnectionHealthChanged {
+                            profile_id: profile_id.clone(),
+                            old,
+                            new: current.clone(),
+                        },
+                    );
+                }
+            }
+            *health = current;
+        }
     }
 
     fn lost(&mut self, profile_id: &ProfileId) {
@@ -806,6 +864,11 @@ impl Engine {
                 details: scan
                     .and_then(|scan| session(&scan.sessions, &tunnel.spec.name))
                     .map(details)
+                    .unwrap_or_default(),
+                health: self
+                    .health
+                    .get(&tunnel.spec.profile_id)
+                    .map(|(health, _)| health.clone())
                     .unwrap_or_default(),
             })
             .collect::<Vec<_>>();

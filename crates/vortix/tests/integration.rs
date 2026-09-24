@@ -113,6 +113,7 @@ fn set_projection(app: &mut App, name: &str, state: &vortix::core::engine::state
             interface: "wg0".into(),
             ..Default::default()
         },
+        health: vortix::core::engine::state::ConnectionHealth::default(),
     });
     app.apply_control_snapshot(std::sync::Arc::new(snapshot));
 }

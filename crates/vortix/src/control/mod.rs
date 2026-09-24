@@ -95,6 +95,7 @@ pub struct TunnelView {
     pub routes: Vec<Cidr>,
     pub dns: Vec<IpAddr>,
     pub details: DetailedConnectionInfo,
+    pub health: crate::core::engine::state::ConnectionHealth,
 }
 
 impl TunnelView {
@@ -177,6 +178,7 @@ pub struct Config {
     pub max_retries: u32,
     pub retry_base: Duration,
     pub retry_max: Duration,
+    pub wireguard_stale_after: Duration,
 }
 
 impl Config {
@@ -195,6 +197,7 @@ impl Config {
             openvpn_timeout: Duration::from_secs(
                 config.connect_operation_timeout_secs(ProtocolKind::OpenVpn),
             ),
+            wireguard_stale_after: Duration::from_secs(config.wireguard_handshake_stale_secs),
             wireguard_timeout: Duration::from_secs(
                 config.connect_operation_timeout_secs(ProtocolKind::WireGuard),
             ),
