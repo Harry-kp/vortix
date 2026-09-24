@@ -20,7 +20,6 @@ use crate::core::profile::{Profile, ProfileId, ProtocolKind};
 use crate::core::scanner::ActiveSession;
 use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
-use crate::state::Protocol;
 
 use crate::core::ports::tunnel::{TunnelError, TunnelStatus};
 use crate::openvpn::OvpnTunnel;
@@ -101,13 +100,6 @@ fn classify(error: &str) -> StartError {
     }
 }
 
-fn protocol(profile: &Profile) -> Protocol {
-    match profile.protocol {
-        ProtocolKind::WireGuard => Protocol::WireGuard,
-        ProtocolKind::OpenVpn => Protocol::OpenVPN,
-    }
-}
-
 fn revision(generation: u64) -> TunnelRevision {
     TunnelRevision {
         authority_epoch: EPOCH,
@@ -127,7 +119,7 @@ pub fn start(
 ) -> Result<Live, StartError> {
     let deadline = Instant::now() + timeout;
     let mut kind = tunnel_for_with_wireguard_policy(
-        protocol(profile),
+        profile.protocol,
         &settings.config_dir,
         &settings.openvpn_verbosity,
         settings.connect_timeout_secs,
@@ -213,7 +205,7 @@ pub fn adopt(
             };
             Ok(Some(Live {
                 kind: tunnel_for(
-                    Protocol::WireGuard,
+                    ProtocolKind::WireGuard,
                     &settings.config_dir,
                     &settings.openvpn_verbosity,
                     settings.connect_timeout_secs,
@@ -226,7 +218,7 @@ pub fn adopt(
                 return Ok(None);
             };
             let kind = tunnel_for(
-                Protocol::OpenVPN,
+                ProtocolKind::OpenVpn,
                 &settings.config_dir,
                 &settings.openvpn_verbosity,
                 settings.connect_timeout_secs,
@@ -467,14 +459,14 @@ pub(crate) fn standard_openvpn_owner(
 /// protocol again. Adding a third protocol means adding one variant here.
 #[must_use]
 pub fn tunnel_for(
-    protocol: Protocol,
+    protocol: ProtocolKind,
     config_dir: &Path,
     ovpn_verbosity: &str,
     connect_timeout_secs: u64,
 ) -> TunnelKind {
     match protocol {
-        Protocol::WireGuard => TunnelKind::WireGuard(WgTunnel::new()),
-        Protocol::OpenVPN => TunnelKind::OpenVpn(
+        ProtocolKind::WireGuard => TunnelKind::WireGuard(WgTunnel::new()),
+        ProtocolKind::OpenVpn => TunnelKind::OpenVpn(
             OvpnTunnel::new(config_dir.join(crate::constants::OPENVPN_RUN_DIR))
                 .with_auth_dir(config_dir.join(crate::constants::OPENVPN_AUTH_DIR))
                 .with_verbosity(ovpn_verbosity)
@@ -486,7 +478,7 @@ pub fn tunnel_for(
 /// Construct a tunnel with the configured `WireGuard` handshake gate.
 #[must_use]
 pub fn tunnel_for_with_wireguard_policy(
-    protocol: Protocol,
+    protocol: ProtocolKind,
     config_dir: &Path,
     ovpn_verbosity: &str,
     connect_timeout_secs: u64,
@@ -494,7 +486,7 @@ pub fn tunnel_for_with_wireguard_policy(
     wireguard_health_targets: &[String],
 ) -> TunnelKind {
     match protocol {
-        Protocol::WireGuard => TunnelKind::WireGuard(
+        ProtocolKind::WireGuard => TunnelKind::WireGuard(
             WgTunnel::new().with_handshake_policy(
                 std::time::Duration::from_secs(wireguard_handshake_timeout_secs),
                 wireguard_health_targets
@@ -502,7 +494,9 @@ pub fn tunnel_for_with_wireguard_policy(
                     .filter_map(|target| target.parse().ok()),
             ),
         ),
-        Protocol::OpenVPN => tunnel_for(protocol, config_dir, ovpn_verbosity, connect_timeout_secs),
+        ProtocolKind::OpenVpn => {
+            tunnel_for(protocol, config_dir, ovpn_verbosity, connect_timeout_secs)
+        }
     }
 }
 
@@ -512,13 +506,5 @@ pub fn tunnel_for_with_wireguard_policy(
 /// translates at the trait boundary.
 #[must_use]
 pub fn profile_view(p: &VpnProfile) -> Profile {
-    Profile::new(
-        p.id.clone(),
-        &p.name,
-        match p.protocol {
-            Protocol::WireGuard => ProtocolKind::WireGuard,
-            Protocol::OpenVPN => ProtocolKind::OpenVpn,
-        },
-        p.config_path.clone(),
-    )
+    Profile::new(p.id.clone(), &p.name, p.protocol, p.config_path.clone())
 }

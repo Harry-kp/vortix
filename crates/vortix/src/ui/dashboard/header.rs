@@ -262,8 +262,8 @@ fn connected_line(
         .iter()
         .find(|p| p.name == profile_name)
         .map_or("", |p| match p.protocol {
-            crate::state::Protocol::WireGuard => "WG",
-            crate::state::Protocol::OpenVPN => "OVPN",
+            crate::core::profile::ProtocolKind::WireGuard => "WG",
+            crate::core::profile::ProtocolKind::OpenVpn => "OVPN",
         });
 
     let proto_suffix = if proto_tag.is_empty() {
@@ -375,7 +375,7 @@ fn render_primary_line(
                         .iter()
                         .find(|profile| profile.id == primary_snap.profile_id)
                         .is_some_and(|profile| {
-                            profile.protocol == crate::state::Protocol::WireGuard
+                            profile.protocol == crate::core::profile::ProtocolKind::WireGuard
                         }) =>
                 {
                     "HANDSHAKING"
@@ -821,7 +821,7 @@ mod tests {
         out
     }
 
-    fn app_handshaking(protocol: crate::state::Protocol) -> App {
+    fn app_handshaking(protocol: crate::core::profile::ProtocolKind) -> App {
         let mut app = App::new_test();
         app.runtime.profiles.push(crate::state::VpnProfile {
             id: ProfileId::new("corp"),
@@ -856,11 +856,19 @@ mod tests {
 
     #[test]
     fn compact_header_uses_protocol_specific_connect_label() {
-        let wg = render_to_string(&app_handshaking(crate::state::Protocol::WireGuard), 80, 1);
+        let wg = render_to_string(
+            &app_handshaking(crate::core::profile::ProtocolKind::WireGuard),
+            80,
+            1,
+        );
         assert!(wg.contains("HANDSHAKING"), "{wg}");
         assert!(!wg.contains("NO EXIT"), "{wg}");
 
-        let ovpn = render_to_string(&app_handshaking(crate::state::Protocol::OpenVPN), 80, 1);
+        let ovpn = render_to_string(
+            &app_handshaking(crate::core::profile::ProtocolKind::OpenVpn),
+            80,
+            1,
+        );
         assert!(ovpn.contains("CONNECTING"), "{ovpn}");
         assert!(!ovpn.contains("HANDSHAKING"), "{ovpn}");
     }

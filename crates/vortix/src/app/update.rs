@@ -5,8 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use super::{App, ConnectionState, FocusedPanel, InputMode, Protocol, ToastType};
+use super::{App, ConnectionState, FocusedPanel, InputMode, ToastType};
 use crate::constants;
+use crate::core::profile::ProtocolKind;
 use crate::core::telemetry::TelemetryUpdate;
 use crate::logger;
 use crate::message::{Message, ScrollMove, SelectionMove};
@@ -416,7 +417,7 @@ impl App {
     fn handle_manage_auth(&mut self) {
         if let Some(idx) = self.profile_list_state.selected() {
             if let Some(profile) = self.runtime.profiles.get(idx) {
-                if !matches!(profile.protocol, Protocol::OpenVPN) {
+                if !matches!(profile.protocol, ProtocolKind::OpenVpn) {
                     self.show_toast(
                         "Auth credentials only apply to OpenVPN profiles".to_string(),
                         ToastType::Info,
@@ -484,7 +485,7 @@ impl App {
     fn handle_clear_auth(&mut self) {
         if let Some(idx) = self.profile_list_state.selected() {
             if let Some(profile) = self.runtime.profiles.get(idx) {
-                let is_openvpn = matches!(profile.protocol, Protocol::OpenVPN);
+                let is_openvpn = matches!(profile.protocol, ProtocolKind::OpenVpn);
                 let has_auth = utils::openvpn_config_needs_auth(&profile.config_path);
                 let name = profile.name.clone();
                 let profile_id = profile.id.clone();

@@ -4,7 +4,7 @@ use crate::config::profile_store::{FsProfileStore, ProfileStore};
 use crate::constants;
 use crate::core::profile::{Profile, ProfileId, ProtocolKind};
 use crate::logger::{self, LogLevel};
-use crate::state::{Protocol, VpnProfile};
+use crate::state::VpnProfile;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -74,7 +74,7 @@ pub(crate) fn prepare_profile_import(
     })?;
 
     let protocol = match extension.as_str() {
-        "ovpn" => Protocol::OpenVPN,
+        "ovpn" => ProtocolKind::OpenVpn,
         "conf" => {
             // .conf is ambiguous -- use content-based detection
             detect_protocol_from_content(&content)
@@ -91,7 +91,7 @@ pub(crate) fn prepare_profile_import(
         }
     };
 
-    if protocol == Protocol::WireGuard {
+    if protocol == ProtocolKind::WireGuard {
         let interface_name = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -105,8 +105,8 @@ pub(crate) fn prepare_profile_import(
 
     // Extract and validate profile info
     let (name, location) = match protocol {
-        Protocol::WireGuard => parse_wireguard_config(&content, path)?,
-        Protocol::OpenVPN => parse_openvpn_config(&content, path)?,
+        ProtocolKind::WireGuard => parse_wireguard_config(&content, path)?,
+        ProtocolKind::OpenVpn => parse_openvpn_config(&content, path)?,
     };
 
     let dest_filename = format!("{name}.{extension}");
@@ -123,15 +123,7 @@ pub(crate) fn prepare_profile_import(
 
     let id =
         ProfileId::generate().map_err(|error| format!("Failed to create profile ID: {error}"))?;
-    let stored = Profile::new(
-        id.clone(),
-        &name,
-        match protocol {
-            Protocol::WireGuard => ProtocolKind::WireGuard,
-            Protocol::OpenVPN => ProtocolKind::OpenVpn,
-        },
-        dest_path.clone(),
-    );
+    let stored = Profile::new(id.clone(), &name, protocol, dest_path.clone());
     Ok(PreparedProfileImport {
         stored,
         raw_body: Zeroizing::new(content.into_bytes().into_boxed_slice()),
@@ -172,7 +164,7 @@ pub(crate) fn commit_profile_import(
 ///
 /// `WireGuard` configs have `[Interface]` and `[Peer]` INI-style sections.
 /// `OpenVPN` configs have directives like `remote`, `client`, `dev`, `proto`.
-fn detect_protocol_from_content(content: &str) -> Protocol {
+fn detect_protocol_from_content(content: &str) -> ProtocolKind {
     let lower = content.to_lowercase();
     let has_interface = lower.contains("[interface]");
     let has_peer = lower.contains("[peer]");
@@ -185,12 +177,12 @@ fn detect_protocol_from_content(content: &str) -> Protocol {
     });
 
     if has_interface && has_peer {
-        Protocol::WireGuard
+        ProtocolKind::WireGuard
     } else if has_remote || has_openvpn_markers {
-        Protocol::OpenVPN
+        ProtocolKind::OpenVpn
     } else {
         // Default to WireGuard for .conf (historical behavior); validation will catch errors
-        Protocol::WireGuard
+        ProtocolKind::WireGuard
     }
 }
 
@@ -510,15 +502,12 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
     let mut profiles = Vec::new();
     let mut errors = 0;
     for summary in summaries {
-        let protocol = match summary.protocol {
-            ProtocolKind::WireGuard => Protocol::WireGuard,
-            ProtocolKind::OpenVpn => Protocol::OpenVPN,
-        };
+        let protocol = summary.protocol;
         let path = profiles_dir.join(&summary.config_file);
         if let Ok(content) = fs::read_to_string(&path) {
             let result = match protocol {
-                Protocol::WireGuard => parse_wireguard_config(&content, &path),
-                Protocol::OpenVPN => parse_openvpn_config(&content, &path),
+                ProtocolKind::WireGuard => parse_wireguard_config(&content, &path),
+                ProtocolKind::OpenVpn => parse_openvpn_config(&content, &path),
             };
             match result {
                 Ok((name, location)) => {
@@ -574,11 +563,11 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
 
     let wg_count = profiles
         .iter()
-        .filter(|p| matches!(p.protocol, Protocol::WireGuard))
+        .filter(|p| matches!(p.protocol, ProtocolKind::WireGuard))
         .count();
     let ovpn_count = profiles
         .iter()
-        .filter(|p| matches!(p.protocol, Protocol::OpenVPN))
+        .filter(|p| matches!(p.protocol, ProtocolKind::OpenVpn))
         .count();
 
     logger::log(
@@ -627,7 +616,7 @@ mod tests {
         let loaded = load_profiles_from(profiles_dir.path());
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].protocol, Protocol::OpenVPN);
+        assert_eq!(loaded[0].protocol, ProtocolKind::OpenVpn);
         assert_eq!(loaded[0].config_path, config_path);
         assert!(
             loaded[0].last_used.is_some(),
@@ -917,7 +906,7 @@ MIIDqzCCApOgAwIB...
         let wg_config = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = xyz\nEndpoint = 1.2.3.4:51820\n";
         assert!(matches!(
             detect_protocol_from_content(wg_config),
-            Protocol::WireGuard
+            ProtocolKind::WireGuard
         ));
     }
 
@@ -926,7 +915,7 @@ MIIDqzCCApOgAwIB...
         let ovpn_config = "client\ndev tun\nproto udp\nremote vpn.example.com 1194\n";
         assert!(matches!(
             detect_protocol_from_content(ovpn_config),
-            Protocol::OpenVPN
+            ProtocolKind::OpenVpn
         ));
     }
 
@@ -936,7 +925,7 @@ MIIDqzCCApOgAwIB...
         let config = "dev tun\nremote server.example.com 443\nproto tcp\n";
         assert!(matches!(
             detect_protocol_from_content(config),
-            Protocol::OpenVPN
+            ProtocolKind::OpenVpn
         ));
     }
 
@@ -946,7 +935,7 @@ MIIDqzCCApOgAwIB...
         let config = "some random text\nwith no VPN directives\n";
         assert!(matches!(
             detect_protocol_from_content(config),
-            Protocol::WireGuard
+            ProtocolKind::WireGuard
         ));
     }
 

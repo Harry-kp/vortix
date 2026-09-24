@@ -14,8 +14,8 @@ pub mod connection {
 
     use std::time::Duration;
 
+    use crate::core::profile::ProtocolKind;
     use crate::core::scanner;
-    use crate::state::Protocol;
 
     use super::VpnRuntime;
 
@@ -158,7 +158,7 @@ pub mod connection {
                     // Direct scanner state is observation-only. Even a fresh or
                     // historically non-zero handshake timestamp cannot recreate
                     // the current attempt generation and ownership receipt.
-                    let observed_state = if matches!(proto, Some(Protocol::WireGuard)) {
+                    let observed_state = if matches!(proto, Some(ProtocolKind::WireGuard)) {
                         "handshaking"
                     } else {
                         "connected"
@@ -220,7 +220,7 @@ pub mod connection {
             let mut generation = None;
             if let Some(session) = session {
                 if let Some(profile) = self.profiles.iter().find(|profile| {
-                    profile.name == session.name && profile.protocol == Protocol::WireGuard
+                    profile.name == session.name && profile.protocol == ProtocolKind::WireGuard
                 }) {
                     if let Some(mut receipt) =
                         crate::core::managed_wireguard::load(&self.config_dir, &profile.id)
@@ -737,9 +737,10 @@ use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 use crate::constants;
+use crate::core::profile::ProtocolKind;
 use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::message::Message;
-use crate::state::{ProfileSortOrder, Protocol, VpnProfile};
+use crate::state::{ProfileSortOrder, VpnProfile};
 
 use crate::utils;
 
@@ -986,10 +987,10 @@ impl VpnRuntime {
                 });
             }
             ProfileSortOrder::Protocol => {
-                fn proto_rank(p: Protocol) -> u8 {
+                fn proto_rank(p: ProtocolKind) -> u8 {
                     match p {
-                        Protocol::WireGuard => 0,
-                        Protocol::OpenVPN => 1,
+                        ProtocolKind::WireGuard => 0,
+                        ProtocolKind::OpenVpn => 1,
                     }
                 }
                 self.profiles.sort_by(|a, b| {
@@ -1038,10 +1039,13 @@ impl VpnRuntime {
     /// builds silently drop `--pull-filter`, breaking multi-tunnel DNS
     /// scoping).
     #[must_use]
-    pub fn check_dependencies(protocol: Protocol, config_path: &std::path::Path) -> Vec<String> {
+    pub fn check_dependencies(
+        protocol: ProtocolKind,
+        config_path: &std::path::Path,
+    ) -> Vec<String> {
         let mut missing = Vec::new();
         match protocol {
-            Protocol::WireGuard => {
+            ProtocolKind::WireGuard => {
                 // Both `wg` and `wg-quick` ship in the wireguard-tools
                 // package on every supported distro — report them under
                 // a single label so the install hint isn't duplicated.
@@ -1079,7 +1083,7 @@ impl VpnRuntime {
                 #[cfg(not(target_os = "linux"))]
                 let _ = config_path; // suppress unused warning on non-Linux
             }
-            Protocol::OpenVPN => {
+            ProtocolKind::OpenVpn => {
                 if utils::binary_exists("openvpn") {
                     // Assert OpenVPN ≥ 2.4 so `--pull-filter` (multi-tunnel
                     // DNS scoping) is available. Older builds silently

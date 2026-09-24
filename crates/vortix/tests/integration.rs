@@ -17,9 +17,9 @@
 use std::sync::Once;
 use std::time::Instant;
 
-use vortix::app::{
-    App, ConnectionState, FocusedPanel, InputMode, Protocol, Toast, ToastType, VpnProfile,
-};
+use vortix::core::profile::ProtocolKind;
+
+use vortix::app::{App, ConnectionState, FocusedPanel, InputMode, Toast, ToastType, VpnProfile};
 use vortix::message::{Message, ScrollMove, SelectionMove};
 
 static INIT: Once = Once::new();
@@ -52,7 +52,7 @@ fn add_wg_profiles(app: &mut App, names: &[&str]) {
         app.runtime.profiles.push(VpnProfile {
             id: vortix::core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
             location: "Test".to_string(),
             last_used: None,
@@ -168,7 +168,7 @@ mod profile_import {
             "Valid WireGuard config should import: {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap().protocol, Protocol::WireGuard);
+        assert_eq!(result.unwrap().protocol, ProtocolKind::WireGuard);
     }
 
     #[test]
@@ -190,7 +190,7 @@ mod profile_import {
             "Valid OpenVPN config should import: {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap().protocol, Protocol::OpenVPN);
+        assert_eq!(result.unwrap().protocol, ProtocolKind::OpenVpn);
     }
 
     #[test]

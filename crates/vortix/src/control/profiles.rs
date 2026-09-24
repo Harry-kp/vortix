@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::cidr::Cidr;
 use crate::core::openvpn_routes::OpenVpnRedirectGateway;
 use crate::core::profile::{Profile, ProfileId, ProtocolKind, ResolvedEndpoint};
-use crate::state::{Protocol, VpnProfile};
+use crate::state::VpnProfile;
 
 use super::state::Spec;
 
@@ -127,7 +127,7 @@ fn parse(
         }
     };
     let (protocol, dns) = match profile.protocol {
-        Protocol::WireGuard => {
+        ProtocolKind::WireGuard => {
             let parsed =
                 crate::wireguard::parser::parse_wg_conf(body).map_err(|error| error.to_string())?;
             for peer in &parsed.peers {
@@ -145,7 +145,7 @@ fn parse(
             }
             (ProtocolKind::WireGuard, parsed.dns_request())
         }
-        Protocol::OpenVPN => {
+        ProtocolKind::OpenVpn => {
             let parsed =
                 crate::openvpn::parser::parse_ovpn_conf(body).map_err(|error| error.to_string())?;
             if parsed

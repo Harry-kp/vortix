@@ -27,26 +27,7 @@ mod profile {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
-    use crate::core::profile::ProfileId;
-
-    /// Supported VPN protocol types.
-    #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-    pub enum Protocol {
-        /// `WireGuard` VPN protocol.
-        #[default]
-        WireGuard,
-        /// `OpenVPN` protocol.
-        OpenVPN,
-    }
-
-    impl std::fmt::Display for Protocol {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Protocol::WireGuard => write!(f, "WireGuard"),
-                Protocol::OpenVPN => write!(f, "OpenVPN"),
-            }
-        }
-    }
+    use crate::core::profile::{ProfileId, ProtocolKind};
 
     /// VPN profile configuration.
     ///
@@ -58,7 +39,7 @@ mod profile {
         /// Display name for the profile.
         pub name: String,
         /// VPN protocol type (`WireGuard` or `OpenVPN`).
-        pub protocol: Protocol,
+        pub protocol: ProtocolKind,
         /// Geographic location or server identifier.
         pub location: String,
         /// Path to the configuration file on disk.
@@ -545,7 +526,7 @@ mod ui {
 
 // Re-export all types for easy access
 pub use killswitch::{KillSwitchMode, KillSwitchState};
-pub use profile::{Protocol, VpnProfile};
+pub use profile::VpnProfile;
 pub use ui::{
     help_max_scroll_for_terminal_height, AuthField, FlipState, FocusedPanel, HelpTab, InputMode,
     ProfileSortOrder, QualityLevel, SecretText, Toast, ToastType, DISMISS_DURATION,

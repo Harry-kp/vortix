@@ -7,7 +7,8 @@
 mod control_scenarios;
 
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
-use vortix::state::{Protocol, VpnProfile};
+use vortix::core::profile::ProtocolKind;
+use vortix::state::VpnProfile;
 use vortix::vpn_runtime::VpnRuntime;
 
 // ============================================================================
@@ -39,7 +40,7 @@ fn engine_find_profile_by_name() {
     engine.profiles.push(VpnProfile {
         id: vortix::core::profile::ProfileId::new("work-vpn"),
         name: "work-vpn".into(),
-        protocol: Protocol::WireGuard,
+        protocol: ProtocolKind::WireGuard,
         config_path: "/tmp/work.conf".into(),
         location: "US".into(),
         last_used: None,
@@ -47,7 +48,7 @@ fn engine_find_profile_by_name() {
     engine.profiles.push(VpnProfile {
         id: vortix::core::profile::ProfileId::new("personal"),
         name: "personal".into(),
-        protocol: Protocol::OpenVPN,
+        protocol: ProtocolKind::OpenVpn,
         config_path: "/tmp/personal.ovpn".into(),
         location: "EU".into(),
         last_used: None,
@@ -65,7 +66,7 @@ fn engine_sort_profiles_by_name() {
         engine.profiles.push(VpnProfile {
             id: vortix::core::profile::ProfileId::new(*name),
             name: (*name).into(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             config_path: format!("/tmp/{name}.conf").into(),
             location: "Test".into(),
             last_used: None,
@@ -89,7 +90,7 @@ fn engine_sort_profiles_by_protocol() {
     engine.profiles.push(VpnProfile {
         id: vortix::core::profile::ProfileId::new("ovpn-profile"),
         name: "ovpn-profile".into(),
-        protocol: Protocol::OpenVPN,
+        protocol: ProtocolKind::OpenVpn,
         config_path: "/tmp/a.ovpn".into(),
         location: "EU".into(),
         last_used: None,
@@ -97,7 +98,7 @@ fn engine_sort_profiles_by_protocol() {
     engine.profiles.push(VpnProfile {
         id: vortix::core::profile::ProfileId::new("wg-profile"),
         name: "wg-profile".into(),
-        protocol: Protocol::WireGuard,
+        protocol: ProtocolKind::WireGuard,
         config_path: "/tmp/b.conf".into(),
         location: "US".into(),
         last_used: None,
@@ -105,15 +106,15 @@ fn engine_sort_profiles_by_protocol() {
 
     engine.sort_order = vortix::state::ProfileSortOrder::Protocol;
     engine.sort_profiles();
-    assert_eq!(engine.profiles[0].protocol, Protocol::WireGuard);
-    assert_eq!(engine.profiles[1].protocol, Protocol::OpenVPN);
+    assert_eq!(engine.profiles[0].protocol, ProtocolKind::WireGuard);
+    assert_eq!(engine.profiles[1].protocol, ProtocolKind::OpenVpn);
 }
 
 #[test]
 fn engine_check_dependencies_wireguard() {
     // Use a dummy config path — the resolvconf check only matters on Linux
     let dummy = std::path::Path::new("/dev/null");
-    let missing = VpnRuntime::check_dependencies(Protocol::WireGuard, dummy);
+    let missing = VpnRuntime::check_dependencies(ProtocolKind::WireGuard, dummy);
     // In test env, wg-quick/wg may or may not be available; just ensure no panic
     assert!(missing.len() <= 3); // wg-quick, wg, and possibly resolvconf on Linux
 }

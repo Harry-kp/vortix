@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::profile::ProtocolKind;
 
 fn init_test_env() {
     use std::sync::Once;
@@ -119,7 +120,7 @@ fn add_profiles(app: &mut App, names: &[&str]) {
         app.runtime.profiles.push(VpnProfile {
             id: crate::core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
             location: "Test".to_string(),
             last_used: None,
@@ -149,7 +150,7 @@ fn add_stored_profile(
     app.runtime.profiles.push(VpnProfile {
         id: profile_id.clone(),
         name: name.to_string(),
-        protocol: Protocol::WireGuard,
+        protocol: ProtocolKind::WireGuard,
         config_path,
         location: "Test".to_string(),
         last_used: None,
@@ -631,7 +632,7 @@ fn test_open_config_caches_content_and_close_clears() {
     app.runtime.profiles.push(VpnProfile {
         id: crate::core::profile::ProfileId::new("test-vpn"),
         name: "test-vpn".to_string(),
-        protocol: Protocol::WireGuard,
+        protocol: ProtocolKind::WireGuard,
         config_path: tmp.path().to_path_buf(),
         location: "Test".to_string(),
         last_used: None,
@@ -1086,7 +1087,7 @@ fn test_rename_updates_last_connected_profile() {
     app.runtime.profiles.push(VpnProfile {
         id: stable_id.clone(),
         name: "old-name".to_string(),
-        protocol: Protocol::WireGuard,
+        protocol: ProtocolKind::WireGuard,
         config_path: conf_path,
         location: String::new(),
         last_used: None,
@@ -1182,7 +1183,7 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
     app.runtime.profiles.push(VpnProfile {
         id: crate::core::profile::ProfileId::new("active-vpn"),
         name: "active-vpn".to_string(),
-        protocol: Protocol::WireGuard,
+        protocol: ProtocolKind::WireGuard,
         config_path: conf_path,
         location: String::new(),
         last_used: None,
@@ -2202,7 +2203,7 @@ fn test_auth_delete_profile_cleans_auth_file() {
     app.runtime.profiles.push(VpnProfile {
         id: stable_id.clone(),
         name: "del-vpn".to_string(),
-        protocol: Protocol::OpenVPN,
+        protocol: ProtocolKind::OpenVpn,
         config_path,
         location: "Test".to_string(),
         last_used: None,

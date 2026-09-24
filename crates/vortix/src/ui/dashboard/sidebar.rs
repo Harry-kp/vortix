@@ -75,7 +75,7 @@ use ratatui::{
 /// between this renderer and the `?` help overlay's Sigils tab.
 fn status_badge_for(
     snapshot: &TunnelSnapshot,
-    protocol: Option<crate::state::Protocol>,
+    protocol: Option<crate::core::profile::ProtocolKind>,
 ) -> Option<(&'static str, Style)> {
     use crate::ui::sigils::sigil;
     let id = status_sigil_id(snapshot, protocol)?;
@@ -85,7 +85,7 @@ fn status_badge_for(
 
 fn status_sigil_id(
     snapshot: &TunnelSnapshot,
-    protocol: Option<crate::state::Protocol>,
+    protocol: Option<crate::core::profile::ProtocolKind>,
 ) -> Option<crate::ui::sigils::SigilId> {
     use crate::ui::sigils::SigilId;
     Some(match &snapshot.state {
@@ -103,7 +103,10 @@ fn status_sigil_id(
             }
         }
         Connection::Connecting { .. } => {
-            if matches!(protocol, Some(crate::state::Protocol::WireGuard)) {
+            if matches!(
+                protocol,
+                Some(crate::core::profile::ProtocolKind::WireGuard)
+            ) {
                 SigilId::Handshaking
             } else {
                 SigilId::Connecting
@@ -177,7 +180,7 @@ fn signal_for(
     snapshots: &[TunnelSnapshot],
     primary: Option<&ProfileId>,
     profile_id: &ProfileId,
-    protocol: crate::state::Protocol,
+    protocol: crate::core::profile::ProtocolKind,
 ) -> RowSignal {
     let Some(snap) = snapshots.iter().find(|s| &s.profile_id == profile_id) else {
         return RowSignal::empty();
@@ -264,8 +267,8 @@ fn profile_row(
     let name_cell = Cell::from(Line::from(name_spans));
 
     let proto_icon = match profile.protocol {
-        crate::app::Protocol::WireGuard => "WG",
-        crate::app::Protocol::OpenVPN => "OV",
+        crate::core::profile::ProtocolKind::WireGuard => "WG",
+        crate::core::profile::ProtocolKind::OpenVpn => "OV",
     };
     let proto_color = if is_selected {
         theme::current().row_selected_fg
@@ -439,7 +442,8 @@ mod tests {
     use crate::core::engine::registry::Role;
     use crate::core::engine::state::ConnectionHealth;
     use crate::core::profile::ProfileId;
-    use crate::state::{Protocol, VpnProfile};
+    use crate::core::profile::ProtocolKind;
+    use crate::state::VpnProfile;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -450,7 +454,7 @@ mod tests {
         VpnProfile {
             id: crate::core::profile::ProfileId::new(name),
             name: name.to_string(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             location: String::new(),
             config_path: PathBuf::from(format!("/tmp/{name}.conf")),
             last_used: None,
@@ -606,7 +610,7 @@ mod tests {
             &snapshots,
             None,
             &ProfileId::new("anything"),
-            Protocol::WireGuard,
+            ProtocolKind::WireGuard,
         );
         assert!(!sig.is_active);
         assert!(sig.badge.is_none());
@@ -625,7 +629,7 @@ mod tests {
             },
         );
         let (glyph, _) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connected → badge");
+            status_badge_for(&snap, Some(ProtocolKind::WireGuard)).expect("connected → badge");
         assert_eq!(glyph, "●");
     }
 
@@ -633,7 +637,7 @@ mod tests {
     fn connecting_snapshot_renders_half_circle_glyph() {
         let snap = snap_connecting("vpn1");
         let (glyph, _) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connecting → badge");
+            status_badge_for(&snap, Some(ProtocolKind::WireGuard)).expect("connecting → badge");
         assert_eq!(glyph, "◐");
     }
 
@@ -641,11 +645,11 @@ mod tests {
     fn connecting_sigil_identity_is_protocol_specific() {
         let snap = snap_connecting("vpn1");
         assert_eq!(
-            status_sigil_id(&snap, Some(Protocol::WireGuard)),
+            status_sigil_id(&snap, Some(ProtocolKind::WireGuard)),
             Some(crate::ui::sigils::SigilId::Handshaking)
         );
         assert_eq!(
-            status_sigil_id(&snap, Some(Protocol::OpenVPN)),
+            status_sigil_id(&snap, Some(ProtocolKind::OpenVpn)),
             Some(crate::ui::sigils::SigilId::Connecting)
         );
     }
@@ -671,7 +675,7 @@ mod tests {
             details.interface_authoritative = false;
         }
         let (glyph, style) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connected → badge");
+            status_badge_for(&snap, Some(ProtocolKind::WireGuard)).expect("connected → badge");
         assert_eq!(glyph, "●", "still Connected — glyph stays a filled dot");
         assert!(
             style.add_modifier.contains(Modifier::DIM),
@@ -699,7 +703,7 @@ mod tests {
             },
         );
         let (glyph, style) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connected → badge");
+            status_badge_for(&snap, Some(ProtocolKind::WireGuard)).expect("connected → badge");
         assert_eq!(glyph, "●");
         assert!(!style.add_modifier.contains(Modifier::DIM));
         assert_eq!(style.fg, Some(theme::current().success));
@@ -709,7 +713,7 @@ mod tests {
     fn reconnecting_snapshot_renders_reload_glyph_dim() {
         let snap = snap_reconnecting("vpn1");
         let (glyph, style) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("reconnecting → badge");
+            status_badge_for(&snap, Some(ProtocolKind::WireGuard)).expect("reconnecting → badge");
         assert_eq!(glyph, "↻");
         assert!(
             style.add_modifier.contains(Modifier::DIM),
@@ -729,7 +733,7 @@ mod tests {
             interface_name: None,
             started_at: None,
         };
-        assert!(status_badge_for(&snap, Some(Protocol::WireGuard)).is_none());
+        assert!(status_badge_for(&snap, Some(ProtocolKind::WireGuard)).is_none());
     }
 
     #[test]
@@ -748,7 +752,7 @@ mod tests {
             started_at: None,
         };
         let (glyph, style) =
-            status_badge_for(&snap, Some(Protocol::WireGuard)).expect("failure → badge");
+            status_badge_for(&snap, Some(ProtocolKind::WireGuard)).expect("failure → badge");
         assert_eq!(glyph, "✗");
         assert_eq!(style.fg, Some(theme::current().error));
     }
@@ -818,7 +822,7 @@ mod tests {
             std::slice::from_ref(&snap),
             Some(&primary),
             &ProfileId::new("corp"),
-            Protocol::WireGuard,
+            ProtocolKind::WireGuard,
         );
         assert!(sig.is_primary);
         assert!(sig.is_active);
@@ -838,7 +842,7 @@ mod tests {
             std::slice::from_ref(&snap),
             Some(&primary),
             &ProfileId::new("other"),
-            Protocol::WireGuard,
+            ProtocolKind::WireGuard,
         );
         assert!(!sig.is_primary);
         assert!(!sig.is_active);

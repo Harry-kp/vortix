@@ -182,7 +182,7 @@ pub struct Config {
 impl Config {
     #[must_use]
     pub fn from_app(config: &crate::config::AppConfig, config_dir: &Path) -> Self {
-        use crate::state::Protocol;
+        use crate::core::profile::ProtocolKind;
         Self {
             config_dir: config_dir.to_path_buf(),
             tunnels: tunnels::Settings {
@@ -193,10 +193,10 @@ impl Config {
                 wireguard_health_targets: config.ping_targets.clone(),
             },
             openvpn_timeout: Duration::from_secs(
-                config.connect_operation_timeout_secs(Protocol::OpenVPN),
+                config.connect_operation_timeout_secs(ProtocolKind::OpenVpn),
             ),
             wireguard_timeout: Duration::from_secs(
-                config.connect_operation_timeout_secs(Protocol::WireGuard),
+                config.connect_operation_timeout_secs(ProtocolKind::WireGuard),
             ),
             auto_reconnect: config.auto_reconnect,
             reconnect_delay: Duration::from_secs(config.auto_reconnect_delay_secs),

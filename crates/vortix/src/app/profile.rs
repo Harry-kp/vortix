@@ -2,10 +2,11 @@
 
 use std::path::Path;
 
-use super::{App, InputMode, Protocol, ToastType};
+use super::{App, InputMode, ToastType};
 use crate::config::profile_store::{FsProfileStore, ProfileStore};
 use crate::constants;
 use crate::core::profile::ProfileId;
+use crate::core::profile::ProtocolKind;
 use crate::utils;
 
 fn importable_profile_paths(dir_path: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
@@ -118,7 +119,7 @@ impl App {
         // The profile store owns remembered-credential cleanup as part of its
         // crash-safe delete transaction. The App only clears transient run
         // artifacts in this detached compatibility path.
-        if matches!(protocol, Protocol::OpenVPN) {
+        if matches!(protocol, ProtocolKind::OpenVpn) {
             utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &profile_name);
         }
 

@@ -55,7 +55,7 @@ fn show_lifecycle_progress(
 
 fn connect_operation_timeout_secs(
     explicit: Option<u64>,
-    protocol: crate::state::Protocol,
+    protocol: crate::core::profile::ProtocolKind,
     config: &AppConfig,
 ) -> u64 {
     explicit.unwrap_or_else(|| config.connect_operation_timeout_secs(protocol))
@@ -1641,14 +1641,15 @@ mod list_tests {
     //! sidecar filesystem read + scanner subprocess, but the policy
     //! decision (per-row connected flag) lives in this helper.
     use super::*;
-    use crate::state::{Protocol, VpnProfile};
+    use crate::core::profile::ProtocolKind;
+    use crate::state::VpnProfile;
     use std::collections::HashSet;
 
     fn profile(name: &str) -> VpnProfile {
         VpnProfile {
             id: crate::core::profile::ProfileId::new(name),
             name: name.to_string(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
             location: String::new(),
             last_used: None,
@@ -2132,7 +2133,7 @@ fn handle_delete(
             ExitCode::GeneralError,
         );
     }
-    if fresh_profile.protocol == crate::state::Protocol::OpenVPN {
+    if fresh_profile.protocol == crate::core::profile::ProtocolKind::OpenVpn {
         crate::utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &fresh_name);
     }
 
@@ -2233,7 +2234,7 @@ fn handle_rename(
         mode,
     );
 
-    if fresh_profile.protocol == crate::state::Protocol::WireGuard
+    if fresh_profile.protocol == crate::core::profile::ProtocolKind::WireGuard
         && crate::core::profile::validate_wireguard_interface_name(trimmed).is_err()
     {
         print_error_and_exit(
@@ -2737,11 +2738,19 @@ mod tests {
         };
 
         assert_eq!(
-            connect_operation_timeout_secs(None, crate::state::Protocol::WireGuard, &config),
+            connect_operation_timeout_secs(
+                None,
+                crate::core::profile::ProtocolKind::WireGuard,
+                &config
+            ),
             22
         );
         assert_eq!(
-            connect_operation_timeout_secs(None, crate::state::Protocol::OpenVPN, &config),
+            connect_operation_timeout_secs(
+                None,
+                crate::core::profile::ProtocolKind::OpenVpn,
+                &config
+            ),
             32
         );
     }
@@ -2751,7 +2760,7 @@ mod tests {
         assert_eq!(
             connect_operation_timeout_secs(
                 Some(7),
-                crate::state::Protocol::WireGuard,
+                crate::core::profile::ProtocolKind::WireGuard,
                 &AppConfig::default(),
             ),
             7

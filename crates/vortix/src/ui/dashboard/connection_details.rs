@@ -2,7 +2,8 @@ use crate::app::App;
 use crate::core::cidr::Cidr;
 use crate::core::engine::registry::{Role, TunnelSnapshot};
 use crate::core::engine::state::{Connection, DetailedConnectionInfo};
-use crate::state::{Protocol, QualityLevel};
+use crate::core::profile::ProtocolKind;
+use crate::state::QualityLevel;
 use crate::ui::helpers;
 use crate::{constants, theme, utils};
 use ratatui::{
@@ -396,7 +397,7 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
                 .profiles
                 .iter()
                 .find(|profile| profile.id == snap.profile_id)
-                .is_some_and(|profile| profile.protocol == Protocol::WireGuard);
+                .is_some_and(|profile| profile.protocol == ProtocolKind::WireGuard);
             (
                 format!(
                     "{} (attempt {attempt})",
@@ -716,7 +717,7 @@ fn fwmark_warning_line(app: &App, snap: &TunnelSnapshot) -> Option<Line<'static>
         .profiles
         .iter()
         .find(|p| p.id == snap.profile_id)?;
-    if profile.protocol != Protocol::WireGuard {
+    if profile.protocol != ProtocolKind::WireGuard {
         return None;
     }
 
@@ -836,7 +837,8 @@ mod tests {
     use crate::app::App;
     use crate::core::engine::state::PromptKind;
     use crate::core::profile::ProfileId;
-    use crate::state::{Protocol, VpnProfile};
+    use crate::core::profile::ProtocolKind;
+    use crate::state::VpnProfile;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -851,7 +853,7 @@ mod tests {
         VpnProfile {
             id: crate::core::profile::ProfileId::new(name),
             name: name.to_string(),
-            protocol: Protocol::WireGuard,
+            protocol: ProtocolKind::WireGuard,
             location: String::new(),
             config_path,
             last_used: None,
@@ -903,8 +905,8 @@ mod tests {
     #[test]
     fn compact_details_use_protocol_specific_connect_label() {
         for (protocol, expected, forbidden) in [
-            (Protocol::WireGuard, "Handshaking", "Connecting"),
-            (Protocol::OpenVPN, "Connecting", "Handshaking"),
+            (ProtocolKind::WireGuard, "Handshaking", "Connecting"),
+            (ProtocolKind::OpenVpn, "Connecting", "Handshaking"),
         ] {
             let mut app = App::new_test();
             app.runtime.profiles.push(VpnProfile {

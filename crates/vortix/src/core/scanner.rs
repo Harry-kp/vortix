@@ -3,7 +3,9 @@
 //! This module provides functionality to detect active VPN connections
 //! by scanning system interfaces and processes for `WireGuard` and `OpenVPN` sessions.
 
-use crate::app::{Protocol, VpnProfile};
+use crate::core::profile::ProtocolKind;
+
+use crate::app::VpnProfile;
 use crate::process::simple_output as cmd_output;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -131,7 +133,7 @@ fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
     // exact resolved interface selects its typed status from this snapshot.
     let (wireguard_statuses, wireguard_observation_complete) = if profiles
         .iter()
-        .any(|profile| matches!(profile.protocol, Protocol::WireGuard))
+        .any(|profile| matches!(profile.protocol, ProtocolKind::WireGuard))
     {
         match crate::wireguard::WgTunnel::observe_all_interfaces() {
             Ok(statuses) => (statuses, true),
@@ -157,7 +159,7 @@ fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
     // 1. Batch lookup for OpenVPN
     let (openvpn_pids, openvpn_observation_complete) = if profiles
         .iter()
-        .any(|profile| matches!(profile.protocol, Protocol::OpenVPN))
+        .any(|profile| matches!(profile.protocol, ProtocolKind::OpenVpn))
     {
         get_all_openvpn_pids().map_or_else(|| (Vec::new(), false), |pids| (pids, true))
     } else {
@@ -165,8 +167,8 @@ fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
     };
     for profile in profiles {
         let session_info = match profile.protocol {
-            Protocol::WireGuard => check_wireguard_by_name(&profile.name, &wireguard_statuses),
-            Protocol::OpenVPN => {
+            ProtocolKind::WireGuard => check_wireguard_by_name(&profile.name, &wireguard_statuses),
+            ProtocolKind::OpenVpn => {
                 let path_str = profile.config_path.to_str().unwrap_or("");
                 // Match either the exact source config argument or Vortix's
                 // exact generation-bound private config name.

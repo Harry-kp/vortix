@@ -100,8 +100,8 @@ use crate::vpn_runtime::VpnRuntime;
 
 // Re-export state types for convenient access
 pub use crate::state::{
-    AuthField, FlipState, FocusedPanel, InputMode, ProfileSortOrder, Protocol, Toast, ToastType,
-    VpnProfile, DISMISS_DURATION,
+    AuthField, FlipState, FocusedPanel, InputMode, ProfileSortOrder, Toast, ToastType, VpnProfile,
+    DISMISS_DURATION,
 };
 // The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
 // lives on `crate::vpn_runtime` after the registry migration; re-export through `app::`
