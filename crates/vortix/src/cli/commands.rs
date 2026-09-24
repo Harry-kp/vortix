@@ -319,12 +319,11 @@ fn handle_up(
 ) -> i32 {
     // `--yes` explicitly bypasses the shared route-conflict admission check.
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "up");
-    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let profile_name = if let Some(name) = profile {
         name.to_string()
     } else {
-        engine.load_metadata();
         match engine
             .profiles
             .iter()
@@ -361,7 +360,6 @@ fn handle_up(
     // `VpnRuntime::check_dependencies` so the TUI and CLI refuse the
     // same dep set — including the OpenVPN 2.4+ probe that the
     // legacy inline CLI check used to skip.
-    engine.load_metadata();
     if let Some(profile) = engine.profiles.iter().find(|p| p.name == profile_name) {
         let missing = crate::vpn_runtime::VpnRuntime::check_dependencies(
             profile.protocol,
@@ -764,8 +762,7 @@ fn handle_reconnect(
     mode: OutputMode,
 ) -> i32 {
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "reconnect");
-    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    engine.load_metadata();
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     // Validate the requested profile exists in the catalog before we
     // poke the system. NotFound (exit 3) > "no active" idempotency.
@@ -1447,7 +1444,6 @@ fn handle_list(
     mode: OutputMode,
 ) -> i32 {
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    engine.load_metadata();
 
     // Sort
     match sort.unwrap_or("name") {

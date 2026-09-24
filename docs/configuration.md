@@ -30,7 +30,6 @@ Vortix keeps user files owned by the invoking user even when tunnel operations r
 ├── logs/              application logs
 ├── config.toml        optional UI and legacy runtime settings
 ├── settings.toml      optional layered engine settings
-├── metadata.json      profile metadata such as last-used time
 ├── killswitch.state   persisted kill-switch preference
 └── real-ip.cache      last observed un-tunneled identity
 ```

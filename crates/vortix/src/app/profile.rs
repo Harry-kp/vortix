@@ -199,7 +199,6 @@ impl App {
             // Registry/retry state is keyed by stable ProfileId, so no
             // in-memory re-keying is required for a display-name change.
 
-            self.runtime.save_metadata();
             self.runtime.sort_profiles();
             self.sync_profiles();
 

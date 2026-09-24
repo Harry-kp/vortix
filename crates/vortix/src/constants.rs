@@ -90,8 +90,6 @@ pub const DEFAULT_PING_TARGETS: [&str; 4] = [
 pub const PROFILES_DIR_NAME: &str = "profiles";
 /// Name of the logs subdirectory.
 pub const LOGS_DIR_NAME: &str = "logs";
-/// Name of the profile metadata file.
-pub const METADATA_FILE_NAME: &str = "metadata.json";
 /// Kill switch state persistence filename.
 pub const KILLSWITCH_STATE_FILE: &str = "killswitch.state";
 /// Cached pre-VPN public IPv4 / IPv6 filenames (mode 0600). See

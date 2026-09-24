@@ -194,7 +194,6 @@ impl App {
         let mut runtime = VpnRuntime::new(config, config_dir);
 
         // Load metadata and sort
-        runtime.load_metadata();
         runtime.sort_profiles();
 
         // Apply user's logging preferences
