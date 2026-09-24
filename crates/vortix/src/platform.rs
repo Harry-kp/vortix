@@ -17,11 +17,11 @@ pub use crate::macos::{
 pub fn available_network_interfaces() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
-        crate::linux::interface_list::available_network_interfaces()
+        crate::linux::interface::available_network_interfaces()
     }
     #[cfg(target_os = "macos")]
     {
-        crate::macos::interface_list::available_network_interfaces()
+        crate::macos::interface::available_network_interfaces()
     }
 }
 

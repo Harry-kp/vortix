@@ -11,15 +11,12 @@
 pub mod dns;
 pub mod firewall;
 pub mod interface;
-pub mod interface_list;
-mod libproc_ffi;
-pub mod network_stats;
+mod libproc;
 pub mod route_table;
-pub mod socket_audit;
 
 pub use dns::MacDns;
 pub use firewall::PfFirewall;
 pub use interface::MacInterface;
-pub use network_stats::MacNetworkStats;
+pub use interface::MacNetworkStats;
+pub use libproc::LsofSocketAudit;
 pub use route_table::MacRouteTable;
-pub use socket_audit::LsofSocketAudit;
