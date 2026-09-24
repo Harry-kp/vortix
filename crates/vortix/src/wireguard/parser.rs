@@ -9,48 +9,15 @@
 //! binary still hands `wg-quick` the on-disk path; this parser is only
 //! used for pre-flight inspection.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
+use crate::core::cidr::Cidr;
 use crate::core::ports::tunnel::ParseError;
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_PEERS: usize = 256;
 const MAX_CONFIG_ROUTES_PER_PEER: usize = 256;
 const MAX_CONFIG_FIELD_BYTES: usize = 4096;
-
-/// CIDR block: an IP address paired with a prefix length.
-///
-/// This is a small, local wrapper used by the `WireGuard` parser. A
-/// workspace-wide `core::cidr` helper is planned;
-/// when it lands, this type will be replaced by a re-export and the
-/// rest of the WG parser will continue to compile unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cidr {
-    pub addr: IpAddr,
-    pub prefix_len: u8,
-}
-
-impl Cidr {
-    /// Parse a `<addr>/<prefix_len>` CIDR string.
-    ///
-    /// Returns `None` for any malformed input (missing slash, invalid
-    /// address, non-numeric prefix, or prefix-length out of range for
-    /// the address family).
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        let (addr_s, prefix_s) = s.split_once('/')?;
-        let addr: IpAddr = addr_s.trim().parse().ok()?;
-        let prefix_len: u8 = prefix_s.trim().parse().ok()?;
-        let max_prefix = match addr {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-        if prefix_len > max_prefix {
-            return None;
-        }
-        Some(Self { addr, prefix_len })
-    }
-}
 
 /// One `[Peer]` block from a `WireGuard` configuration.
 #[derive(Debug, Default, Clone)]
@@ -201,7 +168,7 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                             if entry.is_empty() {
                                 continue;
                             }
-                            match Cidr::parse(entry) {
+                            match entry.parse::<Cidr>().ok() {
                                 Some(cidr) => {
                                     if peer.allowed_ips.len() >= MAX_CONFIG_ROUTES_PER_PEER {
                                         return Err(ParseError::MalformedField {
@@ -287,6 +254,7 @@ pub(crate) fn parse_endpoint_host(value: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]

@@ -70,6 +70,23 @@ impl Cidr {
         }
     }
 
+    /// Build from an IPv4 `<addr> <netmask>` pair, as `OpenVPN` writes routes.
+    /// `None` unless both are IPv4 and the mask is a contiguous prefix.
+    #[must_use]
+    pub fn parse_netmask_v4(addr: &str, mask: &str) -> Option<Self> {
+        let addr: IpAddr = addr.trim().parse().ok()?;
+        let mask: IpAddr = mask.trim().parse().ok()?;
+        let (IpAddr::V4(_), IpAddr::V4(mask)) = (addr, mask) else {
+            return None;
+        };
+        let bits = u32::from(mask);
+        let prefix_len: u8 = bits.leading_ones().try_into().ok()?;
+        if u32::from(prefix_len) + bits.trailing_zeros() != 32 {
+            return None;
+        }
+        Some(Self { addr, prefix_len })
+    }
+
     #[must_use]
     pub fn is_v4(&self) -> bool {
         matches!(self.addr, IpAddr::V4(_))
@@ -192,8 +209,12 @@ impl FromStr for Cidr {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (addr_part, prefix_part) = s.split_once('/').ok_or(CidrParseError::MissingPrefix)?;
-        let addr: IpAddr = addr_part.parse().map_err(|_| CidrParseError::InvalidAddr)?;
+        let addr: IpAddr = addr_part
+            .trim()
+            .parse()
+            .map_err(|_| CidrParseError::InvalidAddr)?;
         let prefix_len: u8 = prefix_part
+            .trim()
             .parse()
             .map_err(|_| CidrParseError::InvalidPrefix)?;
         Self::new(addr, prefix_len).ok_or(CidrParseError::PrefixOutOfRange)
@@ -265,6 +286,20 @@ fn covers_full_u128(ranges: &mut [(u128, u128)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_trimmed_slash_and_openvpn_netmask_forms() {
+        assert_eq!(
+            " 10.0.0.0 / 8 ".parse::<Cidr>().unwrap(),
+            "10.0.0.0/8".parse::<Cidr>().unwrap()
+        );
+        assert_eq!(
+            Cidr::parse_netmask_v4("10.8.0.0", "255.255.0.0"),
+            Some("10.8.0.0/16".parse().unwrap())
+        );
+        assert_eq!(Cidr::parse_netmask_v4("10.8.0.0", "255.0.255.0"), None);
+        assert_eq!(Cidr::parse_netmask_v4("::1", "255.255.0.0"), None);
+    }
 
     fn v6(s: &str) -> Cidr {
         s.parse().expect("valid v6 cidr")

@@ -13,50 +13,8 @@ use crate::core::openvpn_routes::{
 
 use tracing::warn;
 
+use crate::core::cidr::Cidr;
 use crate::core::ports::tunnel::ParseError;
-
-/// IP-family CIDR. Local until a shared helper introduces `core::cidr`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Cidr {
-    pub addr: IpAddr,
-    pub prefix_len: u8,
-}
-
-impl Cidr {
-    /// Build a `Cidr` from `<addr>/<prefix>` form. Returns `None` on parse
-    /// failure or an out-of-range prefix.
-    #[must_use]
-    pub fn parse_slash(text: &str) -> Option<Self> {
-        let (a, p) = text.split_once('/')?;
-        let addr = IpAddr::from_str(a.trim()).ok()?;
-        let prefix_len: u8 = p.trim().parse().ok()?;
-        let max = if addr.is_ipv4() { 32 } else { 128 };
-        if prefix_len > max {
-            return None;
-        }
-        Some(Self { addr, prefix_len })
-    }
-
-    /// Build a `Cidr` from `<addr> <netmask>` IPv4 form. Returns `None` if the
-    /// netmask isn't a contiguous-1s prefix or either token is not an IPv4
-    /// address.
-    #[must_use]
-    pub fn parse_netmask_v4(addr: &str, mask: &str) -> Option<Self> {
-        let addr = IpAddr::from_str(addr.trim()).ok()?;
-        let mask = IpAddr::from_str(mask.trim()).ok()?;
-        let (IpAddr::V4(_), IpAddr::V4(m)) = (addr, mask) else {
-            return None;
-        };
-        let bits = u32::from(m);
-        // Reject non-contiguous masks (e.g. 255.0.255.0).
-        let prefix_len: u8 = bits.leading_ones().try_into().ok()?;
-        let trailing_zeros = bits.trailing_zeros();
-        if u32::from(prefix_len) + trailing_zeros != 32 {
-            return None;
-        }
-        Some(Self { addr, prefix_len })
-    }
-}
 
 /// One `remote` directive entry. Port defaults to 1194 if absent; `proto`
 /// captured verbatim when present (e.g. `udp`, `tcp-client`).
@@ -460,7 +418,7 @@ where
 
     let (destination, gateway_tok) = if dest_tok.contains('/') {
         // CIDR form: `route 10.0.0.0/8 [gateway] [metric]`
-        (Cidr::parse_slash(dest_tok)?, second)
+        (dest_tok.parse::<Cidr>().ok()?, second)
     } else {
         // Netmask form: `route 10.0.0.0 255.0.0.0 [gateway] [metric]`
         let mask = second?;

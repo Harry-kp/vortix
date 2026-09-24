@@ -1005,10 +1005,9 @@ struct ProbePlan {
 }
 
 fn peer_covers_target(peer: &crate::wireguard::parser::WgPeer, target: IpAddr) -> bool {
-    peer.allowed_ips.iter().any(|route| {
-        crate::core::cidr::Cidr::new(route.addr, route.prefix_len)
-            .is_some_and(|route| route_covers_target(route, target))
-    })
+    peer.allowed_ips
+        .iter()
+        .any(|route| route_covers_target(*route, target))
 }
 
 fn route_covers_target(route: crate::core::cidr::Cidr, target: IpAddr) -> bool {

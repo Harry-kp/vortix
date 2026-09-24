@@ -131,11 +131,7 @@ fn parse(
             let parsed =
                 crate::wireguard::parser::parse_wg_conf(body).map_err(|error| error.to_string())?;
             for peer in &parsed.peers {
-                routes.extend(
-                    peer.allowed_ips
-                        .iter()
-                        .filter_map(|route| Cidr::new(route.addr, route.prefix_len)),
-                );
+                routes.extend(peer.allowed_ips.iter().copied());
                 if let Some(endpoint) = peer.endpoint {
                     server_ips.insert(endpoint.ip());
                 }
@@ -157,9 +153,7 @@ fn parse(
                     Cidr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0).expect("v4 default"),
                 );
             }
-            routes.extend(parsed.routes.iter().filter_map(|route| {
-                Cidr::new(route.destination.addr, route.destination.prefix_len)
-            }));
+            routes.extend(parsed.routes.iter().map(|route| route.destination));
             for remote in &parsed.remotes {
                 resolve(&remote.host, remote.port, &mut server_ips);
             }

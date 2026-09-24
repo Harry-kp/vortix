@@ -167,10 +167,7 @@ pub(crate) fn openvpn_route_evidence(
 }
 
 fn canonical_openvpn_route(route: &OvpnRoute) -> Result<OpenVpnRoute, OpenVpnRouteEvidenceError> {
-    let destination =
-        crate::core::cidr::Cidr::new(route.destination.addr, route.destination.prefix_len)
-            .ok_or(OpenVpnRouteEvidenceError::Invalid)?;
-    OpenVpnRoute::with_gateway(destination, route.gateway, route.metric)
+    OpenVpnRoute::with_gateway(route.destination, route.gateway, route.metric)
         .map_err(|_| OpenVpnRouteEvidenceError::Invalid)
 }
 
