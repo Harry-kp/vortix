@@ -13,17 +13,15 @@
 
 #![allow(clippy::must_use_candidate)]
 
-use crate::core::ports::socket_audit::{
-    SocketAudit, SocketAuditResult, SocketProtocol, SocketSnapshot,
-};
+use crate::core::ports::socket_audit::{SocketAuditResult, SocketProtocol, SocketSnapshot};
 
 use super::libproc_ffi::{self, InetKind, SocketView};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LsofSocketAudit;
 
-impl SocketAudit for LsofSocketAudit {
-    fn snapshot() -> SocketAuditResult<Vec<SocketSnapshot>> {
+impl LsofSocketAudit {
+    pub fn snapshot() -> SocketAuditResult<Vec<SocketSnapshot>> {
         let mut out = Vec::new();
         for (pid, _fd, view) in libproc_ffi::iter_all_sockets() {
             let SocketView::Inet {

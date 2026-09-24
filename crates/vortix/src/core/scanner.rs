@@ -99,9 +99,7 @@ pub fn gather_system_state(profiles: &[VpnProfile]) -> ScannerResult {
     let (sessions, tunnel_observation_complete) = scan_active_profiles(profiles);
     ScannerResult {
         sessions,
-        default_route: crate::platform::current_platform()
-            .route_table
-            .default_route_observation(),
+        default_route: crate::platform::Routes::default_route_observation(),
         tunnel_observation_complete,
     }
 }
@@ -313,14 +311,11 @@ fn check_wireguard_by_name(
     name: &str,
     statuses: &std::collections::BTreeMap<String, crate::wireguard::tunnel::WgStatus>,
 ) -> Option<ActiveSession> {
-    // Platform-dispatched interface check via the platform aggregate.
-    let platform = crate::platform::current_platform();
-
     // On macOS, `resolve_wireguard_interface` reads /var/run/wireguard/
     // <name>.name and returns Some(utunN). On Linux, the kernel device
     // is the config name. Protocol identity is established below by the
     // typed WireGuard observer.
-    let interface_name = platform.interface.resolve_wireguard_interface(name)?;
+    let interface_name = crate::platform::Interface::resolve_wireguard_interface(name)?;
 
     let mut session = ActiveSession {
         interface: interface_name.clone(),
@@ -329,7 +324,7 @@ fn check_wireguard_by_name(
     };
 
     // 1. Attempt to find PID (wireguard-go or similar)
-    if let Some(pid) = platform.interface.get_wireguard_pid(&interface_name) {
+    if let Some(pid) = crate::platform::Interface::get_wireguard_pid(&interface_name) {
         session.pid = Some(pid);
 
         // Primary method: Get start time from process (works cross-platform)
@@ -399,7 +394,7 @@ fn check_wireguard_by_name(
     session.wireguard_peers.clone_from(&status.peers);
 
     // 4. Get IP and MTU using platform-specific interface info
-    let (ip, mtu) = platform.interface.get_interface_info(&interface_name);
+    let (ip, mtu) = crate::platform::Interface::get_interface_info(&interface_name);
     if !ip.is_empty() {
         session.internal_ip = ip;
     }

@@ -746,9 +746,7 @@ impl WgTunnel {
         };
         let interface_name = resolve_kernel_iface(
             &attempt.interface_basename,
-            crate::platform::current_platform()
-                .interface
-                .resolve_wireguard_interface(&attempt.interface_basename),
+            crate::platform::Interface::resolve_wireguard_interface(&attempt.interface_basename),
             &attempt.profile_id,
         );
         if !Self::interface_exists(&interface_name) {
@@ -893,9 +891,7 @@ impl WgTunnel {
     }
 
     fn ensure_probe_route(target: IpAddr, owned_interface: &str) -> Result<(), TunnelError> {
-        let observation = crate::platform::current_platform()
-            .route_table
-            .route_interface_for(target);
+        let observation = crate::platform::Routes::route_interface_for(target);
         verify_probe_route(observation, target, owned_interface)
     }
 
@@ -915,9 +911,7 @@ impl WgTunnel {
         let basename = interface_from_path(&temp_path);
         let interface_name = resolve_kernel_iface(
             &basename,
-            crate::platform::current_platform()
-                .interface
-                .resolve_wireguard_interface(&basename),
+            crate::platform::Interface::resolve_wireguard_interface(&basename),
             &profile.id,
         );
         let initially_exists = Self::interface_exists(&interface_name);
@@ -1376,9 +1370,7 @@ impl WgTunnel {
         let basename = interface_from_path(&effective_path);
         let interface_name = resolve_kernel_iface(
             &basename,
-            crate::platform::current_platform()
-                .interface
-                .resolve_wireguard_interface(&basename),
+            crate::platform::Interface::resolve_wireguard_interface(&basename),
             &profile.id,
         );
 

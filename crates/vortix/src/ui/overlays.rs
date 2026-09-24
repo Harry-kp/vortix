@@ -715,7 +715,7 @@ pub mod help {
     //!   on-screen and what the help shows is structurally impossible.
     //! - **Guard** — card-style explainer for the Security Guard panel:
     //!   the three headline states (EXPOSED / PARTIAL / PROTECTED) and
-    //!   what each row (IP, DNS, Killswitch, Encryption) actually
+    //!   what each row (IP, DNS, Encryption) actually
     //!   checks. Complements the Sigils tab — sigils explain the glyphs,
     //!   Guard explains the semantics.
 
@@ -878,7 +878,7 @@ pub mod help {
     /// `(label, description_paragraph)` matching the same card-style
     /// layout as the Roles tab. Two clusters:
     ///   1. The three headline states (EXPOSED / PARTIAL / PROTECTED).
-    ///   2. Each row the panel renders (IP, DNS, Killswitch, etc.) and
+    ///   2. Each row the panel renders (IP, DNS, etc.) and
     ///      what makes that row light up vs stay quiet.
     const GUARD_GLOSSARY: &[(&str, &str)] = &[
     (

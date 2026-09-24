@@ -720,7 +720,7 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
     let tx_clone = tx.clone();
     let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
-        let dns = crate::platform::current_platform().dns.get_dns_server();
+        let dns = crate::platform::Dns::get_dns_server();
         if let Some(dns_server) = dns {
             let _ = tx_clone.send(TelemetryUpdate::Dns(dns_server));
         }

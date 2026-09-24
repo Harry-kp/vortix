@@ -23,7 +23,6 @@ use system_configuration::sys::schema_definitions::{
     kSCPropNetDNSServerAddresses,
 };
 
-use crate::core::ports::dns::DnsResolver;
 use crate::core::ports::dns::{
     DnsAssignment, DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource,
     DnsPlatformCapabilities, DnsPolicy, DnsPolicyAdapter, DnsScope,
@@ -42,8 +41,9 @@ const MAX_DYNAMIC_STORE_VALUE_BYTES: usize = 128 * 1024;
 /// macOS DNS resolution via `SCDynamicStore` + `/etc/resolv.conf`.
 pub struct MacDns;
 
-impl DnsResolver for MacDns {
-    fn get_dns_server() -> Option<String> {
+impl MacDns {
+    #[must_use]
+    pub fn get_dns_server() -> Option<String> {
         // Global DNS aggregates the active interface's configured nameservers
         // (the same view `scutil --dns` summarises). resolv.conf is kept as
         // the cross-system fallback for parity with the prior chain; the

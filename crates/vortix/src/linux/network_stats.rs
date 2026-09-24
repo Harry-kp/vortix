@@ -1,14 +1,13 @@
 //! Linux network statistics via `/proc/net/dev`.
 
-use crate::core::ports::network_stats::NetworkStats;
-
 const PROC_NET_DEV_PATH: &str = "/proc/net/dev";
 
 /// Linux network stats from `/proc/net/dev`.
 pub struct LinuxNetworkStats;
 
-impl NetworkStats for LinuxNetworkStats {
-    fn get_total_bytes() -> (u64, u64) {
+impl LinuxNetworkStats {
+    #[must_use]
+    pub fn get_total_bytes() -> (u64, u64) {
         match std::fs::read_to_string(PROC_NET_DEV_PATH) {
             Ok(content) => parse_proc_net_dev(&content),
             Err(_) => (0, 0),

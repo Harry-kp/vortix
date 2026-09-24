@@ -178,9 +178,7 @@ pub fn validate_policy(active: &[ActiveTunnelInfo]) -> Result<()> {
 ///
 /// Returns error if not running as root or firewall commands fail.
 pub fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
-    crate::platform::current_platform()
-        .killswitch
-        .enable_blocking_multi(active)
+    crate::platform::Firewall::enable_blocking_multi(active)
 }
 
 /// Disable kill switch by flushing firewall rules.
@@ -189,16 +187,12 @@ pub fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
 ///
 /// Returns error if not running as root or firewall commands fail.
 pub fn disable_blocking() -> Result<()> {
-    crate::platform::current_platform()
-        .killswitch
-        .disable_blocking()
+    crate::platform::Firewall::disable_blocking()
 }
 
 /// Prove that no Vortix-owned firewall policy remains without mutating it.
 pub fn verify_disabled() -> Result<()> {
-    crate::platform::current_platform()
-        .killswitch
-        .verify_disabled()
+    crate::platform::Firewall::verify_disabled()
 }
 
 /// Get the state file path.
@@ -448,7 +442,7 @@ pub fn load_state_checked() -> std::result::Result<Option<PersistedState>, Persi
         Err(source) => return Err(PersistedStateLoadError::Read { path, source }),
     };
     let mut persisted = decode_persisted_state(&content, &path)?;
-    let live = crate::platform::current_platform().available_network_interfaces();
+    let live = crate::platform::available_network_interfaces();
     filter_phantom_tunnels(&mut persisted, &live);
 
     Ok(Some(persisted))

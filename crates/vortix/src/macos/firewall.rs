@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::core::cidr::{rfc1918_ranges, Cidr};
 use crate::core::cidr_subtract::cidr_subtract;
-use crate::core::ports::killswitch::{ActiveTunnelInfo, Killswitch, KillswitchError, Result};
+use crate::core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
 use crate::process::{CommandSpec, PrivilegeReq};
 use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use tracing::{debug, error, info};
@@ -364,7 +364,7 @@ fn fmt_ip(ip: &IpAddr) -> String {
     ip.to_string()
 }
 
-impl Killswitch for PfFirewall {
+impl PfFirewall {
     /// Engage the killswitch with a ruleset covering every tunnel in
     /// `active`. The ruleset is loaded into the Vortix anchor via stdin, which
     /// performs an atomic in-kernel replace — both fresh enable and
@@ -375,7 +375,7 @@ impl Killswitch for PfFirewall {
     /// `pfctl -e` is called after the load to ensure pf is enabled.
     /// `pfctl -e` is idempotent (returns "already enabled" on the second
     /// call), so the refresh path leaves the enabled state alone.
-    fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
+    pub fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
         info!(
             target: "vortix::killswitch",
             tunnels = active.len(),
@@ -447,7 +447,7 @@ impl Killswitch for PfFirewall {
     /// Disable only Vortix's anchor. pf may have been enabled before Vortix
     /// and may protect unrelated host policy, so global flush/disable is
     /// never an owned operation.
-    fn disable_blocking() -> Result<()> {
+    pub fn disable_blocking() -> Result<()> {
         info!(target: "vortix::killswitch", "disabling kill switch");
 
         if !crate::utils::is_root() {
@@ -483,7 +483,7 @@ impl Killswitch for PfFirewall {
         Ok(())
     }
 
-    fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
+    pub fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
         let (root, anchor, status) = read_pf_state()?;
         if root.status.success()
             && anchor.status.success()
@@ -503,7 +503,7 @@ impl Killswitch for PfFirewall {
         }
     }
 
-    fn verify_disabled() -> Result<()> {
+    pub fn verify_disabled() -> Result<()> {
         let anchor = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
         if anchor.status.success()
             && Self::canonical_pf_rules(&String::from_utf8_lossy(&anchor.stdout)).is_empty()

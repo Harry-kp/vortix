@@ -68,7 +68,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 Code gated to Linux (`linux/*`) never compiles on macOS, and vice versa. Local clippy on a macOS host **cannot** catch a Linux-only lint. CI runs the matrix; humans usually don't.
 
 **Mitigations:**
-- Where feasible, cross-compile-check before pushing: `cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu` (or `aarch64-apple-darwin` from a Linux box). Linker errors are expected for non-host targets; the lint pass still runs.
+- Cross-check Linux code from macOS before pushing (`rustup target add x86_64-unknown-linux-gnu` once). `ring`'s build script needs a C compiler for the target; macOS clang works when pointed at the SDK's libc headers, and clippy never links:
+  ```bash
+  SDK=$(xcrun --show-sdk-path) \
+  CC_x86_64_unknown_linux_gnu=clang AR_x86_64_unknown_linux_gnu=ar \
+  CFLAGS_x86_64_unknown_linux_gnu="--target=x86_64-unknown-linux-gnu -isystem $SDK/usr/include" \
+  cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+  ```
   **This usually does not work from macOS.** `ring` runs a build script that needs a Linux C cross-compiler, so the build fails there and never reaches the lint pass. Adding the rustup target is not enough. Treat this bullet as available only where a cross toolchain is already installed, and do not plan a verification step around it.
 - Otherwise: push to a feature branch, watch CI, fix from the failure log. Don't merge until all matrix legs are green. On this repo that is the normal path, not the fallback: a single branch shipped three separate Linux-only failures (a DNS regression invisible to macOS tests, then `clippy::unnecessary_wraps` and `clippy::items_after_test_module`) where every local run was green.
 

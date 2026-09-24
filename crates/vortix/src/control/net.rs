@@ -51,32 +51,31 @@ impl Net {
     }
 
     fn apply_routes(&self, target: &NetworkPlan) -> Result<(), String> {
-        let table = &crate::platform::current_platform().route_table;
+        use crate::platform::Routes as table;
         // A prefix the target still carries is retargeted in place, never
         // deleted first: that gap leaks traffic onto the real address.
         for (cidr, interface) in &self.applied.routes {
             if !target.routes.contains_key(cidr) {
-                if let Err(error) = table.unbind_route(&cidr.to_string(), interface) {
+                if let Err(error) = table::unbind_route(&cidr.to_string(), interface) {
                     tracing::warn!(target: "vortix::net", %cidr, %interface, %error, "route removal failed");
                 }
             }
         }
         for endpoint in self.applied.host_routes.difference(&target.host_routes) {
-            if let Err(error) = table.unbind_host_route(*endpoint) {
+            if let Err(error) = table::unbind_host_route(*endpoint) {
                 tracing::warn!(target: "vortix::net", %endpoint, %error, "server route removal failed");
             }
         }
         if !target.host_routes.is_empty() {
-            let gateway = table
-                .default_gateway()
+            let gateway = table::default_gateway()
                 .ok_or("no physical default gateway to pin the VPN server route to")?;
             for endpoint in &target.host_routes {
-                table.bind_host_route(*endpoint, &gateway)?;
+                table::bind_host_route(*endpoint, &gateway)?;
             }
         }
         for (cidr, interface) in &target.routes {
             if !Self::routes_through(target, *cidr, interface) {
-                table.bind_route(&cidr.to_string(), interface)?;
+                table::bind_route(&cidr.to_string(), interface)?;
             }
         }
         Ok(())
@@ -88,11 +87,9 @@ impl Net {
         let config_dir = &self.config_dir;
         let effective = self
             .dns
-            .reconcile_durable(
-                &target.dns,
-                &crate::platform::current_platform().dns,
-                |state| crate::core::dns_policy::save(config_dir, state),
-            )
+            .reconcile_durable(&target.dns, &crate::platform::Dns, |state| {
+                crate::core::dns_policy::save(config_dir, state)
+            })
             .map_err(|error| error.to_string())?;
         match effective.status {
             DnsEffectiveStatus::Applied | DnsEffectiveStatus::Released => Ok(()),
@@ -150,7 +147,7 @@ impl Net {
             return true;
         };
         matches!(
-            crate::platform::current_platform().route_table.route_interface_for(probe),
+            crate::platform::Routes::route_interface_for(probe),
             DefaultRouteObservation::Interface(observed) if observed == interface
         )
     }

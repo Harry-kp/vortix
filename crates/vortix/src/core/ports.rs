@@ -20,12 +20,6 @@ pub mod dns {
 
     use crate::core::profile::ProfileId;
 
-    /// Read-only DNS resolver inspection.
-    pub trait DnsResolver {
-        /// Get the current system DNS server address, if any.
-        fn get_dns_server() -> Option<String>;
-    }
-
     /// Resolver settings requested by one protocol profile or live session.
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct DnsRequest {
@@ -504,22 +498,6 @@ pub mod dns {
 }
 pub mod interface {
     //! `Interface` port — VPN interface detection.
-
-    /// Detect and inspect VPN interfaces on the host.
-    ///
-    /// Implementations resolve the platform-specific mapping between a profile
-    /// name and the actual kernel/userspace interface, query process state, and
-    /// extract IP/MTU information.
-    pub trait Interface {
-        /// Resolve the real interface name for a `WireGuard` profile.
-        fn resolve_wireguard_interface(name: &str) -> Option<String>;
-
-        /// PID of the `WireGuard` user-space process managing an interface (if any).
-        fn get_wireguard_pid(interface: &str) -> Option<u32>;
-
-        /// `(ip, mtu)` for an interface; empty strings if unavailable.
-        fn get_interface_info(interface: &str) -> (String, String);
-    }
 }
 pub mod killswitch {
     //! `Killswitch` port — kill-switch firewall control.
@@ -609,66 +587,9 @@ pub mod killswitch {
             self.interface.is_empty()
         }
     }
-
-    /// Firewall control for the kill switch.
-    ///
-    /// Implementations block all non-VPN traffic when enabled. The
-    /// multi-tunnel form lets the synthesizer install allow rules for every
-    /// active tunnel in a single atomic ruleset.
-    ///
-    /// Note: the trait stays sync for now. The async engine
-    /// transition adds an explicit `&CommandRunner` parameter; today impls
-    /// route subprocess calls through `crate::process::run_to_output(...)`
-    /// (the process-global runner installed by `main.rs`).
-    pub trait Killswitch {
-        /// Enable the kill switch with a ruleset covering every tunnel in
-        /// `active`. An empty slice installs a base block-all ruleset with
-        /// no per-tunnel allow rules (used during early bring-up and on
-        /// hard-fail Armed states).
-        ///
-        /// # Errors
-        ///
-        /// Returns [`KillswitchError`] when the firewall command fails, the
-        /// caller is not root, or no backend is available.
-        fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()>;
-
-        /// Disable the kill switch by flushing firewall rules.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`KillswitchError`] when the firewall command fails or the
-        /// caller is not root.
-        fn disable_blocking() -> Result<()>;
-
-        /// Read back the platform-owned blocking policy without changing it.
-        fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
-            let _ = active;
-            Err(KillswitchError::CommandFailed(
-                "kill-switch read-back is unavailable on this platform".into(),
-            ))
-        }
-
-        /// Prove that the Vortix-owned firewall policy is absent without
-        /// changing host firewall state.
-        fn verify_disabled() -> Result<()> {
-            Err(KillswitchError::CommandFailed(
-                "kill-switch read-back is unavailable on this platform".into(),
-            ))
-        }
-    }
 }
 pub mod network_stats {
     //! `NetworkStats` port — per-host byte counters.
-
-    /// Read aggregate interface byte counters.
-    ///
-    /// Implementations read whichever per-interface byte counter source is
-    /// available on the host (`netstat -ib` on macOS, `/proc/net/dev` on Linux)
-    /// and return the running totals across all non-loopback interfaces.
-    pub trait NetworkStats {
-        /// Total bytes received and transmitted across all non-loopback interfaces.
-        fn get_total_bytes() -> (u64, u64);
-    }
 }
 pub mod process {
     //! `CommandRunner` port — the typed seam through which every subprocess flows.
@@ -983,8 +904,6 @@ pub mod process {
 pub mod route_table {
     //! `RouteTable` port — system route inspection and exact scoped writes.
 
-    use std::net::IpAddr;
-
     /// Result of probing the route used for public-internet traffic.
     ///
     /// `NoDefaultRoute` is an observed kernel state. `ProbeFailed` means the
@@ -1006,44 +925,6 @@ pub mod route_table {
                 Self::NoDefaultRoute | Self::ProbeFailed => None,
             }
         }
-    }
-
-    /// Read-only access to the host's routing table.
-    pub trait RouteTable {
-        /// IP address of the current default gateway, if any.
-        fn default_gateway() -> Option<String>;
-
-        /// Name of the network interface carrying the current default route, if
-        /// any (e.g. `en0`, `wlan0`, `utun3`). Used by the tunnel registry to
-        /// detect which physical/virtual interface owns the default route so it
-        /// can identify primary tunnels and reason about VPN-over-VPN topologies
-        ///.
-        fn default_route_observation() -> DefaultRouteObservation;
-
-        /// Observe the exact kernel route selected for `target`.
-        ///
-        /// Protocol probes use this before emitting traffic so a configured
-        /// split-tunnel destination cannot silently escape over a physical link.
-        fn route_interface_for(target: IpAddr) -> DefaultRouteObservation;
-
-        /// Bind `cidr` to `interface`, regardless of how a gateway would resolve.
-        ///
-        /// macOS `OpenVPN` installs a pushed split route via its gateway; when a full
-        /// tunnel already owns `0.0.0.0/1` that gateway resolves through the full
-        /// tunnel, so the split route lands on the wrong interface. Re-scoping it to
-        /// the named interface fixes it. Linux already installs device-scoped, so
-        /// its implementation is a no-op.
-        fn bind_route(cidr: &str, interface: &str) -> Result<(), String>;
-
-        /// Keep a VPN server reachable through the pre-tunnel gateway before a
-        /// default-route claim is transferred to that VPN.
-        fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String>;
-
-        /// Remove an interface-scoped route previously installed by Vortix.
-        fn unbind_route(cidr: &str, interface: &str) -> Result<(), String>;
-
-        /// Remove a VPN-server escape route previously installed by Vortix.
-        fn unbind_host_route(destination: IpAddr) -> Result<(), String>;
     }
 }
 pub mod socket_audit {
@@ -1109,7 +990,7 @@ pub mod socket_audit {
         pub interface: Option<String>,
     }
 
-    /// Errors produced by [`SocketAudit::snapshot`].
+    /// Errors produced by a socket-audit snapshot.
     #[derive(Debug, Error)]
     #[non_exhaustive]
     pub enum SocketAuditError {
@@ -1133,24 +1014,6 @@ pub mod socket_audit {
 
     /// Result alias for socket-audit operations.
     pub type SocketAuditResult<T> = std::result::Result<T, SocketAuditError>;
-
-    /// Capability port: enumerate the system's open sockets.
-    ///
-    /// Implementations are platform-specific:
-    /// - Linux: parses `/proc/net/{tcp,tcp6,udp,udp6}` + walks
-    ///   `/proc/<pid>/fd/*` for PID resolution
-    /// - macOS: shells to `lsof -i -P -n -F` for machine-readable output
-    /// - Windows: returns [`SocketAuditError::Unsupported`]
-    pub trait SocketAudit {
-        /// Snapshot the current socket inventory. Returns an empty list
-        /// (not an error) when no sockets are visible to the caller.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`SocketAuditError`] when the platform impl is
-        /// unavailable or the underlying probe fails.
-        fn snapshot() -> SocketAuditResult<Vec<SocketSnapshot>>;
-    }
 
     #[cfg(test)]
     mod tests {

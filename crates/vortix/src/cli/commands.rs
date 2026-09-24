@@ -217,8 +217,7 @@ struct AuditData {
 }
 
 fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i32 {
-    let platform = crate::platform::current_platform();
-    let mut snapshots = match platform.socket_audit.snapshot() {
+    let mut snapshots = match crate::platform::SocketAudit::snapshot() {
         Ok(s) => s,
         Err(crate::core::ports::socket_audit::SocketAuditError::Unsupported) => {
             print_error_and_exit(

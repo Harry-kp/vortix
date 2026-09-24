@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use crate::core::cidr::{rfc1918_ranges, Cidr};
 use crate::core::cidr_subtract::cidr_subtract;
-use crate::core::ports::killswitch::{ActiveTunnelInfo, Killswitch, KillswitchError, Result};
+use crate::core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
 use crate::process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, error, info};
 
@@ -545,7 +545,7 @@ impl IptablesFirewall {
     }
 }
 
-impl Killswitch for IptablesFirewall {
+impl IptablesFirewall {
     /// Engage the killswitch with one nftables `inet` transaction covering
     /// every tunnel in `active`. Both fresh enable and refresh with a changed
     /// active set go through this atomic dual-family path.
@@ -553,7 +553,7 @@ impl Killswitch for IptablesFirewall {
     /// Empty `active` slice installs the base block-all ruleset (rules
     /// 1-4 only) — used during early bring-up and on hard-fail Armed
     /// states.
-    fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
+    pub fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
         if !crate::utils::is_root() {
             error!(target: "vortix::killswitch", "kill switch requires root privileges");
             return Err(KillswitchError::NotRoot);
@@ -578,7 +578,7 @@ impl Killswitch for IptablesFirewall {
         Ok(())
     }
 
-    fn disable_blocking() -> Result<()> {
+    pub fn disable_blocking() -> Result<()> {
         info!(target: "vortix::killswitch", "disabling kill switch");
 
         if !crate::utils::is_root() {
@@ -609,7 +609,7 @@ impl Killswitch for IptablesFirewall {
         Ok(())
     }
 
-    fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
+    pub fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
         crate::core::killswitch::validate_policy(active)?;
         match Self::nft_table_snapshot()? {
             Some(snapshot) if nft_policy::snapshot_matches(active, &snapshot) => Ok(()),
@@ -619,7 +619,7 @@ impl Killswitch for IptablesFirewall {
         }
     }
 
-    fn verify_disabled() -> Result<()> {
+    pub fn verify_disabled() -> Result<()> {
         let iptables_result = Self::verify_iptables_disabled();
         let nft_result = Self::nft_table_snapshot();
         let nft_available = match nft_result {

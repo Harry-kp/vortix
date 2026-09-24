@@ -114,9 +114,7 @@ pub fn load(config_dir: &Path, profile_id: &ProfileId) -> Option<ManagedWireGuar
 #[must_use]
 pub fn tracked_wireguard_pids(config_dir: &Path) -> Vec<u32> {
     tracked_wireguard_pids_with(config_dir, |interface| {
-        crate::platform::current_platform()
-            .interface
-            .get_wireguard_pid(interface)
+        crate::platform::Interface::get_wireguard_pid(interface)
     })
 }
 

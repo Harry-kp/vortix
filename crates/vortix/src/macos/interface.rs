@@ -4,7 +4,6 @@
 //! Replaced `ifconfig <iface>`, `ps -ax -o pid,command`,
 //! and `lsof -t <socket>` shell-outs with direct libc / libproc calls.
 
-use crate::core::ports::interface::Interface;
 use std::path::{Path, PathBuf};
 
 use super::libproc_ffi::{self, SocketView};
@@ -14,8 +13,9 @@ const WIREGUARD_RUN_DIR: &str = "/var/run/wireguard";
 /// macOS interface detection using libc + /var/run/wireguard/*.name files.
 pub struct MacInterface;
 
-impl Interface for MacInterface {
-    fn resolve_wireguard_interface(name: &str) -> Option<String> {
+impl MacInterface {
+    #[must_use]
+    pub fn resolve_wireguard_interface(name: &str) -> Option<String> {
         let pid_file = PathBuf::from(WIREGUARD_RUN_DIR).join(format!("{name}.name"));
         if pid_file.exists() {
             Some(
@@ -29,7 +29,8 @@ impl Interface for MacInterface {
         }
     }
 
-    fn get_wireguard_pid(interface: &str) -> Option<u32> {
+    #[must_use]
+    pub fn get_wireguard_pid(interface: &str) -> Option<u32> {
         let sock_path = PathBuf::from(WIREGUARD_RUN_DIR).join(format!("{interface}.sock"));
 
         // primary path is libproc — walk every PID's socket
@@ -45,7 +46,8 @@ impl Interface for MacInterface {
         find_pid_with_cmdline_substring("wireguard", Some(interface))
     }
 
-    fn get_interface_info(interface: &str) -> (String, String) {
+    #[must_use]
+    pub fn get_interface_info(interface: &str) -> (String, String) {
         // Per-interface (vs the interface listing):
         // ifconfig <iface> replaced with libc::getifaddrs walk for the
         // named interface. Same data, no PATH dependency.

@@ -8,13 +8,12 @@
 //! Loopback interfaces are skipped to match the old parser's `lo*`
 //! filter.
 
-use crate::core::ports::network_stats::NetworkStats;
-
 /// macOS network stats via `getifaddrs` + BSD `if_data`.
 pub struct MacNetworkStats;
 
-impl NetworkStats for MacNetworkStats {
-    fn get_total_bytes() -> (u64, u64) {
+impl MacNetworkStats {
+    #[must_use]
+    pub fn get_total_bytes() -> (u64, u64) {
         get_total_bytes_via_getifaddrs().unwrap_or((0, 0))
     }
 }

@@ -21,7 +21,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::core::ports::route_table::{DefaultRouteObservation, RouteTable};
+use crate::core::ports::route_table::DefaultRouteObservation;
 use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
 use crate::process::CommandSpec;
 
@@ -47,8 +47,9 @@ static ROUTE_PROBE: RouteProbe = RouteProbe::new();
 /// macOS routing-table reader using `route -n get <target>`.
 pub struct MacRouteTable;
 
-impl RouteTable for MacRouteTable {
-    fn default_gateway() -> Option<String> {
+impl MacRouteTable {
+    #[must_use]
+    pub fn default_gateway() -> Option<String> {
         // Read the literal default (/0) row, NOT `route get default`. That query
         // resolves the destination 0.0.0.0, which longest-prefix-matches our own
         // `0.0.0.0/1 -> utunN` once it is installed — so it answers with the
@@ -95,11 +96,12 @@ impl RouteTable for MacRouteTable {
         }
     }
 
-    fn default_route_observation() -> DefaultRouteObservation {
+    #[must_use]
+    pub fn default_route_observation() -> DefaultRouteObservation {
         Self::route_interface_for(INTERNET_ROUTE_PROBE)
     }
 
-    fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
+    pub fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
         if add_or_change(|verb| bind_route_args(verb, cidr, interface)) {
             Ok(())
         } else {
@@ -107,7 +109,7 @@ impl RouteTable for MacRouteTable {
         }
     }
 
-    fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String> {
+    pub fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String> {
         let ran = add_or_change(|verb| bind_host_route_args(verb, destination, gateway));
         if ran && selected_gateway(destination).as_deref() == Some(gateway) {
             Ok(())
@@ -118,18 +120,19 @@ impl RouteTable for MacRouteTable {
         }
     }
 
-    fn unbind_route(cidr: &str, interface: &str) -> Result<(), String> {
+    pub fn unbind_route(cidr: &str, interface: &str) -> Result<(), String> {
         run_route_delete(unbind_route_args(cidr, interface), &format!("route {cidr}"))
     }
 
-    fn unbind_host_route(destination: IpAddr) -> Result<(), String> {
+    pub fn unbind_host_route(destination: IpAddr) -> Result<(), String> {
         run_route_delete(
             unbind_host_route_args(destination),
             &format!("host route for {destination}"),
         )
     }
 
-    fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
+    #[must_use]
+    pub fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
         let spec = CommandSpec::oneshot("route", route_get_args(target))
             .timeout(ROUTE_QUERY_TIMEOUT)
             .output_limit(64 * 1024);

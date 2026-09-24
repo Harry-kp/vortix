@@ -5,13 +5,12 @@
 //! read for MTU. No more parsing of human-formatted `ip` output; no PATH dependency
 //! on iproute2 for read-only interface inspection.
 
-use crate::core::ports::interface::Interface;
-
 /// Linux interface detection using `libc::getifaddrs` and `/sys/class/net`.
 pub struct LinuxInterface;
 
-impl Interface for LinuxInterface {
-    fn resolve_wireguard_interface(name: &str) -> Option<String> {
+impl LinuxInterface {
+    #[must_use]
+    pub fn resolve_wireguard_interface(name: &str) -> Option<String> {
         // Protocol identity is verified by the WireGuard adapter. This port
         // answers only the platform question: does a kernel interface with
         // this basename exist?
@@ -21,7 +20,8 @@ impl Interface for LinuxInterface {
             .then(|| name.to_string())
     }
 
-    fn get_wireguard_pid(interface: &str) -> Option<u32> {
+    #[must_use]
+    pub fn get_wireguard_pid(interface: &str) -> Option<u32> {
         // walk /proc directly instead of shelling to `ps`.
         // Kernel WG has no userspace PID (returns None); wireguard-go has
         // a process whose cmdline contains both "wireguard" and the
@@ -29,7 +29,8 @@ impl Interface for LinuxInterface {
         find_pid_with_cmdline_substrings(&["wireguard", interface])
     }
 
-    fn get_interface_info(interface: &str) -> (String, String) {
+    #[must_use]
+    pub fn get_interface_info(interface: &str) -> (String, String) {
         // IPv4 address from libc::getifaddrs; MTU from sysfs.
         // Used to shell to `ip addr show <iface>` and parse the human-
         // formatted output — both are direct kernel reads now.

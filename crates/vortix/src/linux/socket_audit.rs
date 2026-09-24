@@ -21,16 +21,14 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use crate::core::ports::socket_audit::{
-    SocketAudit, SocketAuditResult, SocketProtocol, SocketSnapshot,
-};
+use crate::core::ports::socket_audit::{SocketAuditResult, SocketProtocol, SocketSnapshot};
 
 /// Marker type implementing the [`SocketAudit`] trait for Linux.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcSocketAudit;
 
-impl SocketAudit for ProcSocketAudit {
-    fn snapshot() -> SocketAuditResult<Vec<SocketSnapshot>> {
+impl ProcSocketAudit {
+    pub fn snapshot() -> SocketAuditResult<Vec<SocketSnapshot>> {
         // Build an inode → (pid, command) map first; cheap when no
         // pids are visible, otherwise the snapshot lookup is O(1).
         let inode_owners = collect_socket_inode_owners();

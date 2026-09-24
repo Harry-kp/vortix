@@ -57,9 +57,7 @@ impl App {
         // 2. Kick off a new fetch via the platform aggregate.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let totals = crate::platform::current_platform()
-                .network_stats
-                .get_total_bytes();
+            let totals = crate::platform::NetworkStats::get_total_bytes();
             let _ = tx.send(totals);
         });
         self.runtime.netstats_rx = Some(rx);

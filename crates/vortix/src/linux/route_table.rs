@@ -17,7 +17,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::core::ports::route_table::{DefaultRouteObservation, RouteTable};
+use crate::core::ports::route_table::DefaultRouteObservation;
 use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
 use crate::process::CommandSpec;
 
@@ -38,13 +38,14 @@ static ROUTE_PROBE: RouteProbe = RouteProbe::new();
 /// Linux routing-table reader using `ip route get <target>`.
 pub struct LinuxRouteTable;
 
-impl RouteTable for LinuxRouteTable {
-    fn default_gateway() -> Option<String> {
+impl LinuxRouteTable {
+    #[must_use]
+    pub fn default_gateway() -> Option<String> {
         let text = run_ip_route_show_default()?;
         parse_gateway(&text)
     }
 
-    fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
+    pub fn bind_route(cidr: &str, interface: &str) -> Result<(), String> {
         // xtask:allow-shell-regression: `ip route replace ... dev` is the native Linux route mutation interface; the process layer provides bounded execution.
         let spec = CommandSpec::oneshot("ip", bind_route_args(cidr, interface))
             .timeout(ROUTE_QUERY_TIMEOUT)
@@ -55,7 +56,7 @@ impl RouteTable for LinuxRouteTable {
         }
     }
 
-    fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String> {
+    pub fn bind_host_route(destination: IpAddr, gateway: &str) -> Result<(), String> {
         // xtask:allow-shell-regression: `ip route replace ... via` is the native Linux route mutation interface; the process layer provides bounded execution.
         let spec = CommandSpec::oneshot("ip", bind_host_route_args(destination, gateway))
             .timeout(ROUTE_QUERY_TIMEOUT)
@@ -73,22 +74,24 @@ impl RouteTable for LinuxRouteTable {
         }
     }
 
-    fn unbind_route(cidr: &str, interface: &str) -> Result<(), String> {
+    pub fn unbind_route(cidr: &str, interface: &str) -> Result<(), String> {
         run_ip_route_delete(unbind_route_args(cidr, interface), &format!("route {cidr}"))
     }
 
-    fn unbind_host_route(destination: IpAddr) -> Result<(), String> {
+    pub fn unbind_host_route(destination: IpAddr) -> Result<(), String> {
         run_ip_route_delete(
             unbind_host_route_args(destination),
             &format!("host route for {destination}"),
         )
     }
 
-    fn default_route_observation() -> DefaultRouteObservation {
+    #[must_use]
+    pub fn default_route_observation() -> DefaultRouteObservation {
         Self::route_interface_for(INTERNET_ROUTE_PROBE)
     }
 
-    fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
+    #[must_use]
+    pub fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
         let spec =
             // xtask:allow-shell-regression: `ip route get <target>` is the supported Linux route-selection proof; no existing libc port exposes policy-routing resolution.
             CommandSpec::oneshot("ip", vec!["route".into(), "get".into(), target.to_string()])

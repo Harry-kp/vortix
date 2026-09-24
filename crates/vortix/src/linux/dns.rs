@@ -5,7 +5,7 @@
 
 use crate::core::ports::dns::{
     DnsAssignment, DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource,
-    DnsPlatformCapabilities, DnsPolicy, DnsPolicyAdapter, DnsResolver, DnsScope,
+    DnsPlatformCapabilities, DnsPolicy, DnsPolicyAdapter, DnsScope,
 };
 use crate::process::{CommandSpec, PrivilegeReq};
 use std::collections::{HashMap, HashSet};
@@ -105,8 +105,9 @@ fn policy_engine() -> &'static Mutex<LinuxDnsPolicyEngine<RealDnsCommandRunner>>
     POLICY_ENGINE.get_or_init(|| Mutex::new(LinuxDnsPolicyEngine::new(RealDnsCommandRunner)))
 }
 
-impl DnsResolver for LinuxDns {
-    fn get_dns_server() -> Option<String> {
+impl LinuxDns {
+    #[must_use]
+    pub fn get_dns_server() -> Option<String> {
         try_get_dns_resolvectl()
             .or_else(try_get_dns_nmcli)
             .or_else(try_get_dns_resolv_conf)
