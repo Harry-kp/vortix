@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Instant, SystemTime};
 
-use crate::app::registry::{classify_route_conflict, Conflict};
 use crate::cidr::Cidr;
 use crate::control::dns::DnsRequest;
 use crate::control::killswitch::KillSwitchMode;
@@ -327,6 +326,64 @@ impl State {
             _ => false,
         }
     }
+}
+
+/// What kind of conflict `detect_conflict` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Conflict {
+    /// Two profiles both claim the kernel default route. The `current` holder
+    /// may be either Connected (already on the route) or Connecting (claimed
+    /// it but `tunnel.up` hasn't returned yet — the §7.3 in-flight rule).
+    DefaultRouteTakeover { current: ProfileId, new: ProfileId },
+    /// Non-default-route overlap. Reserved for the future v2 conflict surface
+    ///; not produced by the v1
+    /// `detect_conflict` which only inspects the default route.
+    RouteOverlap {
+        with: ProfileId,
+        overlapping_cidrs: Vec<Cidr>,
+    },
+}
+
+/// Whether two route sets collide, and how.
+///
+/// Admission, the dashboard overlay and the CLI gate all have to answer this
+/// identically: if they disagree, one refuses a connect another will not offer
+/// to confirm. They each used to carry their own copy of the rule.
+///
+/// A default route intersects every other route, so it is only ever compared
+/// against another default. That question is asked first; everything after it
+/// is about specific destinations. A split tunnel alongside a full one is
+/// legitimate — the more specific prefix wins, which is the point of running
+/// both.
+#[must_use]
+pub fn classify_route_conflict(
+    requested: &[Cidr],
+    existing: &[Cidr],
+    existing_profile: &ProfileId,
+    requested_profile: &ProfileId,
+) -> Option<Conflict> {
+    let specific = |routes: &[Cidr]| {
+        routes
+            .iter()
+            .filter(|route| route.prefix_len != 0)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let claims_default = |routes: &[Cidr]| routes.iter().any(|route| route.prefix_len == 0);
+
+    if claims_default(requested) && claims_default(existing) {
+        return Some(Conflict::DefaultRouteTakeover {
+            current: existing_profile.clone(),
+            new: requested_profile.clone(),
+        });
+    }
+    let overlapping_cidrs =
+        crate::cidr::overlapping_cidrs(&specific(requested), &specific(existing));
+    (!overlapping_cidrs.is_empty()).then(|| Conflict::RouteOverlap {
+        with: existing_profile.clone(),
+        overlapping_cidrs,
+    })
 }
 
 #[cfg(test)]

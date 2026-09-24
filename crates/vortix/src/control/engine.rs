@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::app::registry::Conflict;
 use crate::config::openvpn_credentials::{FsOpenVpnCredentialStore, RememberedOpenVpnCredentials};
 use crate::config::secret::Secret;
 use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::control::scanner::{ActiveSession, ScannerResult};
+use crate::control::Conflict;
 use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 use crate::platform::DefaultRouteObservation;

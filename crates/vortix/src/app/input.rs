@@ -76,11 +76,11 @@ impl App {
         let Some(idx) = self.profile_list_state.selected() else {
             return;
         };
-        let state = self.runtime.profiles.get(idx).and_then(|profile| {
-            self.registry
-                .snapshot(&profile.id)
-                .map(|snapshot| snapshot.state)
-        });
+        let state = self
+            .runtime
+            .profiles
+            .get(idx)
+            .and_then(|profile| self.tunnel(&profile.id).map(|snapshot| snapshot.state));
         match focused_tunnel_action(state.as_ref()) {
             FocusedTunnelAction::Disconnect => {
                 self.handle_message(Message::DisconnectProfile { idx });
@@ -809,9 +809,7 @@ impl crate::app::App {
                         return;
                     };
                     let state = self.runtime.profiles.get(idx).and_then(|profile| {
-                        self.registry
-                            .snapshot(&profile.id)
-                            .map(|snapshot| snapshot.state)
+                        self.tunnel(&profile.id).map(|snapshot| snapshot.state)
                     });
                     match focused_tunnel_action(state.as_ref()) {
                         FocusedTunnelAction::Connect => {

@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::app::registry::{classify_route_conflict, Conflict};
 use crate::cidr::Cidr;
 use crate::config::openvpn_credentials::{
     CredentialClearOutcome, FsOpenVpnCredentialStore, RememberedOpenVpnCredentials,
@@ -32,7 +31,7 @@ use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::profile::ProfileId;
 use crate::tunnel::DetailedConnectionInfo;
 
-pub use state::Phase;
+pub use state::{classify_route_conflict, Conflict, Phase};
 
 #[derive(Debug, Clone)]
 pub enum Command {

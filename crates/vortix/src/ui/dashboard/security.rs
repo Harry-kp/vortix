@@ -1,5 +1,5 @@
-use crate::app::registry::TunnelSnapshot;
 use crate::app::App;
+use crate::app::TunnelSnapshot;
 use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::tunnel::Connection;
 use crate::{constants, ui::theme};
@@ -617,15 +617,12 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let primary_snap = app
-        .registry
-        .primary()
-        .and_then(|id| app.registry.snapshot(id));
+    let primary_snap = app.primary_id().and_then(|id| app.tunnel(id));
     let primary_connected = matches!(
         primary_snap.as_ref().map(|s| &s.state),
         Some(Connection::Connected { .. })
     );
-    let any_tunnels = app.registry.tunnel_count() > 0;
+    let any_tunnels = app.tunnel_count() > 0;
 
     let verdict = if primary_connected {
         verdict_for_protected(app, primary_snap.as_ref())
@@ -814,7 +811,7 @@ fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
     if public.is_none() && real.is_none() {
         return Ipv6RowStatus::Absent;
     }
-    if app.registry.primary().is_none() {
+    if app.primary_id().is_none() {
         return Ipv6RowStatus::Masked;
     }
     match (public, real) {
@@ -885,7 +882,7 @@ fn collect_partial_state(
     // from the registry (split-only topology). Ciphers are usually
     // homogeneous in practice (all WG or all OpenVPN); if they diverge,
     // surfacing the first one is still strictly more useful than `N/A`.
-    let snapshots = app.registry.snapshot_all();
+    let snapshots = app.tunnels();
     let encryption = if let Some(snap) = primary_snap {
         derive_encryption(Some(snap))
     } else {
@@ -1290,7 +1287,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let is_connected = app.registry.primary().is_some();
+    let is_connected = app.primary_id().is_some();
 
     let text = if is_connected {
         vec![
@@ -1371,18 +1368,12 @@ mod tests {
     use std::time::Instant;
 
     fn insert_idle_tunnel(app: &mut App, name: &str) {
-        use crate::app::registry::{Role, TunnelSnapshot};
-        use crate::tunnel::{Connection, ConnectionHealth};
-        app.registry.insert_for_test(TunnelSnapshot {
-            profile_id: ProfileId::new(name),
-            state: Connection::Disconnected,
-            role: Role::Addressable {
-                allowed_ips: Vec::new(),
-            },
-            health: ConnectionHealth::default(),
-            interface_name: None,
-            started_at: None,
-        });
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .tunnels
+            .push(crate::app::connection::test_view(
+                name,
+                crate::control::Phase::Starting,
+            ));
     }
 
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
@@ -2209,7 +2200,7 @@ mod tests {
     #[test]
     fn no_tunnels_renders_exposed_with_banner_and_polish() {
         let app = App::new_test();
-        assert_eq!(app.registry.tunnel_count(), 0);
+        assert_eq!(app.tunnel_count(), 0);
 
         let out = render_to_string(&app, 60, 20);
         // Loud EXPOSED banner is the eye-catcher when no VPN is up.
@@ -2422,10 +2413,7 @@ mod tests {
             .dns
             .status = crate::control::DnsSecurityStatus::Protected;
         // A profile owns the default route, so IPv4 is carried by the tunnel.
-        app.registry.replace_control_projection(
-            &std::collections::BTreeMap::new(),
-            Some(ProfileId::new("alpha")),
-        );
+        app.set_tunnels_for_test(Vec::new(), Some(ProfileId::new("alpha")));
         // An IPv4-only tunnel leaves IPv6 on the ISP link, so every
         // IPv6-reachable site still sees the real address.
         app.runtime.real_ipv6 = Some("2401:4900::abcd".to_string());

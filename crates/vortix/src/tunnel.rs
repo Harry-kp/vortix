@@ -376,12 +376,9 @@ pub struct DetailedConnectionInfo {
     /// externally-started tunnel on a platform where its per-PID
     /// interface detection is unreliable (current state: macOS
     /// multi-`OpenVPN`, where the ifconfig fallback collides across
-    /// PIDs). Tunnels with `false` are excluded from primary-election
-    /// candidacy in [`crate::app::registry::TunnelRegistry`]'s
-    /// `recompute_primary` and render
-    /// as `Role::Addressable` regardless of declared `AllowedIPs`,
-    /// because vortix cannot truthfully claim a routing status it
-    /// can't verify byte-for-byte against the kernel.
+    /// PIDs). The engine never adopts a tunnel with `false`, because
+    /// vortix cannot claim a routing status it can't verify against the
+    /// kernel.
     ///
     /// Defaults to `true` — most tunnels are authoritative; the
     /// adoption path is the narrow exception that must opt out.

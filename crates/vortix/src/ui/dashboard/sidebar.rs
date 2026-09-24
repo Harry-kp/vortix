@@ -17,7 +17,7 @@
 //! ```
 //!
 //! The primary tunnel (kernel-truth holder of the default route, per
-//! `TunnelRegistry::primary`) is suffixed with ` *` after the profile name to
+//! `App::primary_id`) is suffixed with ` *` after the profile name to
 //! cross-correlate with the header's primary marker.
 //!
 //! ## Risk annotations
@@ -49,8 +49,8 @@
 //! `unicode_width_of_reconnecting_glyph_is_one` — which is load-bearing for
 //! the `fixed_cols` arithmetic above.
 
-use crate::app::registry::{Role, TunnelSnapshot};
 use crate::app::App;
+use crate::app::{Role, TunnelSnapshot};
 use crate::profile::ProfileId;
 use crate::tunnel::Connection;
 use crate::ui::theme;
@@ -358,8 +358,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
 
     // snapshots come from the registry; profile catalog still on engine.
-    let snapshots = app.registry.snapshot_all();
-    let primary = app.registry.primary().cloned();
+    let snapshots = app.tunnels();
+    let primary = app.primary_id().cloned();
 
     if app.runtime.profiles.is_empty() && snapshots.is_empty() {
         render_empty_state(frame, inner);
@@ -431,8 +431,8 @@ mod tests {
     //! and the narrow-width fallback at the 24-char inner-width boundary.
     //! Earlier smoke tests (empty-state, row rendering) remain.
     use super::*;
-    use crate::app::registry::Role;
     use crate::app::App;
+    use crate::app::Role;
     use crate::cidr::Cidr;
     use crate::config::profiles::VpnProfile;
     use crate::profile::ProfileId;
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn empty_registry_and_empty_profiles_renders_no_profiles_empty_state() {
         let mut app = App::new_test();
-        assert_eq!(app.registry.tunnel_count(), 0);
+        assert_eq!(app.tunnel_count(), 0);
         assert!(app.runtime.profiles.is_empty());
 
         let out = render_to_string(&mut app, 40, 10);

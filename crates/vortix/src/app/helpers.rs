@@ -27,14 +27,12 @@ impl App {
     /// The tunnel the dashboard treats as current: the primary, else the
     /// first one that is not disconnected.
     #[must_use]
-    pub fn current_tunnel(&self) -> Option<crate::app::registry::TunnelSnapshot> {
+    pub fn current_tunnel(&self) -> Option<crate::app::TunnelSnapshot> {
         use crate::tunnel::Connection;
-        self.registry
-            .primary()
-            .and_then(|pid| self.registry.snapshot(pid))
+        self.primary_id()
+            .and_then(|pid| self.tunnel(pid))
             .or_else(|| {
-                self.registry
-                    .snapshot_all()
+                self.tunnels()
                     .into_iter()
                     .find(|s| !matches!(s.state, Connection::Disconnected))
             })
@@ -70,8 +68,7 @@ impl App {
 
     pub(crate) fn has_active_connection(&self) -> bool {
         use crate::tunnel::Connection;
-        self.registry
-            .snapshot_all()
+        self.tunnels()
             .iter()
             .any(|s| matches!(s.state, Connection::Connected { .. }))
     }
@@ -105,8 +102,7 @@ impl App {
     #[must_use]
     pub(crate) fn active_tunnel_count(&self) -> usize {
         use crate::tunnel::Connection;
-        self.registry
-            .snapshot_all()
+        self.tunnels()
             .iter()
             .filter(|s| !matches!(s.state, Connection::Disconnected))
             .count()
@@ -134,7 +130,7 @@ impl App {
     pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
         use crate::tunnel::Connection;
         self.profile_id_for_name(profile_name)
-            .and_then(|id| self.registry.snapshot(&id))
+            .and_then(|id| self.tunnel(&id))
             .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected))
     }
 
@@ -146,8 +142,7 @@ impl App {
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };
-        self.registry
-            .snapshot(&profile.id)
+        self.tunnel(&profile.id)
             .is_some_and(|snap| matches!(snap.state, Connection::Connecting { .. }))
     }
 

@@ -75,13 +75,13 @@ fn u1_multi_tunnel_no_primary_projection_is_stable_and_sorted() {
     set_connected(&mut app, "zeta");
     set_connected(&mut app, "alpha");
 
-    let snapshots = app.registry.snapshot_all();
+    let snapshots = app.tunnels();
     let names: Vec<&str> = snapshots
         .iter()
         .map(|snapshot| snapshot.profile_id.as_str())
         .collect();
     assert_eq!(names, ["alpha", "zeta"]);
-    assert!(app.registry.primary().is_none());
+    assert!(app.primary_id().is_none());
     let current = app
         .current_tunnel()
         .expect("with no primary the first active tunnel is current");
@@ -1555,8 +1555,7 @@ fn sidebar_d_on_inactive_row_never_disconnects_another_tunnel() {
 
     assert!(app.toast.is_none(), "inactive-row d must be a quiet no-op");
     assert!(matches!(
-        app.registry
-            .snapshot(&crate::profile::ProfileId::new("active"))
+        app.tunnel(&crate::profile::ProfileId::new("active"))
             .unwrap()
             .state,
         crate::tunnel::Connection::Connected { .. }
@@ -2284,7 +2283,7 @@ fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
         Err(mpsc::TryRecvError::Empty),
         "presentation-only transfer counters must not wake public-IP probes"
     );
-    let rendered = app.registry.snapshot(&profile_id).unwrap();
+    let rendered = app.tunnel(&profile_id).unwrap();
     let Connection::Connected { details, .. } = rendered.state else {
         panic!("renderer projection must remain connected");
     };
@@ -2361,24 +2360,6 @@ fn an_unmanaged_tunnel_on_the_default_route_blocks_real_ip_caching() {
     }
 }
 
-/// `TunnelRegistry::recompute_primary` reads the default-route interface from
-/// the registry's own cache, and `feed_default_route_interface` is its only
-/// production write path. Nothing called it: every caller was a test. So the
-/// cache stayed empty for the whole process, `primary` was permanently `None`,
-/// and a full tunnel rendered as `Split tunnel` under a `NO EXIT` header while
-/// the kernel routed every packet through it. The registry's own unit tests
-/// missed it because they call the feeder directly. Assert the App forwards the
-/// canonical observation instead.
-#[test]
-fn a_control_snapshot_feeds_the_registry_default_route() {
-    let mut app = test_app();
-    app.apply_control_snapshot(std::sync::Arc::new(crate::control::Snapshot {
-        default_route: Some("utun4".into()),
-        ..crate::control::Snapshot::default()
-    }));
-    assert_eq!(app.registry.default_route_interface(), Some("utun4"));
-}
-
 #[test]
 fn a_stale_wireguard_handshake_reaches_the_dashboard() {
     use crate::tunnel::{ConnectionHealth, DegradedReason};
@@ -2397,7 +2378,7 @@ fn a_stale_wireguard_handshake_reaches_the_dashboard() {
     snapshot.version += 1;
     let profile_id = snapshot.tunnels[0].profile_id.clone();
     app.apply_control_snapshot(std::sync::Arc::new(snapshot));
-    assert_eq!(app.registry.snapshot(&profile_id).unwrap().health, stale);
+    assert_eq!(app.tunnel(&profile_id).unwrap().health, stale);
 }
 
 #[test]

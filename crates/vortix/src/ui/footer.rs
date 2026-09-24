@@ -1,6 +1,6 @@
 //! Footer widget with context-aware keybinding hints
 
-use crate::app::registry::TunnelSnapshot;
+use crate::app::TunnelSnapshot;
 use crate::app::{focused_tunnel_action, App, FocusedTunnelAction};
 use crate::tunnel::Connection;
 use ratatui::{
@@ -37,7 +37,7 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         crate::app::FocusedPanel::Security => "Security",
         crate::app::FocusedPanel::Logs => "Logs",
     };
-    let snapshots = app.registry.snapshot_all();
+    let snapshots = app.tunnels();
     let focused_state = (app.focused_panel == crate::app::FocusedPanel::Sidebar)
         .then(|| focused_profile_state(app, &snapshots))
         .flatten();

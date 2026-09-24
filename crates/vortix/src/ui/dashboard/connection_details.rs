@@ -1,6 +1,6 @@
-use crate::app::registry::{Role, TunnelSnapshot};
 use crate::app::state::QualityLevel;
 use crate::app::App;
+use crate::app::{Role, TunnelSnapshot};
 use crate::cidr::Cidr;
 use crate::profile::ProtocolKind;
 use crate::tunnel::{Connection, DetailedConnectionInfo};
@@ -53,12 +53,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .selected()
         .and_then(|idx| app.runtime.profiles.get(idx))
         .map(|p| p.id.clone())
-        .or_else(|| app.registry.primary().cloned());
+        .or_else(|| app.primary_id().cloned());
 
-    let focused_snap = focused_profile_id
-        .as_ref()
-        .and_then(|id| app.registry.snapshot(id));
-    let primary_id = app.registry.primary();
+    let focused_snap = focused_profile_id.as_ref().and_then(|id| app.tunnel(id));
+    let primary_id = app.primary_id();
     let is_focused_primary = matches!(
         (&focused_profile_id, primary_id),
         (Some(focused), Some(primary)) if focused == primary
@@ -453,7 +451,7 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
     }
 
     // Tab-cycle hint when N>1 .
-    if app.registry.tunnel_count() > 1 {
+    if app.tunnel_count() > 1 {
         text.push(Line::from(vec![Span::styled(
             "Press [Tab] to cycle focused tunnel",
             Style::default().fg(theme::current().text_secondary),
@@ -701,7 +699,7 @@ fn awaiting_user_input_hint(prompt_kind: &crate::tunnel::PromptKind) -> Line<'st
 fn fwmark_warning_line(app: &App, snap: &TunnelSnapshot) -> Option<Line<'static>> {
     // Bail if focused tunnel is the primary (warning only applies to
     // secondaries that are at fwmark-hijack risk against the primary).
-    let primary = app.registry.primary()?;
+    let primary = app.primary_id()?;
     if primary == &snap.profile_id {
         return None;
     }
@@ -857,25 +855,14 @@ mod tests {
     }
 
     fn insert_connected(app: &mut App, name: &str, interface: &str, allowed_ips: Vec<Cidr>) {
-        use crate::app::registry::{Role, TunnelSnapshot};
-        use crate::tunnel::{Connection, ConnectionHealth};
-        let profile_id = ProfileId::new(name);
-        app.registry.insert_for_test(TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: Connection::Connected {
-                profile_id,
-                since: SystemTime::UNIX_EPOCH,
-                details: Box::new(crate::tunnel::DetailedConnectionInfo {
-                    interface: interface.to_owned(),
-                    interface_authoritative: true,
-                    ..Default::default()
-                }),
-            },
-            role: Role::Addressable { allowed_ips },
-            health: ConnectionHealth::default(),
-            interface_name: Some(interface.to_owned()),
-            started_at: Some(SystemTime::UNIX_EPOCH),
-        });
+        let mut view = crate::app::connection::test_view(name, crate::control::Phase::Up);
+        view.interface = Some(interface.to_owned());
+        view.routes = allowed_ips;
+        view.details.interface = interface.to_owned();
+        view.details.interface_authoritative = true;
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .tunnels
+            .push(view);
     }
 
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
@@ -915,22 +902,11 @@ mod tests {
                 group: None,
             });
             app.profile_list_state.select(Some(0));
-            let profile_id = ProfileId::new("corp");
-            let tunnel = crate::app::registry::TunnelSnapshot {
-                profile_id: profile_id.clone(),
-                state: crate::tunnel::Connection::Connecting {
-                    profile_id: profile_id.clone(),
-                    started_at: std::time::SystemTime::UNIX_EPOCH,
-                },
-                role: Role::Addressable {
-                    allowed_ips: Vec::new(),
-                },
-                health: crate::tunnel::ConnectionHealth::Unknown,
-                interface_name: None,
-                started_at: Some(std::time::SystemTime::UNIX_EPOCH),
-            };
-            app.registry.replace_control_projection(
-                &std::collections::BTreeMap::from([(profile_id, tunnel)]),
+            app.set_tunnels_for_test(
+                vec![crate::app::connection::test_view(
+                    "corp",
+                    crate::control::Phase::Starting,
+                )],
                 None,
             );
             let out = render_to_string(&mut app, 80, 10);
@@ -1339,36 +1315,16 @@ mod tests {
             make_profile("corp", primary_cfg),
             make_profile("lab", secondary_cfg),
         ];
-        // Insert two engines into the registry.
         insert_connected(&mut app, "corp", "utun7", vec![v4("0.0.0.0/0")]);
         insert_connected(&mut app, "lab", "utun8", vec![v4("10.0.0.0/8")]);
+        std::sync::Arc::make_mut(&mut app.control_snapshot).primary = Some(ProfileId::new("corp"));
 
-        // Build the warning line directly via the helper, since
-        // `registry.primary()` depends on the host route table — we test
-        // the helper's logic by exercising it with a manually-arranged
-        // App where we know the focused snap and registry primary.
-        // Manually compute snapshots:
-        let lab_snap = app
-            .registry
-            .snapshot(&ProfileId::new("lab"))
-            .expect("lab snapshot");
-        // Force-set primary via the registry's public refresh path is
-        // platform-dependent; for unit-purposes we instead call the
-        // helper using a registry that has both entries — when no primary
-        // is detected on host CI the helper returns None, so we can only
-        // assert that path. Cover the rendered-warning path by branching
-        // on availability.
-        if app.registry.primary().is_some() {
-            let l = fwmark_warning_line(&app, &lab_snap)
-                .expect("warning expected when primary holds default");
-            let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
-            assert!(s.contains("Fwmark"));
-            assert!(s.contains("docs/multi-tunnel-fwmark.md"));
-        } else {
-            // No primary on this CI — helper short-circuits to None. The
-            // logic is exercised by the other fwmark tests below using a
-            // controlled probe-backed registry.
-        }
+        let lab_snap = app.tunnel(&ProfileId::new("lab")).expect("lab snapshot");
+        let l = fwmark_warning_line(&app, &lab_snap)
+            .expect("warning expected when primary holds default");
+        let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert!(s.contains("Fwmark"));
+        assert!(s.contains("docs/multi-tunnel-fwmark.md"));
         let _ = (Duration::from_secs(0), SystemTime::now());
     }
 
@@ -1381,13 +1337,9 @@ mod tests {
         app.runtime.profiles = vec![make_profile("corp", cfg)];
         insert_connected(&mut app, "corp", "utun7", vec![v4("0.0.0.0/0")]);
 
-        let snap = app
-            .registry
-            .snapshot(&ProfileId::new("corp"))
-            .expect("snap");
-        // Primary slot may or may not be set depending on host; if set
-        // and it matches snap, the helper returns None. Either way the
-        // helper must not panic.
-        let _ = fwmark_warning_line(&app, &snap);
+        std::sync::Arc::make_mut(&mut app.control_snapshot).primary = Some(ProfileId::new("corp"));
+
+        let snap = app.tunnel(&ProfileId::new("corp")).expect("snap");
+        assert!(fwmark_warning_line(&app, &snap).is_none());
     }
 }

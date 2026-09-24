@@ -5,8 +5,8 @@
 //!
 //! ## Architecture
 //!
-//! `App` is a control client: it caches one immutable canonical snapshot and
-//! copies its tunnel projection into the renderer-facing registry. Telemetry
+//! `App` is a control client: it caches one immutable engine snapshot and
+//! renders tunnels straight from it (`App::tunnels`). Telemetry
 //! and profile presentation remain in [`VpnRuntime`]; lifecycle, retry,
 //! scanner, policy, and protocol ownership do not.
 //!
@@ -24,6 +24,7 @@
 //! - `helpers` — Logging, scrolling, toast notifications, and utilities
 
 pub(crate) mod connection;
+pub use connection::{Role, TunnelSnapshot};
 mod helpers;
 mod input;
 mod profile;
@@ -34,7 +35,6 @@ mod update;
 
 pub(crate) use input::{focused_tunnel_action, FocusedTunnelAction};
 
-pub mod registry;
 #[cfg(test)]
 mod tests;
 
@@ -95,7 +95,6 @@ pub(crate) struct PendingThemeChange {
 }
 use std::collections::HashMap;
 
-use crate::app::registry::TunnelRegistry;
 use crate::constants;
 use crate::logger;
 use crate::message::Message;
@@ -109,22 +108,13 @@ pub use state::{
 
 /// Main application state container.
 ///
-/// Holds the VPN runtime (telemetry, profiles, config, background workers)
-/// alongside the `TunnelRegistry` (active tunnel FSMs) and TUI-specific
-/// state (panels, overlays, animations). Reads explicitly route through
-/// `self.runtime.X` for telemetry/profiles and `self.registry` for
-/// active-tunnel snapshots.
+/// Holds the VPN runtime (telemetry, profiles, config, background workers),
+/// the engine snapshot, and TUI state (panels, overlays, animations).
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     /// The headless VPN runtime — telemetry, profile catalog, config,
-    /// background workers, kill-switch mode. Active tunnel FSMs live on
-    /// `self.registry`.
+    /// background workers, kill-switch mode.
     pub runtime: VpnRuntime,
-
-    /// The `TunnelRegistry` owns active tunnel
-    /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
-    /// `connection_details`, security, chart).
-    pub registry: TunnelRegistry,
 
     /// The connection engine. `None` while it is starting.
     pub(crate) control: Option<crate::control::Control>,
@@ -179,12 +169,6 @@ pub struct App {
     pub terminal_size: (u16, u16),
 }
 
-// An earlier refactor removed the previous `impl Deref<Target = VpnRuntime>` — the
-// porous boundary let every TUI/app/CLI callsite reach into VpnRuntime
-// without the indirection being visible at the call site. Use
-// `app.runtime.X` for runtime fields and `app.registry` for active
-// tunnels explicitly.
-
 impl App {
     /// Create a new App instance with the given configuration.
     #[must_use]
@@ -200,11 +184,9 @@ impl App {
         // Seed from disk so the first frame cannot show Off while a
         // persisted firewall is still present.
         let (kill_switch, kill_switch_state) = crate::control::killswitch::persisted();
-        let registry = TunnelRegistry::new();
 
         let mut app = Self {
             runtime,
-            registry,
             control: None,
             control_starting: true,
             control_snapshot: std::sync::Arc::new(crate::control::Snapshot {
@@ -353,7 +335,6 @@ impl App {
         let runtime = VpnRuntime::new_test();
         Self {
             runtime,
-            registry: TunnelRegistry::new(),
             control: None,
             control_starting: false,
             control_snapshot: std::sync::Arc::default(),

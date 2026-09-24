@@ -1,6 +1,6 @@
-use crate::app::registry::TunnelSnapshot;
 use crate::app::state::QualityLevel;
 use crate::app::App;
+use crate::app::TunnelSnapshot;
 use crate::profile::ProfileId;
 use crate::tunnel::Connection;
 use crate::ui::helpers;
@@ -42,9 +42,9 @@ fn profile_display_name(app: &App, id: &ProfileId) -> String {
 /// dropped with a `+N` overflow suffix, then the whole strip collapses to a
 /// dot-row of badge chars (`[●●●● +1]`).
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let tunnel_count = app.registry.tunnel_count();
-    let primary = app.registry.primary().cloned();
-    let primary_snap = primary.as_ref().and_then(|id| app.registry.snapshot(id));
+    let tunnel_count = app.tunnel_count();
+    let primary = app.primary_id().cloned();
+    let primary_snap = primary.as_ref().and_then(|id| app.tunnel(id));
     let startup_label = app.control_starting.then_some({
         if area.width >= 70 {
             "Starting…"
@@ -77,7 +77,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // (tunnels ARE up) and from CONNECTED (no exit owner). Tunnels
     // strip still appends so the user sees what's connected.
     let Some(primary_snap) = primary_snap else {
-        let snapshots = app.registry.snapshot_all();
+        let snapshots = app.tunnels();
         let content_width = status_content_width(startup_label, area.width)
             .saturating_sub(u16::from(snapshots.len() >= 2) * 8);
         if let Some(transitional) = snapshots.iter().find(|snapshot| {
@@ -119,7 +119,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     if tunnel_count >= 2 {
-        let snapshots = app.registry.snapshot_all();
+        let snapshots = app.tunnels();
         line = append_tunnels_strip(Some(app), line, &snapshots, primary.as_ref(), area.width);
     }
 
@@ -758,14 +758,11 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
 mod tests {
     //! Header rendering tests. These exercise the empty-registry and
     //! `≥2` overflow ladder paths via `App::new_test` + direct construction
-    //! of `TunnelSnapshot` values fed to the strip builders. The strip
-    //! builders are deliberately the unit-of-test rather than the full
-    //! `render()` path because populating a real `TunnelRegistry<TunnelKind>`
-    //! requires driving the FSM through async tunnel ops — out of scope for
-    //! the rendering smoke covered here.
+    //! of `TunnelSnapshot` values fed to the strip builders, plus full
+    //! `render()` smokes seeded through `App::set_tunnels_for_test`.
     use super::*;
-    use crate::app::registry::{Role, TunnelSnapshot};
     use crate::app::App;
+    use crate::app::{Role, TunnelSnapshot};
     use crate::profile::ProfileId;
     use crate::tunnel::{Connection, ConnectionHealth, DetailedConnectionInfo};
     use ratatui::backend::TestBackend;
@@ -801,6 +798,12 @@ mod tests {
         )
     }
 
+    fn up_view(name: &str) -> crate::control::TunnelView {
+        let mut view = crate::app::connection::test_view(name, crate::control::Phase::Up);
+        view.details.interface = format!("utun-{name}");
+        view
+    }
+
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -834,22 +837,11 @@ mod tests {
                 last_used: None,
                 group: None,
             });
-        let profile_id = ProfileId::new("corp");
-        let tunnel = crate::app::registry::TunnelSnapshot {
-            profile_id: profile_id.clone(),
-            state: crate::tunnel::Connection::Connecting {
-                profile_id: profile_id.clone(),
-                started_at: std::time::SystemTime::UNIX_EPOCH,
-            },
-            role: crate::app::registry::Role::Addressable {
-                allowed_ips: Vec::new(),
-            },
-            health: crate::tunnel::ConnectionHealth::Unknown,
-            interface_name: None,
-            started_at: Some(std::time::SystemTime::UNIX_EPOCH),
-        };
-        app.registry.replace_control_projection(
-            &std::collections::BTreeMap::from([(profile_id, tunnel)]),
+        app.set_tunnels_for_test(
+            vec![crate::app::connection::test_view(
+                "corp",
+                crate::control::Phase::Starting,
+            )],
             None,
         );
         app
@@ -897,11 +889,9 @@ mod tests {
     #[test]
     fn connected_header_keeps_kill_switch_visible_at_80_columns() {
         let mut app = App::new_test();
-        let snapshot = connected("a-very-long-profile-name");
-        let profile_id = snapshot.profile_id.clone();
-        app.registry.replace_control_projection(
-            &std::collections::BTreeMap::from([(profile_id.clone(), snapshot)]),
-            Some(profile_id),
+        app.set_tunnels_for_test(
+            vec![up_view("a-very-long-profile-name")],
+            Some(ProfileId::new("a-very-long-profile-name")),
         );
 
         let out = render_to_string(&app, 80, 1);
@@ -924,14 +914,9 @@ mod tests {
     fn hidden_mode_label_leaves_multi_tunnel_strip_visible() {
         let mut app = App::new_test();
         let tunnels = (0..6)
-            .map(|index| {
-                let snapshot = connected(&format!("tunnel-{index}"));
-                (snapshot.profile_id.clone(), snapshot)
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let primary = ProfileId::new("tunnel-0");
-        app.registry
-            .replace_control_projection(&tunnels, Some(primary));
+            .map(|index| up_view(&format!("tunnel-{index}")))
+            .collect();
+        app.set_tunnels_for_test(tunnels, Some(ProfileId::new("tunnel-0")));
 
         let out = render_to_string(&app, 80, 1);
         assert!(!out.contains("Standard"), "{out}");
@@ -1052,7 +1037,7 @@ mod tests {
     #[test]
     fn empty_registry_does_not_emit_tunnels_label() {
         let app = App::new_test();
-        assert_eq!(app.registry.tunnel_count(), 0);
+        assert_eq!(app.tunnel_count(), 0);
         let out = render_to_string(&app, 80, 1);
         assert!(!out.contains("Tunnels"), "got:\n{out}");
     }

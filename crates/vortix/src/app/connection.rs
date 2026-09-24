@@ -1,14 +1,13 @@
 //! TUI side of the connection engine: sends commands, renders snapshots.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::{App, InputMode, ToastType};
-use crate::app::registry::Conflict;
-use crate::app::registry::{Role, TunnelSnapshot};
+use crate::cidr::Cidr;
+use crate::control::Conflict;
 use crate::control::{Command, Level, Phase, Snapshot, TunnelView};
 use crate::profile::ProfileId;
-use crate::tunnel::{Connection, PromptKind};
+use crate::tunnel::{Connection, ConnectionHealth, PromptKind};
 
 pub(super) const CONTROL_STARTING_MESSAGE: &str =
     "The VPN service is still starting. Try again in a moment.";
@@ -23,13 +22,36 @@ fn initial_auth_focus(otp: bool, credentials_prefilled: bool) -> crate::app::sta
     }
 }
 
-/// The renderer still reads the registry; this is its only feed.
-fn projection(snapshot: &Snapshot) -> BTreeMap<ProfileId, TunnelSnapshot> {
-    snapshot
-        .tunnels
-        .iter()
-        .map(|tunnel| (tunnel.profile_id.clone(), tunnel_snapshot(snapshot, tunnel)))
-        .collect()
+/// Per-tunnel role derived from declared `AllowedIPs` + current primary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Role {
+    /// Owns the kernel default route. Carries the declared `AllowedIPs` for
+    /// display / Security Guard scoping.
+    Primary { allowed_ips: Vec<Cidr> },
+    /// Reachable for its declared `AllowedIPs`; doesn't claim the default route.
+    Addressable { allowed_ips: Vec<Cidr> },
+    /// Declared `0/0` but another tunnel currently holds the default route —
+    /// either because of a takeover race or because the user connected this
+    /// one without `--force` and it landed second.
+    AddressableSuppressed { allowed_ips: Vec<Cidr> },
+    /// Reconnecting; the inner role is the one this tunnel held before the
+    /// link went down (so the UI can render "Reconnecting (was Primary)").
+    Reconnecting { prior_role: Box<Role> },
+    /// Mid-connect prompt (2FA, passphrase) — role unknown until the prompt
+    /// resolves.
+    AwaitingInput,
+}
+
+/// Read-only view of one FSM. UI panels read through these.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TunnelSnapshot {
+    pub profile_id: ProfileId,
+    pub state: Connection,
+    pub role: Role,
+    pub health: ConnectionHealth,
+    pub interface_name: Option<String>,
+    pub started_at: Option<std::time::SystemTime>,
 }
 
 fn tunnel_snapshot(snapshot: &Snapshot, tunnel: &TunnelView) -> TunnelSnapshot {
@@ -86,6 +108,49 @@ fn tunnel_snapshot(snapshot: &Snapshot, tunnel: &TunnelView) -> TunnelSnapshot {
 }
 
 impl App {
+    /// Every tunnel, in stable profile order so panels do not flicker.
+    #[must_use]
+    pub fn tunnels(&self) -> Vec<TunnelSnapshot> {
+        let mut tunnels: Vec<_> = self
+            .control_snapshot
+            .tunnels
+            .iter()
+            .map(|tunnel| tunnel_snapshot(&self.control_snapshot, tunnel))
+            .collect();
+        tunnels.sort_by(|a, b| a.profile_id.cmp(&b.profile_id));
+        tunnels
+    }
+
+    #[must_use]
+    pub fn tunnel(&self, profile_id: &ProfileId) -> Option<TunnelSnapshot> {
+        self.control_snapshot
+            .tunnel(profile_id)
+            .map(|tunnel| tunnel_snapshot(&self.control_snapshot, tunnel))
+    }
+
+    /// The tunnel that owns the default route.
+    #[must_use]
+    pub fn primary_id(&self) -> Option<&ProfileId> {
+        self.control_snapshot.primary.as_ref()
+    }
+
+    #[must_use]
+    pub fn tunnel_count(&self) -> usize {
+        self.control_snapshot.tunnels.len()
+    }
+
+    /// Replace the engine's tunnel list; renderer tests only.
+    #[cfg(test)]
+    pub(crate) fn set_tunnels_for_test(
+        &mut self,
+        tunnels: Vec<TunnelView>,
+        primary: Option<ProfileId>,
+    ) {
+        let snapshot = Arc::make_mut(&mut self.control_snapshot);
+        snapshot.tunnels = tunnels;
+        snapshot.primary = primary;
+    }
+
     pub fn attach_control(&mut self, control: crate::control::Control) {
         let snapshot = control.snapshot();
         self.control = Some(control);
@@ -131,8 +196,6 @@ impl App {
                     .tunnels
                     .iter()
                     .map(|t| (&t.profile_id, t.phase, &t.interface)));
-        self.registry
-            .replace_control_projection(&projection(&snapshot), snapshot.primary.clone());
         if let Some(profile_id) = snapshot.primary.clone().or_else(|| {
             snapshot
                 .tunnels
@@ -151,11 +214,6 @@ impl App {
         self.show_notices(&snapshot);
 
         self.runtime.scanner_first_tick_done = true;
-        self.runtime
-            .default_route_interface
-            .clone_from(&snapshot.default_route);
-        self.registry
-            .feed_default_route_interface(snapshot.default_route.clone());
         self.runtime.last_kernel_session_count = snapshot
             .tunnels
             .iter()
@@ -424,6 +482,22 @@ impl App {
             return;
         };
         self.send(Command::Reconnect(profile_id));
+    }
+}
+
+/// A tunnel as the engine reports it; renderer tests only.
+#[cfg(test)]
+pub(crate) fn test_view(name: &str, phase: Phase) -> TunnelView {
+    TunnelView {
+        profile_id: ProfileId::new(name),
+        name: name.into(),
+        phase,
+        interface: None,
+        since: std::time::SystemTime::UNIX_EPOCH,
+        routes: Vec::new(),
+        dns: Vec::new(),
+        details: crate::tunnel::DetailedConnectionInfo::default(),
+        health: ConnectionHealth::default(),
     }
 }
 

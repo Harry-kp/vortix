@@ -172,8 +172,7 @@ impl App {
             // another rename while the dialog is open.
             use crate::tunnel::Connection;
             if self
-                .registry
-                .snapshot(&stable_id)
+                .tunnel(&stable_id)
                 .is_some_and(|snapshot| !matches!(snapshot.state, Connection::Disconnected))
             {
                 self.show_toast(

@@ -662,8 +662,8 @@ impl App {
                     && !is_connected
                     && !self.default_route_is_tunnel();
                 let no_tunnel_routes_v6 = is_connected
-                    && !self.registry.snapshot_all().into_iter().any(|snap| {
-                        use crate::app::registry::Role;
+                    && !self.tunnels().into_iter().any(|snap| {
+                        use crate::app::Role;
                         use crate::tunnel::Connection;
                         match (snap.state, snap.role) {
                             (
@@ -920,8 +920,8 @@ impl App {
     /// Whether the kernel's last observed default route leaves through a
     /// tunnel device, managed by Vortix or not.
     pub(crate) fn default_route_is_tunnel(&self) -> bool {
-        self.runtime
-            .default_route_interface
+        self.control_snapshot
+            .default_route
             .as_deref()
             .is_some_and(interface_is_tunnel)
     }

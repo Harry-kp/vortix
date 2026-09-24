@@ -398,14 +398,14 @@ fn handle_up(
                     .map_or_else(|| id.to_string(), |profile| profile.name.clone())
             };
             let (code, message) = match &conflict {
-                crate::app::registry::Conflict::DefaultRouteTakeover { current, new: _ } => (
+                crate::control::Conflict::DefaultRouteTakeover { current, new: _ } => (
                     "state_conflict_default_route",
                     format!(
                         "Profile '{profile_name}' would take over the default route from '{}'",
                         named(current)
                     ),
                 ),
-                crate::app::registry::Conflict::RouteOverlap {
+                crate::control::Conflict::RouteOverlap {
                     with,
                     overlapping_cidrs,
                 } => (
@@ -545,12 +545,12 @@ fn engine_failure_or_exit(mode: OutputMode, command: &str, message: String) -> !
 
 /// Detect a multi-tunnel conflict for the CLI's `up` path.
 ///
-/// The CLI doesn't share an in-memory `TunnelRegistry` with the running
+/// The CLI doesn't share an in-memory engine with the running
 /// session — active tunnels are discovered via
 /// `scanner::get_active_profiles`. We inspect each active session's parsed
 /// config and use the **shared** `cidr` and
 /// `claims_default_route_*` helpers (same logic the TUI's
-/// `TunnelRegistry::detect_conflict` uses) so the two surfaces refuse the
+/// the engine uses) so the two surfaces refuse the
 /// same set of takeovers. The route-overlap branch is a CLI-only
 /// superset until a follow-up brings route-overlap detection into the
 /// registry.
@@ -588,7 +588,7 @@ fn detect_conflict_for_cli(
     profiles: &[crate::config::profiles::VpnProfile],
     config_dir: &Path,
     target_name: &str,
-) -> Option<crate::app::registry::Conflict> {
+) -> Option<crate::control::Conflict> {
     let target_profile = profiles.iter().find(|p| p.name == target_name)?;
     let specs = crate::control::profiles::load(config_dir, profiles.to_vec());
     let routes = |id: &crate::profile::ProfileId| {
@@ -611,7 +611,7 @@ fn detect_conflict_for_cli(
             continue;
         };
         let active_allowed = routes(&active_profile.id);
-        if let Some(conflict) = crate::app::registry::classify_route_conflict(
+        if let Some(conflict) = crate::control::classify_route_conflict(
             &target_allowed,
             &active_allowed,
             &active_profile.id,

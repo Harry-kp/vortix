@@ -112,10 +112,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
 
     // Session totals derived from the primary tunnel's snapshot.
-    let primary_snap = app
-        .registry
-        .primary()
-        .and_then(|id| app.registry.snapshot(id));
+    let primary_snap = app.primary_id().and_then(|id| app.tunnel(id));
     let (session_rx, session_tx) = match primary_snap.as_ref().map(|s| &s.state) {
         Some(Connection::Connected { details, .. }) => (
             helpers::nonempty_or(&details.transfer_rx, "0B").to_string(),
