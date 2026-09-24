@@ -2116,7 +2116,7 @@ fn diagnostic_log_batch_rotates_before_crossing_the_boundary() {
         "second02".to_string(),
         "third-03".to_string(),
     ];
-    App::append_to_log_file_batch(&entries, config.path(), 10, 7);
+    crate::logger::append_to_file(&entries, config.path(), 10, 7);
 
     let log_dir = config.path().join(crate::constants::LOGS_DIR_NAME);
     let files = std::fs::read_dir(&log_dir)

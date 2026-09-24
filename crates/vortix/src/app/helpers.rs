@@ -1,10 +1,8 @@
 //! Logging, scrolling, toast notifications, and utility helpers.
 
-use std::path::Path;
 use std::time::Instant;
 
 use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
-use time::OffsetDateTime;
 
 use super::{App, FocusedPanel, Toast, ToastType};
 use crate::constants;
@@ -80,7 +78,7 @@ impl App {
         // Auto-save to log file
         let timestamp = crate::ui::helpers::format_local_time();
         let level_tag = level.prefix();
-        Self::append_to_log_file_batch(
+        crate::logger::append_to_file(
             &[format!("{timestamp} [{level_tag}] {category}: {content}")],
             &self.runtime.config_dir,
             self.runtime.config.log_rotation_size,
@@ -298,108 +296,6 @@ impl App {
                 format!("Failed to copy to clipboard: {error}"),
                 ToastType::Error,
             ),
-        }
-    }
-
-    /// Append log entry to file with automatic rotation
-    pub(super) fn append_to_log_file_batch(
-        entries: &[String],
-        config_dir: &std::path::Path,
-        rotation_size: u64,
-        retention_days: u64,
-    ) {
-        static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        use std::io::Write;
-
-        if entries.is_empty() {
-            return;
-        }
-        let log_dir = config_dir.join(constants::LOGS_DIR_NAME);
-
-        // Create log directory if needed
-        if crate::config::owned_file::create_user_dir(&log_dir).is_err() {
-            return;
-        }
-
-        // Use date-based log file
-        let today = OffsetDateTime::now_local()
-            .unwrap_or_else(|_| OffsetDateTime::now_utc())
-            .date();
-        let log_file = log_dir.join(format!("vortix-{today}.log"));
-
-        let mut current_len = std::fs::metadata(&log_file).map_or(0, |metadata| metadata.len());
-        let mut file = None;
-        for entry in entries {
-            let encoded_len = u64::try_from(entry.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
-            if current_len > 0 && current_len.saturating_add(encoded_len) > rotation_size {
-                drop(file.take());
-                Self::rotate_log_file(&log_file, &log_dir, today);
-                current_len = 0;
-            }
-            if file.is_none() {
-                let is_new = !log_file.exists();
-                file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_file)
-                    .ok();
-                if is_new && file.is_some() {
-                    crate::config::fix_ownership(&log_file);
-                }
-            }
-            let Some(writer) = file.as_mut() else {
-                break;
-            };
-            if writeln!(writer, "{entry}").is_err() {
-                break;
-            }
-            current_len = current_len.saturating_add(encoded_len);
-        }
-
-        // Clean up old logs periodically
-        let added = u32::try_from(entries.len()).unwrap_or(u32::MAX);
-        let count = CLEANUP_COUNTER.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
-        let last = count.saturating_add(added.saturating_sub(1));
-        if count % constants::LOG_CLEANUP_INTERVAL == 0
-            || count / constants::LOG_CLEANUP_INTERVAL != last / constants::LOG_CLEANUP_INTERVAL
-        {
-            Self::cleanup_old_logs(&log_dir, retention_days);
-        }
-    }
-
-    fn rotate_log_file(log_file: &Path, log_dir: &Path, today: time::Date) {
-        if !log_file.exists() {
-            return;
-        }
-        let rotated = (1_u32..=u32::from(u16::MAX))
-            .map(|suffix| log_dir.join(format!("vortix-{today}.{suffix}.log")))
-            .find(|candidate| !candidate.exists());
-        if let Some(rotated) = rotated {
-            let _ = std::fs::rename(log_file, rotated);
-        }
-    }
-
-    /// Remove log files older than `retention_days` days.
-    fn cleanup_old_logs(log_dir: &Path, retention_days: u64) {
-        use std::time::{Duration, SystemTime};
-
-        let max_age = Duration::from_secs(retention_days * 24 * 60 * 60);
-        let cutoff = SystemTime::now()
-            .checked_sub(max_age)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-
-        if let Ok(entries) = std::fs::read_dir(log_dir) {
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified < cutoff {
-                            let _ = std::fs::remove_file(entry.path());
-                        }
-                    }
-                }
-            }
         }
     }
 }

@@ -167,10 +167,7 @@ fn main() -> Result<()> {
 
     // Journal — open the per-session JSONL writer using the runner's own
     // tokio runtime after the authoritative settings path is known.
-    if let Some(handle) = vortix::process::global_runner()
-        .as_real()
-        .map(|r| r.runtime().handle().clone())
-    {
+    if let Some(handle) = vortix::process::runtime_handle() {
         let _guard = handle.enter();
         match vortix::journal::Journal::open(vortix::journal::JournalConfig {
             disk: settings.journal.disk,

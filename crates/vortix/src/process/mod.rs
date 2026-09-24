@@ -18,7 +18,6 @@ pub use real::{RealProcessLifecycle, RealRunner};
 
 /// The enum carrier — held by value, dispatched statically.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum CommandRunner {
     Real(RealRunner),
     #[cfg(test)]
@@ -51,19 +50,6 @@ impl CommandRunner {
         Self::Real(RealRunner::new())
     }
 
-    /// Borrow the production runner variant, if this enum is `Real`.
-    ///
-    /// Returns `None` for the `Mock` variant. Used by `main.rs` to grab the
-    /// bundled tokio runtime handle for spawning auxiliary tasks.
-    #[must_use]
-    pub fn as_real(&self) -> Option<&RealRunner> {
-        match self {
-            Self::Real(r) => Some(r),
-            #[cfg(test)]
-            Self::Mock(_) => None,
-        }
-    }
-
     /// Construct a mock runner that succeeds at every call.
     #[cfg(test)]
     #[must_use]
@@ -87,6 +73,16 @@ pub fn global_runner() -> &'static CommandRunner {
     #[cfg(not(test))]
     {
         GLOBAL_RUNNER.get_or_init(CommandRunner::real)
+    }
+}
+
+/// The process-wide runner's tokio runtime, for auxiliary tasks.
+#[must_use]
+pub fn runtime_handle() -> Option<tokio::runtime::Handle> {
+    match global_runner() {
+        CommandRunner::Real(runner) => Some(runner.runtime().handle().clone()),
+        #[cfg(test)]
+        CommandRunner::Mock(_) => None,
     }
 }
 
