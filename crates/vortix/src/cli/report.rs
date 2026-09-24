@@ -734,10 +734,10 @@ fn redact_home_prefix(path: &str) -> String {
 mod tests {
     use super::*;
 
-    /// `recovered_state` owns the "a durable request is not kernel proof"
-    /// rule (see `control::killswitch`); this pins the rendering around it.
+    /// `PersistedState::live_state` owns the "a durable request is not kernel
+    /// proof" rule; this pins the rendering around it.
     #[test]
-    fn persisted_state_renders_mode_and_recovered_state() {
+    fn persisted_state_renders_mode_and_live_state() {
         assert_eq!(
             persisted_killswitch_summary(
                 crate::control::killswitch::KillSwitchMode::AlwaysOn,

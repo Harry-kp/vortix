@@ -426,72 +426,6 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-
-// Re-export the canonical types so existing `crate::control::killswitch::*`
-// imports keep resolving.
-
-/// Typed proof attached only after a platform adapter has read back the
-/// Vortix-owned policy it just applied.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FirewallVerification {
-    /// Digest of the complete normalized multi-tunnel policy.
-    pub policy_digest: String,
-    /// Wall-clock observation timestamp for diagnostics/persistence.
-    pub observed_at_unix_ms: u64,
-    /// Hard freshness ceiling; later units add event-driven invalidation.
-    pub fresh_until_unix_ms: u64,
-    /// Local authority epoch. A process restart cannot reuse this proof.
-    pub executor_epoch: String,
-    /// OS boot identity. Proof cannot cross a reboot even if process metadata
-    /// is accidentally reused.
-    pub boot_id: String,
-    /// Observation mechanism, currently platform-owned kernel read-back.
-    pub source: FirewallObservationSource,
-}
-
-/// Allowlisted source of firewall verification evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum FirewallObservationSource {
-    /// The selected platform adapter read back its owned kernel policy.
-    PlatformReadback,
-}
-
-impl FirewallVerification {
-    /// Whether this proof still stands for `expected_policy_digest`.
-    ///
-    /// Proof cannot cross a process restart (`executor_epoch`), a reboot
-    /// (`boot_id`), its freshness ceiling, or an edit to the policy it
-    /// describes. Readers of the state file use this to tell a durable
-    /// `Blocking` *request* from a `Blocking` *fact*.
-    #[must_use]
-    pub fn proves(&self, expected_policy_digest: &str, now_unix_ms: u64) -> bool {
-        self.policy_digest == expected_policy_digest
-            && self.fresh_until_unix_ms > now_unix_ms
-            && self.executor_epoch == local_executor_epoch()
-            && crate::platform::boot_identity().is_some_and(|boot_id| self.boot_id == boot_id)
-    }
-}
-
-fn now_unix_millis() -> Option<u64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis()
-        .try_into()
-        .ok()
-}
-
-fn local_executor_epoch() -> &'static str {
-    static EPOCH: OnceLock<String> = OnceLock::new();
-    EPOCH.get_or_init(|| {
-        let started_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("standard-local:{}:{started_ns}", std::process::id())
-    })
-}
 
 /// Stable digest of the complete requested firewall policy.
 ///
@@ -677,10 +611,6 @@ pub struct PersistedState {
     /// Empty for V1 files until coerced by `load_state`.
     #[serde(default)]
     pub active_tunnels: Vec<PersistedTunnelInfo>,
-    /// Present only for a successfully read-back Blocking policy. Missing or
-    /// stale evidence makes the next process start explicitly Degraded.
-    #[serde(default)]
-    pub firewall_verification: Option<FirewallVerification>,
     /// Durable fence written by `release-killswitch`. Canonical startup must
     /// honor this even when the control journal was temporarily unreadable
     /// during the emergency release.
@@ -689,54 +619,22 @@ pub struct PersistedState {
 }
 
 impl PersistedState {
-    /// The state a reader may present for a record loaded from disk.
-    ///
-    /// `Blocking` survives the round trip only while the record still carries
-    /// proof this process can use — same process, same boot, inside the
-    /// freshness ceiling, for this exact policy. Otherwise the record is a
-    /// durable *request* and reads as `Degraded` until a live read-back
-    /// re-proves it.
-    ///
-    /// Every reader routes through this one helper. While each applied its own
-    /// version of the rule, `vortix killswitch` printed the raw field and told
-    /// users the firewall was blocking on the strength of a file.
+    /// The state a reader may present for a record loaded from disk. A
+    /// `Blocking` record is a request, not proof: it stands only while a live
+    /// read-back finds that exact policy in the firewall, and reads as
+    /// `Degraded` otherwise. Every reader routes through here.
     #[must_use]
-    pub fn recovered_state(&self) -> KillSwitchState {
+    pub fn live_state(&self) -> KillSwitchState {
         let state = self.effective_state.unwrap_or(self.state);
         if state != KillSwitchState::Blocking {
             return state;
         }
-        let proven = self
-            .firewall_verification
-            .as_ref()
-            .is_some_and(|verification| {
-                policy_digest_from_persisted(&self.active_tunnels)
-                    .zip(now_unix_millis())
-                    .is_some_and(|(digest, now_ms)| verification.proves(&digest, now_ms))
-            });
-        if proven {
+        let verified = active_from_persisted(&self.active_tunnels)
+            .is_some_and(|active| crate::platform::Firewall::verify_blocking(&active).is_ok());
+        if verified {
             KillSwitchState::Blocking
         } else {
             KillSwitchState::Degraded
-        }
-    }
-
-    /// [`Self::recovered_state`], except that a `Blocking` record without
-    /// in-process proof is re-proved by reading the firewall back, so another
-    /// process does not report a working kill switch as degraded.
-    #[must_use]
-    pub fn live_state(&self) -> KillSwitchState {
-        let recovered = self.recovered_state();
-        let claims_blocking =
-            self.effective_state.unwrap_or(self.state) == KillSwitchState::Blocking;
-        if recovered == KillSwitchState::Degraded
-            && claims_blocking
-            && active_from_persisted(&self.active_tunnels)
-                .is_some_and(|active| crate::platform::Firewall::verify_blocking(&active).is_ok())
-        {
-            KillSwitchState::Blocking
-        } else {
-            recovered
         }
     }
 }
@@ -935,21 +833,10 @@ pub fn save_state(
     state: KillSwitchState,
     active_tunnels: Vec<PersistedTunnelInfo>,
 ) -> Result<()> {
-    save_state_with_verification(mode, state, active_tunnels, None)
-}
-
-/// Save requested/effective state with optional fresh kernel read-back proof.
-///
-/// # Errors
-///
-/// Returns [`KillswitchError::Io`] when the file cannot be written.
-pub fn save_state_with_verification(
-    mode: KillSwitchMode,
-    state: KillSwitchState,
-    active_tunnels: Vec<PersistedTunnelInfo>,
-    firewall_verification: Option<FirewallVerification>,
-) -> Result<()> {
-    save_state_with_options(mode, state, active_tunnels, firewall_verification, false)
+    let Some(path) = get_state_path() else {
+        return Ok(()); // Silently skip if no home dir
+    };
+    save_state_at(&path, mode, state, active_tunnels, false)
 }
 
 /// Persist an emergency `off` intent that fences any temporarily unreadable
@@ -959,61 +846,26 @@ pub fn save_state_with_verification(
 ///
 /// Returns [`KillswitchError::Io`] when the state cannot be durably replaced.
 pub(crate) fn save_emergency_release_state(config_dir: &std::path::Path) -> Result<()> {
-    save_state_with_options_at(
+    save_state_at(
         &config_dir.join(constants::KILLSWITCH_STATE_FILE),
         KillSwitchMode::Off,
         KillSwitchState::Disabled,
         Vec::new(),
-        None,
         true,
     )
 }
 
-fn save_state_with_options(
-    mode: KillSwitchMode,
-    state: KillSwitchState,
-    active_tunnels: Vec<PersistedTunnelInfo>,
-    firewall_verification: Option<FirewallVerification>,
-    emergency_release_fence: bool,
-) -> Result<()> {
-    let Some(path) = get_state_path() else {
-        return Ok(()); // Silently skip if no home dir
-    };
-    save_state_with_options_at(
-        &path,
-        mode,
-        state,
-        active_tunnels,
-        firewall_verification,
-        emergency_release_fence,
-    )
-}
-
-fn save_state_with_options_at(
+fn save_state_at(
     path: &std::path::Path,
     mode: KillSwitchMode,
     state: KillSwitchState,
     active_tunnels: Vec<PersistedTunnelInfo>,
-    firewall_verification: Option<FirewallVerification>,
     emergency_release_fence: bool,
 ) -> Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    let firewall_verification = firewall_verification.or_else(|| {
-        if state != KillSwitchState::Blocking {
-            return None;
-        }
-        let content = fs::read_to_string(path).ok()?;
-        let existing: PersistedState = serde_json::from_str(&content).ok()?;
-        let verification = existing.firewall_verification?;
-        let expected = policy_digest_from_persisted(&active_tunnels)?;
-        verification
-            .proves(&expected, now_unix_millis()?)
-            .then_some(verification)
-    });
 
     let legacy_state = if state == KillSwitchState::Degraded {
         KillSwitchState::Armed
@@ -1030,7 +882,6 @@ fn save_state_with_options_at(
         vpn_interface: None,
         vpn_server_ip: None,
         active_tunnels,
-        firewall_verification,
         emergency_release_fence,
     };
 
@@ -1038,10 +889,6 @@ fn save_state_with_options_at(
 
     atomic_write(path, content.as_bytes())?;
     Ok(())
-}
-
-fn policy_digest_from_persisted(active: &[PersistedTunnelInfo]) -> Option<String> {
-    active_from_persisted(active).map(|active| policy_digest(&active))
 }
 
 fn active_from_persisted(active: &[PersistedTunnelInfo]) -> Option<Vec<ActiveTunnelInfo>> {
@@ -1214,10 +1061,9 @@ mod tests {
                 vpn_interface: None,
                 vpn_server_ip: None,
                 active_tunnels: Vec::new(),
-                firewall_verification: None,
                 emergency_release_fence: false,
             };
-            assert_eq!(record.recovered_state(), state);
+            assert_eq!(record.live_state(), state);
         }
     }
 
@@ -1236,7 +1082,6 @@ mod tests {
                 declared_cidrs: vec!["10.0.0.0/8".to_string()],
                 is_primary: true,
             }],
-            firewall_verification: None,
             emergency_release_fence: false,
         };
 
@@ -1351,7 +1196,6 @@ mod tests {
                     is_primary: false,
                 },
             ],
-            firewall_verification: None,
             emergency_release_fence: false,
         };
         let live = vec!["lo".to_string(), "eth0".to_string()];
@@ -1377,7 +1221,6 @@ mod tests {
                 declared_cidrs: Vec::new(),
                 is_primary: true,
             }],
-            firewall_verification: None,
             emergency_release_fence: false,
         };
         filter_phantom_tunnels(&mut state, &[]);
@@ -1490,7 +1333,6 @@ mod tests {
             vpn_interface: None,
             vpn_server_ip: None,
             active_tunnels: Vec::new(),
-            firewall_verification: None,
             emergency_release_fence: false,
         };
         let json = serde_json::to_string(&state).unwrap();
