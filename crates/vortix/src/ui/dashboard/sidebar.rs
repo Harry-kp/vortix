@@ -455,6 +455,7 @@ mod tests {
             location: String::new(),
             config_path: PathBuf::from(format!("/tmp/{name}.conf")),
             last_used: None,
+            group: None,
         }
     }
 

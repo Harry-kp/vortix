@@ -39,6 +39,7 @@ fn engine_find_profile_by_name() {
         config_path: "/tmp/work.conf".into(),
         location: "US".into(),
         last_used: None,
+        group: None,
     });
     engine.profiles.push(VpnProfile {
         id: vortix::core::profile::ProfileId::new("personal"),
@@ -47,6 +48,7 @@ fn engine_find_profile_by_name() {
         config_path: "/tmp/personal.ovpn".into(),
         location: "EU".into(),
         last_used: None,
+        group: None,
     });
 
     assert_eq!(engine.find_profile("work-vpn"), Some(0));
@@ -65,6 +67,7 @@ fn engine_sort_profiles_by_name() {
             config_path: format!("/tmp/{name}.conf").into(),
             location: "Test".into(),
             last_used: None,
+            group: None,
         });
     }
 
@@ -89,6 +92,7 @@ fn engine_sort_profiles_by_protocol() {
         config_path: "/tmp/a.ovpn".into(),
         location: "EU".into(),
         last_used: None,
+        group: None,
     });
     engine.profiles.push(VpnProfile {
         id: vortix::core::profile::ProfileId::new("wg-profile"),
@@ -97,6 +101,7 @@ fn engine_sort_profiles_by_protocol() {
         config_path: "/tmp/b.conf".into(),
         location: "US".into(),
         last_used: None,
+        group: None,
     });
 
     engine.sort_order = vortix::app::state::ProfileSortOrder::Protocol;

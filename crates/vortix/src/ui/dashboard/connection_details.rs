@@ -852,6 +852,7 @@ mod tests {
             location: String::new(),
             config_path,
             last_used: None,
+            group: None,
         }
     }
 
@@ -910,6 +911,7 @@ mod tests {
                 location: String::new(),
                 config_path: PathBuf::from("/tmp/corp.conf"),
                 last_used: None,
+                group: None,
             });
             app.profile_list_state.select(Some(0));
             let profile_id = ProfileId::new("corp");

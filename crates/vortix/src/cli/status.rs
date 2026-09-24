@@ -78,30 +78,30 @@ pub fn scan_status(
                 Some(s.name.clone()),
                 proto.map(|p| format!("{p}")),
                 uptime,
-                if s.endpoint.is_empty() {
+                if s.details.endpoint.is_empty() {
                     None
                 } else {
-                    Some(s.endpoint.clone())
+                    Some(s.details.endpoint.clone())
                 },
-                if s.interface.is_empty() {
+                if s.details.interface.is_empty() {
                     None
                 } else {
-                    Some(s.interface.clone())
+                    Some(s.details.interface.clone())
                 },
-                if s.internal_ip.is_empty() {
+                if s.details.internal_ip.is_empty() {
                     None
                 } else {
-                    Some(s.internal_ip.clone())
+                    Some(s.details.internal_ip.clone())
                 },
-                if s.transfer_rx.is_empty() {
+                if s.details.transfer_rx.is_empty() {
                     None
                 } else {
-                    Some(s.transfer_rx.clone())
+                    Some(s.details.transfer_rx.clone())
                 },
-                if s.transfer_tx.is_empty() {
+                if s.details.transfer_tx.is_empty() {
                     None
                 } else {
-                    Some(s.transfer_tx.clone())
+                    Some(s.details.transfer_tx.clone())
                 },
             )
         } else {

@@ -177,7 +177,7 @@ pub fn adopt(
     profile: &Profile,
     session: &ActiveSession,
 ) -> Result<Option<Live>, String> {
-    if !session.interface_authoritative || session.interface.is_empty() {
+    if !session.details.interface_authoritative || session.details.interface.is_empty() {
         return Ok(None);
     }
     match profile.protocol {
@@ -236,7 +236,7 @@ pub fn adopt(
             let handle = TunnelHandle {
                 profile_id: profile.id.clone(),
                 display_name: profile.display_name.clone(),
-                interface_name: session.interface.clone(),
+                interface_name: session.details.interface.clone(),
                 pid: Some(owner.protocol_pid()),
                 started_at: session
                     .started_at
@@ -437,6 +437,7 @@ pub(crate) fn standard_openvpn_owner(
         return Ok(None);
     }
     let scanner_pid = session
+        .details
         .pid
         .ok_or_else(|| "active OpenVPN target has no scanner process PID".to_string())?;
     if !crate::process::custodian::contains_protocol_pid(&custody, scanner_pid)

@@ -11,71 +11,19 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Information about an active VPN session detected on the system.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ActiveSession {
     /// Profile name associated with this session.
     pub name: String,
-    /// Process ID for `OpenVPN` or interface index (not used yet).
-    pub pid: Option<u32>,
     /// Timestamp when the connection was established.
     pub started_at: Option<SystemTime>,
-    /// System interface name (e.g., utun3, wg0, tun0).
-    pub interface: String,
-    /// Whether `interface` came from a reliable per-tunnel source.
-    ///
-    /// `true` when the platform's per-PID iface detection is reliable
-    /// (Linux `/proc/PID/fd/*`, macOS `/var/run/wireguard/<name>.name`
-    /// for WG). `false` only when the scanner fell back to the macOS
-    /// ifconfig-scan heuristic (`check_openvpn_by_pid` Method B), which
-    /// collides across multiple `OpenVPN` PIDs and so cannot
-    /// truthfully identify which utun belongs to which process.
-    /// Scanner evidence remains observational regardless of this bit. It is
-    /// useful for display attribution, never for primary or retry authority.
-    ///
-    /// Defaults to `true` — most platforms / protocols / paths are
-    /// reliable. The macOS `OpenVPN` Method-B fallback is the narrow
-    /// exception that opts out.
-    pub interface_authoritative: bool,
-    /// Internal VPN IP address assigned to this interface.
-    pub internal_ip: String,
-    /// Remote server endpoint address.
-    pub endpoint: String,
-    /// Maximum transmission unit size.
-    pub mtu: String,
-    /// `WireGuard` public key (empty for `OpenVPN`).
-    pub public_key: String,
-    /// Local listening port for the VPN interface.
-    pub listen_port: String,
-    /// Total bytes received over the tunnel.
-    pub transfer_rx: String,
-    /// Total bytes transmitted over the tunnel.
-    pub transfer_tx: String,
-    /// Time since last successful handshake.
-    pub latest_handshake: String,
-    /// Typed `WireGuard` peer facts. Empty for `OpenVPN`. Display strings above
-    /// are compatibility projections and never control authority.
+    /// Interface, addresses, counters and pid as the kernel reports them.
+    /// `details.interface_authoritative` is false only when the macOS
+    /// `OpenVPN` fallback guessed the utun by scanning `ifconfig`, which cannot
+    /// tell several `OpenVPN` processes apart.
+    pub details: crate::core::engine::state::DetailedConnectionInfo,
+    /// Typed `WireGuard` peer facts. Empty for `OpenVPN`.
     pub wireguard_peers: Vec<crate::core::ports::tunnel::TunnelPeerStatus>,
-}
-
-impl Default for ActiveSession {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            pid: None,
-            started_at: None,
-            interface: String::new(),
-            interface_authoritative: true,
-            internal_ip: String::new(),
-            endpoint: String::new(),
-            mtu: String::new(),
-            public_key: String::new(),
-            listen_port: String::new(),
-            transfer_rx: String::new(),
-            transfer_tx: String::new(),
-            latest_handshake: String::new(),
-            wireguard_peers: Vec::new(),
-        }
-    }
 }
 
 /// Combined result of a scanner sweep: active VPN sessions plus the
@@ -319,14 +267,16 @@ fn check_wireguard_by_name(
     let interface_name = crate::platform::Interface::resolve_wireguard_interface(name)?;
 
     let mut session = ActiveSession {
-        interface: interface_name.clone(),
-        interface_authoritative: true,
+        details: crate::core::engine::state::DetailedConnectionInfo {
+            interface: interface_name.clone(),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
     // 1. Attempt to find PID (wireguard-go or similar)
     if let Some(pid) = crate::platform::Interface::get_wireguard_pid(&interface_name) {
-        session.pid = Some(pid);
+        session.details.pid = Some(pid);
 
         // Primary method: Get start time from process (works cross-platform)
         if let Some(output) = cmd_output("ps", &["-p", &pid.to_string(), "-o", "etime="]) {
@@ -364,28 +314,31 @@ fn check_wireguard_by_name(
     // Protocol-owned machine-readable observation. The scanner projects
     // display metadata but cannot manufacture connection truth.
     let status = statuses.get(&interface_name)?;
-    session.public_key.clone_from(&status.interface_public_key);
-    session.listen_port = status
+    session
+        .details
+        .public_key
+        .clone_from(&status.interface_public_key);
+    session.details.listen_port = status
         .listen_port
         .map_or_else(String::new, |port| port.to_string());
-    session.endpoint = status
+    session.details.endpoint = status
         .peers
         .iter()
         .find_map(|peer| peer.endpoint.clone())
         .unwrap_or_default();
-    session.transfer_rx = status
+    session.details.transfer_rx = status
         .peers
         .iter()
         .map(|peer| peer.bytes_rx)
         .sum::<u64>()
         .to_string();
-    session.transfer_tx = status
+    session.details.transfer_tx = status
         .peers
         .iter()
         .map(|peer| peer.bytes_tx)
         .sum::<u64>()
         .to_string();
-    session.latest_handshake = status
+    session.details.latest_handshake = status
         .peers
         .iter()
         .filter_map(|peer| peer.latest_handshake)
@@ -397,10 +350,10 @@ fn check_wireguard_by_name(
     // 4. Get IP and MTU using platform-specific interface info
     let (ip, mtu) = crate::platform::Interface::get_interface_info(&interface_name);
     if !ip.is_empty() {
-        session.internal_ip = ip;
+        session.details.internal_ip = ip;
     }
     if !mtu.is_empty() {
-        session.mtu = mtu;
+        session.details.mtu = mtu;
     }
 
     Some(session)
@@ -424,7 +377,10 @@ fn check_openvpn_by_pid(
     display_name: &str,
 ) -> Option<ActiveSession> {
     let mut session = ActiveSession {
-        pid: Some(pid),
+        details: crate::core::engine::state::DetailedConnectionInfo {
+            pid: Some(pid),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -559,8 +515,8 @@ fn check_openvpn_by_pid(
                                     .unwrap_or("")
                                     .to_string();
                                 if !detected_iface.is_empty() {
-                                    session.interface.clone_from(&detected_iface);
-                                    session.mtu.clone_from(&iface_mtu);
+                                    session.details.interface.clone_from(&detected_iface);
+                                    session.details.mtu.clone_from(&iface_mtu);
                                 }
                             }
                         }
@@ -572,9 +528,9 @@ fn check_openvpn_by_pid(
                         if parts.len() >= 2
                             && !crate::wireguard::WgTunnel::interface_exists(&current_iface)
                         {
-                            session.internal_ip = parts[1].to_string();
-                            session.mtu.clone_from(&iface_mtu);
-                            session.interface.clone_from(&current_iface);
+                            session.details.internal_ip = parts[1].to_string();
+                            session.details.mtu.clone_from(&iface_mtu);
+                            session.details.interface.clone_from(&current_iface);
                             break;
                         }
                     }
@@ -610,7 +566,7 @@ fn check_openvpn_by_pid(
 
                             // Extract MTU
                             if let Some(mtu_idx) = line.find("mtu ") {
-                                session.mtu = line[mtu_idx + 4..]
+                                session.details.mtu = line[mtu_idx + 4..]
                                     .split_whitespace()
                                     .next()
                                     .unwrap_or("")
@@ -624,9 +580,9 @@ fn check_openvpn_by_pid(
                     if trimmed.starts_with("inet ") {
                         let parts: Vec<&str> = trimmed.split_whitespace().collect();
                         if parts.len() >= 2 {
-                            session.internal_ip =
+                            session.details.internal_ip =
                                 parts[1].split('/').next().unwrap_or("").to_string();
-                            session.interface.clone_from(&current_iface);
+                            session.details.interface.clone_from(&current_iface);
                             // Linux `ip addr` reliably attributes each
                             // tun/tap device — no multi-PID collision
                             // surface like the macOS Method B fallback.
@@ -640,8 +596,8 @@ fn check_openvpn_by_pid(
     }
 
     // Ensure interface is set if we detected one
-    if session.interface.is_empty() && !detected_iface.is_empty() {
-        session.interface = detected_iface;
+    if session.details.interface.is_empty() && !detected_iface.is_empty() {
+        session.details.interface = detected_iface;
     }
 
     // Record the iface-attribution-reliability decision on the session.
@@ -653,12 +609,12 @@ fn check_openvpn_by_pid(
     // ACCEPT rules if the registry takes that value as authoritative.
     // By contract: adopted entries with unreliable iface are
     // excluded from primary-election by the registry.
-    session.interface_authoritative = iface_authoritative;
+    session.details.interface_authoritative = iface_authoritative;
 
     // No tun/tap interface means OpenVPN is running but NOT connected yet
     // (still negotiating TLS, authenticating, or has failed silently).
     // Don't report this as an active session — the scanner will re-check next tick.
-    if session.interface.is_empty() {
+    if session.details.interface.is_empty() {
         crate::logger::log(
             crate::logger::LogLevel::Debug,
             "SCANNER",
@@ -676,18 +632,18 @@ fn check_openvpn_by_pid(
             if !parts.is_empty() {
                 let host = parts[0];
                 let port = parts.get(1).unwrap_or(&"1194");
-                session.endpoint = format!("{host}:{port}");
+                session.details.endpoint = format!("{host}:{port}");
             }
         }
     }
 
     // Set cipher info (OpenVPN default or from config)
-    session.public_key = "OpenVPN".to_string();
+    session.details.public_key = "OpenVPN".to_string();
 
     // Read config file once for both endpoint and cipher extraction
     if let Ok(config_content) = std::fs::read_to_string(config_path) {
         // If no endpoint from args, try parsing the config file
-        if session.endpoint.is_empty() {
+        if session.details.endpoint.is_empty() {
             for line in config_content.lines() {
                 let line = line.trim();
                 if line.to_lowercase().starts_with("remote ") {
@@ -695,7 +651,7 @@ fn check_openvpn_by_pid(
                     if parts.len() >= 2 {
                         let host = parts[1];
                         let port = parts.get(2).unwrap_or(&"1194");
-                        session.endpoint = format!("{host}:{port}");
+                        session.details.endpoint = format!("{host}:{port}");
                         break;
                     }
                 }
@@ -707,7 +663,7 @@ fn check_openvpn_by_pid(
             let line = line.trim();
             if line.to_lowercase().starts_with("cipher ") {
                 if let Some(cipher) = line.split_whitespace().nth(1) {
-                    session.latest_handshake = format!("Cipher: {cipher}");
+                    session.details.latest_handshake = format!("Cipher: {cipher}");
                     break;
                 }
             }

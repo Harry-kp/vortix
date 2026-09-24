@@ -6,7 +6,6 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::openvpn_credentials::{FsOpenVpnCredentialStore, RememberedOpenVpnCredentials};
-use crate::core::engine::state::DetailedConnectionInfo;
 use crate::core::engine::Conflict;
 use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::core::ports::route_table::DefaultRouteObservation;
@@ -863,7 +862,7 @@ impl Engine {
                 dns: tunnel.spec.dns.servers.clone(),
                 details: scan
                     .and_then(|scan| session(&scan.sessions, &tunnel.spec.name))
-                    .map(details)
+                    .map(|session| session.details.clone())
                     .unwrap_or_default(),
                 health: self
                     .health
@@ -1144,23 +1143,6 @@ impl Engine {
 
 fn session<'a>(sessions: &'a [ActiveSession], name: &str) -> Option<&'a ActiveSession> {
     sessions.iter().find(|session| session.name == name)
-}
-
-fn details(session: &ActiveSession) -> DetailedConnectionInfo {
-    DetailedConnectionInfo {
-        interface: session.interface.clone(),
-        interface_authoritative: session.interface_authoritative,
-        internal_ip: session.internal_ip.clone(),
-        endpoint: session.endpoint.clone(),
-        mtu: session.mtu.clone(),
-        public_key: session.public_key.clone(),
-        listen_port: session.listen_port.clone(),
-        transfer_rx: session.transfer_rx.clone(),
-        transfer_tx: session.transfer_tx.clone(),
-        latest_handshake: session.latest_handshake.clone(),
-        pid: session.pid,
-        ..DetailedConnectionInfo::default()
-    }
 }
 
 fn start_hooks(

@@ -27,6 +27,8 @@ pub struct VpnProfile {
     pub config_path: PathBuf,
     /// Last time this profile was used.
     pub last_used: Option<SystemTime>,
+    /// Optional group label from the sidecar.
+    pub group: Option<String>,
 }
 
 /// Import a VPN profile from a file
@@ -153,6 +155,7 @@ pub(crate) fn prepare_profile_import(
             location,
             config_path: dest_path,
             last_used: None,
+            group: None,
         },
     })
 }
@@ -564,6 +567,7 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
                         location,
                         config_path: path.clone(),
                         last_used: summary.last_used,
+                        group: summary.group,
                     });
                 }
                 Err(e) => {

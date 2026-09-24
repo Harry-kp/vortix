@@ -832,6 +832,7 @@ mod tests {
                 config_path: "/tmp/corp.conf".into(),
                 location: String::new(),
                 last_used: None,
+                group: None,
             });
         let profile_id = ProfileId::new("corp");
         let tunnel = crate::core::engine::TunnelSnapshot {

@@ -57,6 +57,7 @@ fn add_wg_profiles(app: &mut App, names: &[&str]) {
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
             location: "Test".to_string(),
             last_used: None,
+            group: None,
         });
     }
 }

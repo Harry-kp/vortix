@@ -211,8 +211,8 @@ impl StandardTunnelOwnershipStore {
                 .wg_quick_interface
                 .as_deref()
                 .is_some_and(|recorded| recorded != wg_quick_interface)
-            || record.interface_name != session.interface
-            || !session.interface_authoritative
+            || record.interface_name != session.details.interface
+            || !session.details.interface_authoritative
             || !peer_matches
             || record.teardown_config_identity != content_identity(&teardown_bytes)
         {
@@ -241,7 +241,7 @@ impl StandardTunnelOwnershipStore {
             || record.owner_uid != self.owner_uid
             || active
                 .iter()
-                .any(|session| session.interface == record.interface_name)
+                .any(|session| session.details.interface == record.interface_name)
         {
             return Ok(false);
         }
@@ -506,8 +506,10 @@ mod tests {
     fn session(profile: &Profile, evidence: &HandshakeEvidence) -> ActiveSession {
         ActiveSession {
             name: profile.display_name.clone(),
-            interface: "wg0".into(),
-            interface_authoritative: true,
+            details: crate::core::engine::state::DetailedConnectionInfo {
+                interface: "wg0".into(),
+                ..Default::default()
+            },
             wireguard_peers: vec![TunnelPeerStatus {
                 public_key: evidence.peer_public_key.clone(),
                 endpoint: None,
@@ -600,7 +602,7 @@ mod tests {
         record.as_object_mut().unwrap().remove("wg_quick_interface");
         std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
         let mut active = session(&profile, &evidence);
-        active.interface = "utun4".into();
+        active.details.interface = "utun4".into();
 
         let recovered = store.validate_wireguard(&profile, &active).unwrap();
         assert_eq!(

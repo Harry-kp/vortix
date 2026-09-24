@@ -177,7 +177,6 @@ pub fn handle_command(
             *reverse,
             protocol.as_deref(),
             *names_only,
-            config_dir,
             mode,
         ),
         Commands::Import { file } => handle_import(file, config, config_dir, mode),
@@ -1402,7 +1401,6 @@ fn handle_list(
     reverse: bool,
     protocol_filter: Option<&str>,
     names_only: bool,
-    config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
     let mut all = crate::config::profiles::load_profiles();
@@ -1456,19 +1454,6 @@ fn handle_list(
         return 0;
     }
 
-    // Index sidecars by display_name so we can enrich each entry with the
-    // stable profile_id + group label. The lookup is
-    // O(N + M) which is fine for the typical handful of profiles.
-    let sidecars_by_name: std::collections::HashMap<String, _> = {
-        let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
-        store
-            .list()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.display_name.clone(), s))
-            .collect()
-    };
-
     // Multi-tunnel: every kernel-visible session counts. Built as a
     // HashSet so per-entry membership lookup is O(1) and every
     // active profile gets its dot — not just the first one (the
@@ -1481,10 +1466,7 @@ fn handle_list(
 
     let entries: Vec<ProfileEntry> = profiles
         .iter()
-        .map(|p| {
-            let sidecar = sidecars_by_name.get(&p.name);
-            build_profile_entry(p, &active_names, sidecar)
-        })
+        .map(|p| build_profile_entry(p, &active_names))
         .collect();
 
     match mode {
@@ -1562,7 +1544,6 @@ fn format_elapsed(secs: u64) -> String {
 fn build_profile_entry(
     profile: &crate::config::profiles::VpnProfile,
     active_names: &std::collections::HashSet<String>,
-    sidecar: Option<&crate::config::profile_store::ProfileSummary>,
 ) -> ProfileEntry {
     ProfileEntry {
         name: profile.name.clone(),
@@ -1581,8 +1562,8 @@ fn build_profile_entry(
                 }
                 Err(_) => "unknown".into(),
             }),
-        profile_id: sidecar.map(|s| s.id.as_str().to_string()),
-        group: sidecar.and_then(|s| s.group.clone()),
+        profile_id: Some(profile.id.as_str().to_string()),
+        group: profile.group.clone(),
     }
 }
 
@@ -1611,6 +1592,7 @@ mod list_tests {
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
             location: String::new(),
             last_used: None,
+            group: None,
         }
     }
 
@@ -1627,7 +1609,7 @@ mod list_tests {
 
         let entries: Vec<_> = profiles
             .iter()
-            .map(|p| build_profile_entry(p, &active, None))
+            .map(|p| build_profile_entry(p, &active))
             .collect();
 
         // Both active profiles report connected=true. Pre-fix only
@@ -1657,7 +1639,7 @@ mod list_tests {
         let profiles = [profile("alpha"), profile("beta")];
         let entries: Vec<_> = profiles
             .iter()
-            .map(|p| build_profile_entry(p, &active, None))
+            .map(|p| build_profile_entry(p, &active))
             .collect();
         assert!(
             entries.iter().all(|e| !e.connected),
@@ -1673,7 +1655,7 @@ mod list_tests {
         // Compile-time check via the struct definition: no
         // `skip_serializing_if` on `connected`. Run-time check via
         // serde round-trip.
-        let entry = build_profile_entry(&profile("alpha"), &HashSet::new(), None);
+        let entry = build_profile_entry(&profile("alpha"), &HashSet::new());
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(
             json.contains("\"connected\":false"),

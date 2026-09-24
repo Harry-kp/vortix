@@ -51,7 +51,7 @@ impl ManagedWireGuardReceipt {
             && self.generation > 0
             && self.handshake.generation == self.generation
             && !self.interface_name.is_empty()
-            && self.interface_name == session.interface
+            && self.interface_name == session.details.interface
             && session.wireguard_peers.iter().any(|peer| {
                 peer.public_key == self.handshake.peer_public_key
                     && peer.allowed_routes == self.handshake.allowed_routes
@@ -433,7 +433,10 @@ mod tests {
         let receipt = load(dir.path(), &profile).unwrap();
         let session = ActiveSession {
             name: "corp".into(),
-            interface: "wg0".into(),
+            details: crate::core::engine::state::DetailedConnectionInfo {
+                interface: "wg0".into(),
+                ..Default::default()
+            },
             wireguard_peers: vec![TunnelPeerStatus {
                 public_key: "peer-a".into(),
                 endpoint: None,
@@ -450,7 +453,7 @@ mod tests {
         assert!(receipt.validates(&profile, &session));
         assert!(!receipt.validates(&ProfileId::new("other"), &session));
         let mut wrong_interface = session.clone();
-        wrong_interface.interface = "wg1".into();
+        wrong_interface.details.interface = "wg1".into();
         assert!(!receipt.validates(&profile, &wrong_interface));
     }
 

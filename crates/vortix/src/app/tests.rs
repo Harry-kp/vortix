@@ -133,6 +133,7 @@ fn add_profiles(app: &mut App, names: &[&str]) {
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
             location: "Test".to_string(),
             last_used: None,
+            group: None,
         });
     }
 }
@@ -163,6 +164,7 @@ fn add_stored_profile(
         config_path,
         location: "Test".to_string(),
         last_used: None,
+        group: None,
     });
     profile_id
 }
@@ -650,6 +652,7 @@ fn test_open_config_caches_content_and_close_clears() {
         config_path: tmp.path().to_path_buf(),
         location: "Test".to_string(),
         last_used: None,
+        group: None,
     });
     app.profile_list_state.select(Some(0));
 
@@ -1163,6 +1166,7 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
         config_path: conf_path,
         location: String::new(),
         last_used: None,
+        group: None,
     });
     app.profile_list_state.select(Some(0));
     set_connected(&mut app, "active-vpn");
@@ -2186,6 +2190,7 @@ fn test_auth_delete_profile_cleans_auth_file() {
         config_path,
         location: "Test".to_string(),
         last_used: None,
+        group: None,
     });
     app.runtime.config_dir = tmp.path().to_path_buf();
     let (uid, gid) = crate::config::config_owner(tmp.path()).unwrap();
