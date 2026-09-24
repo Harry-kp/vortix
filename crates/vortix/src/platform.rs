@@ -2,8 +2,20 @@
 
 #[cfg(target_os = "linux")]
 pub use crate::linux::{
+    clipboard_commands,
+    interface::{process_tun_device, tun_addresses, wireguard_started_at},
+    os_description, FIREWALL_TOOL,
+};
+#[cfg(target_os = "linux")]
+pub use crate::linux::{
     LinuxDns as Dns, LinuxInterface as Interface, LinuxNetworkStats as NetworkStats,
     LinuxRouteTable as Routes, NftFirewall as Firewall, ProcSocketAudit as SocketAudit,
+};
+#[cfg(target_os = "macos")]
+pub use crate::macos::{
+    clipboard_commands,
+    interface::{process_tun_device, tun_addresses, wireguard_started_at},
+    os_description, FIREWALL_TOOL,
 };
 #[cfg(target_os = "macos")]
 pub use crate::macos::{
@@ -22,6 +34,30 @@ pub fn available_network_interfaces() -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
         crate::macos::interface::available_network_interfaces()
+    }
+}
+
+/// Read the `release` field from `libc::uname` — equivalent to `uname -r`.
+///
+/// Replaces the shell-out to `uname` in `get_os_info`. Pure libc; no
+/// PATH dependency; ~10× faster than spawning a subprocess.
+///
+pub(crate) fn uname_release() -> Option<String> {
+    // SAFETY: `libc::uname` writes a `utsname` struct's worth of bytes
+    // into the pointer we provide. We pass a zero-initialised stack
+    // buffer of exactly the right size; the kernel cannot write past
+    // it. Return value is 0 on success, -1 on failure.
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut buf: libc::utsname = std::mem::zeroed();
+        if libc::uname(std::ptr::from_mut(&mut buf)) != 0 {
+            return None;
+        }
+        // `release` is a fixed-size C char array; convert to &str via
+        // CStr to honor null termination.
+        let release_ptr = buf.release.as_ptr();
+        let cstr = std::ffi::CStr::from_ptr(release_ptr);
+        cstr.to_str().ok().map(str::to_string)
     }
 }
 

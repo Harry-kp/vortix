@@ -83,10 +83,11 @@ look unrelated to your change.
 run the tests, which also runs Linux-only code for real:
 
 ```bash
-L='ssh -i ~/.ssh/vortix_lab_ed25519 -o BatchMode=yes harrykp@192.168.1.97'
-git diff origin/main...HEAD | $L 'cd ~/vortix && git fetch -q origin \
-  && git checkout -q -B lab origin/main && git apply --index \
-  && cargo build -p vortix && cargo test -p vortix'
+# a function, not a variable: the shell here is zsh, which does not split $L
+lab() { ssh -i ~/.ssh/vortix_lab_ed25519 -o BatchMode=yes harrykp@192.168.1.97 "$@"; }
+lab 'cd ~/vortix && git fetch -q origin main && git checkout -q -f -B lab FETCH_HEAD'
+git diff origin/main -- crates scripts | lab 'cd ~/vortix && git apply --index'
+lab 'cd ~/vortix && cargo build -p vortix && cargo test -p vortix'
 ```
 
 **Live check** when the change affects runtime behaviour (connect, routes, DNS,
@@ -96,10 +97,10 @@ kill switch, TUI frames), on both machines:
   skip and say so in the PR. Send `q` to window 0 first in case an old TUI
   holds the lifecycle lock, then run
   `/Users/harshitchaudhary/Documents/personal/vortix/target/debug/vortix`.
-- Linux: `$L 'sudo -n env SUDO_UID=1000 SUDO_GID=1000 SUDO_USER=harrykp
-  ./vortix/target/debug/vortix …'` for CLI checks; drive the TUI with
-  `$L 'tmux send-keys -t vxlinux:1 …'` and read it with
-  `$L 'tmux capture-pane -p -t vxlinux:1'`.
+- Linux: `lab 'cd ~/vortix && sudo -n env SUDO_UID=1000 SUDO_GID=1000
+  SUDO_USER=harrykp ./target/debug/vortix …'` for CLI checks; drive the TUI
+  with `lab 'tmux send-keys -t vxlinux:1 …'` and read it with
+  `lab 'tmux capture-pane -p -t vxlinux:1'`.
 
 Behaviour must match on both; a Linux-only difference is a bug, not a quirk.
 

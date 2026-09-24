@@ -22,3 +22,38 @@ pub use route_table::LinuxRouteTable;
 pub use socket_audit::ProcSocketAudit;
 
 const POLICY_COMMENT_PREFIX: &str = "vortix-policy:";
+
+/// Report line for this OS, e.g. `Ubuntu 24.04 LTS (kernel 6.8.0)`.
+#[must_use]
+pub fn os_description() -> String {
+    let distro = linux_distro_name().unwrap_or_else(|| "Linux".to_string());
+    let kernel = crate::platform::uname_release().unwrap_or_default();
+    if kernel.is_empty() {
+        distro
+    } else {
+        format!("{distro} (kernel {kernel})")
+    }
+}
+
+/// The kill-switch firewall tool and its version flag.
+pub const FIREWALL_TOOL: (&str, &[&str]) = ("nft", &["--version"]);
+
+/// Clipboard writers to try, in order: the session's own first.
+#[must_use]
+pub fn clipboard_commands() -> Vec<&'static str> {
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        vec!["wl-copy", "xclip", "xsel"]
+    } else {
+        vec!["xclip", "xsel", "wl-copy"]
+    }
+}
+
+fn linux_distro_name() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/os-release").ok()?;
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+    None
+}

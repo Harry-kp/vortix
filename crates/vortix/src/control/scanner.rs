@@ -289,15 +289,8 @@ fn check_wireguard_by_name(
         }
     }
 
-    // 2. Fallback: Try file metadata (only reliable on macOS)
-    #[cfg(target_os = "macos")]
-    // xtask:allow-platform-cfg: WIREGUARD_RUN_DIR file metadata is a macOS-only fallback
     if session.started_at.is_none() {
-        let pid_file =
-            PathBuf::from(crate::constants::WIREGUARD_RUN_DIR).join(format!("{name}.name"));
-        if pid_file.exists() {
-            session.started_at = std::fs::metadata(&pid_file).and_then(|m| m.created()).ok();
-        }
+        session.started_at = crate::platform::wireguard_started_at(name);
     }
 
     // Log if we couldn't determine start time
@@ -451,117 +444,30 @@ fn check_openvpn_by_pid(
         }
     }
 
-    #[cfg(target_os = "macos")]
-    // xtask:allow-platform-cfg: lsof-based OpenVPN tun-iface discovery is macOS-only; Interface port extension deferred
-    {
-        // Skip Method A when Method 0 already resolved the iface
-        // authoritatively from vortix's own log -- lsof Method A
-        // returns a /dev/utun device file only for legacy openvpn
-        // builds; on modern openvpn (utun-socket API) it returns
-        // nothing and would leave detected_iface untouched anyway,
-        // but the explicit skip keeps the intent obvious.
-        if !iface_authoritative {
-            if let Some(output) = cmd_output("lsof", &["-n", "-P", "-p", &pid.to_string()]) {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if let Some(idx) = line.find("/dev/") {
-                        let dev_path = line[idx..].split_whitespace().next().unwrap_or("");
-                        if dev_path.contains("utun")
-                            || dev_path.contains("tun")
-                            || dev_path.contains("tap")
-                        {
-                            detected_iface = dev_path.trim_start_matches("/dev/").to_string();
-                            // Method A succeeded — lsof showed THIS PID's
-                            // own /dev/utun fd, so the iface is reliably
-                            // attributable to this process.
-                            iface_authoritative = true;
-                            break;
-                        }
-                    }
-                }
-            }
+    if !iface_authoritative {
+        if let Some(iface) = crate::platform::process_tun_device(pid) {
+            detected_iface = iface;
+            iface_authoritative = true;
         }
     }
-
-    // Method B: Scan for tun/tap interfaces and get IP/MTU
-    #[cfg(target_os = "macos")]
-    // xtask:allow-platform-cfg: ifconfig-based OpenVPN tun-iface discovery is macOS-only
-    {
-        if let Some(output) = cmd_output("ifconfig", &[]) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut current_iface = String::new();
-            let mut found_openvpn_iface = false;
-            let mut iface_mtu = String::new();
-
-            for line in stdout.lines() {
-                if !line.starts_with(' ') && !line.starts_with('\t') {
-                    if let Some(iface_name) = line.split(':').next() {
-                        current_iface = iface_name.to_string();
-                        if detected_iface.is_empty() {
-                            found_openvpn_iface = current_iface.starts_with("utun")
-                                || current_iface.starts_with("tun")
-                                || current_iface.starts_with("tap");
-                        } else {
-                            found_openvpn_iface = current_iface == detected_iface;
-                        }
-
-                        if found_openvpn_iface {
-                            if let Some(mtu_idx) = line.find("mtu ") {
-                                iface_mtu = line[mtu_idx + 4..]
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or("")
-                                    .to_string();
-                                if !detected_iface.is_empty() {
-                                    session.details.interface.clone_from(&detected_iface);
-                                    session.details.mtu.clone_from(&iface_mtu);
-                                }
-                            }
-                        }
-                    }
-                } else if found_openvpn_iface {
-                    let line = line.trim();
-                    if line.starts_with("inet ") {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2
-                            && !crate::wireguard::WgTunnel::interface_exists(&current_iface)
-                        {
-                            session.details.internal_ip = parts[1].to_string();
-                            session.details.mtu.clone_from(&iface_mtu);
-                            session.details.interface.clone_from(&current_iface);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    // xtask:allow-platform-cfg: ip-addr-based OpenVPN tun-iface discovery is Linux-only
-    {
-        if let Some(output) = cmd_output("ip", &["addr"]) {
-            let candidates = linux_tun_addresses(&String::from_utf8_lossy(&output.stdout))
-                .into_iter()
-                .filter(|(iface, _, _)| !crate::wireguard::WgTunnel::interface_exists(iface))
-                .collect::<Vec<_>>();
-            // `ip addr` lists every tun device, not this process's: it only
-            // decides the interface when nothing better did and only one exists.
-            let chosen = if iface_authoritative {
-                candidates
-                    .iter()
-                    .find(|(iface, _, _)| *iface == detected_iface)
-            } else {
-                iface_authoritative = candidates.len() == 1;
-                candidates.first()
-            };
-            if let Some((iface, mtu, internal_ip)) = chosen {
-                detected_iface.clone_from(iface);
-                session.details.interface.clone_from(iface);
-                session.details.mtu.clone_from(mtu);
-                session.details.internal_ip.clone_from(internal_ip);
-            }
-        }
+    // The device list covers every tun on the host, not this process's: it
+    // fills in the known device's address, and otherwise is only a guess.
+    let candidates = crate::platform::tun_addresses()
+        .into_iter()
+        .filter(|(iface, _, _)| !crate::wireguard::WgTunnel::interface_exists(iface))
+        .collect::<Vec<_>>();
+    let chosen = if detected_iface.is_empty() {
+        candidates.first()
+    } else {
+        candidates
+            .iter()
+            .find(|(iface, _, _)| *iface == detected_iface)
+    };
+    if let Some((iface, mtu, internal_ip)) = chosen {
+        detected_iface.clone_from(iface);
+        session.details.interface.clone_from(iface);
+        session.details.mtu.clone_from(mtu);
+        session.details.internal_ip.clone_from(internal_ip);
     }
 
     // Ensure interface is set if we detected one
@@ -569,9 +475,8 @@ fn check_openvpn_by_pid(
         session.details.interface = detected_iface;
     }
 
-    // The fallbacks (macOS Method B, Linux `ip addr` with several tun
-    // devices) cannot tell concurrent OpenVPN processes apart, so they leave
-    // this false and the engine refuses to adopt on their word.
+    // A guess from the device list cannot tell concurrent OpenVPN processes
+    // apart, so it leaves this false and the engine refuses to adopt it.
     session.details.interface_authoritative = iface_authoritative;
 
     // No tun/tap interface means OpenVPN is running but NOT connected yet
@@ -694,57 +599,10 @@ fn parse_ps_etime(etime: &str) -> Option<std::time::Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-/// `(interface, mtu, first IPv4)` for every tun/tap device with an IPv4
-/// address in `ip addr` output.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_tun_addresses(ip_addr: &str) -> Vec<(String, String, String)> {
-    let mut found = Vec::new();
-    let mut current: Option<(String, String)> = None;
-    for line in ip_addr.lines() {
-        if !line.starts_with(' ') {
-            current = line.split(':').nth(1).map(str::trim).and_then(|iface| {
-                (iface.starts_with("tun") || iface.starts_with("tap")).then(|| {
-                    let mtu = line
-                        .split_once("mtu ")
-                        .and_then(|(_, rest)| rest.split_whitespace().next())
-                        .unwrap_or("")
-                        .to_string();
-                    (iface.to_string(), mtu)
-                })
-            });
-        } else if let Some((iface, mtu)) = &current {
-            if let Some(address) = line.trim().strip_prefix("inet ") {
-                let ip = address.split(['/', ' ']).next().unwrap_or("").to_string();
-                found.push((iface.clone(), mtu.clone(), ip));
-                current = None;
-            }
-        }
-    }
-    found
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn linux_tun_addresses_lists_each_device_with_its_own_address() {
-        let out = "\
-1: lo: <LOOPBACK,UP> mtu 65536 qdisc noqueue
-    inet 127.0.0.1/8 scope host lo
-5: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel
-    inet 10.80.0.2/24 scope global tun0
-6: tun1: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400 qdisc fq_codel
-    inet 10.80.0.3/24 scope global tun1
-";
-        assert_eq!(
-            linux_tun_addresses(out),
-            vec![
-                ("tun0".into(), "1500".into(), "10.80.0.2".into()),
-                ("tun1".into(), "1400".into(), "10.80.0.3".into()),
-            ]
-        );
-    }
     use std::time::Duration;
 
     #[test]

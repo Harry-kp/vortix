@@ -221,6 +221,54 @@ pub(crate) fn parse_proc_net_dev(content: &str) -> (u64, u64) {
     (total_in, total_out)
 }
 
+/// `(interface, mtu, first IPv4)` for every tun/tap device with an address.
+#[must_use]
+pub fn tun_addresses() -> Vec<(String, String, String)> {
+    crate::process::simple_output("ip", &["addr"])
+        .map(|output| parse_ip_addr(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+/// Linux has no per-process device lookup; the `OpenVPN` log names it.
+#[must_use]
+pub fn process_tun_device(_pid: u32) -> Option<String> {
+    None
+}
+
+/// No file records when a `WireGuard` interface came up on Linux.
+#[must_use]
+pub fn wireguard_started_at(_name: &str) -> Option<std::time::SystemTime> {
+    None
+}
+
+/// `(interface, mtu, first IPv4)` for every tun/tap device with an IPv4
+/// address in `ip addr` output.
+pub(crate) fn parse_ip_addr(ip_addr: &str) -> Vec<(String, String, String)> {
+    let mut found = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    for line in ip_addr.lines() {
+        if !line.starts_with(' ') {
+            current = line.split(':').nth(1).map(str::trim).and_then(|iface| {
+                (iface.starts_with("tun") || iface.starts_with("tap")).then(|| {
+                    let mtu = line
+                        .split_once("mtu ")
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        .unwrap_or("")
+                        .to_string();
+                    (iface.to_string(), mtu)
+                })
+            });
+        } else if let Some((iface, mtu)) = &current {
+            if let Some(address) = line.trim().strip_prefix("inet ") {
+                let ip = address.split(['/', ' ']).next().unwrap_or("").to_string();
+                found.push((iface.clone(), mtu.clone(), ip));
+                current = None;
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +361,29 @@ mod network_stats_tests {
         let (bytes_in, bytes_out) = parse_proc_net_dev("");
         assert_eq!(bytes_in, 0);
         assert_eq!(bytes_out, 0);
+    }
+}
+
+#[cfg(test)]
+mod tun_tests {
+    use super::*;
+
+    #[test]
+    fn ip_addr_lists_each_device_with_its_own_address() {
+        let out = "\
+1: lo: <LOOPBACK,UP> mtu 65536 qdisc noqueue
+    inet 127.0.0.1/8 scope host lo
+5: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel
+    inet 10.80.0.2/24 scope global tun0
+6: tun1: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400 qdisc fq_codel
+    inet 10.80.0.3/24 scope global tun1
+";
+        assert_eq!(
+            parse_ip_addr(out),
+            vec![
+                ("tun0".into(), "1500".into(), "10.80.0.2".into()),
+                ("tun1".into(), "1400".into(), "10.80.0.3".into()),
+            ]
+        );
     }
 }

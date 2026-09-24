@@ -274,6 +274,65 @@ fn is_loopback(name: &[u8]) -> bool {
     name.starts_with(b"lo")
 }
 
+/// `(interface, mtu, first IPv4)` for every utun/tun/tap device with an address.
+#[must_use]
+pub fn tun_addresses() -> Vec<(String, String, String)> {
+    crate::process::simple_output("ifconfig", &[])
+        .map(|output| parse_ifconfig(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+pub(crate) fn parse_ifconfig(ifconfig: &str) -> Vec<(String, String, String)> {
+    let mut found = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    for line in ifconfig.lines() {
+        if !line.starts_with([' ', '\t']) {
+            current = line.split(':').next().and_then(|iface| {
+                (iface.starts_with("utun") || iface.starts_with("tun") || iface.starts_with("tap"))
+                    .then(|| {
+                        let mtu = line
+                            .split_once("mtu ")
+                            .and_then(|(_, rest)| rest.split_whitespace().next())
+                            .unwrap_or("")
+                            .to_string();
+                        (iface.to_string(), mtu)
+                    })
+            });
+        } else if let Some((iface, mtu)) = &current {
+            if let Some(address) = line.trim().strip_prefix("inet ") {
+                let ip = address.split_whitespace().next().unwrap_or("").to_string();
+                found.push((iface.clone(), mtu.clone(), ip));
+                current = None;
+            }
+        }
+    }
+    found
+}
+
+/// The tun device `pid` holds open, when `lsof` can see it (legacy
+/// `OpenVPN` opens `/dev/utun*`; the utun socket API shows nothing).
+#[must_use]
+pub fn process_tun_device(pid: u32) -> Option<String> {
+    let output = crate::process::simple_output("lsof", &["-n", "-P", "-p", &pid.to_string()])?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let device = line[line.find("/dev/")?..].split_whitespace().next()?;
+            (device.contains("tun") || device.contains("tap"))
+                .then(|| device.trim_start_matches("/dev/").to_string())
+        })
+}
+
+/// When wireguard-go created `<name>`, from its runtime name file.
+#[must_use]
+pub fn wireguard_started_at(name: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(
+        std::path::Path::new(crate::constants::WIREGUARD_RUN_DIR).join(format!("{name}.name")),
+    )
+    .and_then(|metadata| metadata.created())
+    .ok()
+}
+
 #[cfg(test)]
 mod interface_list_tests {
     use super::*;
@@ -340,5 +399,31 @@ mod network_stats_tests {
         let (b_in, b_out) = MacNetworkStats::get_total_bytes();
         assert!(b_in >= a_in, "ibytes regressed: {a_in} -> {b_in}");
         assert!(b_out >= a_out, "obytes regressed: {a_out} -> {b_out}");
+    }
+}
+
+#[cfg(test)]
+mod tun_tests {
+    use super::*;
+
+    #[test]
+    fn ifconfig_lists_each_tunnel_device_with_its_own_address() {
+        let out = "\
+en0: flags=8863<UP,BROADCAST> mtu 1500
+\tinet 192.168.1.5 netmask 0xffffff00
+utun3: flags=8051<UP,POINTOPOINT> mtu 1380
+\tinet6 fe80::1%utun3 prefixlen 64
+utun4: flags=8051<UP,POINTOPOINT> mtu 1500
+\tinet 10.80.0.2 --> 10.80.0.1 netmask 0xffffff00
+utun5: flags=8051<UP,POINTOPOINT> mtu 1400
+\tinet 10.80.0.3 --> 10.80.0.1 netmask 0xffffff00
+";
+        assert_eq!(
+            parse_ifconfig(out),
+            vec![
+                ("utun4".into(), "1500".into(), "10.80.0.2".into()),
+                ("utun5".into(), "1400".into(), "10.80.0.3".into()),
+            ]
+        );
     }
 }
