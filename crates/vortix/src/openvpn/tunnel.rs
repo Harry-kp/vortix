@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 use crate::core::ids::OperationId;
 use crate::core::ports::process::ManagedProcessId;
 use crate::core::ports::tunnel::{
-    Tunnel, TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelStatus,
+    TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelStatus,
 };
 use crate::core::profile::{unambiguous_legacy_artifact_key, Profile, ProfileId};
 use crate::core::secret::Secret;
@@ -923,9 +923,9 @@ fn pushed_dns_evidence(
     }
 }
 
-impl Tunnel for OvpnTunnel {
+impl OvpnTunnel {
     #[allow(clippy::too_many_lines)] // single linear sequence of pid/log/auth setup + daemon spawn + log-poll; splitting would obscure the connect flow without simplifying it
-    fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
+    pub fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
         self.remaining_connect_timeout()?;
         let artifact_key = profile.id.as_str();
         let pid_path = self.pid_path(artifact_key);
@@ -1189,7 +1189,7 @@ impl Tunnel for OvpnTunnel {
         startup.map_err(|error| cleanup_startup_failure(&handshake, error))
     }
 
-    fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
+    pub fn down(&mut self, handle: &TunnelHandle) -> Result<(), TunnelError> {
         info!(
             target: "vortix::control::tunnels::openvpn",
             profile = %handle.profile_id,
@@ -1209,7 +1209,7 @@ impl Tunnel for OvpnTunnel {
                     identity.generation
                 ))
             })?;
-            self.cleanup_run_artifacts(&handle);
+            self.cleanup_run_artifacts(handle);
             return Ok(());
         }
 
@@ -1222,11 +1222,11 @@ impl Tunnel for OvpnTunnel {
                     .into(),
             ));
         }
-        self.cleanup_run_artifacts(&handle);
+        self.cleanup_run_artifacts(handle);
         Ok(())
     }
 
-    fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
+    pub fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
         if let Some(identity) = handle.process_ownership.as_ref() {
             let alive = crate::process::status_managed_foreground(identity).map_err(|error| {
                 TunnelError::Subprocess(format!("OpenVPN custody status: {error}"))

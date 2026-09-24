@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::ports::tunnel::{
-    HandshakeAttempt, ProbeReceipt, Tunnel, TunnelError, TunnelExecutionContext, TunnelHandle,
+    HandshakeAttempt, ProbeReceipt, TunnelError, TunnelExecutionContext, TunnelHandle,
     TunnelKindTag, TunnelPeerStatus, TunnelStatus, TunnelTeardownConfig,
 };
 use crate::core::profile::Profile;
@@ -774,7 +774,7 @@ impl WgTunnel {
             dns_request: crate::core::ports::dns::DnsRequest::default(),
             openvpn_routes: None,
         };
-        self.down(handle)?;
+        self.down(&handle)?;
         if wait_for_interface_absence(&interface_name, Duration::from_secs(2)) {
             Ok(())
         } else {
@@ -946,7 +946,7 @@ impl WgTunnel {
             &interface_name,
             initially_exists,
             || cleanup_managed_temp_config(&cleanup_path),
-            || self.down(handle),
+            || self.down(&handle),
             || wait_for_interface_absence(&interface_name, Duration::from_secs(2)),
             || wait_for_interface_presence(&interface_name, Duration::from_secs(2)),
         )
@@ -1244,9 +1244,9 @@ fn wg_quick_down_spec(target: String) -> CommandSpec {
     CommandSpec::oneshot("wg-quick", vec!["down".into(), target]).privilege(PrivilegeReq::Root)
 }
 
-impl Tunnel for WgTunnel {
+impl WgTunnel {
     #[allow(clippy::too_many_lines)]
-    fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
+    pub fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
         self.validate_settings()?;
         // Reject legacy or externally-created invalid names before reading
         // secrets, spawning `wg-quick`, or entering a Handshaking UI state.
@@ -1418,7 +1418,7 @@ impl Tunnel for WgTunnel {
             }
             Ok(Err(error)) => {
                 self.inflight = None;
-                let cleanup = self.down(handle.clone());
+                let cleanup = self.down(&handle);
                 return Err(match cleanup {
                     Ok(())
                         if wait_for_interface_absence(
@@ -1438,7 +1438,7 @@ impl Tunnel for WgTunnel {
             }
             Err(_) => {
                 self.inflight = None;
-                let cleanup = self.down(handle.clone());
+                let cleanup = self.down(&handle);
                 return Err(match cleanup {
                     Ok(()) if wait_for_interface_absence(&handle.interface_name, Duration::from_secs(2)) => {
                         TunnelError::Other("WireGuard handshake worker panicked; attempt was cleaned up".into())
@@ -1455,7 +1455,7 @@ impl Tunnel for WgTunnel {
         Ok(handle)
     }
 
-    fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
+    pub fn down(&mut self, handle: &TunnelHandle) -> Result<(), TunnelError> {
         info!(
             target: "vortix::control::tunnels::wireguard",
             profile = %handle.profile_id,
@@ -1477,7 +1477,7 @@ impl Tunnel for WgTunnel {
             return Ok(());
         }
 
-        let prepared = prepare_down_target(&handle)?;
+        let prepared = prepare_down_target(handle)?;
         let output = crate::process::run_to_output(wg_quick_down_spec(prepared.target));
 
         if let Some(path) = &prepared.cleanup_after_attempt {
@@ -1515,7 +1515,7 @@ impl Tunnel for WgTunnel {
         }
     }
 
-    fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
+    pub fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
         if self.cancellation_requested() {
             return Err(TunnelError::Cancelled);
         }

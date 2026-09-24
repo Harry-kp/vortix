@@ -205,13 +205,13 @@ pub mod state {
     pub enum FailureReason {
         /// The retry budget expired with no successful connection.
         RetryBudgetExhausted { attempts: u32, elapsed: Duration },
-        /// `Tunnel::up` reported `HandshakeFailed`.
+        /// the protocol `up` reported `HandshakeFailed`.
         HandshakeFailed(String),
-        /// `Tunnel::up` reported `AuthFailed`.
+        /// the protocol `up` reported `AuthFailed`.
         AuthFailed(String),
         /// Profile parsing surfaced an unrecoverable error.
         ConfigInvalid(String),
-        /// `Tunnel::up` exceeded its configured timeout with no progress.
+        /// the protocol `up` exceeded its configured timeout with no progress.
         Timeout(Duration),
         /// The network link went down and never came back during the retry budget.
         NoNetworkLink,
@@ -305,7 +305,7 @@ pub mod state {
         pub teardown_config: Option<crate::core::ports::tunnel::TunnelTeardownConfig>,
         /// Whether `interface` came from a reliable per-tunnel source.
         ///
-        /// `true` when set by the protocol layer's `Tunnel::up()` result
+        /// `true` when set by the protocol layer's the protocol `up()` result
         /// (`OpenVPN` log scrape, wg-quick output resolved through the
         /// platform port). `false` only when the scanner adopted an
         /// externally-started tunnel on a platform where its per-PID

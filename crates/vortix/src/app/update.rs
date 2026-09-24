@@ -834,7 +834,7 @@ impl App {
 
     // Removed by the state-authority rework: `scanner_promote_to_connected`. The scanner can no
     // longer drive the Connecting → Connected transition. Only the
-    // protocol layer's `Tunnel::up()` success result (via
+    // protocol layer's the protocol `up()` success result (via
     // `Message::ConnectResult` → `mirror_connect_into_registry`) can.
     // The (Connecting, Some(session)) arm in `handle_sync_system_state`
     // now just logs the kernel-visible-but-not-yet-tracked state at

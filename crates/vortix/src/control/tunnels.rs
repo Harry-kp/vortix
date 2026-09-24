@@ -22,7 +22,7 @@ use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 use crate::state::Protocol;
 
-use crate::core::ports::tunnel::{Tunnel, TunnelError, TunnelStatus};
+use crate::core::ports::tunnel::{TunnelError, TunnelStatus};
 use crate::openvpn::OvpnTunnel;
 use crate::state::VpnProfile;
 use crate::wireguard::WgTunnel;
@@ -151,7 +151,7 @@ pub fn start(
     if handle.kind == TunnelKindTag::WireGuard {
         if let Err(error) = record_wireguard(settings, ownership, profile, generation, &mut handle)
         {
-            let _ = kind.down(handle);
+            let _ = kind.down(&handle);
             return Err(StartError::Failed(error));
         }
     }
@@ -167,7 +167,7 @@ pub fn stop(
     let Live { mut kind, handle } = live;
     let profile_id = handle.profile_id.clone();
     let wireguard = handle.kind == TunnelKindTag::WireGuard;
-    kind.down(handle).map_err(|error| error.to_string())?;
+    kind.down(&handle).map_err(|error| error.to_string())?;
     if wireguard {
         let _ = ownership.remove_after_confirmed_absence(&profile_id, &[]);
         let _ = crate::core::managed_wireguard::remove_after_confirmed_absence(
@@ -334,15 +334,10 @@ fn route_claims(evidence: &OpenVpnRouteEvidence) -> BTreeSet<Cidr> {
 }
 
 /// Runtime-selectable carrier over the closed protocol set.
-///
-/// Mock variant uses `crate::core::ports::tunnel::mock::MockTunnel` so tests
-/// can substitute scripted behaviour without touching the real impls.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum TunnelKind {
     WireGuard(WgTunnel),
     OpenVpn(OvpnTunnel),
-    Mock(crate::core::ports::tunnel::mock::MockTunnel),
 }
 
 impl TunnelKind {
@@ -351,7 +346,6 @@ impl TunnelKind {
         match self {
             Self::WireGuard(tunnel) => Self::WireGuard(tunnel.for_generation(generation)),
             Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.for_generation(generation)),
-            other => other,
         }
     }
 
@@ -359,7 +353,7 @@ impl TunnelKind {
     pub fn for_operation(self, operation_id: crate::core::ids::OperationId) -> Self {
         match self {
             Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.for_operation(operation_id)),
-            other => other,
+            tunnel @ Self::WireGuard(_) => tunnel,
         }
     }
 
@@ -368,7 +362,6 @@ impl TunnelKind {
         match self {
             Self::WireGuard(tunnel) => Self::WireGuard(tunnel.with_execution_context(context)),
             Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.with_execution_context(context)),
-            other => other,
         }
     }
 
@@ -381,22 +374,20 @@ impl TunnelKind {
             Self::OpenVpn(tunnel) => {
                 Self::OpenVpn(tunnel.with_static_challenge_credentials(credentials))
             }
-            other => other,
+            tunnel @ Self::WireGuard(_) => tunnel,
         }
     }
     pub fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
         match self {
             Self::WireGuard(t) => t.up(profile),
             Self::OpenVpn(t) => t.up(profile),
-            Self::Mock(t) => t.up(profile),
         }
     }
 
-    pub fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
+    pub fn down(&mut self, handle: &TunnelHandle) -> Result<(), TunnelError> {
         match self {
             Self::WireGuard(t) => t.down(handle),
             Self::OpenVpn(t) => t.down(handle),
-            Self::Mock(t) => t.down(handle),
         }
     }
 
@@ -404,7 +395,6 @@ impl TunnelKind {
         match self {
             Self::WireGuard(t) => t.status(handle),
             Self::OpenVpn(t) => t.status(handle),
-            Self::Mock(t) => t.status(handle),
         }
     }
 
@@ -414,9 +404,7 @@ impl TunnelKind {
             Self::WireGuard(tunnel) => tunnel
                 .compensate_inflight()
                 .map_err(|error| error.to_string()),
-            Self::OpenVpn(_) | Self::Mock(_) => {
-                Err("protocol did not retain an exact in-flight capability".into())
-            }
+            Self::OpenVpn(_) => Err("protocol did not retain an exact in-flight capability".into()),
         }
     }
 }
@@ -471,21 +459,6 @@ pub(crate) fn standard_openvpn_owner(
         custody,
         protocol_pid: scanner_pid,
     }))
-}
-
-// Implement the `Tunnel` trait by delegating to the inherent methods.
-// Plan 005's `Engine<T: Tunnel>` requires this so the binary can construct
-// `Engine<TunnelKind>` and drive the FSM with the existing dispatch.
-impl crate::core::ports::tunnel::Tunnel for TunnelKind {
-    fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
-        TunnelKind::up(self, profile)
-    }
-    fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
-        TunnelKind::down(self, handle)
-    }
-    fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
-        TunnelKind::status(self, handle)
-    }
 }
 
 /// THE single routing function: protocol → `TunnelKind`.
