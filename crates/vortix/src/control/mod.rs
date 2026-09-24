@@ -104,7 +104,7 @@ pub struct TunnelView {
 impl TunnelView {
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.routes.iter().any(|route| route.prefix_len == 0)
+        crate::cidr::is_full(&self.routes)
     }
 }
 

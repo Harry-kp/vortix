@@ -326,7 +326,7 @@ impl State {
                 matches!(
                     tunnel.phase,
                     Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
-                ) && tunnel.spec.routes.iter().any(|cidr| cidr.prefix_len == 0)
+                ) && crate::cidr::is_full(&tunnel.spec.routes)
             })
             .flat_map(|tunnel| tunnel.spec.server_ips.iter().copied())
             .collect();
@@ -396,9 +396,7 @@ pub fn classify_route_conflict(
             .copied()
             .collect::<Vec<_>>()
     };
-    let claims_default = |routes: &[Cidr]| routes.iter().any(|route| route.prefix_len == 0);
-
-    if claims_default(requested) && claims_default(existing) {
+    if crate::cidr::is_full(requested) && crate::cidr::is_full(existing) {
         return Some(Conflict::DefaultRouteTakeover {
             current: existing_profile.clone(),
             new: requested_profile.clone(),
@@ -636,9 +634,7 @@ mod tests {
                     assert_invariants(&input, &plan(&input));
                     let full_up = state
                         .tunnels()
-                        .filter(|t| {
-                            t.phase == Phase::Up && t.spec.routes.iter().any(|r| r.prefix_len == 0)
-                        })
+                        .filter(|t| t.phase == Phase::Up && crate::cidr::is_full(&t.spec.routes))
                         .count();
                     assert!(full_up <= 1, "two full tunnels are never both up");
                 }

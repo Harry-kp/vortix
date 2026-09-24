@@ -242,8 +242,15 @@ impl std::fmt::Display for CidrParseError {
 
 impl std::error::Error for CidrParseError {}
 
+/// A full tunnel: it routes a `/0`, so it competes for the default route.
+#[must_use]
+pub fn is_full<'a>(routes: impl IntoIterator<Item = &'a Cidr>) -> bool {
+    routes.into_iter().any(|route| route.prefix_len == 0)
+}
+
 /// Returns `true` iff the union of all IPv6 CIDRs in `allowed_ips` covers
-/// `::/0`. IPv4 entries are ignored.
+/// `::/0`, so split halves such as `::/1` + `8000::/1` count. IPv4 entries
+/// are ignored.
 #[must_use]
 pub fn claims_default_route_v6(allowed_ips: &[Cidr]) -> bool {
     let mut ranges: Vec<(u128, u128)> = Vec::new();

@@ -34,7 +34,7 @@ impl LiveTunnel {
 
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.claims_default(true) || self.claims_default(false)
+        crate::cidr::is_full(&self.routes)
     }
 }
 

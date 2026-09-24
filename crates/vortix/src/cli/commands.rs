@@ -242,17 +242,6 @@ pub(super) fn engine_failure_or_exit(mode: OutputMode, command: &str, message: S
     )
 }
 
-/// Detect a multi-tunnel conflict for the CLI's `up` path.
-///
-/// The CLI doesn't share an in-memory engine with the running
-/// session — active tunnels are discovered via
-/// `scanner::get_active_profiles`. We inspect each active session's parsed
-/// config and use the **shared** `cidr` and
-/// `claims_default_route_*` helpers (same logic the TUI's
-/// the engine uses) so the two surfaces refuse the
-/// same set of takeovers. The route-overlap branch is a CLI-only
-/// superset until a follow-up brings route-overlap detection into the
-/// engine snapshot.
 /// Acquire the cross-process lifecycle lock or exit with a structured
 /// error. Proceeding without the lock would reintroduce the concurrent
 /// `up`/`down` interleaving the lock exists to prevent.
