@@ -496,33 +496,17 @@ fn check_openvpn_by_pid(
         }
     }
 
-    // Read config file once for both endpoint and cipher extraction
-    if let Ok(config_content) = std::fs::read_to_string(config_path) {
-        // If no endpoint from args, try parsing the config file
+    let parsed = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| crate::openvpn::parser::parse_ovpn_conf(&text).ok());
+    if let Some(parsed) = parsed {
         if session.details.endpoint.is_empty() {
-            for line in config_content.lines() {
-                let line = line.trim();
-                if line.to_lowercase().starts_with("remote ") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        let host = parts[1];
-                        let port = parts.get(2).unwrap_or(&"1194");
-                        session.details.endpoint = format!("{host}:{port}");
-                        break;
-                    }
-                }
+            if let Some(remote) = parsed.remotes.first() {
+                session.details.endpoint = format!("{}:{}", remote.host, remote.port);
             }
         }
-
-        // Try to get cipher from config
-        for line in config_content.lines() {
-            let line = line.trim();
-            if line.to_lowercase().starts_with("cipher ") {
-                if let Some(cipher) = line.split_whitespace().nth(1) {
-                    session.details.latest_handshake = format!("Cipher: {cipher}");
-                    break;
-                }
-            }
+        if let Some(cipher) = parsed.cipher {
+            session.details.latest_handshake = format!("Cipher: {cipher}");
         }
     }
 

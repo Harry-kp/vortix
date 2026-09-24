@@ -68,6 +68,8 @@ pub struct OvpnParsedProfile {
     pub dns_servers: Vec<IpAddr>,
     /// Suffixes requested with `dhcp-option DOMAIN` / `DOMAIN-SEARCH`.
     pub dns_search_domains: Vec<String>,
+    /// The first `cipher` directive.
+    pub cipher: Option<String>,
 }
 
 impl OvpnParsedProfile {
@@ -142,6 +144,9 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             }
             "remote-random" => {
                 profile.remote_random = true;
+            }
+            "cipher" if profile.cipher.is_none() => {
+                profile.cipher = tokens.next().map(str::to_string);
             }
             "redirect-gateway"
             | "redirect-gateway-ipv6"
@@ -898,5 +903,11 @@ mod tests {
         let text = "static-challenge \"unterminated 1\n";
         let p = parse_ovpn_conf(text).unwrap();
         assert!(p.static_challenge.is_none());
+    }
+
+    #[test]
+    fn the_first_cipher_directive_is_reported() {
+        let parsed = parse_ovpn_conf("client\ncipher AES-128-CBC\ncipher BF-CBC\n").unwrap();
+        assert_eq!(parsed.cipher.as_deref(), Some("AES-128-CBC"));
     }
 }
