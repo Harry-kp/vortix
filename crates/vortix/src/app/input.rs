@@ -5,8 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::{App, AuthField, FocusedPanel, InputMode, ToastType};
 use crate::app::state::help_max_scroll_for_terminal_height;
 use crate::constants;
+use crate::control::Phase;
 use crate::message::{self, Message, ScrollMove, SelectionMove};
-use crate::tunnel::Connection;
 
 enum ConfirmAction {
     Confirmed,
@@ -25,16 +25,14 @@ pub(crate) enum FocusedTunnelAction {
 }
 
 /// Classify one focused tunnel without falling back to another active tunnel.
-pub(crate) const fn focused_tunnel_action(state: Option<&Connection>) -> FocusedTunnelAction {
-    match state {
-        Some(Connection::Disconnecting { .. }) => FocusedTunnelAction::ForceDisconnect,
-        Some(
-            Connection::Connecting { .. }
-            | Connection::Reconnecting { .. }
-            | Connection::AwaitingUserInput { .. },
-        ) => FocusedTunnelAction::Cancel,
-        Some(Connection::Connected { .. }) => FocusedTunnelAction::Disconnect,
-        Some(Connection::Disconnected) | None => FocusedTunnelAction::Connect,
+pub(crate) const fn focused_tunnel_action(phase: Option<Phase>) -> FocusedTunnelAction {
+    match phase {
+        Some(Phase::Stopping) => FocusedTunnelAction::ForceDisconnect,
+        Some(Phase::Starting | Phase::Waiting { .. } | Phase::AwaitingCredentials) => {
+            FocusedTunnelAction::Cancel
+        }
+        Some(Phase::Up) => FocusedTunnelAction::Disconnect,
+        None => FocusedTunnelAction::Connect,
     }
 }
 
@@ -69,19 +67,19 @@ fn handle_confirm_keys(key: KeyEvent, confirm_selected: &mut bool) -> ConfirmAct
 impl App {
     /// Apply the sidebar disconnect shortcut to the focused profile only.
     ///
-    /// An inactive row is deliberately a no-op: falling back to the registry
+    /// An inactive row is deliberately a no-op: falling back to the engine snapshot
     /// primary here would disconnect a different profile than the one the user
     /// selected.
     fn handle_focused_profile_disconnect(&mut self) {
         let Some(idx) = self.profile_list_state.selected() else {
             return;
         };
-        let state = self
+        let phase = self
             .runtime
             .profiles
             .get(idx)
-            .and_then(|profile| self.tunnel(&profile.id).map(|snapshot| snapshot.state));
-        match focused_tunnel_action(state.as_ref()) {
+            .and_then(|profile| self.tunnel(&profile.id).map(|tunnel| tunnel.phase));
+        match focused_tunnel_action(phase) {
             FocusedTunnelAction::Disconnect => {
                 self.handle_message(Message::DisconnectProfile { idx });
             }
@@ -808,10 +806,11 @@ impl crate::app::App {
                     let Some(idx) = self.profile_list_state.selected() else {
                         return;
                     };
-                    let state = self.runtime.profiles.get(idx).and_then(|profile| {
-                        self.tunnel(&profile.id).map(|snapshot| snapshot.state)
-                    });
-                    match focused_tunnel_action(state.as_ref()) {
+                    let phase =
+                        self.runtime.profiles.get(idx).and_then(|profile| {
+                            self.tunnel(&profile.id).map(|tunnel| tunnel.phase)
+                        });
+                    match focused_tunnel_action(phase) {
                         FocusedTunnelAction::Connect => {
                             self.handle_message(Message::ToggleConnect(Some(idx)));
                         }

@@ -215,7 +215,7 @@ mod ui {
         ConfirmRouteOverlap {
             /// Profile id of the conflicting (already-active) tunnel.
             with_profile_id: ProfileId,
-            /// The overlapping CIDRs reported by the registry's conflict detector.
+            /// The overlapping CIDRs reported by the engine's conflict detector.
             overlapping_cidrs: Vec<Cidr>,
             /// Profile id of the new tunnel attempting to connect.
             to_profile_id: ProfileId,

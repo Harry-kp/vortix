@@ -25,21 +25,14 @@ impl App {
     }
 
     /// The tunnel the dashboard treats as current: the primary, else the
-    /// first one that is not disconnected.
+    /// first one.
     #[must_use]
-    pub fn current_tunnel(&self) -> Option<crate::app::TunnelSnapshot> {
-        use crate::tunnel::Connection;
+    pub fn current_tunnel(&self) -> Option<&crate::control::TunnelView> {
         self.primary_id()
             .and_then(|pid| self.tunnel(pid))
-            .or_else(|| {
-                self.tunnels()
-                    .into_iter()
-                    .find(|s| !matches!(s.state, Connection::Disconnected))
-            })
+            .or_else(|| self.tunnels().into_iter().next())
     }
 
-    /// Whether the registry currently has at least one Connected tunnel.
-    #[must_use]
     /// How long one telemetry observation may go unrefreshed before its
     /// value stops standing for the present.
     ///
@@ -67,10 +60,10 @@ impl App {
     }
 
     pub(crate) fn has_active_connection(&self) -> bool {
-        use crate::tunnel::Connection;
-        self.tunnels()
+        self.control_snapshot
+            .tunnels
             .iter()
-            .any(|s| matches!(s.state, Connection::Connected { .. }))
+            .any(|tunnel| tunnel.phase == crate::control::Phase::Up)
     }
 
     /// Add a log message via centralized logger
@@ -95,20 +88,8 @@ impl App {
         );
     }
 
-    /// Count active tunnels for keybinding decisions (multi-tunnel
-    /// work). "Active" means the FSM is not `Disconnected` — that
-    /// includes `Connecting`, `Connected`, `Disconnecting`,
-    /// `AwaitingUserInput`, and any other in-flight states.
-    #[must_use]
-    pub(crate) fn active_tunnel_count(&self) -> usize {
-        use crate::tunnel::Connection;
-        self.tunnels()
-            .iter()
-            .filter(|s| !matches!(s.state, Connection::Disconnected))
-            .count()
-    }
     /// Resolve a user/scanner-facing display name at the App boundary.
-    /// Internal registry and lifecycle code carries the returned stable ID.
+    /// Internal engine snapshot and lifecycle code carries the returned stable ID.
     #[must_use]
     pub(crate) fn profile_id_for_name(
         &self,
@@ -121,29 +102,23 @@ impl App {
             .map(|profile| profile.id.clone())
     }
 
-    /// Whether the named profile is currently in any non-`Disconnected` state
-    /// (`Connecting` / `Connected` / `Disconnecting` / `Reconnecting` /
-    /// `AwaitingUserInput`). Used by deletion-safety checks where we need
-    /// to refuse to delete a profile that has an in-flight or active
-    /// tunnel.
+    /// Whether the named profile has a tunnel in any phase; deletion refuses
+    /// while it does.
     #[must_use]
     pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
-        use crate::tunnel::Connection;
         self.profile_id_for_name(profile_name)
-            .and_then(|id| self.tunnel(&id))
-            .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected))
+            .is_some_and(|id| self.tunnel(&id).is_some())
     }
 
     /// Whether the profile at `idx` is currently Connecting (in-flight).
     /// Used by the `c` cancel keybinding ().
     #[must_use]
     pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
-        use crate::tunnel::Connection;
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };
         self.tunnel(&profile.id)
-            .is_some_and(|snap| matches!(snap.state, Connection::Connecting { .. }))
+            .is_some_and(|tunnel| tunnel.phase == crate::control::Phase::Starting)
     }
 
     /// Resolve the profile index that the Connection Details panel is

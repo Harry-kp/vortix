@@ -63,38 +63,12 @@ fn add_wg_profiles(app: &mut App, names: &[&str]) {
 }
 
 fn set_connected(app: &mut App, name: &str) {
+    use vortix::control::{Phase, TunnelView};
+    use vortix::profile::ProfileId;
+
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_wg_profiles(app, &[name]);
     }
-    let details = vortix::tunnel::DetailedConnectionInfo {
-        interface: "wg0".to_string(),
-        interface_authoritative: true,
-        pid: Some(12345),
-        ..Default::default()
-    };
-    set_projection(
-        app,
-        name,
-        &vortix::tunnel::Connection::Connected {
-            profile_id: vortix::profile::ProfileId::new(name),
-            since: std::time::SystemTime::now(),
-            details: Box::new(details),
-        },
-    );
-}
-
-fn set_projection(app: &mut App, name: &str, state: &vortix::tunnel::Connection) {
-    use vortix::control::{Phase, TunnelView};
-    use vortix::profile::ProfileId;
-    use vortix::tunnel::Connection;
-
-    let phase = match state {
-        Connection::Connected { .. } => Phase::Up,
-        Connection::Disconnecting { .. } => Phase::Stopping,
-        Connection::Reconnecting { .. } => Phase::Waiting { retry_at: None },
-        Connection::AwaitingUserInput { .. } => Phase::AwaitingCredentials,
-        _ => Phase::Starting,
-    };
     let profile_id = ProfileId::new(name);
     let mut snapshot = (*app.control_snapshot).clone();
     snapshot.version += 1;
@@ -105,7 +79,7 @@ fn set_projection(app: &mut App, name: &str, state: &vortix::tunnel::Connection)
     snapshot.tunnels.push(TunnelView {
         profile_id,
         name: name.to_owned(),
-        phase,
+        phase: Phase::Up,
         interface: Some("wg0".into()),
         since: std::time::SystemTime::now(),
         routes: Vec::new(),
@@ -504,9 +478,7 @@ mod message_routing {
         add_wg_profiles(&mut app, &["vpn-a"]);
 
         app.handle_message(Message::QuickConnect(99));
-        assert!(app
-            .current_tunnel()
-            .is_none_or(|t| matches!(t.state, vortix::tunnel::Connection::Disconnected)));
+        assert!(app.current_tunnel().is_none());
     }
 
     #[test]

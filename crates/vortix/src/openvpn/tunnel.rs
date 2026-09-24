@@ -665,7 +665,7 @@ const OVPN_IFACE_ANCHORS: &[(&str, &str)] = &[
 /// Parse the kernel-visible interface name from `OpenVPN`'s log output.
 ///
 /// The returned name MUST equal the kernel-visible interface name; the
-/// registry's primary-election compares it byte-for-byte against
+/// engine snapshot's primary-election compares it byte-for-byte against
 /// `route get default` / `ip route show default` output. The legacy
 /// synthetic `openvpn-{name}` was the source of the "always Split tunnel"
 /// bug — see [`OVPN_IFACE_ANCHORS`] for the patterns we accept.

@@ -192,7 +192,7 @@ pub fn scan_status(
 ///   work in the primary-only case.
 ///
 /// A follow-up will replace the transitional single-entry construction below
-/// with a registry-driven snapshot; this stage's job is just to make the v2
+/// with a engine snapshot-driven snapshot; this stage's job is just to make the v2
 /// envelope shape available.
 #[derive(Serialize)]
 struct StatusData {
@@ -244,7 +244,7 @@ pub(super) fn handle_status(
     let is_connected = snap.connection_state == "connected";
     let is_present = snap.connection_state != "disconnected";
 
-    // Transitional shape: the registry-driven multi-tunnel snapshot
+    // Transitional shape: the engine snapshot-driven multi-tunnel snapshot
     // lands later. Until then, "primary" is the single active tunnel
     // (when connected), and `connections` is a one-element vec mirroring
     // it. When disconnected, `connections` is empty and `primary` /

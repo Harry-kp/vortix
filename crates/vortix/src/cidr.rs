@@ -130,7 +130,7 @@ impl Cidr {
     /// never intersect.
     ///
     /// Used by the CLI's `up` conflict gate to detect non-default
-    /// route overlap; available to the registry when conflict detection grows
+    /// route overlap; available to the engine when conflict detection grows
     /// route-overlap detection.
     #[must_use]
     pub fn intersects(&self, other: &Cidr) -> bool {

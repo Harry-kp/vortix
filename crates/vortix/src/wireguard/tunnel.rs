@@ -1086,7 +1086,7 @@ fn wait_for_interface_absence(interface_name: &str, timeout: Duration) -> bool {
 /// - **macOS**: `wg-quick` creates a `utunN` kernel device via
 ///   wireguard-go and writes the config-basename → `utunN` mapping to
 ///   `/var/run/wireguard/<basename>.name`. The platform port returns
-///   `Some("utun7")` (or similar). The registry needs `utun7` stored
+///   `Some("utun7")` (or similar). The engine snapshot needs `utun7` stored
 ///   to match `route -n get`'s output.
 ///
 /// Falling back to the basename when the port returns `None` is the
@@ -1776,7 +1776,7 @@ mod tests {
     #[test]
     fn resolve_kernel_iface_uses_port_result_when_present() {
         // macOS-shape: platform port returns the underlying utun device.
-        // This is the value the registry must store to match `route get`'s
+        // This is the value the engine snapshot must store to match `route get`'s
         // output byte-for-byte.
         let profile_id = crate::profile::ProfileId::new("corp");
         let resolved = resolve_kernel_iface("corp", Some("utun7".to_string()), &profile_id);

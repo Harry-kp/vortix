@@ -61,13 +61,13 @@ pub struct VpnRuntime {
     /// real-IP cache gate must withhold trust on the first
     /// telemetry sample. Without this flag, vortix opened while a
     /// VPN is already up races: telemetry returns the VPN's exit
-    /// IP, the registry is briefly empty (adoption hasn't run
+    /// IP, the engine snapshot is briefly empty (adoption hasn't run
     /// yet), and the wrong IP gets cached as `real_ip`.
     pub scanner_first_tick_done: bool,
 
     /// Number of kernel-visible VPN sessions observed at the most
     /// recent scanner tick. Reading raw kernel state (not the
-    /// registry) catches tunnels that have not yet been adopted —
+    /// engine snapshot) catches tunnels that have not yet been adopted —
     /// e.g. an OVPN process running outside vortix on macOS where
     /// adoption needs the lsof Method A probe to attribute the
     /// iface to the PID. Real-IP caching requires this to be zero.

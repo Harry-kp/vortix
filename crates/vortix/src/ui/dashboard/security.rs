@@ -1,7 +1,6 @@
 use crate::app::App;
-use crate::app::TunnelSnapshot;
 use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
-use crate::tunnel::Connection;
+use crate::control::{Phase, TunnelView};
 use crate::{constants, ui::theme};
 use ratatui::{
     layout::Rect,
@@ -463,8 +462,8 @@ fn footer_line(secs: Option<u64>) -> Line<'static> {
 
 /// Compact data the layout builders read from. Lifting this off `App`
 /// makes the builders pure functions, which lets us unit-test the
-/// `PROTECTED` branch without driving the registry into
-/// `Connection::Connected` (currently requires private test helpers).
+/// `PROTECTED` branch without driving the engine into
+/// an up tunnel (currently requires private test helpers).
 #[derive(Clone)]
 struct PanelState {
     inner_width: u16,
@@ -618,14 +617,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let primary_snap = app.primary_id().and_then(|id| app.tunnel(id));
-    let primary_connected = matches!(
-        primary_snap.as_ref().map(|s| &s.state),
-        Some(Connection::Connected { .. })
-    );
+    let primary_connected = primary_snap.is_some_and(|tunnel| tunnel.phase == Phase::Up);
     let any_tunnels = app.tunnel_count() > 0;
 
     let verdict = if primary_connected {
-        verdict_for_protected(app, primary_snap.as_ref())
+        verdict_for_protected(app, primary_snap)
     } else if any_tunnels {
         Verdict::Partial
     } else {
@@ -643,11 +639,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let body = match verdict {
         Verdict::Protected => {
-            let state = collect_protected_state(app, primary_snap.as_ref(), inner.width);
+            let state = collect_protected_state(app, primary_snap, inner.width);
             build_protected_audit(&state)
         }
         Verdict::Partial => {
-            let state = collect_partial_state(app, primary_snap.as_ref(), inner.width);
+            let state = collect_partial_state(app, primary_snap, inner.width);
             build_partial_audit(&state)
         }
         Verdict::Exposed => build_exposed_audit(app, inner.width),
@@ -666,7 +662,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// Refines the headline verdict for the connected-primary case. Even with
 /// a primary up, the panel demotes to `Partial` when IP/DNS posture is
 /// degraded so the title doesn't claim full protection while a row is red.
-fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Verdict {
+fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelView>) -> Verdict {
     let ip_leaking = matches!(&app.runtime.real_ip, Some(real) if &app.runtime.public_ip == real);
     let dns_unverified =
         app.control_snapshot.dns.status != crate::control::DnsSecurityStatus::Protected;
@@ -824,7 +820,7 @@ fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
 
 fn collect_protected_state(
     app: &App,
-    primary_snap: Option<&TunnelSnapshot>,
+    primary_snap: Option<&TunnelView>,
     inner_width: u16,
 ) -> PanelState {
     let ip_status = derive_ip_status(app);
@@ -874,22 +870,24 @@ fn collect_protected_state(
 
 fn collect_partial_state(
     app: &App,
-    primary_snap: Option<&TunnelSnapshot>,
+    primary_snap: Option<&TunnelView>,
     inner_width: u16,
 ) -> PanelState {
     // Cipher source: prefer the primary (when verdict is Partial because
     // of degraded defense), otherwise pick the first Connected tunnel
-    // from the registry (split-only topology). Ciphers are usually
+    // from the snapshot (split-only topology). Ciphers are usually
     // homogeneous in practice (all WG or all OpenVPN); if they diverge,
     // surfacing the first one is still strictly more useful than `N/A`.
-    let snapshots = app.tunnels();
     let encryption = if let Some(snap) = primary_snap {
         derive_encryption(Some(snap))
     } else {
-        snapshots
-            .iter()
-            .find(|s| matches!(s.state, Connection::Connected { .. }))
-            .map_or_else(|| "N/A".to_string(), |s| derive_encryption(Some(s)))
+        app.tunnels()
+            .into_iter()
+            .find(|tunnel| tunnel.phase == Phase::Up)
+            .map_or_else(
+                || "N/A".to_string(),
+                |tunnel| derive_encryption(Some(tunnel)),
+            )
     };
 
     // When a primary IS present (Partial fired from a degraded-defense
@@ -950,9 +948,13 @@ fn collect_partial_state(
 /// no primary is connected — callers should treat unrecognised strings
 /// the same as `classify_cipher` would (downgrades unknown to
 /// `Deprecated`).
-fn derive_encryption(primary_snap: Option<&TunnelSnapshot>) -> String {
-    match primary_snap.map(|s| &s.state) {
-        Some(Connection::Connected { details, .. }) => {
+fn derive_encryption(primary_snap: Option<&TunnelView>) -> String {
+    match primary_snap {
+        Some(TunnelView {
+            phase: Phase::Up,
+            details,
+            ..
+        }) => {
             if details.public_key == "OpenVPN" || details.public_key.is_empty() {
                 if details.latest_handshake.starts_with("Cipher:") {
                     details.latest_handshake.replace("Cipher: ", "")
@@ -1357,8 +1359,8 @@ mod tests {
     //! for `PARTIAL` and `EXPOSED` (the branches reachable from
     //! `App::new_test()`) and adds pure-function tests against
     //! `build_protected_audit` for the `PROTECTED` branch (which still
-    //! can't be driven into `Connection::Connected` without private
-    //! registry test helpers).
+    //! can't be driven into an up tunnel without private
+    //! snapshot test helpers).
     use super::*;
     use crate::app::App;
     use crate::control::killswitch::KillSwitchMode;
@@ -2388,7 +2390,7 @@ mod tests {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
         // Deliberately diverge the obsolete runtime mirror: renderers must
-        // follow the registry's canonical policy projection exclusively.
+        // follow the engine snapshot's policy exclusively.
         std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch = KillSwitchMode::AlwaysOn;
         std::sync::Arc::make_mut(&mut app.control_snapshot).kill_switch_state =
             KillSwitchState::Blocking;

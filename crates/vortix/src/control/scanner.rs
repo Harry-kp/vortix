@@ -419,10 +419,8 @@ fn check_openvpn_by_pid(
     //               isn't WG". Cannot distinguish between multiple
     //               openvpn pids; marked unauthoritative.
     //
-    // The flag flows into `session.interface_authoritative` at session-
-    // return time so `App::adopt_registry_from_session` can mark the
-    // adopted entry ineligible for primary-election when the iface
-    // can't be trusted against the kernel.
+    // The flag flows into `session.interface_authoritative`; the engine
+    // refuses to adopt a session whose interface it cannot trust.
     let mut iface_authoritative = false;
 
     // Method 0: vortix-spawned tunnel? If our run-dir holds an openvpn
@@ -606,9 +604,9 @@ fn check_openvpn_by_pid(
     // it cannot distinguish between concurrent OpenVPN processes, so
     // when two are up, both `check_openvpn_by_pid` calls return the
     // same utun — corrupting primary-election and per-tunnel killswitch
-    // ACCEPT rules if the registry takes that value as authoritative.
+    // ACCEPT rules if the engine snapshot takes that value as authoritative.
     // By contract: adopted entries with unreliable iface are
-    // excluded from primary-election by the registry.
+    // excluded from primary-election by the engine snapshot.
     session.details.interface_authoritative = iface_authoritative;
 
     // No tun/tap interface means OpenVPN is running but NOT connected yet
@@ -783,7 +781,7 @@ mod tests {
 
     /// `ScannerResult::default()` must produce a sentinel "nothing
     /// observed yet" value — empty session list AND `None` route
-    /// interface. The registry's `feed_default_route_interface(None)`
+    /// interface. The engine snapshot's `feed_default_route_interface(None)`
     /// is a legitimate "kernel reports no default route" signal, so
     /// we need a way to distinguish "scanner ran and saw nothing"
     /// from the initial pre-scan state. Default supplies the latter.

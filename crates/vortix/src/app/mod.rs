@@ -24,7 +24,7 @@
 //! - `helpers` — Logging, scrolling, toast notifications, and utilities
 
 pub(crate) mod connection;
-pub use connection::{Role, TunnelSnapshot};
+pub use connection::Role;
 mod helpers;
 mod input;
 mod profile;

@@ -1045,7 +1045,7 @@ fn policy_digest_from_persisted(active: &[PersistedTunnelInfo]) -> Option<String
 }
 
 /// Convenience helper: build a `PersistedTunnelInfo` slice from
-/// `ActiveTunnelInfo` and persist. Callers holding the live registry
+/// `ActiveTunnelInfo` and persist. Callers holding the live engine snapshot
 /// can stringify in one place.
 #[must_use]
 pub fn persisted_from_active(active: &[ActiveTunnelInfo]) -> Vec<PersistedTunnelInfo> {

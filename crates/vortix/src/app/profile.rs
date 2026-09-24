@@ -170,11 +170,7 @@ impl App {
             // started. Re-check the stable identity at the mutation point;
             // an index or display-name check can be invalidated by sorting or
             // another rename while the dialog is open.
-            use crate::tunnel::Connection;
-            if self
-                .tunnel(&stable_id)
-                .is_some_and(|snapshot| !matches!(snapshot.state, Connection::Disconnected))
-            {
+            if self.tunnel(&stable_id).is_some() {
                 self.show_toast(
                     "Cannot rename an active profile — disconnect first".to_string(),
                     ToastType::Warning,

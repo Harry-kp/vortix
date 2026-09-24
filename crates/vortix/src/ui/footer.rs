@@ -1,8 +1,7 @@
 //! Footer widget with context-aware keybinding hints
 
-use crate::app::TunnelSnapshot;
 use crate::app::{focused_tunnel_action, App, FocusedTunnelAction};
-use crate::tunnel::Connection;
+use crate::control::Phase;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -37,9 +36,8 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         crate::app::FocusedPanel::Security => "Security",
         crate::app::FocusedPanel::Logs => "Logs",
     };
-    let snapshots = app.tunnels();
     let focused_state = (app.focused_panel == crate::app::FocusedPanel::Sidebar)
-        .then(|| focused_profile_state(app, &snapshots))
+        .then(|| focused_profile_phase(app))
         .flatten();
 
     let mut context_hints = Vec::new();
@@ -74,20 +72,18 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
 
     // Reflects what `d` will do against the most relevant tunnel. Priority:
     // Disconnecting (already tearing down → Force Kill) > Connecting /
-    // Reconnecting / AwaitingUserInput (in-flight → Cancel) > Connected
+    // Reconnecting / AwaitingCredentials (in-flight → Cancel) > Connected
     // (steady → Disconnect). When no tunnel is active but a prior session
     // exists, surface `r Reconnect`.
-    let active_state = snapshots
+    let active_state = app
+        .control_snapshot
+        .tunnels
         .iter()
-        .map(|snapshot| &snapshot.state)
-        .filter(|st| !matches!(st, Connection::Disconnected))
-        .min_by_key(|st| match st {
-            Connection::Disconnecting { .. } => 0,
-            Connection::Connecting { .. }
-            | Connection::Reconnecting { .. }
-            | Connection::AwaitingUserInput { .. } => 1,
-            Connection::Connected { .. } => 2,
-            Connection::Disconnected => 3,
+        .map(|tunnel| tunnel.phase)
+        .min_by_key(|phase| match phase {
+            Phase::Stopping => 0,
+            Phase::Starting | Phase::Waiting { .. } | Phase::AwaitingCredentials => 1,
+            Phase::Up => 2,
         });
     let disconnect_hint = if app.focused_panel == crate::app::FocusedPanel::Sidebar {
         focused_disconnect_hint(focused_state)
@@ -116,19 +112,15 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Label the focused row's primary action without falling back to another
 /// active tunnel. This mirrors the sidebar `c` key's profile-scoped behavior.
-fn focused_profile_state<'a>(app: &App, snapshots: &'a [TunnelSnapshot]) -> Option<&'a Connection> {
-    let profile_id = app
+fn focused_profile_phase(app: &App) -> Option<Phase> {
+    let profile = app
         .profile_list_state
         .selected()
-        .and_then(|index| app.runtime.profiles.get(index))
-        .map(|profile| &profile.id)?;
-    snapshots
-        .iter()
-        .find(|snapshot| snapshot.profile_id == *profile_id)
-        .map(|snapshot| &snapshot.state)
+        .and_then(|index| app.runtime.profiles.get(index))?;
+    app.tunnel(&profile.id).map(|tunnel| tunnel.phase)
 }
 
-fn focused_profile_action(state: Option<&Connection>) -> &'static str {
+fn focused_profile_action(state: Option<Phase>) -> &'static str {
     match focused_tunnel_action(state) {
         FocusedTunnelAction::Connect => "Connect",
         FocusedTunnelAction::Cancel => "Cancel",
@@ -137,7 +129,7 @@ fn focused_profile_action(state: Option<&Connection>) -> &'static str {
     }
 }
 
-fn focused_disconnect_hint(state: Option<&Connection>) -> Option<(&'static str, &'static str)> {
+fn focused_disconnect_hint(state: Option<Phase>) -> Option<(&'static str, &'static str)> {
     match focused_tunnel_action(state) {
         FocusedTunnelAction::ForceDisconnect => Some(("d", "Force Kill")),
         FocusedTunnelAction::Cancel => Some(("d", "Cancel")),
@@ -147,7 +139,7 @@ fn focused_disconnect_hint(state: Option<&Connection>) -> Option<(&'static str, 
 }
 
 fn global_disconnect_hint(
-    state: Option<&Connection>,
+    state: Option<Phase>,
     can_reconnect: bool,
 ) -> Option<(&'static str, &'static str)> {
     focused_disconnect_hint(state).or_else(|| can_reconnect.then_some(("r", "Reconnect")))
@@ -341,41 +333,25 @@ mod tests {
 
     #[test]
     fn focused_footer_labels_match_profile_scoped_shortcuts() {
-        use crate::profile::ProfileId;
-        use crate::tunnel::DetailedConnectionInfo;
-        use std::time::SystemTime;
-
-        let profile_id = ProfileId::new("focused");
-        let now = SystemTime::UNIX_EPOCH;
-        let connecting = Connection::Connecting {
-            profile_id: profile_id.clone(),
-            started_at: now,
-        };
-        let connected = Connection::Connected {
-            profile_id: profile_id.clone(),
-            since: now,
-            details: Box::new(DetailedConnectionInfo::default()),
-        };
-        let disconnecting = Connection::Disconnecting {
-            profile_id,
-            started_at: now,
-        };
+        let connecting = Phase::Starting;
+        let connected = Phase::Up;
+        let disconnecting = Phase::Stopping;
 
         assert_eq!(focused_profile_action(None), "Connect");
         assert_eq!(focused_disconnect_hint(None), None);
-        assert_eq!(focused_profile_action(Some(&connecting)), "Cancel");
+        assert_eq!(focused_profile_action(Some(connecting)), "Cancel");
         assert_eq!(
-            focused_disconnect_hint(Some(&connecting)),
+            focused_disconnect_hint(Some(connecting)),
             Some(("d", "Cancel"))
         );
-        assert_eq!(focused_profile_action(Some(&connected)), "Disconnect");
+        assert_eq!(focused_profile_action(Some(connected)), "Disconnect");
         assert_eq!(
-            focused_disconnect_hint(Some(&connected)),
+            focused_disconnect_hint(Some(connected)),
             Some(("d", "Disconnect"))
         );
-        assert_eq!(focused_profile_action(Some(&disconnecting)), "Force Kill");
+        assert_eq!(focused_profile_action(Some(disconnecting)), "Force Kill");
         assert_eq!(
-            focused_disconnect_hint(Some(&disconnecting)),
+            focused_disconnect_hint(Some(disconnecting)),
             Some(("d", "Force Kill"))
         );
     }

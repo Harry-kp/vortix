@@ -7,7 +7,6 @@ use crate::cidr::Cidr;
 use crate::control::Conflict;
 use crate::control::{Command, Level, Phase, Snapshot, TunnelView};
 use crate::profile::ProfileId;
-use crate::tunnel::{Connection, ConnectionHealth, PromptKind};
 
 pub(super) const CONTROL_STARTING_MESSAGE: &str =
     "The VPN service is still starting. Try again in a moment.";
@@ -22,110 +21,41 @@ fn initial_auth_focus(otp: bool, credentials_prefilled: bool) -> crate::app::sta
     }
 }
 
-/// Per-tunnel role derived from declared `AllowedIPs` + current primary.
+/// Which traffic a tunnel carries, from its routes and the current primary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Role {
-    /// Owns the kernel default route. Carries the declared `AllowedIPs` for
-    /// display / Security Guard scoping.
+    /// Owns the default route.
     Primary { allowed_ips: Vec<Cidr> },
-    /// Reachable for its declared `AllowedIPs`; doesn't claim the default route.
+    /// Carries only its own routes.
     Addressable { allowed_ips: Vec<Cidr> },
-    /// Declared `0/0` but another tunnel currently holds the default route —
-    /// either because of a takeover race or because the user connected this
-    /// one without `--force` and it landed second.
+    /// Claims `0/0`, but another tunnel holds the default route.
     AddressableSuppressed { allowed_ips: Vec<Cidr> },
-    /// Reconnecting; the inner role is the one this tunnel held before the
-    /// link went down (so the UI can render "Reconnecting (was Primary)").
-    Reconnecting { prior_role: Box<Role> },
-    /// Mid-connect prompt (2FA, passphrase) — role unknown until the prompt
-    /// resolves.
-    AwaitingInput,
-}
-
-/// Read-only view of one FSM. UI panels read through these.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TunnelSnapshot {
-    pub profile_id: ProfileId,
-    pub state: Connection,
-    pub role: Role,
-    pub health: ConnectionHealth,
-    pub interface_name: Option<String>,
-    pub started_at: Option<std::time::SystemTime>,
-}
-
-fn tunnel_snapshot(snapshot: &Snapshot, tunnel: &TunnelView) -> TunnelSnapshot {
-    let profile_id = tunnel.profile_id.clone();
-    let allowed_ips = tunnel.routes.clone();
-    let role = if snapshot.primary.as_ref() == Some(&profile_id) {
-        Role::Primary { allowed_ips }
-    } else if tunnel.is_full() {
-        Role::AddressableSuppressed { allowed_ips }
-    } else {
-        Role::Addressable { allowed_ips }
-    };
-    let state = match tunnel.phase {
-        Phase::Starting => Connection::Connecting {
-            profile_id,
-            started_at: tunnel.since,
-        },
-        Phase::AwaitingCredentials => Connection::AwaitingUserInput {
-            profile_id,
-            prompt_kind: PromptKind::Generic {
-                label: "OpenVPN credentials".into(),
-            },
-            since: tunnel.since,
-        },
-        Phase::Up => Connection::Connected {
-            profile_id,
-            since: tunnel.since,
-            details: Box::new(tunnel.details.clone()),
-        },
-        Phase::Waiting { .. } => Connection::Reconnecting {
-            profile_id,
-            started_at: tunnel.since,
-        },
-        Phase::Stopping => Connection::Disconnecting {
-            profile_id,
-            started_at: tunnel.since,
-        },
-    };
-    let role = if matches!(tunnel.phase, Phase::Waiting { .. }) {
-        Role::Reconnecting {
-            prior_role: Box::new(role),
-        }
-    } else {
-        role
-    };
-    TunnelSnapshot {
-        profile_id: tunnel.profile_id.clone(),
-        state,
-        role,
-        health: tunnel.health.clone(),
-        interface_name: tunnel.interface.clone(),
-        started_at: Some(tunnel.since),
-    }
 }
 
 impl App {
     /// Every tunnel, in stable profile order so panels do not flicker.
     #[must_use]
-    pub fn tunnels(&self) -> Vec<TunnelSnapshot> {
-        let mut tunnels: Vec<_> = self
-            .control_snapshot
-            .tunnels
-            .iter()
-            .map(|tunnel| tunnel_snapshot(&self.control_snapshot, tunnel))
-            .collect();
+    pub fn tunnels(&self) -> Vec<&TunnelView> {
+        let mut tunnels: Vec<_> = self.control_snapshot.tunnels.iter().collect();
         tunnels.sort_by(|a, b| a.profile_id.cmp(&b.profile_id));
         tunnels
     }
 
     #[must_use]
-    pub fn tunnel(&self, profile_id: &ProfileId) -> Option<TunnelSnapshot> {
-        self.control_snapshot
-            .tunnel(profile_id)
-            .map(|tunnel| tunnel_snapshot(&self.control_snapshot, tunnel))
+    pub fn tunnel(&self, profile_id: &ProfileId) -> Option<&TunnelView> {
+        self.control_snapshot.tunnel(profile_id)
+    }
+
+    #[must_use]
+    pub fn role(&self, tunnel: &TunnelView) -> Role {
+        let allowed_ips = tunnel.routes.clone();
+        if self.primary_id() == Some(&tunnel.profile_id) {
+            Role::Primary { allowed_ips }
+        } else if tunnel.is_full() {
+            Role::AddressableSuppressed { allowed_ips }
+        } else {
+            Role::Addressable { allowed_ips }
+        }
     }
 
     /// The tunnel that owns the default route.
@@ -497,7 +427,7 @@ pub(crate) fn test_view(name: &str, phase: Phase) -> TunnelView {
         routes: Vec::new(),
         dns: Vec::new(),
         details: crate::tunnel::DetailedConnectionInfo::default(),
-        health: ConnectionHealth::default(),
+        health: crate::tunnel::ConnectionHealth::default(),
     }
 }
 

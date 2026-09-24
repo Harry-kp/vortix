@@ -1,5 +1,4 @@
 use crate::app::App;
-use crate::tunnel::Connection;
 use crate::ui::helpers;
 use crate::{constants, ui::theme};
 use ratatui::{
@@ -113,10 +112,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     // Session totals derived from the primary tunnel's snapshot.
     let primary_snap = app.primary_id().and_then(|id| app.tunnel(id));
-    let (session_rx, session_tx) = match primary_snap.as_ref().map(|s| &s.state) {
-        Some(Connection::Connected { details, .. }) => (
-            helpers::nonempty_or(&details.transfer_rx, "0B").to_string(),
-            helpers::nonempty_or(&details.transfer_tx, "0B").to_string(),
+    let (session_rx, session_tx) = match primary_snap {
+        Some(tunnel) if tunnel.phase == crate::control::Phase::Up => (
+            helpers::nonempty_or(&tunnel.details.transfer_rx, "0B").to_string(),
+            helpers::nonempty_or(&tunnel.details.transfer_tx, "0B").to_string(),
         ),
         _ => ("0B".to_string(), "0B".to_string()),
     };

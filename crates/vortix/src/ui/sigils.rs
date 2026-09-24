@@ -35,7 +35,7 @@ pub enum SigilId {
     Reconnecting,
     /// `◑` yellow — Disconnecting (teardown in flight).
     Disconnecting,
-    /// `?` yellow — `AwaitingUserInput` (2FA / passphrase prompt).
+    /// `?` yellow — awaiting credentials.
     AwaitingInput,
     /// `✗` red — Disconnected with a failure record.
     Failed,

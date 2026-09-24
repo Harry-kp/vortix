@@ -111,7 +111,7 @@ impl App {
             | Message::ForceDisconnectProfile { idx }
             | Message::CancelConnect { idx } => self.disconnect_profile_by_idx(idx),
             Message::RequestDisconnectAll => {
-                let count = self.active_tunnel_count();
+                let count = self.tunnel_count();
                 if count > 1 {
                     self.input_mode = InputMode::ConfirmDisconnectAll {
                         count,
@@ -147,8 +147,7 @@ impl App {
                     .and_then(|idx| Some((idx, self.runtime.profiles.get(idx)?.id.clone())))
                 {
                     let connected = self.current_tunnel().is_some_and(|tunnel| {
-                        tunnel.profile_id == profile_id
-                            && matches!(tunnel.state, crate::tunnel::Connection::Connected { .. })
+                        tunnel.profile_id == profile_id && tunnel.phase == crate::control::Phase::Up
                     });
                     if connected {
                         self.send(crate::control::Command::Reconnect(profile_id));
@@ -662,18 +661,9 @@ impl App {
                     && !is_connected
                     && !self.default_route_is_tunnel();
                 let no_tunnel_routes_v6 = is_connected
-                    && !self.tunnels().into_iter().any(|snap| {
-                        use crate::app::Role;
-                        use crate::tunnel::Connection;
-                        match (snap.state, snap.role) {
-                            (
-                                Connection::Connected { .. },
-                                Role::Primary { allowed_ips }
-                                | Role::Addressable { allowed_ips }
-                                | Role::AddressableSuppressed { allowed_ips },
-                            ) => crate::cidr::claims_default_route_v6(&allowed_ips),
-                            _ => false,
-                        }
+                    && !self.control_snapshot.tunnels.iter().any(|tunnel| {
+                        tunnel.phase == crate::control::Phase::Up
+                            && crate::cidr::claims_default_route_v6(&tunnel.routes)
                     });
                 let safe_to_cache = disconnect_safe || no_tunnel_routes_v6;
                 if safe_to_cache {
@@ -769,7 +759,7 @@ impl App {
             }
         }
 
-        // Cache the real address only after the scanner, the registry and the
+        // Cache the real address only after the scanner, the engine snapshot and the
         // kernel's own default route all agree no tunnel owns the egress path.
         let safe_to_cache = self.runtime.scanner_first_tick_done
             && self.runtime.last_kernel_session_count == 0
@@ -829,7 +819,7 @@ impl App {
     // Removed by the state-authority rework: `scanner_promote_to_connected`. The scanner can no
     // longer drive the Connecting → Connected transition. Only the
     // protocol layer's the protocol `up()` success result (via
-    // `Message::ConnectResult` → `mirror_connect_into_registry`) can.
+    // `Message::ConnectResult` → `the connect result`) can.
     // The (Connecting, Some(session)) arm in `handle_sync_system_state`
     // now just logs the kernel-visible-but-not-yet-tracked state at
     // SCANNER_LOG_INTERVAL_SECS cadence; the connect-timeout safety

@@ -2,7 +2,7 @@
 //!
 //! Extracts what the engine actually needs today: DNS servers (for
 //! `resolvconf` dependency hinting), peer routing data (`AllowedIPs`,
-//! `Endpoint`, `FwMark`) used by the multi-tunnel registry's conflict
+//! `Endpoint`, `FwMark`) used by the multi-tunnel engine snapshot's conflict
 //! detector and killswitch synthesis, a `has_hooks` flag derived from
 //! rejection of `PreUp`/`PostUp`/`PreDown`/`PostDown` executable directives
 //! in the `[Interface]` section, and a passthrough of the raw text. The

@@ -252,7 +252,7 @@ pub(super) fn engine_failure_or_exit(mode: OutputMode, command: &str, message: S
 /// the engine uses) so the two surfaces refuse the
 /// same set of takeovers. The route-overlap branch is a CLI-only
 /// superset until a follow-up brings route-overlap detection into the
-/// registry.
+/// engine snapshot.
 /// Acquire the cross-process lifecycle lock or exit with a structured
 /// error. Proceeding without the lock would reintroduce the concurrent
 /// `up`/`down` interleaving the lock exists to prevent.

@@ -1,5 +1,5 @@
 //! Minimal `.ovpn` parser — enough to detect auth-user-pass mode and surface
-//! the directives required by the multi-tunnel registry (remotes, default
+//! the directives required by the multi-tunnel engine snapshot (remotes, default
 //! route claim, explicit routes).
 
 use std::collections::BTreeSet;

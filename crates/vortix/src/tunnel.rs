@@ -314,7 +314,7 @@ pub enum DegradedReason {
     HighLatency { latency_ms: u64 },
 }
 
-/// Health summary for `Connection::Connected`.
+/// Health summary for an up tunnel.
 ///
 /// `Unknown` is the initial state immediately after a successful `up` —
 /// telemetry hasn't reported yet. The TUI renders "Measuring…" in that
@@ -344,7 +344,7 @@ pub struct DetailedConnectionInfo {
     pub transfer_tx: String,
     pub latest_handshake: String,
     /// Scanner-derived health carried atomically with refreshed metadata.
-    /// Internal-only; the enclosing `Connection` owns the public projection.
+    /// Internal-only; `TunnelView::health` is the public projection.
     #[serde(skip)]
     pub health_hint: ConnectionHealth,
     pub pid: Option<u32>,
@@ -411,154 +411,6 @@ impl Default for DetailedConnectionInfo {
             dns_request: crate::control::dns::DnsRequest::default(),
             teardown_config: None,
             interface_authoritative: true,
-        }
-    }
-}
-
-/// What a mid-connect prompt asks the user for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptKind {
-    TwoFactorCode,
-    Passphrase,
-    Generic { label: String },
-}
-
-/// The connection state machine.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum Connection {
-    /// No active VPN connection.
-    #[default]
-    Disconnected,
-    /// Initial connect in progress.
-    Connecting {
-        profile_id: ProfileId,
-        started_at: SystemTime,
-    },
-    /// Active VPN connection.
-    Connected {
-        profile_id: ProfileId,
-        since: SystemTime,
-        details: Box<DetailedConnectionInfo>,
-    },
-    /// Lost the tunnel; trying to bring it back without involving the user.
-    Reconnecting {
-        profile_id: ProfileId,
-        started_at: SystemTime,
-    },
-    /// User-initiated disconnect in progress.
-    Disconnecting {
-        profile_id: ProfileId,
-        started_at: SystemTime,
-    },
-    /// Waiting for the user to supply credentials.
-    AwaitingUserInput {
-        profile_id: ProfileId,
-        prompt_kind: PromptKind,
-        since: SystemTime,
-    },
-}
-
-impl Connection {
-    /// The profile currently in scope (`None` only for `Disconnected`).
-    #[must_use]
-    pub fn profile_id(&self) -> Option<&ProfileId> {
-        match self {
-            Self::Disconnected { .. } => None,
-            Self::Connecting { profile_id, .. }
-            | Self::Connected { profile_id, .. }
-            | Self::Reconnecting { profile_id, .. }
-            | Self::Disconnecting { profile_id, .. }
-            | Self::AwaitingUserInput { profile_id, .. } => Some(profile_id),
-        }
-    }
-
-    /// `true` when the engine is in a steady-state, non-transitional state.
-    #[must_use]
-    pub fn is_steady(&self) -> bool {
-        matches!(self, Self::Disconnected { .. } | Self::Connected { .. })
-    }
-
-    /// `true` when an active tunnel exists (Connected).
-    #[must_use]
-    pub fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected { .. })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_is_disconnected() {
-        let s = Connection::default();
-        assert!(matches!(s, Connection::Disconnected));
-    }
-
-    #[test]
-    fn profile_id_is_none_for_disconnected() {
-        let s = Connection::default();
-        assert!(s.profile_id().is_none());
-    }
-
-    #[test]
-    fn profile_id_is_some_for_other_states() {
-        let p = ProfileId::new("corp");
-        let s = Connection::Connecting {
-            profile_id: p.clone(),
-            started_at: SystemTime::now(),
-        };
-        assert_eq!(s.profile_id(), Some(&p));
-    }
-
-    #[test]
-    fn is_steady_distinguishes_states() {
-        let p = ProfileId::new("corp");
-        assert!(Connection::default().is_steady());
-        assert!(!Connection::Connecting {
-            profile_id: p.clone(),
-            started_at: SystemTime::now(),
-        }
-        .is_steady());
-    }
-    #[test]
-    fn awaiting_user_input_carries_profile_id() {
-        let p = ProfileId::new("corp");
-        let s = Connection::AwaitingUserInput {
-            profile_id: p.clone(),
-            prompt_kind: PromptKind::TwoFactorCode,
-            since: SystemTime::now(),
-        };
-        assert_eq!(s.profile_id(), Some(&p));
-    }
-
-    #[test]
-    fn awaiting_user_input_is_not_steady() {
-        // Like Connecting/Disconnecting, it's a transitional state.
-        let s = Connection::AwaitingUserInput {
-            profile_id: ProfileId::new("corp"),
-            prompt_kind: PromptKind::TwoFactorCode,
-            since: SystemTime::now(),
-        };
-        assert!(!s.is_steady());
-        assert!(!s.is_connected());
-    }
-
-    #[test]
-    fn prompt_kind_roundtrips_through_json() {
-        let kinds = [
-            PromptKind::TwoFactorCode,
-            PromptKind::Passphrase,
-            PromptKind::Generic {
-                label: "Hardware token PIN".into(),
-            },
-        ];
-        for k in kinds {
-            let json = serde_json::to_string(&k).unwrap();
-            let back: PromptKind = serde_json::from_str(&json).unwrap();
-            assert_eq!(k, back);
         }
     }
 }

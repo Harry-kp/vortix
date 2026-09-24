@@ -101,7 +101,7 @@ pub enum Message {
     RequestDisconnectAll,
     /// user accepted the
     /// `InputMode::ConfirmDisconnectAll` overlay; tear down every active
-    /// tunnel (registry-aware) plus the legacy single-tunnel state.
+    /// tunnel (multi-tunnel) plus the legacy single-tunnel state.
     ConfirmDisconnectAll,
     /// cancel an in-flight connect (the
     /// `c` keybinding on a Connecting row's Connection Details). FSM

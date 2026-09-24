@@ -1,9 +1,10 @@
 use crate::app::state::QualityLevel;
 use crate::app::App;
-use crate::app::{Role, TunnelSnapshot};
+use crate::app::Role;
 use crate::cidr::Cidr;
+use crate::control::{Phase, TunnelView};
 use crate::profile::ProtocolKind;
-use crate::tunnel::{Connection, DetailedConnectionInfo};
+use crate::tunnel::DetailedConnectionInfo;
 use crate::ui::helpers;
 use crate::{constants, ui::theme};
 use ratatui::{
@@ -64,27 +65,17 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     // panel is focus-driven across every snapshot state. Connected
     // shows full details; transitional states render a compact summary
-    // (Role + AwaitingUserInput hint + fwmark warning where applicable);
+    // (Role + awaiting-credentials hint + fwmark warning where applicable);
     // every other case falls back to the disconnected placeholder.
-    if let Some(snap) = focused_snap.as_ref() {
-        match &snap.state {
-            Connection::Connected { details, .. } => {
-                render_connected(frame, app, inner, snap, details, is_focused_primary);
-                return;
-            }
-            Connection::Connecting { .. }
-            | Connection::Reconnecting { .. }
-            | Connection::Disconnecting { .. }
-            | Connection::AwaitingUserInput { .. } => {
-                render_transitional(frame, app, inner, snap);
-                return;
-            }
-            Connection::Disconnected => {
-                // Fall through to disconnected placeholder below.
-            }
+    if let Some(snap) = focused_snap {
+        if snap.phase == Phase::Up {
+            render_connected(frame, app, inner, snap, &snap.details, is_focused_primary);
+        } else {
+            render_transitional(frame, app, inner, snap);
         }
+        return;
     } else if let Some(id) = focused_profile_id.as_ref() {
-        // Sidebar pointed at a profile id but neither the registry nor
+        // Sidebar pointed at a profile id but neither the engine snapshot nor
         // the runtime profile catalogue carries it — typically a delete-
         // mid-render race. Surface an explicit hint rather than a stale
         // placeholder so the user notices.
@@ -273,7 +264,7 @@ fn render_connected(
     frame: &mut Frame,
     app: &App,
     inner: Rect,
-    snap: &TunnelSnapshot,
+    snap: &TunnelView,
     details: &DetailedConnectionInfo,
     is_focused_primary: bool,
 ) {
@@ -368,8 +359,7 @@ fn render_connected(
     text.push(Line::from(""));
     text.push(stats_line(app, details));
 
-    // Role line — declared role drawn from the snapshot.
-    text.push(role_line(&snap.role));
+    text.push(role_line(&app.role(snap), snap.phase));
 
     // persistent fwmark warning for at-risk WG secondaries.
     if let Some(warn) = fwmark_warning_line(app, snap) {
@@ -379,17 +369,13 @@ fn render_connected(
     frame.render_widget(Paragraph::new(text), inner);
 }
 
-/// Render a compact summary for transitional snapshots (`Connecting`,
-/// `Reconnecting`, `Disconnecting`, `AwaitingUserInput`). The full
-/// `render_connected` block requires `DetailedConnectionInfo` which only
-/// exists for `Connected` — for everything else we show the Role line,
-/// the `AwaitingUserInput` call-to-action (when applicable), and the
-/// fwmark warning (when applicable) so users still get focused context.
-fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelSnapshot) {
+/// Compact summary for a tunnel that is not up yet (or any more): headline,
+/// Role line, the credentials call-to-action and the fwmark warning.
+fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelView) {
     let mut text: Vec<Line> = Vec::new();
 
-    let (headline, headline_color) = match &snap.state {
-        Connection::Connecting { .. } => {
+    let (headline, headline_color) = match snap.phase {
+        Phase::Starting => {
             let wireguard = app
                 .runtime
                 .profiles
@@ -406,16 +392,10 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
                 theme::current().yellow,
             )
         }
-        Connection::Reconnecting { .. } => ("Reconnecting".to_string(), theme::current().yellow),
-        Connection::Disconnecting { .. } => {
-            ("Disconnecting".to_string(), theme::current().text_secondary)
-        }
-        Connection::AwaitingUserInput { .. } => {
-            ("Awaiting input".to_string(), theme::current().warning)
-        }
-        // Unreachable in practice — render_transitional is only invoked for
-        // the four variants above — but the match needs to be exhaustive.
-        _ => ("Pending".to_string(), theme::current().text_secondary),
+        Phase::Waiting { .. } => ("Reconnecting".to_string(), theme::current().yellow),
+        Phase::Stopping => ("Disconnecting".to_string(), theme::current().text_secondary),
+        Phase::AwaitingCredentials => ("Awaiting input".to_string(), theme::current().warning),
+        Phase::Up => ("Pending".to_string(), theme::current().text_secondary),
     };
 
     text.push(Line::from(Span::styled(
@@ -441,13 +421,10 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
         }
     }
 
-    // Role line.
-    text.push(role_line(&snap.role));
+    text.push(role_line(&app.role(snap), snap.phase));
 
-    // AwaitingUserInput hint: render "Press [Enter] to provide
-    // 2FA / passphrase" alongside (above) the tab-cycle hint.
-    if let Connection::AwaitingUserInput { prompt_kind, .. } = &snap.state {
-        text.push(awaiting_user_input_hint(prompt_kind));
+    if snap.phase == Phase::AwaitingCredentials {
+        text.push(awaiting_input_hint());
     }
 
     // Tab-cycle hint when N>1 .
@@ -604,9 +581,15 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
 /// * `Split tunnel (0.0.0.0/0, yielded)` — declared a default route
 ///   but another tunnel currently holds it; "yielded" is the plain-
 ///   English equivalent of the prior "suppressed"
-/// * `Reconnecting via <last role>` — carries pre-drop role
-/// * `n/a (awaiting input)` — `AwaitingInput`
-fn role_line(role: &Role) -> Line<'static> {
+/// * `Reconnecting via <last role>` — while the tunnel waits to retry
+fn role_line(role: &Role, phase: Phase) -> Line<'static> {
+    if matches!(phase, Phase::Waiting { .. }) {
+        return helpers::detail_row(
+            "Role    : ",
+            format!("Reconnecting via {}", role_kind_label(role)),
+            theme::current().yellow,
+        );
+    }
     let (value, color) = match role {
         Role::Primary { allowed_ips } => (
             if allowed_ips.is_empty() {
@@ -632,23 +615,16 @@ fn role_line(role: &Role) -> Line<'static> {
             },
             theme::current().yellow,
         ),
-        Role::Reconnecting { prior_role } => (
-            format!("Reconnecting via {}", role_kind_label(prior_role)),
-            theme::current().yellow,
-        ),
-        Role::AwaitingInput => ("n/a (awaiting input)".to_string(), theme::current().warning),
     };
     helpers::detail_row("Role    : ", value, color)
 }
 
 /// Short label for a role used inside "Reconnecting via …".
-fn role_kind_label(role: &Role) -> String {
+const fn role_kind_label(role: &Role) -> &'static str {
     match role {
-        Role::Primary { .. } => "Primary".to_string(),
-        Role::Addressable { .. } => "Split tunnel".to_string(),
-        Role::AddressableSuppressed { .. } => "Split tunnel (yielded)".to_string(),
-        Role::Reconnecting { .. } => "Reconnecting".to_string(),
-        Role::AwaitingInput => "awaiting input".to_string(),
+        Role::Primary { .. } => "Primary",
+        Role::Addressable { .. } => "Split tunnel",
+        Role::AddressableSuppressed { .. } => "Split tunnel (yielded)",
     }
 }
 
@@ -666,18 +642,12 @@ fn format_cidr(c: &Cidr) -> String {
     format!("{}/{}", c.addr, c.prefix_len)
 }
 
-/// `AwaitingUserInput` call-to-action.
-fn awaiting_user_input_hint(prompt_kind: &crate::tunnel::PromptKind) -> Line<'static> {
-    use crate::tunnel::PromptKind;
-    let what = match prompt_kind {
-        PromptKind::TwoFactorCode => "2FA code",
-        PromptKind::Passphrase => "passphrase",
-        PromptKind::Generic { .. } => "input",
-    };
+/// Call-to-action while the engine waits for credentials.
+fn awaiting_input_hint() -> Line<'static> {
     Line::from(vec![
         Span::styled("⚠ ", Style::default().fg(theme::current().warning)),
         Span::styled(
-            format!("Press [Enter] to provide {what}"),
+            "Press [Enter] to provide input",
             Style::default()
                 .fg(theme::current().warning)
                 .add_modifier(Modifier::BOLD),
@@ -690,13 +660,13 @@ fn awaiting_user_input_hint(prompt_kind: &crate::tunnel::PromptKind) -> Line<'st
 /// Render the warning when **all** of the following hold:
 /// * focused tunnel's profile uses `WireGuard`
 /// * focused tunnel is *not* the primary (i.e., it's a secondary)
-/// * the registry currently has a primary tunnel (`registry.primary()` ↔
+/// * the engine snapshot currently has a primary tunnel (`engine snapshot.primary()` ↔
 ///   the kernel default route holder)
 /// * the focused tunnel's on-disk config does not declare any `FwMark`
 ///   directive
 ///
 /// Returns `None` when any condition fails — the line is conjunctive.
-fn fwmark_warning_line(app: &App, snap: &TunnelSnapshot) -> Option<Line<'static>> {
+fn fwmark_warning_line(app: &App, snap: &TunnelView) -> Option<Line<'static>> {
     // Bail if focused tunnel is the primary (warning only applies to
     // secondaries that are at fwmark-hijack risk against the primary).
     let primary = app.primary_id()?;
@@ -823,7 +793,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
 #[cfg(test)]
 mod tests {
     //! Connection Details is focus-driven; Role line covers
-    //! every variant; `AwaitingUserInput` shows the Enter hint; the fwmark
+    //! every variant; awaiting credentials shows the Enter hint; the fwmark
     //! warning fires only under the conjunctive D-1 condition; deleted /
     //! unknown focused profiles surface the "no longer available" hint.
     use super::*;
@@ -831,7 +801,6 @@ mod tests {
     use crate::config::profiles::VpnProfile;
     use crate::profile::ProfileId;
     use crate::profile::ProtocolKind;
-    use crate::tunnel::PromptKind;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -919,9 +888,12 @@ mod tests {
 
     #[test]
     fn role_line_primary_renders_allowed_cidr() {
-        let l = role_line(&Role::Primary {
-            allowed_ips: vec![v4("0.0.0.0/0")],
-        });
+        let l = role_line(
+            &Role::Primary {
+                allowed_ips: vec![v4("0.0.0.0/0")],
+            },
+            Phase::Up,
+        );
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert!(s.contains("Primary"), "missing Primary label: {s}");
         assert!(s.contains("0.0.0.0/0"), "missing CIDR: {s}");
@@ -932,9 +904,12 @@ mod tests {
         // OpenVPN `redirect-gateway` doesn't produce a `route` line,
         // so `extract_allowed_ips` returns empty. Don't render
         // `Primary (-)` — just `Primary`.
-        let l = role_line(&Role::Primary {
-            allowed_ips: vec![],
-        });
+        let l = role_line(
+            &Role::Primary {
+                allowed_ips: vec![],
+            },
+            Phase::Up,
+        );
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert!(s.contains("Primary"), "missing Primary label: {s}");
         assert!(
@@ -947,9 +922,12 @@ mod tests {
     fn role_line_addressable_with_empty_allowed_ips_omits_parens() {
         // Same concern on the Addressable side — `Split tunnel (-)`
         // looks broken; render just `Split tunnel`.
-        let l = role_line(&Role::Addressable {
-            allowed_ips: vec![],
-        });
+        let l = role_line(
+            &Role::Addressable {
+                allowed_ips: vec![],
+            },
+            Phase::Up,
+        );
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert!(s.contains("Split tunnel"), "missing label: {s}");
         assert!(
@@ -960,9 +938,12 @@ mod tests {
 
     #[test]
     fn role_line_addressable_secondary_single_cidr() {
-        let l = role_line(&Role::Addressable {
-            allowed_ips: vec![v4("10.0.0.0/8")],
-        });
+        let l = role_line(
+            &Role::Addressable {
+                allowed_ips: vec![v4("10.0.0.0/8")],
+            },
+            Phase::Up,
+        );
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         // User-facing copy: industry-standard "split tunnel" instead
         // of the plan-internal "Addressable" jargon.
@@ -976,18 +957,24 @@ mod tests {
 
     #[test]
     fn role_line_addressable_multi_cidr() {
-        let l = role_line(&Role::Addressable {
-            allowed_ips: vec![v4("10.0.0.0/8"), v4("192.168.0.0/16")],
-        });
+        let l = role_line(
+            &Role::Addressable {
+                allowed_ips: vec![v4("10.0.0.0/8"), v4("192.168.0.0/16")],
+            },
+            Phase::Up,
+        );
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert!(s.contains("multi"), "expected 'multi' for >1 cidr: {s}");
     }
 
     #[test]
     fn role_line_addressable_suppressed_for_zero_slash_zero_loser() {
-        let l = role_line(&Role::AddressableSuppressed {
-            allowed_ips: vec![v4("0.0.0.0/0")],
-        });
+        let l = role_line(
+            &Role::AddressableSuppressed {
+                allowed_ips: vec![v4("0.0.0.0/0")],
+            },
+            Phase::Up,
+        );
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         // User-facing copy uses "yielded" (plain English) instead of
         // the plan's "suppressed" jargon. Both convey "this tunnel
@@ -1004,20 +991,14 @@ mod tests {
 
     #[test]
     fn role_line_reconnecting_carries_prior_role() {
-        let l = role_line(&Role::Reconnecting {
-            prior_role: Box::new(Role::Primary {
+        let l = role_line(
+            &Role::Primary {
                 allowed_ips: vec![v4("0.0.0.0/0")],
-            }),
-        });
+            },
+            Phase::Waiting { retry_at: None },
+        );
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert!(s.contains("Reconnecting via Primary"), "got: {s}");
-    }
-
-    #[test]
-    fn role_line_awaiting_input() {
-        let l = role_line(&Role::AwaitingInput);
-        let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
-        assert!(s.contains("awaiting input"), "got: {s}");
     }
 
     // ───────────── config_has_fwmark ─────────────
@@ -1049,30 +1030,20 @@ mod tests {
     // ───────────── render: focus-driven snapshot lookup ─────────────
 
     #[test]
-    fn focused_awaiting_user_input_renders_enter_hint() {
-        // Build an Engine and shove an AwaitingUserInput state by going
-        // around the input surface: the Connection enum is in the same
-        // crate, so we can mutate the engine's state via the public
-        // `set_state_for_test`-style helper IF it exists. If not, we test
-        // via the snapshot path: insert an engine, then verify the
-        // top-level render dispatches on `Connection::AwaitingUserInput`.
-        //
-        // The Engine doesn't expose state mutation directly; the FSM
-        // requires an Input. Today no Input drives AwaitingUserInput
-        // (issue #191). Skip this happy-path render check and instead
-        // assert the helper functions used by the AwaitingUserInput
-        // branch render the expected text.
-        let line = awaiting_user_input_hint(&PromptKind::TwoFactorCode);
-        let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
-        assert!(
-            s.contains("[Enter]") && s.contains("2FA"),
-            "expected Enter+2FA hint, got: {s}"
+    fn focused_awaiting_input_renders_enter_hint() {
+        let mut app = App::new_test();
+        app.runtime.profiles = vec![make_profile("corp", PathBuf::from("/tmp/corp.conf"))];
+        app.profile_list_state.select(Some(0));
+        app.set_tunnels_for_test(
+            vec![crate::app::connection::test_view(
+                "corp",
+                Phase::AwaitingCredentials,
+            )],
+            None,
         );
-        let p = awaiting_user_input_hint(&PromptKind::Passphrase);
-        let s: String = p.spans.iter().map(|sp| sp.content.as_ref()).collect();
-        assert!(s.contains("passphrase"));
-        // Silence dead-code on the helper builder until issue #191 wires
-        // a real AwaitingUserInput state into the FSM.
+        let out = render_to_string(&mut app, 80, 12);
+        assert!(out.contains("Awaiting input"), "{out}");
+        assert!(out.contains("Press [Enter] to provide input"), "{out}");
     }
 
     /// The panel's address / network / resolver rows read straight off the
@@ -1132,7 +1103,7 @@ mod tests {
         app.runtime.profiles = vec![make_profile("home", cfg_path)];
         app.profile_list_state.select(Some(0));
 
-        // No registry entry — should fall through to "Not Connected".
+        // No engine snapshot entry — should fall through to "Not Connected".
         let out = render_to_string(&mut app, 80, 12);
         assert!(
             out.contains("Not Connected"),
@@ -1141,9 +1112,9 @@ mod tests {
     }
 
     #[test]
-    fn focused_profile_missing_from_registry_with_no_match_renders_disconnected() {
+    fn focused_profile_missing_from_the_engine_renders_disconnected() {
         // Sidebar selects a profile that exists in `runtime.profiles`
-        // but has no registry entry — fall through to render_disconnected
+        // but has no engine snapshot entry — fall through to render_disconnected
         // (this is the everyday "browsing profiles to pick which to
         // connect" case).
         let mut app = App::new_test();
@@ -1160,7 +1131,7 @@ mod tests {
     fn profile_unavailable_helper_renders_hint() {
         // Exercise render_profile_unavailable directly: easiest way to
         // confirm the hint copy without needing to model a delete-mid-
-        // render race in registry state.
+        // render race in engine snapshot state.
         let backend = TestBackend::new(60, 8);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -1205,12 +1176,12 @@ mod tests {
         app.profile_list_state.select(Some(0));
 
         insert_connected(&mut app, "corp", "utun7", vec![v4("0.0.0.0/0")]);
-        // Force the registry to treat corp as primary by faking the route
-        // probe via a fresh registry with a probe. We can't swap registry's
+        // Force the engine snapshot to treat corp as primary by faking the route
+        // probe via a fresh engine snapshot with a probe. We can't swap engine snapshot's
         // private probe field from outside, so instead we directly invoke
         // refresh_primary in production; here we just assert the Role line
         // appears as Addressable (since refresh_primary will return None on
-        // host CI). The takeaway: Primary-route mapping is registry-
+        // host CI). The takeaway: Primary-route mapping is engine snapshot-
         // internal — UI-side we trust whatever role the snapshot returns.
         // To still exercise the Primary branch, we test role_line directly
         // above; this integration test only confirms the snapshot wiring.
@@ -1245,7 +1216,7 @@ mod tests {
         app.runtime.location = "Frankfurt am Main, DE".to_string();
 
         // Insert a Connected entry whose iface doesn't match any
-        // kernel-route value the test registry knows about, so
+        // kernel-route value the test engine snapshot knows about, so
         // is_focused_primary stays false.
         insert_connected(&mut app, "split", "utun8", vec![v4("10.0.0.0/8")]);
 
@@ -1320,7 +1291,7 @@ mod tests {
         std::sync::Arc::make_mut(&mut app.control_snapshot).primary = Some(ProfileId::new("corp"));
 
         let lab_snap = app.tunnel(&ProfileId::new("lab")).expect("lab snapshot");
-        let l = fwmark_warning_line(&app, &lab_snap)
+        let l = fwmark_warning_line(&app, lab_snap)
             .expect("warning expected when primary holds default");
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert!(s.contains("Fwmark"));
@@ -1340,6 +1311,6 @@ mod tests {
         std::sync::Arc::make_mut(&mut app.control_snapshot).primary = Some(ProfileId::new("corp"));
 
         let snap = app.tunnel(&ProfileId::new("corp")).expect("snap");
-        assert!(fwmark_warning_line(&app, &snap).is_none());
+        assert!(fwmark_warning_line(&app, snap).is_none());
     }
 }

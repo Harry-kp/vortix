@@ -218,8 +218,8 @@ pub(super) fn handle_up(
     }
 
     // route the CLI connect through the
-    // registry's conflict gate before invoking the legacy tunnel-up path.
-    // The CLI is headless and has no in-memory registry, so we build a
+    // engine snapshot's conflict gate before invoking the legacy tunnel-up path.
+    // The CLI is headless and has no in-memory engine, so we build a
     // transient one from the scanner's active-session snapshot and ask it
     // whether the new profile's AllowedIPs collide with anything already
     // up. `--yes` bypasses the gate for scripted callers.

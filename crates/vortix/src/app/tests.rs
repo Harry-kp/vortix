@@ -85,10 +85,7 @@ fn u1_multi_tunnel_no_primary_projection_is_stable_and_sorted() {
     let current = app
         .current_tunnel()
         .expect("with no primary the first active tunnel is current");
-    assert!(matches!(
-        current.state,
-        crate::tunnel::Connection::Connected { .. }
-    ));
+    assert!(current.phase == crate::control::Phase::Up);
     assert_eq!(app.profile_display_name(&current.profile_id), "alpha");
 }
 fn set_disconnecting(app: &mut App, name: &str) {
@@ -110,9 +107,7 @@ fn set_disconnecting(app: &mut App, name: &str) {
 fn test_d_while_disconnected_is_noop() {
     let mut app = test_app();
     app.handle_message(Message::Disconnect);
-    assert!(app
-        .current_tunnel()
-        .is_none_or(|t| matches!(t.state, crate::tunnel::Connection::Disconnected)));
+    assert!(app.current_tunnel().is_none());
 }
 
 // ====================================================================
@@ -223,10 +218,10 @@ fn test_toggle_while_connecting_is_rejected() {
     app.toggle_connection(1);
 
     assert!(app.current_tunnel().is_some_and(|t| matches!(
-        t.state,
-        crate::tunnel::Connection::Connecting { .. }
-            | crate::tunnel::Connection::Reconnecting { .. }
-            | crate::tunnel::Connection::AwaitingUserInput { .. }
+        t.phase,
+        crate::control::Phase::Starting
+            | crate::control::Phase::Waiting { .. }
+            | crate::control::Phase::AwaitingCredentials
     )));
 }
 
@@ -522,8 +517,7 @@ fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
     app.reconnect();
 
     assert!(
-        app.current_tunnel()
-            .is_none_or(|t| matches!(t.state, crate::tunnel::Connection::Disconnected)),
+        app.current_tunnel().is_none(),
         "Should stay disconnected when no last_connected_profile"
     );
 }
@@ -1235,7 +1229,7 @@ fn test_cannot_delete_disconnecting_profile() {
     let mut app = test_app();
     add_profiles(&mut app, &["my-vpn"]);
     app.profile_list_state.select(Some(0));
-    // Disconnecting transitions off Connected; the registry's
+    // Disconnecting transitions off Connected; the engine snapshot's
     // set_disconnecting is a no-op without a prior Connected entry, so
     // seed Connected first.
     set_connected(&mut app, "my-vpn");
@@ -1537,9 +1531,9 @@ fn u19_disconnect_profile_idempotent_for_inactive_row() {
 
     assert!(
         app.current_tunnel()
-            .is_some_and(|t| matches!(t.state, crate::tunnel::Connection::Connected { .. })),
+            .is_some_and(|t| t.phase == crate::control::Phase::Up),
         "DisconnectProfile on inactive row must leave Connected state intact, got {:?}",
-        app.current_tunnel().map(|t| t.state),
+        app.current_tunnel().map(|t| t.phase),
     );
 }
 
@@ -1554,12 +1548,12 @@ fn sidebar_d_on_inactive_row_never_disconnects_another_tunnel() {
     app.handle_key(key_char('d'));
 
     assert!(app.toast.is_none(), "inactive-row d must be a quiet no-op");
-    assert!(matches!(
+    assert_eq!(
         app.tunnel(&crate::profile::ProfileId::new("active"))
             .unwrap()
-            .state,
-        crate::tunnel::Connection::Connected { .. }
-    ));
+            .phase,
+        crate::control::Phase::Up
+    );
 }
 
 #[test]
@@ -1644,7 +1638,7 @@ fn u19_request_disconnect_all_opens_confirm_when_multi() {
     add_profiles(&mut app, &["p1", "p2"]);
     set_connected(&mut app, "p1");
     set_connected(&mut app, "p2");
-    assert_eq!(app.active_tunnel_count(), 2);
+    assert_eq!(app.tunnel_count(), 2);
 
     app.handle_message(Message::RequestDisconnectAll);
 
@@ -1682,16 +1676,12 @@ fn u19_connection_details_follows_sidebar_selection() {
     );
 }
 #[test]
-fn u19_active_tunnel_count_reflects_registry_after_connect() {
-    // Pre-P5a this exercised the legacy fallback when the registry
-    // was empty. Post-P5a the helper reads registry-only; `set_connected`
-    // mirrors into the registry (matching Path A's production path),
-    // so the count flips 0 -> 1.
+fn u19_tunnel_count_reflects_the_engine_after_connect() {
     let mut app = test_app();
     add_profiles(&mut app, &["p1"]);
-    assert_eq!(app.active_tunnel_count(), 0);
+    assert_eq!(app.tunnel_count(), 0);
     set_connected(&mut app, "p1");
-    assert_eq!(app.active_tunnel_count(), 1);
+    assert_eq!(app.tunnel_count(), 1);
 }
 
 #[test]
@@ -1727,7 +1717,7 @@ fn u19_confirm_disconnect_all_overlay_n_key_cancels() {
     // Connection state untouched.
     assert!(app
         .current_tunnel()
-        .is_some_and(|t| matches!(t.state, crate::tunnel::Connection::Connected { .. })));
+        .is_some_and(|t| t.phase == crate::control::Phase::Up));
 }
 
 /// `CachedConfigView::from_content` pre-counts lines and pre-highlights
@@ -1791,10 +1781,10 @@ fn get_config_max_scroll_reads_from_cache() {
 // Bug: vortix opened while a VPN tunnel is already up cached the
 // VPN's exit IP as `real_ip`. Cause: telemetry's first PublicIp
 // poll fires before the scanner's first SyncSystemState tick, so
-// the registry is briefly empty, `!is_connected` is true, and the
+// the engine snapshot is briefly empty, `!is_connected` is true, and the
 // VPN exit IP gets baked into `real_ip`. Fix: require positive
 // proof of zero VPN sessions (scanner has ticked AND kernel
-// reports zero sessions AND registry has zero Connected) before
+// reports zero sessions AND engine snapshot has zero Connected) before
 // caching. The tests below pin each branch of that gate.
 
 #[test]
@@ -2204,57 +2194,31 @@ fn test_auth_delete_profile_cleans_auth_file() {
 #[test]
 fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
     use crate::app::{focused_tunnel_action, FocusedTunnelAction};
-    use crate::profile::ProfileId;
-    use crate::tunnel::{Connection, PromptKind};
-    use std::time::SystemTime;
+    use crate::control::Phase;
 
-    let profile_id = ProfileId::new("focused");
-    let now = SystemTime::UNIX_EPOCH;
-    let transitional = [
-        Connection::Connecting {
-            profile_id: profile_id.clone(),
-            started_at: now,
-        },
-        Connection::Reconnecting {
-            profile_id: profile_id.clone(),
-            started_at: now,
-        },
-        Connection::AwaitingUserInput {
-            profile_id: profile_id.clone(),
-            prompt_kind: PromptKind::TwoFactorCode,
-            since: now,
-        },
-    ];
-    for state in &transitional {
+    for phase in [
+        Phase::Starting,
+        Phase::Waiting { retry_at: None },
+        Phase::AwaitingCredentials,
+    ] {
         assert_eq!(
-            focused_tunnel_action(Some(state)),
+            focused_tunnel_action(Some(phase)),
             FocusedTunnelAction::Cancel
         );
     }
-
-    let connected = Connection::Connected {
-        profile_id: profile_id.clone(),
-        since: now,
-        details: Box::default(),
-    };
     assert_eq!(
-        focused_tunnel_action(Some(&connected)),
+        focused_tunnel_action(Some(Phase::Up)),
         FocusedTunnelAction::Disconnect
     );
-    let disconnecting = Connection::Disconnecting {
-        profile_id,
-        started_at: now,
-    };
     assert_eq!(
-        focused_tunnel_action(Some(&disconnecting)),
+        focused_tunnel_action(Some(Phase::Stopping)),
         FocusedTunnelAction::ForceDisconnect
     );
     assert_eq!(focused_tunnel_action(None), FocusedTunnelAction::Connect);
 }
 
 #[test]
-fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
-    use crate::tunnel::Connection;
+fn scanner_statistics_refresh_the_dashboard_without_nudging_egress_telemetry() {
     use std::sync::mpsc;
 
     let mut app = test_app();
@@ -2284,10 +2248,8 @@ fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
         "presentation-only transfer counters must not wake public-IP probes"
     );
     let rendered = app.tunnel(&profile_id).unwrap();
-    let Connection::Connected { details, .. } = rendered.state else {
-        panic!("renderer projection must remain connected");
-    };
-    assert_eq!(details.transfer_rx, "12.0 MiB");
+    assert_eq!(rendered.phase, crate::control::Phase::Up);
+    assert_eq!(rendered.details.transfer_rx, "12.0 MiB");
 
     let new_path = edit(&app, &|snapshot| {
         snapshot.tunnels[0].interface = Some("utun8".to_string());
@@ -2334,7 +2296,7 @@ fn a_control_snapshot_establishes_the_real_ip_cache_gates() {
 
 /// The real-IP gate proved only that *Vortix* owned no tunnel. A VPN started
 /// outside Vortix still carries the egress, so the probe returned that VPN's
-/// exit address and the gate — scanner ticked, no managed session, registry
+/// exit address and the gate — scanner ticked, no managed session, engine snapshot
 /// disconnected — cached it as the user's real IP. Security Guard then showed
 /// Real IP equal to Exit IP and flagged a leak that was its own bookkeeping.
 #[test]
