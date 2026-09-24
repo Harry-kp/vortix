@@ -36,12 +36,12 @@ If you regularly use Vortix on Linux and want to help more deeply, start in the 
 1. Fork the repo
 2. Create a feature branch: `git checkout -b feat/my-feature`
 3. Make your changes
-4. Run checks:
+4. Run what CI runs:
    ```bash
-   cargo fmt        # Format code
-   cargo clippy     # Lint
-   cargo test       # Run tests
+   scripts/ci-local.sh           # full set
+   scripts/ci-local.sh --quick   # skips the release build
    ```
+   See [docs/ci-parity.md](docs/ci-parity.md) for the individual steps.
 5. Commit with [conventional commits](https://www.conventionalcommits.org/):
    - `feat:` new feature
    - `fix:` bug fix
@@ -51,8 +51,7 @@ If you regularly use Vortix on Linux and want to help more deeply, start in the 
 
 ## Code Style
 
-- Run `cargo fmt` before committing
-- Run `cargo clippy` and fix all warnings
+- `scripts/ci-local.sh` must pass before you push
 - Keep functions small and focused
 - Add doc comments for public APIs
 

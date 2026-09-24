@@ -10,6 +10,15 @@ PRs that only touch `**/*.md`, `LICENSE`, or `CHANGELOG.md` skip every heavy CI 
 
 If your PR mixes a doc change with anything else (any `.rs`, `Cargo.toml`, `Cargo.lock`, or workflow YAML touch), CI fires normally. The skip only triggers when EVERY changed file matches the doc patterns.
 
+## One command
+
+```bash
+scripts/ci-local.sh           # full set, including the Linux cross-clippy on macOS
+scripts/ci-local.sh --quick   # skips the release build
+```
+
+The script runs steps 1 and 3–6 below, the Linux cross-clippy (Trap 2) and the release build from step 7; run `release_smoke.sh` by hand when step 7 applies. Steps are listed so a failure can be re-run on its own.
+
 ## The full set
 
 ```bash
@@ -65,18 +74,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### Trap 2 — `#[cfg(target_os = "...")]` blocks are skipped on the wrong host
 
-Code gated to Linux (`linux/*`) never compiles on macOS, and vice versa. Local clippy on a macOS host **cannot** catch a Linux-only lint. CI runs the matrix; humans usually don't.
+Code gated to Linux (`linux/*`) never compiles on macOS, and vice versa, so a plain local clippy misses the other OS's lints.
 
-**Mitigations:**
-- Cross-check Linux code from macOS before pushing (`rustup target add x86_64-unknown-linux-gnu` once). `ring`'s build script needs a C compiler for the target; macOS clang works when pointed at the SDK's libc headers, and clippy never links:
-  ```bash
-  SDK=$(xcrun --show-sdk-path) \
-  CC_x86_64_unknown_linux_gnu=clang AR_x86_64_unknown_linux_gnu=ar \
-  CFLAGS_x86_64_unknown_linux_gnu="--target=x86_64-unknown-linux-gnu -isystem $SDK/usr/include" \
-  cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
-  ```
-  **This usually does not work from macOS.** `ring` runs a build script that needs a Linux C cross-compiler, so the build fails there and never reaches the lint pass. Adding the rustup target is not enough. Treat this bullet as available only where a cross toolchain is already installed, and do not plan a verification step around it.
-- Otherwise: push to a feature branch, watch CI, fix from the failure log. Don't merge until all matrix legs are green. On this repo that is the normal path, not the fallback: a single branch shipped three separate Linux-only failures (a DNS regression invisible to macOS tests, then `clippy::unnecessary_wraps` and `clippy::items_after_test_module`) where every local run was green.
+**Fix:** on macOS, `scripts/ci-local.sh` also runs clippy for `x86_64-unknown-linux-gnu` once the target is installed (`rustup target add x86_64-unknown-linux-gnu`). `ring`'s build script uses macOS clang pointed at the SDK's libc headers; clippy never links:
+```bash
+SDK=$(xcrun --show-sdk-path) \
+CC_x86_64_unknown_linux_gnu=clang AR_x86_64_unknown_linux_gnu=ar \
+CFLAGS_x86_64_unknown_linux_gnu="--target=x86_64-unknown-linux-gnu -isystem $SDK/usr/include" \
+cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+```
+Linux-only runtime behaviour (tests under `cfg(target_os = "linux")`) still runs only in CI; don't merge until every matrix leg is green.
 
 ### Trap 3 — `cargo clippy` does NOT run rustdoc lints
 
@@ -109,10 +116,9 @@ cargo fmt --all -- --check
 | Situation | Minimum set |
 |---|---|
 | Tight edit loop on a single function | `cargo check -p vortix --lib` |
-| Before opening a PR | Full set above |
-| Before declaring a unit done (per-unit verification in plan docs) | Full set above |
+| Before opening a PR or pushing | `scripts/ci-local.sh` |
 | After dependency bumps (rand, sha2, libc, tokio) | Full set above + manual smoke per `docs/manual-testing/<feature>.md` |
-| After cross-platform code touches | Full set, plus cross-compile-check (`--target`) where possible |
+| After cross-platform code touches | `scripts/ci-local.sh` (includes the Linux cross-clippy on macOS) |
 | Checking a build-time or binary-size regression | `scripts/bench-build.sh` — see [`docs/performance.md`](performance.md) |
 | After touching a cargo profile, a dependency feature, or CLI output | Full set **including step 7** |
 

@@ -1,7 +1,6 @@
 # Multi-tunnel manual verification matrix
 
-12 scenarios that exercise every branch of the multi-tunnel state-authority contract
-(see `docs/brainstorms/2026-06-01-multi-tunnel-state-authority-requirements.md`).
+12 scenarios that exercise every branch of the multi-tunnel state-authority contract.
 Each row names the setup and the per-surface expected output. Run them on a real
 macOS host with the one-droplet compatibility lab available (run
 `scripts/vpn-lab.sh up`) and import its profiles. Use `01`/`03`/`05` or `wg08`/`wg11`
@@ -35,40 +34,20 @@ These derive from the state-authority contract — any violation is a bug, not a
 test-setup quirk:
 
 1. **Sidebar asterisk == header CONNECTED-name == Role: Primary owner.** All three
-   surfaces derive from `registry.primary`; they cannot diverge.
+   surfaces derive from the engine snapshot's primary tunnel; they cannot diverge.
 2. **`route -n get 8.8.8.8`'s interface output equals the asterisked tunnel's
    `details.interface`.** Byte-for-byte. If kernel and vortix disagree, the
-   registry has been corrupted.
+   engine snapshot is wrong.
 3. **`curl https://api.ipify.org` returns the exit IP of whichever profile shows
    `*`**. UI claim matches reality at the egress.
 4. **Scanner reports never change `details.interface` of an existing Connected
    entry.** Even when the scanner ticks during a connect race, the iface set
    by `Tunnel::up()`'s log scrape is preserved.
 
-## Acceptance Examples cross-reference
-
-Each scenario maps to an AE in
-`docs/brainstorms/2026-06-01-multi-tunnel-state-authority-requirements.md`:
-
-| Scenario | AE | Requirements exercised |
-|---|---|---|
-| 1 | AE1 | R1, R7, R9, R10 |
-| 2 | AE2 | R7, R9, R10 |
-| 3 | AE3 | R1, R2, R3, R7, R9, R10 |
-| 4 | AE4 | R7, R9, R10 |
-| 5 | AE5 | R1, R7, R8, R9 |
-| 6 | AE6 | R1, R7, R9, R10 |
-| 7 | AE7 | R7, R8, R9, R10 |
-| 8 | AE8 | R7, R9 |
-| 9 | AE9 | R7, R9 |
-| 10 | AE10 | R7, R8, R9, R10 |
-| 11 | AE11 | R1, R7, R9, R10 |
-| 12 | AE12 | R1, R3, R7, R9, R10 |
-
 ## Density principle reminder
 
 Every scenario above must render cleanly at 80×24 with no panel cropping. The
-TUI density rule (CLAUDE.md §TUI density principle) is load-bearing: signal
+TUI density rule (see CLAUDE.md) is load-bearing: signal
 via badge/color/sigil changes, never via new panels. If any scenario needs a
 new panel to render correctly, that's a design defect to surface, not a layout
 tweak.

@@ -57,7 +57,7 @@ toml_edit = "0.25.13"
 directories = "6"
 figment = { version = "0.10", features = ["toml", "env"] }
 
-# Async runtime + tracing (CommandRunner per docs/plans/2026-05-24-002)
+# Async runtime + tracing (CommandRunner)
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros", "sync", "io-util", "fs", "signal"] }
 tracing = "0.1"
 # `filter::Targets` reads the same `target=level` RUST_LOG syntax without env-filter's regex engine.

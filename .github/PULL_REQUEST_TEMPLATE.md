@@ -16,7 +16,5 @@ Fixes #(issue number)
 
 ## Checklist
 
-- [ ] I ran `cargo fmt`
-- [ ] I ran `cargo clippy` with no warnings
-- [ ] I ran `cargo test` and all tests pass
+- [ ] `scripts/ci-local.sh` passes (see `docs/ci-parity.md`)
 - [ ] I updated documentation if needed

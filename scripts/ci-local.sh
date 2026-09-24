@@ -30,6 +30,7 @@ fi
 
 if ! $quick; then
   step "release build"; cargo build --release -p vortix --locked
+  step "release smoke"; bash tests/integration/release_smoke.sh
 fi
 
 printf '\nAll checks passed.\n'

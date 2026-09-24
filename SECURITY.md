@@ -49,7 +49,7 @@ Vortix handles sensitive VPN configurations. Key security measures:
 
 ### OpenVPN `remote` IP allow-list trust assumption
 
-When the killswitch is in `AlwaysOn` mode, Vortix synthesizes its
+When the kill switch is in `vpn-only` mode, Vortix synthesizes its
 firewall ruleset by allow-listing every `remote <host> <port>`
 directive in every imported `.ovpn` profile. We do this because at
 ruleset-synthesis time we do not yet know which `remote` an OpenVPN
@@ -68,40 +68,36 @@ conditional on the user's profile-import trust.
 
 **Mitigation.** Only import `.ovpn` profiles from VPN providers you
 trust. Vortix v0.4.x relies on the user's profile-import flow as the
-trust gate (this is `NG5` in the multi-connection plan — the sharper
-fix, OpenVPN management-socket integration that allow-lists only the
+trust gate (the sharper fix, OpenVPN management-socket integration that allow-lists only the
 *actually-connected* remote, is deferred to v2). If you ingest
 profiles from untrusted sources, audit the `remote` lines manually
-and remove the killswitch's `AlwaysOn` mode until v2 ships.
+and avoid the `vpn-only` kill switch mode until v2 ships.
 
 ### Credential-safe file handling via `write_secret_file`
 
 OpenVPN auth files (`~/.config/vortix/auth/<profile>.auth`) and
-in-memory generated configs hold credential material. The historical
-implementation in `crates/vortix/src/utils.rs` opened the path with
-`O_CREAT` and then called `chmod(2)` to tighten perms — a TOCTOU
-window during which a local attacker could win a race against the
-chmod and read the file at default-umask perms, or substitute a
+generated runtime configs hold credential material. An older
+implementation opened the path with `O_CREAT` and then called
+`chmod(2)` to tighten perms — a TOCTOU window during which a local
+attacker could read the file at default-umask perms, or substitute a
 symlink to a target they wanted Vortix to clobber.
 
-**Mitigation (U12, commit `cb25725`).** Credential writes now route
-through `write_secret_file`, which:
+**Mitigation (commit `cb25725`).** Credential writes go through
+`write_secret_file` in `crates/vortix/src/config/secret.rs`, which:
 
-- Opens the parent directory via `openat(2)` against a directory
-  file descriptor obtained at startup
-- Sets `O_NOFOLLOW` so a pre-placed symlink at the target path fails
-  the open rather than dereferencing
-- Sets `O_EXCL` so the open fails if the path already exists,
-  forcing an explicit unlink before rewrite
+- Opens the parent directory with `O_DIRECTORY | O_NOFOLLOW` and
+  creates the file with `openat(2)` against that descriptor
+- Sets `O_NOFOLLOW` on the file so a pre-placed symlink fails the open
+- Sets `O_EXCL` so the open fails if the path already exists
 - Creates with mode `0600` directly via the `open(2)` mode argument —
-  no separate `chmod` call, so no TOCTOU window
+  no separate `chmod`, so no TOCTOU window — and fsyncs before return
 
-The combined effect is that symlink attacks against
-`~/.config/vortix/*.auth` (and the WireGuard/OVPN runtime configs
-written under `~/.config/vortix/tmp/<session>/`) are mitigated. The
-session subdirectory itself is created at mode `0700` via
-`DirBuilder::mode(0o700)` rather than relying on the inherited
-umask.
+Other user-owned state (settings, profiles, metadata) goes through
+`crates/vortix/src/config/owned_file.rs`: `write_user_file_atomic`
+replaces a file atomically inside an owner-checked directory without
+following links, and `create_user_dir` creates directories at `0700`
+via `DirBuilder::mode(0o700)` and narrows existing ones to owner-only
+rather than relying on the umask.
 
 ### Fwmark hijack
 

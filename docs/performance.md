@@ -91,9 +91,8 @@ a first attempt at load average 57 produced a spurious 3x "improvement" in both 
 ### `panic = "abort"` — deliberately NOT set
 
 It would drop most of the 1.2 MB of unwind tables, and it is off the table: `catch_unwind` is
-load-bearing. A panic inside a tunnel operation (`tunnel.rs`,
-`wireguard/tunnel.rs`), a control-worker job (`core/control/worker.rs`),
-a lifecycle hook (`hooks/runner.rs`) or a background task (`background.rs`) is caught and turned
+load-bearing. A panic inside a tunnel operation (`control/tunnels.rs`,
+`wireguard/tunnel.rs`) or a lifecycle hook (`hooks.rs`) is caught and turned
 into an error rather than killing a process that holds kill-switch state. Aborting there trades
 a firewall-safety guarantee for binary size.
 
@@ -148,16 +147,14 @@ Five stay as their own targets:
 | `cli_integration.rs` | mutates `VORTIX_CONFIG_DIR` process-wide |
 | `tunnel_custodian.rs` | mutates `VORTIX_CUSTODIAN_*` process-wide |
 | `integration.rs` | installs a process-global config dir; its profile store has a 500 ms lock budget |
-| `control_diagnostics.rs` | flaked when merged |
+| `cli_import_config_dir.rs` | sets `VORTIX_CONFIG_DIR` with `set_var` |
 | `cold_start.rs` | asserts a wall-clock startup ceiling |
 
-That list is empirical, not theoretical. The first version of the merge put `integration.rs` and
-`control_diagnostics.rs` in the shared binary and both flaked within three runs — the profile
+That list is empirical, not theoretical. The first version of the merge put `integration.rs` and a
+since-removed control-diagnostics suite in the shared binary and both flaked within three runs — the profile
 store's 500 ms lock times out when the holding thread is descheduled under ~245-way concurrency.
 
-Modules that remain **do** use second-scale `tokio::time::timeout` hang-guards, and
-`control_reconcile.rs` has two `elapsed() < 250ms` assertions. Those held over 10 consecutive
-runs under 8x CPU oversubscription. If one starts flaking on CI, move that module back to a
+Modules that remain **do** use second-scale `tokio::time::timeout` hang-guards. If one starts flaking on CI, move that module back to a
 top-level `tests/*.rs` rather than raising its budget.
 
 **Adding a test file:** if it touches `std::env::set_var`, `config::set_config_dir`, a fixed port

@@ -29,11 +29,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
-      - name: Subprocess boundary (plan 002)
+      - name: Subprocess boundary
         run: cargo xtask check-subprocess
-      - name: Platform boundary (plan 003)
+      - name: Platform boundary
         run: cargo xtask check-platform-leak
-      - name: Protocol boundary (plan 004)
+      - name: Protocol boundary
         run: cargo xtask check-protocol-leak
-      - name: Shell-regression guard (plan 002 U11)
+      - name: Shell-regression guard
         run: cargo xtask check-no-shell-regressions

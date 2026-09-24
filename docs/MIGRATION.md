@@ -1,6 +1,6 @@
 # Migrating to Vortix v0.3.0
 
-This release lands a large architectural refactor (six internal plans, 28
+This release lands a large architectural refactor (28
 commits). For users, the day-to-day surface barely changes. This document
 covers what's automatic, what's optional, and how to roll back if you need
 to.
@@ -10,15 +10,10 @@ to.
 - **Upgrade is automatic.** Existing `.conf` and `.ovpn` profiles keep
   working. No flags to change. `vortix up <profile>`, `down`, `status`,
   `list`, `import`, `show` all behave exactly as before.
-- **Two new optional features:** an encrypted secret store and a JSON
-  event journal. Both have safe defaults; you only opt into the
-  encrypted store explicitly.
-- **One new top-level subcommand:** `vortix secrets {set,get,delete}`
-  for the encrypted credential store. Everything else is internal
-  architecture.
-- **One new flag** on existing commands: `vortix show <p> --raw
-  --inline-secrets` appends a stored secret as a trailing comment for
-  sharing.
+- **One new optional feature:** a JSON event journal, on by default.
+- v0.3.0 also shipped a `vortix secrets` store and a `show --inline-secrets`
+  flag; both were retired in v0.3.1. Auth credentials live in
+  `auth/<profile>.auth` files or the TUI prompt.
 - **One-line rollback** if you hit trouble: `cargo install vortix
   --version 0.2.2 --force`.
 
@@ -87,33 +82,6 @@ Unset it to restore the implicit migration.
 ---
 
 ## What needs manual opt-in
-
-### Encrypted secret store (opt-in)
-
-v0.3.0 adds `vortix secrets {set,get,delete}` backed by a layered store:
-the OS keyring first (Keychain on macOS, Secret Service on Linux), with
-an AES-256-GCM + argon2id encrypted file as fallback when no keyring is
-available.
-
-By default the store is empty and the rest of vortix doesn't touch it.
-Use it if you want to:
-
-- Keep OpenVPN auth credentials out of plain `.auth` files (see below)
-- Store a passphrase or token alongside a profile without inlining it
-  into the `.conf`
-
-Examples:
-
-```sh
-echo -n 'username:password' | vortix secrets set creds/corp
-vortix secrets get creds/corp        # echoes the value
-vortix secrets delete creds/corp
-```
-
-The encrypted-file fallback lives at `${XDG_CONFIG_HOME}/vortix/secrets.enc`.
-You don't need a passphrase if the keyring works — but on headless Linux
-without `libsecret`, the encrypted-file path needs one (the binary will
-prompt the first time).
 
 ### Session event journal (default on, opt-out)
 
@@ -197,8 +165,6 @@ Everything here is additive. Pre-v0.3.0 commands are unchanged.
 
 | Command | What it does |
 |---|---|
-| `vortix secrets {set,get,delete} <id>` | Manage the layered encrypted secret store (new top-level subcommand) |
-| `vortix show <profile> --raw --inline-secrets` | Streams the profile config with stored credentials appended as a `# vortix-secret:<base64>` comment (new flag on existing `show`) |
 | `vortix info` | Output now includes a `Session journal:` line pointing at the current session's JSONL file |
 
 `vortix --json` envelopes now carry a top-level `schema_version: 1`
@@ -230,8 +196,6 @@ What rollback does to your data:
 - `.meta.toml` sidecars left behind are inert to v0.2.x — they're
   ignored, not parsed. Leave them in place or delete them; either
   works.
-- `secrets.enc` in `${XDG_CONFIG_HOME}/vortix/` is untouched by v0.2.x.
-  Either keep it for the next upgrade attempt or delete it.
 - `sessions/*.jsonl` under `${XDG_DATA_HOME}/vortix/` are pure
   observability data; delete the directory if you want.
 - `settings.toml` is ignored by v0.2.x. Your old `config.toml` (if any)
@@ -246,7 +210,7 @@ read-then-write-new-file.
 
 The multi-connection release ("V2", v0.4.0+) introduces a richer
 killswitch persisted-state shape, additional journal event variants,
-and a multi-tunnel `TunnelRegistry`. If you need to roll back to
+and a multi-tunnel engine. If you need to roll back to
 v0.3.x ("V1"), follow this procedure.
 
 1. **Revert the binary to v0.3.x.**
@@ -263,7 +227,7 @@ v0.3.x ("V1"), follow this procedure.
    ```
 
 2. **Check whether V1 read-tolerance was backported.** If your
-   v0.3.x build received the backport from plan 015 (which makes V1
+   v0.3.x build received the read-tolerance backport (which makes V1
    silently ignore the V2 killswitch state shape and re-arm fresh),
    you are done — no manual cleanup is needed. The backport is
    indicated by the presence of a `killswitch_state.compat = "v2-tolerant"`
