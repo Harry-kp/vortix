@@ -31,6 +31,5 @@ pub mod theme;
 pub mod ui;
 pub mod utils;
 pub mod vpn;
-pub mod vpn_runtime;
 #[doc(hidden)]
 pub mod wireguard;

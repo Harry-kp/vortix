@@ -1,6 +1,6 @@
 //! CLI command handlers.
 //!
-//! Each handler operates headlessly via `VpnRuntime` (no TUI), produces
+//! Each handler runs headlessly (no TUI), produces
 //! structured output via [`OutputMode`], and exits with semantic exit codes.
 
 use std::io::Write;
@@ -17,7 +17,6 @@ use crate::cli::output::{
 use crate::config::profile_store::FsProfileStore;
 use crate::config::AppConfig;
 use crate::constants;
-use crate::vpn_runtime::VpnRuntime;
 
 fn lifecycle_progress_message(
     mode: OutputMode,
@@ -178,14 +177,13 @@ pub fn handle_command(
             *reverse,
             protocol.as_deref(),
             *names_only,
-            config,
             config_dir,
             mode,
         ),
         Commands::Import { file } => handle_import(file, config, config_dir, mode),
-        Commands::Show { profile, raw } => handle_show(profile, *raw, config, config_dir, mode),
-        Commands::Delete { profile, yes } => handle_delete(profile, *yes, config, config_dir, mode),
-        Commands::Rename { old, new } => handle_rename(old, new, config, config_dir, mode),
+        Commands::Show { profile, raw } => handle_show(profile, *raw, mode),
+        Commands::Delete { profile, yes } => handle_delete(profile, *yes, config_dir, mode),
+        Commands::Rename { old, new } => handle_rename(old, new, config_dir, mode),
         Commands::KillSwitch { mode: ks_mode } => {
             handle_killswitch(ks_mode.as_deref(), config, config_dir, mode)
         }
@@ -319,13 +317,12 @@ fn handle_up(
 ) -> i32 {
     // `--yes` explicitly bypasses the shared route-conflict admission check.
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "up");
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let profiles = crate::vpn::load_profiles();
 
     let profile_name = if let Some(name) = profile {
         name.to_string()
     } else {
-        match engine
-            .profiles
+        match profiles
             .iter()
             .filter(|p| p.last_used.is_some())
             .max_by_key(|p| p.last_used)
@@ -347,7 +344,7 @@ fn handle_up(
         }
     };
 
-    if !engine.is_root {
+    if !crate::utils::is_root() {
         print_error_and_exit(
             mode,
             "up",
@@ -357,14 +354,11 @@ fn handle_up(
     }
 
     // Check dependencies before attempting connection. Routes through
-    // `VpnRuntime::check_dependencies` so the TUI and CLI refuse the
+    // `platform::check_dependencies` so the TUI and CLI refuse the
     // same dep set — including the OpenVPN 2.4+ probe that the
     // legacy inline CLI check used to skip.
-    if let Some(profile) = engine.profiles.iter().find(|p| p.name == profile_name) {
-        let missing = crate::vpn_runtime::VpnRuntime::check_dependencies(
-            profile.protocol,
-            &profile.config_path,
-        );
+    if let Some(profile) = profiles.iter().find(|p| p.name == profile_name) {
+        let missing = crate::platform::check_dependencies(profile.protocol, &profile.config_path);
         if !missing.is_empty() {
             let hint = missing
                 .iter()
@@ -395,12 +389,11 @@ fn handle_up(
     // whether the new profile's AllowedIPs collide with anything already
     // up. `--yes` bypasses the gate for scripted callers.
     if !yes {
-        if let Some(conflict) = detect_conflict_for_cli(&engine, &profile_name) {
+        if let Some(conflict) = detect_conflict_for_cli(&profiles, config_dir, &profile_name) {
             // Conflicts carry opaque profile IDs; the reader needs the name
             // they typed, so resolve through the catalog before formatting.
             let named = |id: &crate::core::profile::ProfileId| {
-                engine
-                    .profiles
+                profiles
                     .iter()
                     .find(|profile| &profile.id == id)
                     .map_or_else(|| id.to_string(), |profile| profile.name.clone())
@@ -440,8 +433,7 @@ fn handle_up(
         }
     }
 
-    let target = engine
-        .profiles
+    let target = profiles
         .iter()
         .find(|profile| profile.name == profile_name)
         .cloned()
@@ -460,7 +452,7 @@ fn handle_up(
     if let Err(error) = run_engine_command(
         config,
         config_dir,
-        engine.profiles.clone(),
+        profiles.clone(),
         crate::control::Command::Connect(target.id.clone()),
         Duration::from_secs(timeout_secs),
     ) {
@@ -594,11 +586,12 @@ fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::uti
 }
 
 fn detect_conflict_for_cli(
-    engine: &VpnRuntime,
+    profiles: &[crate::state::VpnProfile],
+    config_dir: &Path,
     target_name: &str,
 ) -> Option<crate::core::engine::Conflict> {
-    let target_profile = engine.profiles.iter().find(|p| p.name == target_name)?;
-    let specs = crate::control::profiles::load(&engine.config_dir, engine.profiles.clone());
+    let target_profile = profiles.iter().find(|p| p.name == target_name)?;
+    let specs = crate::control::profiles::load(config_dir, profiles.to_vec());
     let routes = |id: &crate::core::profile::ProfileId| {
         specs
             .get(id)
@@ -608,14 +601,14 @@ fn detect_conflict_for_cli(
     };
     let target_allowed = routes(&target_profile.id);
 
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
+    let active = crate::core::scanner::get_active_profiles(profiles);
     for session in &active {
         if session.name == target_name {
             // Re-up of an already-up profile isn't a conflict — the
             // connect path is idempotent here.
             continue;
         }
-        let Some(active_profile) = engine.profiles.iter().find(|p| p.name == session.name) else {
+        let Some(active_profile) = profiles.iter().find(|p| p.name == session.name) else {
             continue;
         };
         let active_allowed = routes(&active_profile.id);
@@ -650,26 +643,25 @@ fn handle_down(
 ) -> i32 {
     let _ = all; // `--all` is the explicit form of the no-profile case (already the default).
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "down");
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let profiles = crate::vpn::load_profiles();
 
     // NotFound (exit 3) takes precedence over idempotence: a typo'd
     // profile is a script error, not "already disconnected".
     if let Some(name) = profile_filter {
-        if engine.find_profile(name).is_none() {
+        if !profiles.iter().any(|p| p.name == name) {
             print_error_and_exit(mode, "down", err_not_found(name), ExitCode::NotFound);
         }
     }
 
     // Discover every active tunnel, then filter to the requested target.
     let mut targets: Vec<crate::core::scanner::ActiveSession> =
-        crate::core::scanner::get_active_profiles(&engine.profiles);
+        crate::core::scanner::get_active_profiles(&profiles);
     if let Some(name) = profile_filter {
         targets.retain(|s| s.name == name);
     }
 
     let profile_id = profile_filter.and_then(|name| {
-        engine
-            .profiles
+        profiles
             .iter()
             .find(|profile| profile.name == name)
             .map(|profile| profile.id.clone())
@@ -689,7 +681,7 @@ fn handle_down(
         return 0;
     }
 
-    if !engine.is_root {
+    if !crate::utils::is_root() {
         print_error_and_exit(
             mode,
             "down",
@@ -714,7 +706,7 @@ fn handle_down(
     if let Err(error) = run_engine_command(
         config,
         config_dir,
-        engine.profiles.clone(),
+        profiles.clone(),
         command,
         Duration::from_secs(timeout_secs),
     ) {
@@ -762,12 +754,12 @@ fn handle_reconnect(
     mode: OutputMode,
 ) -> i32 {
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "reconnect");
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let profiles = crate::vpn::load_profiles();
 
     // Validate the requested profile exists in the catalog before we
     // poke the system. NotFound (exit 3) > "no active" idempotency.
     if let Some(name) = profile_filter {
-        if engine.find_profile(name).is_none() {
+        if !profiles.iter().any(|p| p.name == name) {
             print_error_and_exit(mode, "reconnect", err_not_found(name), ExitCode::NotFound);
         }
     }
@@ -779,7 +771,7 @@ fn handle_reconnect(
     // - Without: every currently-Connected tunnel. If none are
     //   currently active, fall back to the last-used profile so the
     //   single-tunnel `vortix reconnect` muscle memory still works.
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
+    let active = crate::core::scanner::get_active_profiles(&profiles);
 
     let to_cycle: Vec<String> = if let Some(name) = profile_filter {
         vec![name.to_string()]
@@ -788,8 +780,7 @@ fn handle_reconnect(
     } else {
         // No active tunnels and no explicit target — fall back to
         // last-used (preserves the single-tunnel behaviour).
-        match engine
-            .profiles
+        match profiles
             .iter()
             .filter(|p| p.last_used.is_some())
             .max_by_key(|p| p.last_used)
@@ -811,7 +802,7 @@ fn handle_reconnect(
         }
     };
 
-    if !engine.is_root {
+    if !crate::utils::is_root() {
         print_error_and_exit(
             mode,
             "reconnect",
@@ -820,12 +811,11 @@ fn handle_reconnect(
         );
     }
     for name in &to_cycle {
-        let profile = engine
-            .profiles
+        let profile = profiles
             .iter()
             .find(|profile| &profile.name == name)
             .expect("reconnect targets were resolved from the profile catalog");
-        let missing = VpnRuntime::check_dependencies(profile.protocol, &profile.config_path);
+        let missing = crate::platform::check_dependencies(profile.protocol, &profile.config_path);
         if !missing.is_empty() {
             print_error_and_exit(
                 mode,
@@ -841,15 +831,13 @@ fn handle_reconnect(
     }
 
     let requested_id = profile_filter.and_then(|name| {
-        engine
-            .profiles
+        profiles
             .iter()
             .find(|profile| profile.name == name)
             .map(|profile| profile.id.clone())
     });
     let fallback_id = (active.is_empty() && requested_id.is_none()).then(|| {
-        engine
-            .profiles
+        profiles
             .iter()
             .find(|profile| profile.name == to_cycle[0])
             .expect("last-used reconnect target exists")
@@ -860,8 +848,7 @@ fn handle_reconnect(
     let timeout_secs = to_cycle
         .iter()
         .filter_map(|name| {
-            engine
-                .profiles
+            profiles
                 .iter()
                 .find(|profile| &profile.name == name)
                 .map(|profile| config.reconnect_operation_timeout_secs(profile.protocol))
@@ -872,7 +859,7 @@ fn handle_reconnect(
         || {
             to_cycle
                 .iter()
-                .filter_map(|name| engine.profiles.iter().find(|p| &p.name == name))
+                .filter_map(|name| profiles.iter().find(|p| &p.name == name))
                 .map(|profile| profile.id.clone())
                 .collect::<Vec<_>>()
         },
@@ -882,7 +869,7 @@ fn handle_reconnect(
         if let Err(error) = run_engine_command(
             config,
             config_dir,
-            engine.profiles.clone(),
+            profiles.clone(),
             crate::control::Command::Reconnect(target),
             Duration::from_secs(timeout_secs),
         ) {
@@ -891,8 +878,7 @@ fn handle_reconnect(
     }
 
     for name in &to_cycle {
-        let profile = engine
-            .profiles
+        let profile = profiles
             .iter()
             .find(|profile| &profile.name == name)
             .expect("reconnect target exists");
@@ -982,8 +968,8 @@ fn handle_status(
         return run_watch(interval, config, config_dir, mode);
     }
 
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    let snap = engine.scan_status();
+    let profiles = crate::vpn::load_profiles();
+    let snap = crate::cli::status::scan_status(&profiles, config, config_dir);
     let is_connected = snap.connection_state == "connected";
     let is_present = snap.connection_state != "disconnected";
 
@@ -1105,8 +1091,8 @@ fn handle_status(
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
     loop {
-        let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-        let snap = engine.scan_status();
+        let profiles = crate::vpn::load_profiles();
+        let snap = crate::cli::status::scan_status(&profiles, config, config_dir);
 
         match mode {
             OutputMode::Json => {
@@ -1155,7 +1141,7 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
     }
 }
 
-fn human_status_headline(snap: &crate::vpn_runtime::connection::StatusSnapshot) -> String {
+fn human_status_headline(snap: &crate::cli::status::StatusSnapshot) -> String {
     let profile = snap.profile.as_deref().unwrap_or("unknown");
     let protocol = snap.protocol.as_deref().unwrap_or("");
     match snap.connection_state.as_str() {
@@ -1249,8 +1235,8 @@ mod handshake_status_tests {
     use super::*;
     use crate::core::killswitch::{KillSwitchMode, KillSwitchState};
 
-    fn snapshot(state: &str, protocol: &str) -> crate::vpn_runtime::connection::StatusSnapshot {
-        crate::vpn_runtime::connection::StatusSnapshot {
+    fn snapshot(state: &str, protocol: &str) -> crate::cli::status::StatusSnapshot {
+        crate::cli::status::StatusSnapshot {
             connection_state: state.into(),
             health: None,
             generation: None,
@@ -1439,21 +1425,20 @@ fn handle_list(
     reverse: bool,
     protocol_filter: Option<&str>,
     names_only: bool,
-    config: &AppConfig,
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut all = crate::vpn::load_profiles();
 
     // Sort
-    match sort.unwrap_or("name") {
-        "protocol" => engine.sort_order = crate::state::ProfileSortOrder::Protocol,
-        "last-used" => engine.sort_order = crate::state::ProfileSortOrder::LastUsed,
-        _ => engine.sort_order = crate::state::ProfileSortOrder::NameAsc,
-    }
-    engine.sort_profiles();
+    let order = match sort.unwrap_or("name") {
+        "protocol" => crate::state::ProfileSortOrder::Protocol,
+        "last-used" => crate::state::ProfileSortOrder::LastUsed,
+        _ => crate::state::ProfileSortOrder::NameAsc,
+    };
+    order.sort(&mut all);
 
-    let mut profiles: Vec<_> = engine.profiles.iter().collect();
+    let mut profiles: Vec<_> = all.iter().collect();
 
     if reverse {
         profiles.reverse();
@@ -1512,7 +1497,7 @@ fn handle_list(
     // active profile gets its dot — not just the first one (the
     // pre-fix `active.first()` was single-tunnel-era legacy).
     let active_names: std::collections::HashSet<String> =
-        crate::core::scanner::get_active_profiles(&engine.profiles)
+        crate::core::scanner::get_active_profiles(&all)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -1950,15 +1935,9 @@ struct ShowData {
     raw_config: Option<String>,
 }
 
-fn handle_show(
-    profile_name: &str,
-    raw: bool,
-    config: &AppConfig,
-    config_dir: &Path,
-    mode: OutputMode,
-) -> i32 {
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    let Some(profile) = engine.profiles.iter().find(|p| p.name == profile_name) else {
+fn handle_show(profile_name: &str, raw: bool, mode: OutputMode) -> i32 {
+    let profiles = crate::vpn::load_profiles();
+    let Some(profile) = profiles.iter().find(|p| p.name == profile_name) else {
         print_error_and_exit(
             mode,
             "show",
@@ -2022,14 +2001,14 @@ struct DeleteData {
 }
 
 fn require_profile_inactive(
-    engine: &VpnRuntime,
+    profiles: &[crate::state::VpnProfile],
     active_name: &str,
     requested_name: &str,
     command: &str,
     retry_command: &str,
     mode: OutputMode,
 ) {
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
+    let active = crate::core::scanner::get_active_profiles(profiles);
     if active.iter().any(|session| session.name == active_name) {
         print_error_and_exit(
             mode,
@@ -2046,16 +2025,10 @@ fn require_profile_inactive(
     }
 }
 
-fn handle_delete(
-    profile_name: &str,
-    yes: bool,
-    config: &AppConfig,
-    config_dir: &Path,
-    mode: OutputMode,
-) -> i32 {
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+fn handle_delete(profile_name: &str, yes: bool, config_dir: &Path, mode: OutputMode) -> i32 {
+    let profiles = crate::vpn::load_profiles();
 
-    let Some(idx) = engine.find_profile(profile_name) else {
+    let Some(idx) = profiles.iter().position(|p| p.name == profile_name) else {
         print_error_and_exit(
             mode,
             "delete",
@@ -2063,10 +2036,10 @@ fn handle_delete(
             ExitCode::NotFound,
         );
     };
-    let profile_id = engine.profiles[idx].id.clone();
+    let profile_id = profiles[idx].id.clone();
 
     require_profile_inactive(
-        &engine,
+        &profiles,
         profile_name,
         profile_name,
         "delete",
@@ -2092,9 +2065,8 @@ fn handle_delete(
     // before deleting so a tunnel started while the prompt was open cannot
     // lose its profile.
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "delete");
-    let fresh_engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    let Some(fresh_profile) = fresh_engine
-        .profiles
+    let fresh_profiles = crate::vpn::load_profiles();
+    let Some(fresh_profile) = fresh_profiles
         .iter()
         .find(|profile| profile.id == profile_id)
     else {
@@ -2107,7 +2079,7 @@ fn handle_delete(
     };
     let fresh_name = fresh_profile.name.clone();
     require_profile_inactive(
-        &fresh_engine,
+        &fresh_profiles,
         &fresh_name,
         profile_name,
         "delete",
@@ -2155,22 +2127,16 @@ struct RenameData {
     clippy::too_many_lines,
     reason = "rename preserves validation, active-state recheck, typed mutation, and output contracts"
 )]
-fn handle_rename(
-    old: &str,
-    new: &str,
-    config: &AppConfig,
-    config_dir: &Path,
-    mode: OutputMode,
-) -> i32 {
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: OutputMode) -> i32 {
+    let profiles = crate::vpn::load_profiles();
 
-    let Some(idx) = engine.find_profile(old) else {
+    let Some(idx) = profiles.iter().position(|p| p.name == old) else {
         print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
     };
-    let profile_id = engine.profiles[idx].id.clone();
+    let profile_id = profiles[idx].id.clone();
 
     require_profile_inactive(
-        &engine,
+        &profiles,
         old,
         old,
         "rename",
@@ -2213,16 +2179,15 @@ fn handle_rename(
     }
 
     let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "rename");
-    let fresh_engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    let Some(fresh_profile) = fresh_engine
-        .profiles
+    let fresh_profiles = crate::vpn::load_profiles();
+    let Some(fresh_profile) = fresh_profiles
         .iter()
         .find(|profile| profile.id == profile_id)
     else {
         print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
     };
     require_profile_inactive(
-        &fresh_engine,
+        &fresh_profiles,
         &fresh_profile.name,
         old,
         "rename",
@@ -2357,7 +2322,7 @@ fn handle_killswitch(
     config_dir: &Path,
     output_mode: OutputMode,
 ) -> i32 {
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let profiles = crate::vpn::load_profiles();
     let (mut mode, mut state) = crate::core::killswitch::persisted();
 
     if let Some(new_mode) = mode_arg {
@@ -2376,7 +2341,7 @@ fn handle_killswitch(
             );
         };
 
-        if !engine.is_root && ks_mode != crate::core::killswitch::KillSwitchMode::Off {
+        if !crate::utils::is_root() && ks_mode != crate::core::killswitch::KillSwitchMode::Off {
             print_error_and_exit(
                 output_mode,
                 "killswitch",
@@ -2389,7 +2354,7 @@ fn handle_killswitch(
         match run_engine_command(
             config,
             config_dir,
-            engine.profiles.clone(),
+            profiles.clone(),
             crate::control::Command::SetKillSwitch(ks_mode),
             Duration::from_secs(config.disconnect_operation_timeout_secs()),
         ) {

@@ -624,5 +624,294 @@ sudo dnf install {pkg}  # Fedora"
     }
 }
 
+/// Check if required binaries are available for a given protocol.
+///
+/// Shared between TUI and CLI so both surfaces refuse the same
+/// missing-dep set (and run the same `OpenVPN` 2.4+ probe — older
+/// builds silently drop `--pull-filter`, breaking multi-tunnel DNS
+/// scoping).
+#[must_use]
+pub fn check_dependencies(
+    protocol: crate::core::profile::ProtocolKind,
+    config_path: &std::path::Path,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    match protocol {
+        crate::core::profile::ProtocolKind::WireGuard => {
+            // Both `wg` and `wg-quick` ship in the wireguard-tools
+            // package on every supported distro — report them under
+            // a single label so the install hint isn't duplicated.
+            if !crate::utils::binary_exists("wg-quick") || !crate::utils::binary_exists("wg") {
+                missing.push("wireguard-tools".to_string());
+            }
+            // On Linux, wg-quick uses `resolvconf` to set DNS when the
+            // config contains a DNS directive. Two escape hatches:
+            //   1. systemd-resolved + working `resolvectl` →
+            //      `WgTunnel::up` takes over per-link DNS via
+            //      `resolvectl` itself; no resolvconf shim needed.
+            //   2. A working `resolvconf` (openresolv on non-resolved
+            //      hosts; systemd-resolvconf shim on resolved hosts).
+            //
+            // Otherwise emit the missing-dep label with a hint at
+            // which shim the user actually needs.
+            #[cfg(target_os = "linux")]
+            // xtask:allow-platform-cfg: resolvconf check is Linux-only DNS plumbing
+            if let Some(label) = wireguard_dns_missing_dep(WireguardDnsGateInputs {
+                has_dns_directive: crate::utils::wireguard_config_has_dns(config_path),
+                resolvectl_path_available: crate::utils::use_resolvectl_path(),
+                resolvconf_works: crate::utils::resolvconf_works(),
+                is_systemd_resolved: crate::utils::is_systemd_resolved(),
+            }) {
+                missing.push(label);
+            }
+            #[cfg(target_os = "linux")]
+            // xtask:allow-platform-cfg: /proc sysctl gate is Linux-only (issue #242)
+            if let Some(label) = wireguard_ipv6_missing_dep(
+                crate::utils::wireguard_config_has_ipv6_address(config_path),
+                crate::utils::host_ipv6_disabled,
+            ) {
+                missing.push(label);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = config_path; // suppress unused warning on non-Linux
+        }
+        crate::core::profile::ProtocolKind::OpenVpn => {
+            if crate::utils::binary_exists("openvpn") {
+                // Assert OpenVPN ≥ 2.4 so `--pull-filter` (multi-tunnel
+                // DNS scoping) is available. Older builds silently
+                // ignore the flag and leak pushed DNS into the primary
+                // tunnel's resolver. Unparseable probe = fail-open with
+                // a tracing warning so vendor-patched or sandboxed
+                // environments aren't blocked.
+                use crate::openvpn::version::OvpnVersionProbe;
+                match crate::openvpn::version::probe_openvpn_version() {
+                    OvpnVersionProbe::Parsed(v) if v.supports_multi_tunnel_dns() => {}
+                    OvpnVersionProbe::Parsed(v) => {
+                        missing.push(format!(
+                            "openvpn 2.4+ required for multi-tunnel DNS scoping (found {v})"
+                        ));
+                    }
+                    OvpnVersionProbe::HelpFallbackOk => {}
+                    OvpnVersionProbe::Unparseable => {
+                        tracing::warn!(
+                            target: "vortix::vpn_runtime",
+                            "openvpn version could not be determined; \
+                             multi-tunnel DNS scoping may not work if the \
+                             installed binary is older than 2.4"
+                        );
+                    }
+                }
+            } else {
+                missing.push("openvpn".to_string());
+            }
+        }
+    }
+    missing
+}
+
+/// Inputs to the `WireGuard` DNS-shim missing-dep decision. Wrapping the
+/// four booleans in a struct keeps the call-site readable (named fields)
+/// and dodges the `fn_params_excessive_bools` lint while staying purely
+/// declarative — no behavior moves into the struct itself.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // intentional flag record; mirrors TunnelCapabilities
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: WG DNS-shim gate is Linux-only
+pub(crate) struct WireguardDnsGateInputs {
+    pub has_dns_directive: bool,
+    pub resolvectl_path_available: bool,
+    pub resolvconf_works: bool,
+    pub is_systemd_resolved: bool,
+}
+
+/// Pure decision logic for the `WireGuard` DNS-shim missing-dep label on Linux.
+///
+/// Returns `Some(label)` when the user must install a DNS-management shim,
+/// `None` when the connect can proceed. Split out so the four-quadrant
+/// gate can be unit-tested without depending on host state (each input
+/// helper — `is_systemd_resolved`, `resolvconf_works`, `resolvectl_works`
+/// — probes real OS state and would make these tests host-dependent).
+#[must_use]
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: gate decision is Linux-only DNS plumbing
+pub(crate) fn wireguard_dns_missing_dep(inputs: WireguardDnsGateInputs) -> Option<String> {
+    if !inputs.has_dns_directive {
+        return None;
+    }
+    if inputs.resolvectl_path_available {
+        return None;
+    }
+    if inputs.resolvconf_works {
+        return None;
+    }
+    Some(
+        if inputs.is_systemd_resolved {
+            "resolvconf (systemd)"
+        } else {
+            "resolvconf"
+        }
+        .to_string(),
+    )
+}
+
+/// Pure decision logic for the host-IPv6 pre-flight gate on Linux (#242).
+///
+/// `wg-quick` runs `ip -6 address add` for each IPv6 entry on the
+/// profile's `Address =` line, which aborts the whole bring-up when
+/// kernel IPv6 is disabled. Refuse up front instead of surfacing raw
+/// wg-quick stderr; never silently strip the user's IPv6 entry.
+///
+/// The host probe is a closure so its `/proc` reads only happen for
+/// profiles that actually declare an IPv6 address.
+#[must_use]
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: gate decision is Linux-only (issue #242)
+pub(crate) fn wireguard_ipv6_missing_dep(
+    profile_has_ipv6_address: bool,
+    host_ipv6_disabled: impl FnOnce() -> bool,
+) -> Option<String> {
+    (profile_has_ipv6_address && host_ipv6_disabled())
+        .then(|| "host IPv6 (kernel disabled)".to_string())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod dns_gate_tests {
+    use super::{wireguard_dns_missing_dep, WireguardDnsGateInputs};
+
+    #[allow(clippy::fn_params_excessive_bools)] // test fixture mirrors the WireguardDnsGateInputs shape
+    fn inputs(
+        has_dns_directive: bool,
+        resolvectl_path_available: bool,
+        resolvconf_works: bool,
+        is_systemd_resolved: bool,
+    ) -> WireguardDnsGateInputs {
+        WireguardDnsGateInputs {
+            has_dns_directive,
+            resolvectl_path_available,
+            resolvconf_works,
+            is_systemd_resolved,
+        }
+    }
+
+    #[test]
+    fn no_dns_directive_returns_none_regardless_of_host_state() {
+        // Every host-state combination with `has_dns = false` must return None.
+        for resolvectl in [false, true] {
+            for resolvconf in [false, true] {
+                for resolved in [false, true] {
+                    assert_eq!(
+                        wireguard_dns_missing_dep(inputs(false, resolvectl, resolvconf, resolved)),
+                        None,
+                        "has_dns=false resolvectl={resolvectl} resolvconf={resolvconf} resolved={resolved}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_with_resolvectl_returns_none() {
+        // The headline behaviour change: a resolved host with a working
+        // resolvectl no longer needs a resolvconf shim, even when the
+        // .conf carries `DNS = ...`.
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, true, false, true)),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_without_resolvectl_falls_back_to_systemd_label() {
+        // Edge case: resolved is detected but resolvectl probe fails
+        // (service crashed, broken systemd install). The user genuinely
+        // needs the `systemd-resolvconf` shim; emit the resolved-flavoured
+        // missing-dep label.
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, false, false, true)),
+            Some("resolvconf (systemd)".to_string())
+        );
+    }
+
+    #[test]
+    fn non_resolved_without_resolvconf_returns_plain_label() {
+        // Classic missing-resolvconf on a non-resolved Linux host.
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, false, false, false)),
+            Some("resolvconf".to_string())
+        );
+    }
+
+    #[test]
+    fn non_resolved_with_resolvconf_returns_none() {
+        // Ubuntu / Debian-shaped happy path: resolvconf is installed and
+        // the host doesn't use systemd-resolved. Unchanged from today.
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, false, true, false)),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_with_both_paths_prefers_resolvectl_over_resolvconf() {
+        // Belt-and-braces: even if resolvconf is also installed, the
+        // resolvectl path takes precedence. This avoids double-management
+        // surprises and matches the WgTunnel::up wiring (which always
+        // uses resolvectl when use_resolvectl_path() is true).
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, true, true, true)),
+            None
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod ipv6_gate_tests {
+    use super::wireguard_ipv6_missing_dep;
+
+    #[test]
+    fn fires_only_when_profile_declares_v6_and_host_disabled() {
+        assert_eq!(
+            wireguard_ipv6_missing_dep(true, || true),
+            Some("host IPv6 (kernel disabled)".to_string())
+        );
+    }
+
+    #[test]
+    fn silent_when_profile_is_v4_only() {
+        assert_eq!(wireguard_ipv6_missing_dep(false, || true), None);
+    }
+
+    #[test]
+    fn silent_when_host_ipv6_enabled() {
+        assert_eq!(wireguard_ipv6_missing_dep(true, || false), None);
+    }
+
+    #[test]
+    fn silent_when_neither() {
+        assert_eq!(wireguard_ipv6_missing_dep(false, || false), None);
+    }
+
+    #[test]
+    fn host_probe_not_evaluated_for_v4_only_profiles() {
+        let called = std::cell::Cell::new(false);
+        let result = wireguard_ipv6_missing_dep(false, || {
+            called.set(true);
+            true
+        });
+        assert_eq!(result, None);
+        assert!(!called.get(), "host probe ran for a v4-only profile");
+    }
+
+    #[test]
+    fn label_maps_to_the_sysctl_hint_not_the_generic_package_fallback() {
+        // The label lives here; the hint arm lives in platform::install_hint.
+        // Pin the pair so a rename on either side fails loudly instead of
+        // rendering "sudo apt install host IPv6 (kernel disabled)".
+        let label = wireguard_ipv6_missing_dep(true, || true).unwrap();
+        let hint = crate::platform::install_hint(&label);
+        assert!(
+            hint.contains("sysctl"),
+            "hint fell back to generic package install: {hint}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod external_interface_tests {}

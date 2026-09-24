@@ -7,3 +7,4 @@ pub mod commands;
 #[doc(hidden)]
 pub mod output;
 pub mod report;
+pub mod status;

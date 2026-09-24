@@ -6,10 +6,10 @@
 #[path = "support/control_scenarios.rs"]
 mod control_scenarios;
 
+use vortix::app::runtime::VpnRuntime;
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
 use vortix::core::profile::ProtocolKind;
 use vortix::state::VpnProfile;
-use vortix::vpn_runtime::VpnRuntime;
 
 // ============================================================================
 // VpnRuntime headless mode
@@ -17,14 +17,9 @@ use vortix::vpn_runtime::VpnRuntime;
 
 #[test]
 fn engine_new_headless_starts_disconnected() {
-    // P5d: the legacy `connection_state` field was retired; a fresh
-    // headless engine carries no active tunnels — verified via the
-    // scanner-driven `scan_status` snapshot below.
     let config = vortix::config::AppConfig::default();
     let dir = tempfile::tempdir().unwrap();
-    let engine = VpnRuntime::new_headless(config, dir.path().to_path_buf());
-    assert!(!engine.is_root); // tests run unprivileged
-    let snap = engine.scan_status();
+    let snap = vortix::cli::status::scan_status(&[], &config, dir.path());
     assert_eq!(snap.connection_state, "disconnected");
 }
 
@@ -114,15 +109,18 @@ fn engine_sort_profiles_by_protocol() {
 fn engine_check_dependencies_wireguard() {
     // Use a dummy config path — the resolvconf check only matters on Linux
     let dummy = std::path::Path::new("/dev/null");
-    let missing = VpnRuntime::check_dependencies(ProtocolKind::WireGuard, dummy);
+    let missing = vortix::platform::check_dependencies(ProtocolKind::WireGuard, dummy);
     // In test env, wg-quick/wg may or may not be available; just ensure no panic
     assert!(missing.len() <= 3); // wg-quick, wg, and possibly resolvconf on Linux
 }
 
 #[test]
 fn engine_scan_status_when_disconnected() {
-    let engine = VpnRuntime::new_test();
-    let snap = engine.scan_status();
+    let snap = vortix::cli::status::scan_status(
+        &[],
+        &vortix::config::AppConfig::default(),
+        std::path::Path::new("/nonexistent"),
+    );
     assert_eq!(snap.connection_state, "disconnected");
     assert!(snap.profile.is_none());
     assert!(snap.uptime_secs.is_none());

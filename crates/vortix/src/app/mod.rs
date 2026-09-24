@@ -27,6 +27,7 @@ pub(crate) mod connection;
 mod helpers;
 mod input;
 mod profile;
+pub mod runtime;
 mod telemetry_poll;
 mod update;
 
@@ -96,7 +97,7 @@ use crate::constants;
 use crate::core::engine::TunnelRegistry;
 use crate::logger;
 use crate::message::Message;
-use crate::vpn_runtime::VpnRuntime;
+use runtime::VpnRuntime;
 
 // Re-export state types for convenient access
 pub use crate::state::{
@@ -384,13 +385,6 @@ impl App {
             toast: None,
             terminal_size: (80, 24),
         }
-    }
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        // VpnRuntime's Drop handles kill switch cleanup and VPN process termination.
-        // Nothing additional needed here.
     }
 }
 
