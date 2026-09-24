@@ -258,9 +258,44 @@ pub fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// What a `.conf` file's syntax says it is: `WireGuard` sections, `OpenVPN`
+/// directives, or both (which nothing can connect, so it is refused).
+/// A file with neither reads as `WireGuard`; its parser then names what is
+/// missing.
+///
+/// # Errors
+///
+/// Returns a message when the file carries both syntaxes.
+pub fn detect_conf_protocol(text: &str) -> Result<ProtocolKind, String> {
+    let (mut wireguard, mut openvpn) = (false, false);
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("[interface]") || line.eq_ignore_ascii_case("[peer]") {
+            wireguard = true;
+        }
+        let directive = line.split_whitespace().next().unwrap_or_default();
+        if matches!(
+            directive.to_ascii_lowercase().as_str(),
+            "client" | "dev" | "remote" | "proto" | "ca" | "cert" | "key" | "auth-user-pass"
+        ) {
+            openvpn = true;
+        }
+    }
+    match (wireguard, openvpn) {
+        (true, true) => Err("the file mixes WireGuard sections and OpenVPN directives".into()),
+        (false, true) => Ok(ProtocolKind::OpenVpn),
+        _ => Ok(ProtocolKind::WireGuard),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hex, sanitize_profile_name, unambiguous_legacy_artifact_key, ProfileId};
+    use super::{
+        detect_conf_protocol, hex, sanitize_profile_name, unambiguous_legacy_artifact_key,
+        ProfileId, ProtocolKind,
+    };
 
     #[test]
     fn digest_keys_are_stable_sha256_prefixes() {
@@ -342,5 +377,22 @@ mod tests {
     #[test]
     fn test_sanitize_profile_name_empty() {
         assert_eq!(sanitize_profile_name(""), "");
+    }
+
+    #[test]
+    fn conf_protocol_follows_syntax_and_refuses_a_mix() {
+        let wg = "[Interface]\nPrivateKey = x\n[Peer]\nPublicKey = y\n";
+        let ovpn = "client\ndev tun\nremote vpn.example.com 1194\n";
+        assert_eq!(detect_conf_protocol(wg), Ok(ProtocolKind::WireGuard));
+        assert_eq!(detect_conf_protocol(ovpn), Ok(ProtocolKind::OpenVpn));
+        assert_eq!(
+            detect_conf_protocol("CLIENT\nRemote a 1\n"),
+            Ok(ProtocolKind::OpenVpn)
+        );
+        assert_eq!(
+            detect_conf_protocol("# only a comment\n"),
+            Ok(ProtocolKind::WireGuard)
+        );
+        assert!(detect_conf_protocol(&format!("{wg}remote x 1\n")).is_err());
     }
 }

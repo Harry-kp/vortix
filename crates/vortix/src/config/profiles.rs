@@ -97,10 +97,7 @@ pub(crate) fn prepare_profile_import(
 
     let protocol = match extension.as_str() {
         "ovpn" => ProtocolKind::OpenVpn,
-        "conf" => {
-            // .conf is ambiguous -- use content-based detection
-            detect_protocol_from_content(&content)
-        }
+        "conf" => crate::profile::detect_conf_protocol(&content)?,
         _ => {
             logger::log(
                 LogLevel::Error,
@@ -181,32 +178,6 @@ pub(crate) fn commit_profile_import(
     Ok(profile)
 }
 
-/// Detect protocol by inspecting file content.
-///
-/// `WireGuard` configs have `[Interface]` and `[Peer]` INI-style sections.
-/// `OpenVPN` configs have directives like `remote`, `client`, `dev`, `proto`.
-fn detect_protocol_from_content(content: &str) -> ProtocolKind {
-    let lower = content.to_lowercase();
-    let has_interface = lower.contains("[interface]");
-    let has_peer = lower.contains("[peer]");
-    let has_remote = lower
-        .lines()
-        .any(|l| l.trim().starts_with("remote ") || l.trim().starts_with("remote\t"));
-    let has_openvpn_markers = lower.lines().any(|l| {
-        let t = l.trim();
-        t == "client" || t.starts_with("dev ") || t.starts_with("proto ")
-    });
-
-    if has_interface && has_peer {
-        ProtocolKind::WireGuard
-    } else if has_remote || has_openvpn_markers {
-        ProtocolKind::OpenVpn
-    } else {
-        // Default to WireGuard for .conf (historical behavior); validation will catch errors
-        ProtocolKind::WireGuard
-    }
-}
-
 /// Parse and **validate** a `WireGuard` config file.
 ///
 /// Required fields: `[Interface]`, `PrivateKey`, `Address`, `[Peer]`, `PublicKey`, `Endpoint`.
@@ -216,78 +187,33 @@ fn parse_wireguard_config(content: &str, path: &Path) -> Result<(String, String)
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
-
-    let lower = content.to_lowercase();
-
-    // Structural checks
-    if !lower.contains("[interface]") {
+    let parsed = crate::wireguard::parser::parse_wg_conf(content)
+        .map_err(|error| format!("Invalid WireGuard config: {error}"))?;
+    if !parsed.has_interface {
         return Err("Missing [Interface] section in WireGuard config".to_string());
     }
-    if !lower.contains("[peer]") {
+    if parsed.peers.is_empty() {
         return Err("Missing [Peer] section in WireGuard config".to_string());
     }
-
-    // Required key checks (case-insensitive, tolerant of whitespace around '=')
-    let mut has_private_key = false;
-    let mut has_address = false;
-    let mut has_public_key = false;
-    let mut endpoint = String::new();
-    let mut in_peer = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        let lower_line = trimmed.to_lowercase();
-
-        if lower_line == "[peer]" {
-            in_peer = true;
-            continue;
-        }
-        if lower_line == "[interface]" {
-            in_peer = false;
-            continue;
-        }
-
-        if let Some((key, value)) = lower_line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "privatekey" if !in_peer => has_private_key = true,
-                "address" if !in_peer => has_address = true,
-                "publickey" if in_peer => has_public_key = true,
-                "endpoint" if in_peer && endpoint.is_empty() => {
-                    // Use original (non-lowered) value for the endpoint
-                    if let Some((_, orig_val)) = trimmed.split_once('=') {
-                        endpoint = orig_val.trim().split(':').next().unwrap_or("").to_string();
-                    }
-                }
-                _ => {}
-            }
-            // Also check non-lowered for PrivateKey detection (some generators use mixed case)
-            let _ = value; // suppress unused warning
-        }
-    }
-
     let mut missing = Vec::new();
-    if !has_private_key {
+    if !parsed.has_private_key {
         missing.push("PrivateKey");
     }
-    if !has_address {
+    if parsed.addresses.is_empty() {
         missing.push("Address");
     }
-    if !has_public_key {
+    if parsed.peers.iter().all(|peer| peer.public_key.is_empty()) {
         missing.push("PublicKey (in [Peer])");
     }
-    if endpoint.is_empty() {
+    if parsed.peers.iter().all(|peer| peer.endpoint_host.is_none()) {
         missing.push("Endpoint (in [Peer])");
     }
-
     if !missing.is_empty() {
         return Err(format!(
             "Invalid WireGuard config — missing required fields: {}",
             missing.join(", ")
         ));
     }
-
     let location = derive_location_from_name(&name);
     Ok((name, location))
 }
@@ -974,44 +900,10 @@ MIIDqzCCApOgAwIB...
         assert_eq!(name, "münchen-vpn");
     }
 
-    // === Content-based protocol detection tests ===
-
     #[test]
-    fn test_detect_protocol_wireguard() {
-        let wg_config = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = xyz\nEndpoint = 1.2.3.4:51820\n";
-        assert!(matches!(
-            detect_protocol_from_content(wg_config),
-            ProtocolKind::WireGuard
-        ));
-    }
-
-    #[test]
-    fn test_detect_protocol_openvpn() {
-        let ovpn_config = "client\ndev tun\nproto udp\nremote vpn.example.com 1194\n";
-        assert!(matches!(
-            detect_protocol_from_content(ovpn_config),
-            ProtocolKind::OpenVpn
-        ));
-    }
-
-    #[test]
-    fn test_detect_protocol_openvpn_with_remote_only_and_dev() {
-        // Has remote + dev but no [Interface]/[Peer] → OpenVPN
-        let config = "dev tun\nremote server.example.com 443\nproto tcp\n";
-        assert!(matches!(
-            detect_protocol_from_content(config),
-            ProtocolKind::OpenVpn
-        ));
-    }
-
-    #[test]
-    fn test_detect_protocol_defaults_to_wireguard_for_unknown() {
-        // Random text that doesn't match either protocol
-        let config = "some random text\nwith no VPN directives\n";
-        assert!(matches!(
-            detect_protocol_from_content(config),
-            ProtocolKind::WireGuard
-        ));
+    fn an_ipv6_endpoint_imports() {
+        let config = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = xyz\nEndpoint = [2001:db8::1]:51820\n";
+        assert!(parse_wireguard_config(config, Path::new("wg-v6.conf")).is_ok());
     }
 
     // === OpenVPN structure validation tests ===

@@ -1193,33 +1193,8 @@ fn validate_inventory(profiles_dir: &Path, inventory: &MigrationInventory) -> st
 }
 
 fn detect_conf_protocol(path: &Path) -> std::io::Result<ProtocolKind> {
-    let body = std::fs::read_to_string(path)?;
-    let mut wireguard = false;
-    let mut openvpn = false;
-    for raw in body.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if matches!(line, "[Interface]" | "[Peer]") {
-            wireguard = true;
-        }
-        let directive = line.split_whitespace().next().unwrap_or_default();
-        if matches!(
-            directive,
-            "client" | "dev" | "remote" | "proto" | "ca" | "cert" | "key" | "auth-user-pass"
-        ) {
-            openvpn = true;
-        }
-    }
-    match (wireguard, openvpn) {
-        (false, true) => Ok(ProtocolKind::OpenVpn),
-        (_, false) => Ok(ProtocolKind::WireGuard),
-        (true, true) => Err(invalid_data(format!(
-            "ambiguous .conf profile {} contains WireGuard and OpenVPN syntax",
-            path.display()
-        ))),
-    }
+    crate::profile::detect_conf_protocol(&std::fs::read_to_string(path)?)
+        .map_err(|reason| invalid_data(format!("{}: {reason}", path.display())))
 }
 
 fn validate_inventory_entry(entry: &InventoryEntry) -> std::io::Result<()> {

@@ -40,6 +40,10 @@ pub struct WgParsedProfile {
     pub dns_search_domains: Vec<String>,
     /// Every `Address =` entry, comments stripped.
     pub addresses: Vec<String>,
+    /// An `[Interface]` section was present.
+    pub has_interface: bool,
+    /// The `[Interface]` section set a `PrivateKey`.
+    pub has_private_key: bool,
     pub mtu: Option<u32>,
     pub peers: Vec<WgPeer>,
 }
@@ -122,6 +126,7 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
             let header = header.trim();
             if header.eq_ignore_ascii_case("Interface") {
                 section = Section::Interface;
+                profile.has_interface = true;
             } else if header.eq_ignore_ascii_case("Peer") {
                 section = Section::Peer;
                 current_peer = Some(WgPeer::default());
@@ -145,7 +150,9 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
 
         match section {
             Section::Interface => {
-                if key.eq_ignore_ascii_case("DNS") {
+                if key.eq_ignore_ascii_case("PrivateKey") {
+                    profile.has_private_key |= !value.is_empty();
+                } else if key.eq_ignore_ascii_case("DNS") {
                     // Strip valid trailing comments before comma
                     // tokenization. Otherwise `1.1.1.1 # note` is no
                     // longer an IP and is misclassified as a search domain.
