@@ -94,7 +94,7 @@ impl Net {
         }
         for endpoint in target.host_routes.iter().filter(|ip| ip.is_ipv6()) {
             // ponytail: only the IPv4 default gateway is read; pinning an
-            // IPv6 server needs its IPv6 gateway.
+            // IPv6 server needs its IPv6 gateway (#308).
             tracing::warn!(target: "vortix::net", %endpoint, "IPv6 server route not pinned");
         }
         for (cidr, interface) in &target.routes {
