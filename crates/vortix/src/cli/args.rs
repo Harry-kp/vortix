@@ -103,8 +103,8 @@ pub enum Commands {
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
 
-        /// Bypass the multi-tunnel conflict gate — default-route takeover
-        /// or route overlap (). Without this flag,
+        /// Bypass the multi-tunnel conflict gate (default-route takeover or
+        /// route overlap) and switch to this tunnel. Without this flag,
         /// conflicting connects exit with code 4 (`StateConflict`) so
         /// scripted callers can branch.
         #[arg(short, long)]

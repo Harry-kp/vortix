@@ -21,7 +21,7 @@
 //! `data.connection` block carrying `state`/`profile`/`protocol`/
 //! `uptime_secs`.
 //!
-//! ## v1 → v2 contract ()
+//! ## v1 → v2 contract
 //!
 //! v0.4.0 bumps `schema_version` to `2` to admit multi-tunnel state in
 //! the `status` payload:
@@ -46,7 +46,7 @@ use serde::Serialize;
 /// require a bump.
 ///
 /// - `1`: single-tunnel `data.connection` block.
-/// - `2` (): adds `data.connections` (array)
+/// - `2`: adds `data.connections` (array)
 ///   and `data.primary` (profile id, nullable). `data.connection` is
 ///   retained as the primary's entry for v1 back-compat. See the module
 ///   docs for the full v1 → v2 contract.

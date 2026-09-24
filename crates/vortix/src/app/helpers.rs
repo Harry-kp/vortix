@@ -111,7 +111,7 @@ impl App {
     }
 
     /// Whether the profile at `idx` is currently Connecting (in-flight).
-    /// Used by the `c` cancel keybinding ().
+    /// Used by the `c` cancel keybinding.
     #[must_use]
     pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
         let Some(profile) = self.runtime.profiles.get(idx) else {

@@ -785,7 +785,6 @@ pub mod help {
             "Switch-VPN overlay",
             &[
                 ("Y / Enter", "Switch — disconnect current, then connect new"),
-                ("B", "Connect both — new becomes active exit"),
                 ("N / Esc", "Cancel"),
             ],
         ),
@@ -850,11 +849,11 @@ pub mod help {
     ),
     (
         "Split tunnel (yielded)",
-        "Wanted to be your exit (declared 0.0.0.0/0) but another tunnel won the race. 'Yielded' = stood down. Sits as a hot standby: if the active primary drops, the kernel re-routes through this tunnel and you'll see a toast naming the new active exit. You see this label after pressing Shift+B (Both) on the takeover overlay.",
+        "Declares 0.0.0.0/0 but another tunnel currently owns the default route, so it carries only traffic nothing else claims. You see it for a moment during a switch, before Vortix stops the tunnel being replaced.",
     ),
     (
         "Split tunnel (multi, yielded)",
-        "Same as yielded; the profile declares multiple subnets including 0/0. Another tunnel is the active exit; this one is a hot standby.",
+        "Same as yielded; the profile declares several subnets including 0/0. Another tunnel is the exit.",
     ),
     (
         "(external) suffix",
@@ -1225,8 +1224,8 @@ pub mod help {
 
         #[test]
         fn multi_tunnel_keys_are_documented() {
-            // Smoke check that the multi-tunnel keys (Shift+D, B on
-            // takeover, etc.) all surfaced in the keybindings section.
+            // The multi-tunnel keys (Shift+D, the takeover choices) are listed,
+            // and the removed "connect both" choice is not.
             use std::fmt::Write;
             let blob = HELP_TEXT
                 .iter()
@@ -1236,7 +1235,8 @@ pub mod help {
                     acc
                 });
             assert!(blob.contains("Disconnect ALL"));
-            assert!(blob.contains("Connect both"));
+            assert!(blob.contains("Switch — disconnect current"));
+            assert!(!blob.contains("Connect both"));
         }
 
         #[test]
