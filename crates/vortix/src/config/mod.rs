@@ -522,8 +522,9 @@ pub fn check_migration(new_dir: &Path) -> Option<PathBuf> {
     }
 
     // New path must be empty or nonexistent
-    let new_has_profiles = new_dir.join("profiles").is_dir()
-        && std::fs::read_dir(new_dir.join("profiles"))
+    let new_profiles = new_dir.join(crate::constants::PROFILES_DIR_NAME);
+    let new_has_profiles = new_profiles.is_dir()
+        && std::fs::read_dir(&new_profiles)
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
     if new_has_profiles {
@@ -542,16 +543,19 @@ pub fn check_migration(new_dir: &Path) -> Option<PathBuf> {
 ///
 /// Returns an error if file operations fail.
 pub fn migrate_data(old_dir: &Path, new_dir: &Path) -> std::io::Result<()> {
+    use crate::constants::{
+        KILLSWITCH_STATE_FILE, LOGS_DIR_NAME, OPENVPN_AUTH_DIR, OPENVPN_RUN_DIR, PROFILES_DIR_NAME,
+    };
     std::fs::create_dir_all(new_dir)?;
 
     let items = [
-        "profiles",
-        "auth",
-        "run",
-        "logs",
+        PROFILES_DIR_NAME,
+        OPENVPN_AUTH_DIR,
+        OPENVPN_RUN_DIR,
+        LOGS_DIR_NAME,
         "metadata.json",
-        "killswitch.state",
-        "config.toml",
+        KILLSWITCH_STATE_FILE,
+        CONFIG_FILE,
     ];
 
     let mut migrated = 0;

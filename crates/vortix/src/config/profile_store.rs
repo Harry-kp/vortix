@@ -335,15 +335,19 @@ impl FsProfileStore {
 
     fn auth_path(&self, id: &ProfileId) -> PathBuf {
         self.root_dir()
-            .join("auth")
-            .join(format!("{}.auth", id.as_str()))
+            .join(crate::constants::OPENVPN_AUTH_DIR)
+            .join(crate::config::openvpn_credentials::auth_file_name(
+                id.as_str(),
+            ))
     }
 
     fn legacy_auth_path(&self, display_name: &str) -> Option<PathBuf> {
         unambiguous_legacy_artifact_key(display_name).map(|legacy_key| {
             self.root_dir()
-                .join("auth")
-                .join(format!("{legacy_key}.auth"))
+                .join(crate::constants::OPENVPN_AUTH_DIR)
+                .join(crate::config::openvpn_credentials::auth_file_name(
+                    legacy_key,
+                ))
         })
     }
 
@@ -368,7 +372,7 @@ impl FsProfileStore {
         let root = self.root_dir();
         reject_symlink(&root)?;
         crate::config::owned_file::create_user_dir(&self.profiles_dir)?;
-        let auth = root.join("auth");
+        let auth = root.join(crate::constants::OPENVPN_AUTH_DIR);
         if auth.exists() {
             reject_symlink(&auth)?;
         }

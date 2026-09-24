@@ -525,7 +525,10 @@ impl OvpnTunnel {
     }
 
     fn auth_path(&self, profile_id: &str) -> PathBuf {
-        self.auth_dir.join(format!("{profile_id}.auth"))
+        self.auth_dir
+            .join(crate::config::openvpn_credentials::auth_file_name(
+                profile_id,
+            ))
     }
 
     /// Path used by the static-challenge SCRV1 envelope. The connect path writes the

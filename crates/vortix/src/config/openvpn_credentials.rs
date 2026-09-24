@@ -20,6 +20,11 @@ use super::owned_file::{
 
 const MAX_AUTH_BYTES: u64 = 16 * 1024;
 
+/// `<key>.auth`: the credential file name for an artifact key.
+pub(crate) fn auth_file_name(key: &str) -> String {
+    format!("{key}.auth")
+}
+
 /// Reusable `OpenVPN` username/password values whose allocations are cleared on drop.
 pub struct RememberedOpenVpnCredentials {
     username: Zeroizing<String>,
@@ -277,7 +282,7 @@ impl FsOpenVpnCredentialStore {
             .ok_or(CredentialStoreError::UnsafeArtifact(
                 CredentialArtifactIssue::UnsafeDirectory,
             ))?;
-        let name = format!("{}.auth", profile_id.as_str());
+        let name = auth_file_name(profile_id.as_str());
         // Keep the validated descriptor alive until publication completes. If
         // the destination is unlinked concurrently, the open descriptor keeps
         // its inode allocated so an attacker cannot recreate the path with an
@@ -357,7 +362,7 @@ impl FsOpenVpnCredentialStore {
         use std::io::Read as _;
 
         validate_artifact_key(key)?;
-        let name = format!("{key}.auth");
+        let name = auth_file_name(key);
         let c_name = CString::new(name.as_str()).map_err(|_| {
             CredentialStoreError::UnsafeArtifact(CredentialArtifactIssue::ChangedEntry)
         })?;
@@ -443,7 +448,7 @@ impl FsOpenVpnCredentialStore {
         let Some(opened) = self.open_entry(directory, key, canonical_stable_id)? else {
             return Ok(false);
         };
-        let name = format!("{key}.auth");
+        let name = auth_file_name(key);
         if !entry_matches(directory, &name, Some(opened.identity))
             .map_err(|error| map_file_error(error, CredentialIoOperation::Clear))?
         {

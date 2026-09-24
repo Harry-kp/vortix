@@ -89,7 +89,7 @@ pub(crate) fn insert_inventory_entry(
         .ok_or_else(|| invalid_data("profile config has no UTF-8 basename"))?
         .to_string();
     validate_config_name(&config_file, &profile.display_name)?;
-    let auth_file = format!("{}.auth", profile.id.as_str());
+    let auth_file = crate::config::openvpn_credentials::auth_file_name(profile.id.as_str());
     let root = profiles_dir.parent().unwrap_or(profiles_dir);
     inventory.entries.push(InventoryEntry {
         config_file,
@@ -97,7 +97,10 @@ pub(crate) fn insert_inventory_entry(
         profile_id: profile.id.clone(),
         display_name: profile.display_name.clone(),
         protocol: profile.protocol,
-        auth_associated: root.join("auth").join(&auth_file).exists(),
+        auth_associated: root
+            .join(crate::constants::OPENVPN_AUTH_DIR)
+            .join(&auth_file)
+            .exists(),
         auth_file,
         boot_associated: root.join("boot.toml").exists(),
         desired_state_associated: root.join("desired-state.toml").exists(),
@@ -422,12 +425,17 @@ fn build_initial_inventory(
             ));
         }
         sidecar_names.remove(&sidecar_file);
-        let auth_file = format!("{}.auth", profile_id.as_str());
+        let auth_file = crate::config::openvpn_credentials::auth_file_name(profile_id.as_str());
         let legacy_auth = sanitize_profile_name(&display_name);
-        let auth_associated = root.join("auth").join(&auth_file).exists()
+        let auth_associated = root
+            .join(crate::constants::OPENVPN_AUTH_DIR)
+            .join(&auth_file)
+            .exists()
             || root
-                .join("auth")
-                .join(format!("{legacy_auth}.auth"))
+                .join(crate::constants::OPENVPN_AUTH_DIR)
+                .join(crate::config::openvpn_credentials::auth_file_name(
+                    &legacy_auth,
+                ))
                 .exists();
         if !associated_auth.insert(auth_file.clone()) {
             return Err(std::io::Error::new(
@@ -474,7 +482,7 @@ fn migrate_legacy_auth_files(
     inventory: &MigrationInventory,
 ) -> std::io::Result<()> {
     let root = profiles_dir.parent().unwrap_or(profiles_dir);
-    let auth_dir = root.join("auth");
+    let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
     if !auth_dir.exists() {
         return Ok(());
     }
