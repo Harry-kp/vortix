@@ -336,7 +336,7 @@ pub struct OvpnTunnel {
     pub run_dir: PathBuf,
     /// Optional auth file directory (`<profile_id>.auth`); absent when the
     /// profile uses other auth mechanisms.
-    pub auth_dir: Option<PathBuf>,
+    pub auth_dir: PathBuf,
     /// `--verb N` value passed to the daemon.
     pub verbosity: String,
     /// Overall connect timeout in seconds.
@@ -377,49 +377,24 @@ impl std::fmt::Debug for OvpnTunnel {
     }
 }
 
-impl Default for OvpnTunnel {
-    fn default() -> Self {
+impl OvpnTunnel {
+    #[must_use]
+    pub fn new(
+        run_dir: PathBuf,
+        auth_dir: PathBuf,
+        verbosity: &str,
+        connect_timeout_secs: u64,
+    ) -> Self {
         Self {
-            run_dir: PathBuf::from("/tmp/vortix-ovpn"),
-            auth_dir: None,
-            verbosity: DEFAULT_OVPN_VERBOSITY.to_string(),
-            connect_timeout_secs: 30,
+            run_dir,
+            auth_dir,
+            verbosity: verbosity.to_string(),
+            connect_timeout_secs,
             generation: None,
             operation_id: None,
             static_challenge_credentials: None,
             execution_context: None,
         }
-    }
-}
-
-impl OvpnTunnel {
-    #[must_use]
-    pub fn new(run_dir: PathBuf) -> Self {
-        Self {
-            run_dir,
-            ..Default::default()
-        }
-    }
-
-    /// Builder: set the auth file directory.
-    #[must_use]
-    pub fn with_auth_dir(mut self, auth_dir: PathBuf) -> Self {
-        self.auth_dir = Some(auth_dir);
-        self
-    }
-
-    /// Builder: set the `--verb` value.
-    #[must_use]
-    pub fn with_verbosity(mut self, verbosity: impl Into<String>) -> Self {
-        self.verbosity = verbosity.into();
-        self
-    }
-
-    /// Builder: set the connect timeout (seconds).
-    #[must_use]
-    pub fn with_connect_timeout(mut self, secs: u64) -> Self {
-        self.connect_timeout_secs = secs;
-        self
     }
 
     /// Bind this protocol attempt to the canonical worker lifetime.
@@ -563,10 +538,8 @@ impl OvpnTunnel {
         self.run_dir.join(format!("{profile_id}.log"))
     }
 
-    fn auth_path(&self, profile_id: &str) -> Option<PathBuf> {
-        self.auth_dir
-            .as_ref()
-            .map(|d| d.join(format!("{profile_id}.auth")))
+    fn auth_path(&self, profile_id: &str) -> PathBuf {
+        self.auth_dir.join(format!("{profile_id}.auth"))
     }
 
     /// Path used by the static-challenge SCRV1 envelope. The connect path writes the
@@ -575,10 +548,8 @@ impl OvpnTunnel {
     /// after the daemon fork returns — keeping the canonical
     /// `<safe>.auth` plain at all times, with no race window for the
     /// async TUI worker thread to lose against.
-    fn scrv1_auth_path(&self, profile_id: &str) -> Option<PathBuf> {
-        self.auth_dir
-            .as_ref()
-            .map(|d| d.join(format!("{profile_id}.scrv1.auth")))
+    fn scrv1_auth_path(&self, profile_id: &str) -> PathBuf {
+        self.auth_dir.join(format!("{profile_id}.scrv1.auth"))
     }
 
     fn management_socket_path(&self, profile_id: &str) -> PathBuf {
@@ -611,24 +582,24 @@ impl OvpnTunnel {
     }
 
     fn existing_auth_path(&self, profile: &Profile) -> Option<PathBuf> {
-        self.auth_path(profile.id.as_str())
-            .filter(|path| path.exists())
-            .or_else(|| {
-                unambiguous_legacy_artifact_key(&profile.display_name)
-                    .and_then(|legacy_key| self.auth_path(legacy_key))
-                    .filter(|path| path.exists())
-            })
+        existing_artifact(profile, |key| self.auth_path(key))
     }
 
     fn existing_scrv1_auth_path(&self, profile: &Profile) -> Option<PathBuf> {
-        self.scrv1_auth_path(profile.id.as_str())
-            .filter(|path| path.exists())
-            .or_else(|| {
-                unambiguous_legacy_artifact_key(&profile.display_name)
-                    .and_then(|legacy_key| self.scrv1_auth_path(legacy_key))
-                    .filter(|path| path.exists())
-            })
+        existing_artifact(profile, |key| self.scrv1_auth_path(key))
     }
+}
+
+/// The artifact at the canonical profile-id path, else at the unambiguous
+/// legacy display-name path, whichever exists.
+fn existing_artifact(profile: &Profile, path: impl Fn(&str) -> PathBuf) -> Option<PathBuf> {
+    Some(path(profile.id.as_str()))
+        .filter(|path| path.exists())
+        .or_else(|| {
+            unambiguous_legacy_artifact_key(&profile.display_name)
+                .map(&path)
+                .filter(|path| path.exists())
+        })
 }
 
 /// Anchor phrases `OpenVPN` writes to its log when it brings the kernel
@@ -1246,11 +1217,16 @@ fn cleanup_startup_failure(
 mod tests {
     use super::*;
 
+    fn test_tunnel(run_dir: PathBuf) -> OvpnTunnel {
+        let auth_dir = run_dir.join("auth");
+        OvpnTunnel::new(run_dir, auth_dir, DEFAULT_OVPN_VERBOSITY, 30)
+    }
+
     #[test]
     fn canonical_generation_and_operation_fence_standard_custodian_identity() {
         let operation: OperationId =
             serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap();
-        let tunnel = OvpnTunnel::default()
+        let tunnel = test_tunnel(PathBuf::from("/tmp/vortix-ovpn"))
             .for_generation(41)
             .for_operation(operation.clone());
         assert_eq!(tunnel.generation, Some(41));
@@ -1262,7 +1238,7 @@ mod tests {
                 .generation,
             41
         );
-        assert!(OvpnTunnel::default()
+        assert!(test_tunnel(PathBuf::from("/tmp/vortix-ovpn"))
             .for_generation(0)
             .ownership_id(&ProfileId::new("corp"))
             .is_err());
@@ -1270,10 +1246,12 @@ mod tests {
 
     #[test]
     fn canonical_execution_context_bounds_and_cancels_openvpn_waits() {
-        let expired = OvpnTunnel::default().with_execution_context(TunnelExecutionContext {
-            cancellation: crate::tunnel::TunnelCancellation::default(),
-            deadline: Instant::now(),
-        });
+        let expired = test_tunnel(PathBuf::from("/tmp/vortix-ovpn")).with_execution_context(
+            TunnelExecutionContext {
+                cancellation: crate::tunnel::TunnelCancellation::default(),
+                deadline: Instant::now(),
+            },
+        );
         assert!(matches!(
             expired.remaining_connect_timeout(),
             Err(TunnelError::Timeout(_))
@@ -1281,10 +1259,12 @@ mod tests {
 
         let cancellation = crate::tunnel::TunnelCancellation::default();
         cancellation.cancel();
-        let cancelled = OvpnTunnel::default().with_execution_context(TunnelExecutionContext {
-            cancellation,
-            deadline: Instant::now() + Duration::from_secs(30),
-        });
+        let cancelled = test_tunnel(PathBuf::from("/tmp/vortix-ovpn")).with_execution_context(
+            TunnelExecutionContext {
+                cancellation,
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+        );
         assert!(matches!(
             cancelled.remaining_connect_timeout(),
             Err(TunnelError::Cancelled)
@@ -1303,7 +1283,7 @@ mod tests {
     fn colliding_display_names_have_isolated_openvpn_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let auth = temp.path().join("auth");
-        let tunnel = OvpnTunnel::new(temp.path().to_path_buf()).with_auth_dir(auth);
+        let tunnel = OvpnTunnel::new(temp.path().to_path_buf(), auth, DEFAULT_OVPN_VERBOSITY, 30);
         let first = "1".repeat(crate::profile::ProfileId::HEX_LEN);
         let second = "2".repeat(crate::profile::ProfileId::HEX_LEN);
 
@@ -1341,7 +1321,7 @@ mod tests {
 
     #[test]
     fn canonical_profile_id_keeps_management_socket_within_unix_path_limit() {
-        let tunnel = OvpnTunnel::new(PathBuf::from("/Users/vortix/.config/vortix/run"));
+        let tunnel = test_tunnel(PathBuf::from("/Users/vortix/.config/vortix/run"));
         let profile_id = "a".repeat(crate::profile::ProfileId::HEX_LEN);
         let socket = tunnel.management_socket_path(&profile_id);
 
@@ -1354,7 +1334,7 @@ mod tests {
 
     #[test]
     fn in_memory_static_challenge_is_redacted_from_debug() {
-        let tunnel = OvpnTunnel::new(PathBuf::from("/tmp/vortix-test"))
+        let tunnel = test_tunnel(PathBuf::from("/tmp/vortix-test"))
             .with_static_challenge_credentials(OpenVpnStaticChallengeCredentials::new(
                 "secret-user".into(),
                 "secret-password".into(),
@@ -1699,7 +1679,7 @@ mod tests {
             "PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n",
         )
         .unwrap();
-        let evidence = OvpnTunnel::new(temp.path().to_path_buf())
+        let evidence = test_tunnel(temp.path().to_path_buf())
             .requested_dns_evidence(&profile)
             .unwrap();
         let OvpnDnsEvidence::Observed(request) = evidence else {
@@ -1732,7 +1712,7 @@ mod tests {
         )
         .unwrap();
 
-        let evidence = OvpnTunnel::new(temp.path().to_path_buf())
+        let evidence = test_tunnel(temp.path().to_path_buf())
             .requested_runtime_evidence(&profile)
             .unwrap();
 
@@ -1819,7 +1799,7 @@ mod tests {
             profile_path,
         );
 
-        let evidence = OvpnTunnel::new(temp.path().to_path_buf())
+        let evidence = test_tunnel(temp.path().to_path_buf())
             .requested_dns_evidence(&profile)
             .unwrap();
         assert!(matches!(

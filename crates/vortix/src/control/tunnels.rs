@@ -324,12 +324,12 @@ impl TunnelKind {
                         .filter_map(|target| target.parse().ok()),
                 ),
             ),
-            ProtocolKind::OpenVpn => Self::OpenVpn(
-                OvpnTunnel::new(config_dir.join(crate::constants::OPENVPN_RUN_DIR))
-                    .with_auth_dir(config_dir.join(crate::constants::OPENVPN_AUTH_DIR))
-                    .with_verbosity(&settings.openvpn_verbosity)
-                    .with_connect_timeout(settings.connect_timeout_secs),
-            ),
+            ProtocolKind::OpenVpn => Self::OpenVpn(OvpnTunnel::new(
+                config_dir.join(crate::constants::OPENVPN_RUN_DIR),
+                config_dir.join(crate::constants::OPENVPN_AUTH_DIR),
+                &settings.openvpn_verbosity,
+                settings.connect_timeout_secs,
+            )),
         }
     }
 

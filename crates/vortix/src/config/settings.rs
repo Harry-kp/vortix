@@ -53,7 +53,7 @@ impl Default for Settings {
 pub struct EngineSettings {
     /// Default `OpenVPN --verb` value.
     pub openvpn_verbosity: String,
-    /// Connect timeout used by `OvpnTunnel::with_connect_timeout`.
+    /// `OpenVPN` connect timeout.
     pub connect_timeout_secs: u64,
     /// `WireGuard` remains Handshaking until current-generation evidence arrives.
     pub wireguard_handshake_timeout_secs: u64,
