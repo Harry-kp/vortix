@@ -1060,19 +1060,12 @@ impl OvpnTunnel {
         ];
         let command = privileged_openvpn_command(&openvpn_binary, args);
         self.remaining_connect_timeout()?;
-        let handshake = match self.operation_id.clone() {
-            Some(operation_id) => crate::process::start_managed_foreground_for_operation(
-                ownership_id.clone(),
-                command,
-                cleanup_paths,
-                operation_id,
-            ),
-            None => crate::process::start_managed_foreground(
-                ownership_id.clone(),
-                command,
-                cleanup_paths,
-            ),
-        };
+        let handshake = crate::process::custodian::spawn_custodian(
+            ownership_id.clone(),
+            command,
+            cleanup_paths,
+            self.operation_id.clone(),
+        );
         let handshake = match handshake {
             Ok(handshake) => handshake,
             Err(error) => {
@@ -1187,11 +1180,11 @@ impl OvpnTunnel {
 
         let identity = match handle.process_ownership.clone() {
             Some(identity) => Some(identity),
-            None => crate::process::managed_identity_for_profile(&handle.profile_id)
+            None => crate::process::custodian::load_identity(&handle.profile_id)
                 .map_err(|error| TunnelError::Subprocess(format!("OpenVPN ownership: {error}")))?,
         };
         if let Some(identity) = identity {
-            crate::process::stop_managed_foreground(&identity).map_err(|error| {
+            crate::process::custodian::remote_stop(&identity).map_err(|error| {
                 TunnelError::Subprocess(format!(
                     "OpenVPN owned teardown was not confirmed for generation {}: {error}",
                     identity.generation
@@ -1216,7 +1209,7 @@ impl OvpnTunnel {
 
     pub fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
         if let Some(identity) = handle.process_ownership.as_ref() {
-            let alive = crate::process::status_managed_foreground(identity).map_err(|error| {
+            let alive = crate::process::custodian::remote_status(identity).map_err(|error| {
                 TunnelError::Subprocess(format!("OpenVPN custody status: {error}"))
             })?;
             if !alive {
@@ -1240,7 +1233,7 @@ fn cleanup_startup_failure(
     handshake: &crate::process::CustodianHandshake,
     startup: TunnelError,
 ) -> TunnelError {
-    match crate::process::stop_failed_managed_foreground_startup(handshake) {
+    match crate::process::custodian::remote_stop_after_startup(handshake) {
         Ok(()) => startup,
         Err(teardown) => TunnelError::Subprocess(format!(
             "{startup}; OpenVPN startup teardown failed and ownership is ambiguous for generation {}: {teardown}",

@@ -5,11 +5,13 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod custodian;
+#[cfg(test)]
 pub mod mock;
 pub mod orphan_scan;
 pub mod real;
 
 pub use custodian::{CustodianError, CustodianHandshake, StandardCustodian};
+#[cfg(test)]
 pub use mock::MockRunner;
 pub use orphan_scan::{filter_untracked, scan_orphans, OrphanProcess};
 pub use real::{RealProcessLifecycle, RealRunner};
@@ -19,6 +21,7 @@ pub use real::{RealProcessLifecycle, RealRunner};
 #[non_exhaustive]
 pub enum CommandRunner {
     Real(RealRunner),
+    #[cfg(test)]
     Mock(MockRunner),
 }
 
@@ -26,6 +29,7 @@ impl CommandRunner {
     pub async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
         match self {
             CommandRunner::Real(r) => r.run(spec).await,
+            #[cfg(test)]
             CommandRunner::Mock(m) => m.run_sync(spec),
         }
     }
@@ -36,6 +40,7 @@ impl CommandRunner {
     pub fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
         match self {
             CommandRunner::Real(r) => r.run_blocking(spec),
+            #[cfg(test)]
             CommandRunner::Mock(m) => m.run_sync(spec),
         }
     }
@@ -54,11 +59,13 @@ impl CommandRunner {
     pub fn as_real(&self) -> Option<&RealRunner> {
         match self {
             Self::Real(r) => Some(r),
+            #[cfg(test)]
             Self::Mock(_) => None,
         }
     }
 
     /// Construct a mock runner that succeeds at every call.
+    #[cfg(test)]
     #[must_use]
     pub fn mock_default_success() -> Self {
         Self::Mock(MockRunner::with_default_success())
@@ -68,72 +75,6 @@ impl CommandRunner {
 use std::sync::OnceLock;
 
 static GLOBAL_RUNNER: OnceLock<CommandRunner> = OnceLock::new();
-
-/// Start a foreground protocol child and return only after lifecycle ownership
-/// is established. This remains a Standard-mode implementation detail.
-pub fn start_managed_foreground(
-    identity: ManagedProcessId,
-    spec: CommandSpec,
-    cleanup_paths: Vec<std::path::PathBuf>,
-) -> Result<CustodianHandshake, CustodianError> {
-    custodian::spawn_custodian(
-        identity,
-        spec,
-        cleanup_paths,
-        std::time::Duration::from_secs(5),
-    )
-}
-
-/// Start a foreground protocol child and persist the canonical operation in
-/// the custodian's authenticated receipt for restart recovery.
-pub fn start_managed_foreground_for_operation(
-    identity: ManagedProcessId,
-    spec: CommandSpec,
-    cleanup_paths: Vec<std::path::PathBuf>,
-    operation_id: crate::tunnel::OperationId,
-) -> Result<CustodianHandshake, CustodianError> {
-    custodian::spawn_custodian_for_operation(
-        identity,
-        spec,
-        cleanup_paths,
-        std::time::Duration::from_secs(5),
-        Some(operation_id),
-    )
-}
-
-/// Stop and reap a foreground protocol child by stable identity.
-pub fn stop_managed_foreground(identity: &ManagedProcessId) -> Result<(), CustodianError> {
-    custodian::remote_stop(identity)
-}
-
-/// Contain a failed startup using the exact handshake retained by its owner.
-#[doc(hidden)]
-pub fn stop_failed_managed_foreground_startup(
-    handshake: &CustodianHandshake,
-) -> Result<(), CustodianError> {
-    custodian::remote_stop_after_startup(handshake)
-}
-
-/// Probe an exact foreground child capability through its tunnel-scoped
-/// custodian.
-pub fn status_managed_foreground(identity: &ManagedProcessId) -> Result<bool, CustodianError> {
-    custodian::remote_status(identity)
-}
-
-/// Recover the current exact receipt for a stable profile identity.
-pub fn managed_identity_for_profile(
-    profile_id: &crate::profile::ProfileId,
-) -> Result<Option<ManagedProcessId>, CustodianError> {
-    custodian::load_identity(profile_id)
-}
-
-/// Set the process-wide runner. First call wins; subsequent calls are ignored.
-///
-/// `main()` calls this at startup with `CommandRunner::real()`. Test harnesses
-/// can call it earlier with a `MockRunner` to redirect subprocess invocations.
-pub fn set_global_runner(runner: CommandRunner) {
-    let _ = GLOBAL_RUNNER.set(runner);
-}
 
 /// Get the process-wide runner. Unit tests that never install one get a
 /// mock that succeeds at every call; everything else gets the real runner,

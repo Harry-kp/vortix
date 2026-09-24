@@ -18,7 +18,6 @@ fn main() -> Result<()> {
     // toggles so production startup is silent; `RUST_LOG=vortix::process=info`
     // surfaces every subprocess invocation as a structured event.
     init_tracing();
-    vortix::process::set_global_runner(vortix::process::CommandRunner::real());
 
     // Wrap Rust's default panic hook with terminal restoration and recovery
     // instructions. Drop glue on App will still run to release kill switch

@@ -250,27 +250,16 @@ impl<P: ProcessLifecycle> StandardCustodian<P> {
     }
 }
 
-/// Start the private custodian subprocess and complete a two-phase handoff.
+/// Start the private custodian subprocess and complete a two-phase handoff,
+/// binding its durable receipt to `operation_id` when given.
 #[allow(clippy::needless_pass_by_value)] // ownership crosses the process boundary in the frame
 pub fn spawn_custodian(
     identity: ManagedProcessId,
     spec: CommandSpec,
     cleanup_paths: Vec<PathBuf>,
-    graceful_timeout: Duration,
-) -> Result<CustodianHandshake, CustodianError> {
-    spawn_custodian_for_operation(identity, spec, cleanup_paths, graceful_timeout, None)
-}
-
-/// Start a private custodian and bind its authenticated durable receipt to
-/// the canonical operation that created the child.
-#[allow(clippy::needless_pass_by_value)] // ownership crosses the process boundary in the frame
-pub fn spawn_custodian_for_operation(
-    identity: ManagedProcessId,
-    spec: CommandSpec,
-    cleanup_paths: Vec<PathBuf>,
-    graceful_timeout: Duration,
     operation_id: Option<OperationId>,
 ) -> Result<CustodianHandshake, CustodianError> {
+    let graceful_timeout = Duration::from_secs(5);
     if !identity.has_valid_token() {
         return Err(CustodianError::Protocol(
             "invalid ownership identity".into(),
@@ -471,9 +460,7 @@ pub fn remote_stop(identity: &ManagedProcessId) -> Result<(), CustodianError> {
 /// receipt before startup polling observes the failure. In that case the
 /// handshake's process-group identity lets the startup owner prove exact
 /// absence instead of misclassifying the already-clean attempt as ambiguous.
-pub(crate) fn remote_stop_after_startup(
-    handshake: &CustodianHandshake,
-) -> Result<(), CustodianError> {
+pub fn remote_stop_after_startup(handshake: &CustodianHandshake) -> Result<(), CustodianError> {
     match load_receipt(&handshake.identity.profile_id)? {
         Some(receipt) if constant_time_identity_eq(&receipt.identity, &handshake.identity) => {
             remote_stop(&handshake.identity)
