@@ -11,8 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::core::ports::process::{
-    CommandOutcome, CommandRunner as Trait, CommandSpec, ExitStatusInfo, ProcessCredentials,
-    ProcessError,
+    CommandOutcome, CommandSpec, ExitStatusInfo, ProcessCredentials, ProcessError,
 };
 
 /// What a recorded invocation looks like.
@@ -259,12 +258,6 @@ impl MockRunner {
     }
 }
 
-impl Trait for MockRunner {
-    async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
-        self.run_sync(spec)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,8 +267,7 @@ mod tests {
     async fn default_success_works() {
         let runner = MockRunner::with_default_success();
         let outcome = runner
-            .run(CommandSpec::oneshot("anything", vec!["arg".into()]))
-            .await
+            .run_sync(CommandSpec::oneshot("anything", vec!["arg".into()]))
             .unwrap();
         assert!(outcome.success());
         assert_eq!(runner.invocations().len(), 1);
@@ -297,11 +289,10 @@ mod tests {
         );
         // xtask:allow-protocol-leak: mock-runner test fixture, not a real wg-quick invocation
         let outcome = runner
-            .run(
+            .run_sync(
                 CommandSpec::oneshot("wg-quick", vec!["up".into(), "corp".into()])
                     .privilege(PrivilegeReq::Root),
             )
-            .await
             .unwrap();
         assert!(outcome.success());
         assert_eq!(outcome.stdout, b"ok");
@@ -316,9 +307,7 @@ mod tests {
             ScriptedOutcome::Failure("Address already in use".into()),
         );
         // xtask:allow-protocol-leak: mock-runner test fixture, not a real wg-quick invocation
-        let result = runner
-            .run(CommandSpec::oneshot("wg-quick", vec!["up".into()]))
-            .await;
+        let result = runner.run_sync(CommandSpec::oneshot("wg-quick", vec!["up".into()]));
         assert!(matches!(result, Err(ProcessError::NonZeroExit { .. })));
     }
 
@@ -334,9 +323,7 @@ mod tests {
             },
         );
         // xtask:allow-protocol-leak: mock-runner bound test, not a real wg invocation
-        let result = runner
-            .run(CommandSpec::oneshot("wg", Vec::new()).output_limit(16))
-            .await;
+        let result = runner.run_sync(CommandSpec::oneshot("wg", Vec::new()).output_limit(16));
         assert!(matches!(
             result,
             Err(ProcessError::OutputLimitExceeded { limit: 16, .. })
@@ -347,6 +334,6 @@ mod tests {
     #[should_panic(expected = "unexpected MockRunner call")]
     async fn unexpected_call_panics() {
         let runner = MockRunner::new();
-        let _ = runner.run(CommandSpec::oneshot("foo", vec![])).await;
+        let _ = runner.run_sync(CommandSpec::oneshot("foo", vec![]));
     }
 }

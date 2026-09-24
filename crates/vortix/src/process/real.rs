@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::ports::process::{
-    CommandOutcome, CommandRunner as Trait, CommandSpec, ExitStatusInfo, ManagedProcessId,
-    PrivilegeReq, ProcessError, ProcessLifecycle, ProcessOwnership,
+    CommandOutcome, CommandSpec, ExitStatusInfo, ManagedProcessId, PrivilegeReq, ProcessError,
+    ProcessLifecycle, ProcessOwnership,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -516,7 +516,7 @@ impl RealRunner {
 
     /// Synchronous wrapper around [`Trait::run`].
     pub fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
-        self.runtime.block_on(<Self as Trait>::run(self, spec))
+        self.runtime.block_on(self.run(spec))
     }
 
     fn check_privilege(spec: &CommandSpec) -> Result<(), ProcessError> {
@@ -687,9 +687,9 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-impl Trait for RealRunner {
+impl RealRunner {
     #[allow(clippy::too_many_lines)]
-    async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
+    pub async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
         Self::check_privilege(&spec)?;
 
         let started_at = SystemTime::now();

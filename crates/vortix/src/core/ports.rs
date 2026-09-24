@@ -887,19 +887,6 @@ pub mod process {
             source: std::io::Error,
         },
     }
-
-    /// The trait every subprocess invocation flows through.
-    ///
-    /// Implementations live in `vortix-process` (`RealRunner` for production, `MockRunner`
-    /// for tests). The trait uses native AFIT (Rust 1.75+); the `vortix-process` crate
-    /// provides a hand-dispatched enum wrapper that callers hold by value.
-    pub trait CommandRunner: Send + Sync {
-        /// Run a one-shot subprocess to completion.
-        fn run(
-            &self,
-            spec: CommandSpec,
-        ) -> impl std::future::Future<Output = Result<CommandOutcome, ProcessError>> + Send;
-    }
 }
 pub mod route_table {
     //! `RouteTable` port — system route inspection and exact scoped writes.

@@ -20,9 +20,8 @@ pub use real::{RealProcessLifecycle, RealRunner};
 // Re-export the port types so callers don't have to depend on vortix-core directly
 // just to construct specs.
 pub use crate::core::ports::process::{
-    CommandOutcome, CommandRunner as CommandRunnerTrait, CommandSpec, ExitStatusInfo,
-    ManagedProcessId, PrivilegeReq, ProcessCredentials, ProcessError, ProcessLifecycle,
-    ProcessOwnership,
+    CommandOutcome, CommandSpec, ExitStatusInfo, ManagedProcessId, PrivilegeReq,
+    ProcessCredentials, ProcessError, ProcessLifecycle, ProcessOwnership,
 };
 
 /// The enum carrier — held by value, dispatched statically.
@@ -37,7 +36,7 @@ impl CommandRunner {
     pub async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
         match self {
             CommandRunner::Real(r) => r.run(spec).await,
-            CommandRunner::Mock(m) => m.run(spec).await,
+            CommandRunner::Mock(m) => m.run_sync(spec),
         }
     }
 
@@ -76,22 +75,6 @@ impl CommandRunner {
         Self::Mock(MockRunner::with_default_success())
     }
 }
-
-impl Default for CommandRunner {
-    fn default() -> Self {
-        Self::mock_default_success()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Process-global runner — the migration seam used by all subprocess callsites.
-//
-// Plan 002 prescribes threading a `runner: CommandRunner` through the engine
-// and supporting functions. For the v1 migration we use a `OnceLock<...>` so
-// callsites can be replaced 1:1 without churning every API in the codebase.
-// Plan 003 (idea 3's `EngineHandle`) replaces this global with proper
-// dependency injection.
-// ---------------------------------------------------------------------------
 
 use std::sync::OnceLock;
 
@@ -163,11 +146,18 @@ pub fn set_global_runner(runner: CommandRunner) {
     let _ = GLOBAL_RUNNER.set(runner);
 }
 
-/// Get the process-wide runner. Lazily initialises with a default
-/// (mock-default-success) if no explicit runner has been set — which is the
-/// right behaviour for tests that don't touch subprocess paths.
+/// Get the process-wide runner. Unit tests that never install one get a
+/// mock that succeeds at every call; everything else gets the real runner,
+/// so a missing setup can never turn commands into silent successes.
 pub fn global_runner() -> &'static CommandRunner {
-    GLOBAL_RUNNER.get_or_init(CommandRunner::mock_default_success)
+    #[cfg(test)]
+    {
+        GLOBAL_RUNNER.get_or_init(CommandRunner::mock_default_success)
+    }
+    #[cfg(not(test))]
+    {
+        GLOBAL_RUNNER.get_or_init(CommandRunner::real)
+    }
 }
 
 /// Run a one-shot subprocess through the process-wide runner.
