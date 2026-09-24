@@ -35,13 +35,6 @@ pub const DEFAULT_PING_TIMEOUT: u64 = 2;
 pub const DEFAULT_CONNECT_TIMEOUT: u64 = 35;
 /// Default maximum seconds to wait for current-generation `WireGuard` evidence.
 pub const DEFAULT_WIREGUARD_HANDSHAKE_TIMEOUT: u64 = 20;
-/// Maximum seconds to wait for a local system command (`ps`, `lsof`, `ifconfig`, etc.)
-/// before killing it. This is a safety net against hung processes — it does NOT affect
-/// UI responsiveness because all scanner/netstats commands run in background threads.
-/// Keep low enough that a full scanner pass (5-6 commands) completes well within
-/// `DEFAULT_CONNECT_TIMEOUT`. Most commands finish in <1s; `lsof` can take 2-4s.
-#[cfg(target_os = "macos")]
-pub const CMD_TIMEOUT_SECS: u64 = 5;
 /// Default maximum seconds to wait for a VPN disconnect before force-killing.
 pub const DEFAULT_DISCONNECT_TIMEOUT: u64 = 30;
 /// Small actor/persistence allowance after a protocol or teardown gate.
@@ -59,10 +52,6 @@ pub const DEFAULT_CONNECT_RETRY_MAX_DELAY_SECS: u64 = 300;
 pub const DEFAULT_AUTO_RECONNECT: bool = true;
 /// Default delay (seconds) before auto-reconnecting after a network change.
 pub const DEFAULT_AUTO_RECONNECT_DELAY_SECS: u64 = 3;
-/// Network monitor gateway check interval in seconds.
-pub const NETWORK_MONITOR_POLL_SECS: u64 = 3;
-/// Duration of the panel flip animation in milliseconds.
-pub const FLIP_ANIMATION_DURATION_MS: u64 = 200;
 /// Target frame interval during flip animation (~40 FPS).
 pub const FLIP_ANIMATION_FRAME_MS: u64 = 25;
 
@@ -134,20 +123,12 @@ pub const TELEMETRY_STALE_FLOOR_SECS: u64 = 90;
 
 // === Platform-Specific Paths ===
 
-/// macOS pf configuration file path (privileged runtime dir, root-only).
-#[cfg(target_os = "macos")]
-pub const PF_CONF_PATH: &str = "/var/run/vortix/killswitch.conf";
-/// Legacy path from pre-v0.2 — cleaned up on first write to the new location.
-#[cfg(target_os = "macos")]
-pub const PF_CONF_PATH_LEGACY: &str = "/tmp/vortix_killswitch.conf";
 /// macOS `WireGuard` runtime directory.
 #[cfg(target_os = "macos")]
 pub const WIREGUARD_RUN_DIR: &str = "/var/run/wireguard";
 /// Linux network device statistics pseudo-file.
 #[cfg(target_os = "linux")]
 pub const PROC_NET_DEV_PATH: &str = "/proc/net/dev";
-/// System DNS resolver configuration file (both platforms).
-pub const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 /// Linux iptables custom chain name for kill switch.
 #[cfg(target_os = "linux")]
 pub const IPTABLES_CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
@@ -172,11 +153,6 @@ pub const LOG_CLEANUP_INTERVAL: u32 = 100;
 // === Scanner & Telemetry Internal Constants ===
 // These are internal tuning values not exposed to user configuration.
 
-/// Interval (seconds) between progress log messages while waiting for a VPN tunnel.
-pub const SCANNER_LOG_INTERVAL_SECS: u64 = 5;
-/// Maximum allowed drift (seconds) between scanner-reported uptime and local clock
-/// before re-syncing the session start time.
-pub const SESSION_TIME_DRIFT_SECS: u64 = 5;
 /// Timeout for file downloads in seconds.
 pub const HTTP_TIMEOUT_SECS: u64 = 10;
 /// Delay between retry attempts in milliseconds.
@@ -189,9 +165,6 @@ pub const RETRY_ATTEMPTS: u8 = 2;
 /// Fixed-width column for the log category label (e.g. `NET`, `TELEMETRY`).
 /// Must be >= the longest category used anywhere in the codebase.
 pub const LOG_CATEGORY_WIDTH: usize = 9;
-/// Total character width of the structured log prefix:
-/// `[HH:MM:SS] ` (12) + `ERROR ` (6) + category (`LOG_CATEGORY_WIDTH`) + `  ` (2).
-pub const LOG_PREFIX_WIDTH: usize = 12 + 6 + LOG_CATEGORY_WIDTH + 2;
 /// Number of data points in the network throughput chart (1 point per tick).
 pub const NETWORK_HISTORY_SIZE: usize = 60;
 /// Lines from the bottom at which the log panel re-enables auto-scroll.
@@ -226,9 +199,6 @@ pub const MSG_UNAVAILABLE: &str = "unavailable";
 
 // === Platform Defaults ===
 
-/// Default VPN interface when none is known.
-#[cfg(target_os = "macos")]
-pub const DEFAULT_VPN_INTERFACE: &str = "utun0";
 #[cfg(target_os = "linux")]
 pub const DEFAULT_VPN_INTERFACE: &str = "wg0";
 
@@ -251,31 +221,6 @@ pub const OPENVPN_RUN_DIR: &str = "run";
 /// crashed disconnect leaves an orphan that the next startup's session-
 /// liveness sweep collects unambiguously by name.
 pub const TMP_CONFIG_DIR: &str = "tmp";
-/// `OpenVPN` log line indicating successful tunnel establishment.
-pub const OVPN_LOG_SUCCESS: &str = "Initialization Sequence Completed";
-/// `OpenVPN` log patterns indicating definitive failure.
-pub const OVPN_LOG_ERRORS: &[&str] = &[
-    "AUTH_FAILED",
-    "TLS Error",
-    "TLS handshake failed",
-    "FATAL",
-    "Cannot open TUN/TAP",
-    "ERROR:",
-    "Exiting due to fatal error",
-    "Options error",
-];
-/// Polling interval for `OpenVPN` log file (milliseconds).
-pub const OVPN_LOG_POLL_MS: u64 = 500;
-/// Delay (ms) after `OpenVPN` fork before chowning pid/log files to the real user.
-pub const OVPN_CHOWN_DELAY_MS: u64 = 200;
-/// Seconds to wait before checking if the `OpenVPN` daemon is still alive.
-pub const OVPN_HEALTH_CHECK_DELAY_SECS: u64 = 2;
-/// Seconds to wait for the `OpenVPN` PID file to appear before declaring failure.
-pub const OVPN_PID_FILE_TIMEOUT_SECS: u64 = 3;
-/// Number of tail log lines to include in error messages when the daemon dies.
-pub const OVPN_ERROR_LOG_TAIL_LINES: usize = 5;
-/// Max seconds to wait for the `OpenVPN` daemon to exit after sending SIGTERM.
-pub const OVPN_KILL_WAIT_SECS: u64 = 10;
 /// Default `OpenVPN` `--verb` (verbosity) level passed to the daemon.
 pub const DEFAULT_OVPN_VERBOSITY: &str = "3";
 /// Subdirectory under the Vortix config dir for `OpenVPN` saved credentials.
@@ -337,27 +282,6 @@ pub const MSG_BATCH_IMPORTED: &str = "Imported ";
 pub const MSG_BATCH_IMPORTED_SUFFIX: &str = " profile(s)";
 
 // === Messages: CLI Output ===
-
-pub const CLI_MSG_DOWNLOADING: &str = "Downloading profile from URL...";
-pub const CLI_MSG_IMPORT_SUCCESS: &str = "Imported profile: ";
-pub const CLI_MSG_IMPORT_DETAILS_PROTO: &str = "   Protocol: ";
-pub const CLI_MSG_IMPORT_DETAILS_LOC: &str = "   Location: ";
-pub const CLI_MSG_IMPORT_DETAILS_PATH: &str = "   Saved to: ";
-pub const CLI_MSG_IMPORT_FAILED: &str = "Import failed: ";
-pub const CLI_MSG_SUMMARY_HEADER: &str = "\nImport Summary:";
-pub const CLI_MSG_SUMMARY_IMPORTED: &str = "   Imported: ";
-pub const CLI_MSG_SUMMARY_FAILED: &str = "   Failed: ";
-pub const CLI_MSG_NO_FILES: &str = "\nNo .conf or .ovpn files found in directory";
-pub const CLI_MSG_DIR_ERROR: &str = "Error reading directory: ";
-pub const CLI_MSG_ERROR: &str = "Error: ";
-
-pub const CLI_MSG_UPDATE_START: &str = "🔄 Updating vortix...\n";
-pub const CLI_MSG_UPDATE_SUCCESS: &str = "Successfully updated vortix!";
-pub const CLI_MSG_UPDATE_CHECK: &str = "   Run 'vortix --version' to see the new version.";
-pub const CLI_MSG_UPDATE_FAIL_MANUAL: &str = "\nUpdate failed. Please try manually:";
-pub const CLI_MSG_UPDATE_CMD: &str = "   cargo install vortix --force";
-pub const CLI_MSG_UPDATE_FAIL_CARGO: &str = "Failed to run cargo: ";
-pub const CLI_MSG_UPDATE_PATH_HINT: &str = "   Make sure cargo is installed and in your PATH.";
 
 // === Bug Report ===
 

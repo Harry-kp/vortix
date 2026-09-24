@@ -24,7 +24,6 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
 use ureq::config::{Config, IpFamily};
 use ureq::Agent;
 
@@ -105,24 +104,6 @@ pub fn get_text_v4_result(url: &str, timeout: Duration) -> Result<String, GetTex
         .body_mut()
         .read_to_string()
         .map_err(|_| GetTextError::Transport)
-}
-
-/// GET `url` over IPv4 with the given per-call timeout and deserialize the
-/// 2xx JSON body into `T`. Returns `None` for any error: timeout, DNS,
-/// connection, TLS, non-2xx, redirect, deserialization.
-#[must_use]
-pub fn get_json_v4<T: DeserializeOwned>(url: &str, timeout: Duration) -> Option<T> {
-    let mut response = ipv4_agent()
-        .get(url)
-        .config()
-        .timeout_global(Some(timeout))
-        .build()
-        .call()
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    response.body_mut().read_json::<T>().ok()
 }
 
 /// IPv6-only GET. Returns the trimmed response body (the host's public

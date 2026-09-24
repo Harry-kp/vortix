@@ -667,68 +667,6 @@ fn parse_ip_api_response(json: &str) -> Option<(String, Option<String>, Option<S
     Some((ip, isp, location))
 }
 
-/// Parsed ping output statistics.
-#[derive(Debug, Default, PartialEq)]
-pub struct PingStats {
-    pub latency_ms: u64,
-    pub packet_loss: f32,
-    pub jitter_ms: u64,
-}
-
-/// Parse ping command output to extract latency, packet loss, and jitter.
-///
-/// Handles both macOS and Linux output formats:
-/// - macOS: "round-trip min/avg/max/stddev = 1.234/5.678/9.012/3.456 ms"
-/// - Linux: "rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms"
-/// - macOS loss: "10 packets transmitted, 8 packets received, 20.0% packet loss"
-/// - Linux loss: "10 packets transmitted, 8 received, 20% packet loss, time 9001ms"
-#[must_use]
-pub fn parse_ping_output(output: &str) -> PingStats {
-    let mut stats = PingStats::default();
-
-    for line in output.lines() {
-        if line.contains("packet loss") {
-            if let Some(loss_idx) = line.find("% packet loss") {
-                let before_loss = &line[..loss_idx];
-                if let Some(percent_str) = before_loss
-                    .split([',', ' '])
-                    .filter(|s| !s.is_empty())
-                    .rfind(|s| s.chars().all(|c| c.is_ascii_digit() || c == '.'))
-                {
-                    if let Ok(val) = percent_str.parse::<f32>() {
-                        stats.packet_loss = val;
-                    }
-                }
-            }
-        }
-
-        // Handle both "min/avg/max/stddev" (Linux mdev) and "round-trip min/avg/max/stddev" (macOS)
-        if line.contains("min/avg/max") {
-            if let Some(eq_pos) = line.find('=') {
-                let values_str = &line[eq_pos + 1..].trim();
-                let values: Vec<&str> = values_str.split('/').collect();
-                if values.len() >= 4 {
-                    if let Ok(avg) = values[1].trim().parse::<f64>() {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        {
-                            stats.latency_ms = avg.max(0.0) as u64;
-                        }
-                    }
-                    let stddev_str = values[3].trim_end_matches(" ms").trim();
-                    if let Ok(stddev) = stddev_str.parse::<f64>() {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        {
-                            stats.jitter_ms = stddev.max(0.0) as u64;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    stats
-}
-
 // Note: `parse_proc_net_dev` and `parse_ip_addr_output` moved to
 // `vortix-platform-linux::network_stats` and `vortix-platform-linux::interface`
 // respectively.
@@ -874,57 +812,6 @@ mod tests {
     }
 
     // === Ping output parsing tests ===
-
-    #[test]
-    fn test_parse_ping_output_macos() {
-        let output = "\
-PING 1.1.1.1 (1.1.1.1): 56 data bytes
-64 bytes from 1.1.1.1: icmp_seq=0 ttl=57 time=1.234 ms
-64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=5.678 ms
-
---- 1.1.1.1 ping statistics ---
-10 packets transmitted, 10 packets received, 0.0% packet loss
-round-trip min/avg/max/stddev = 1.234/5.678/9.012/3.456 ms";
-
-        let stats = parse_ping_output(output);
-        assert_eq!(stats.latency_ms, 5); // avg 5.678 truncated to u64
-        assert!((stats.packet_loss - 0.0).abs() < f32::EPSILON);
-        assert_eq!(stats.jitter_ms, 3); // stddev 3.456 truncated to u64
-    }
-
-    #[test]
-    fn test_parse_ping_output_linux() {
-        let output = "\
-PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
-64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=1.23 ms
-64 bytes from 1.1.1.1: icmp_seq=2 ttl=57 time=5.67 ms
-
---- 1.1.1.1 ping statistics ---
-10 packets transmitted, 8 received, 20% packet loss, time 9001ms
-rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
-
-        let stats = parse_ping_output(output);
-        assert_eq!(stats.latency_ms, 5);
-        assert!((stats.packet_loss - 20.0).abs() < f32::EPSILON);
-        assert_eq!(stats.jitter_ms, 3);
-    }
-
-    #[test]
-    fn test_parse_ping_output_100_percent_loss() {
-        let output = "\
---- 1.1.1.1 ping statistics ---
-10 packets transmitted, 0 packets received, 100.0% packet loss";
-
-        let stats = parse_ping_output(output);
-        assert_eq!(stats.latency_ms, 0);
-        assert!((stats.packet_loss - 100.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_parse_ping_output_empty() {
-        let stats = parse_ping_output("");
-        assert_eq!(stats, PingStats::default());
-    }
 
     // /proc/net/dev and `ip addr` parsing tests moved to
     // `vortix-platform-linux::{network_stats, interface}` along with the

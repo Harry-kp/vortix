@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::core::ports::process::{
-    CommandOutcome, CommandRunner as Trait, CommandSpec, DetachedHandle, ExitStatusInfo,
-    ProcessCredentials, ProcessError,
+    CommandOutcome, CommandRunner as Trait, CommandSpec, ExitStatusInfo, ProcessCredentials,
+    ProcessError,
 };
 
 /// What a recorded invocation looks like.
@@ -20,7 +20,6 @@ use crate::core::ports::process::{
 pub struct RecordedInvocation {
     pub program: String,
     pub args: Vec<String>,
-    pub kind: crate::core::ports::process::Kind,
     pub env: std::collections::HashMap<String, String>,
     pub env_clear: bool,
     pub run_as: Option<ProcessCredentials>,
@@ -80,9 +79,6 @@ pub enum ScriptedOutcome {
     PrivilegeDenied,
     ProgramNotFound,
     Timeout,
-    Detached {
-        pid: u32,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -175,18 +171,6 @@ impl MockRunner {
         Self::map_run_outcome(spec, outcome)
     }
 
-    /// Synchronous `spawn_detached`.
-    ///
-    /// # Panics
-    ///
-    /// Panics on unmatched expectations (see [`Self::run_sync`]).
-    pub fn spawn_detached_sync(&self, spec: CommandSpec) -> Result<DetachedHandle, ProcessError> {
-        let outcome = self.next_outcome(&spec).unwrap_or_else(|msg| {
-            panic!("{msg}");
-        });
-        Self::map_detached_outcome(spec, outcome)
-    }
-
     fn map_run_outcome(
         spec: CommandSpec,
         outcome: ScriptedOutcome,
@@ -232,40 +216,6 @@ impl MockRunner {
                 program: spec.program,
                 duration: spec.timeout.unwrap_or(Duration::from_secs(30)),
             }),
-            ScriptedOutcome::Detached { .. } => {
-                panic!("ScriptedOutcome::Detached returned from run(); use spawn_detached")
-            }
-        }
-    }
-
-    fn map_detached_outcome(
-        spec: CommandSpec,
-        outcome: ScriptedOutcome,
-    ) -> Result<DetachedHandle, ProcessError> {
-        match outcome {
-            ScriptedOutcome::Detached { pid } => Ok(DetachedHandle {
-                pid,
-                spawned_at: SystemTime::now(),
-            }),
-            ScriptedOutcome::Success { .. } => Ok(DetachedHandle {
-                pid: 99999,
-                spawned_at: SystemTime::now(),
-            }),
-            ScriptedOutcome::Failure(stderr) => Err(ProcessError::NonZeroExit {
-                program: spec.program,
-                code: Some(1),
-                stderr: stderr.into_bytes(),
-            }),
-            ScriptedOutcome::PrivilegeDenied => Err(ProcessError::PrivilegeDenied {
-                program: spec.program,
-            }),
-            ScriptedOutcome::ProgramNotFound => Err(ProcessError::ProgramNotFound {
-                program: spec.program,
-            }),
-            ScriptedOutcome::Timeout => Err(ProcessError::Timeout {
-                program: spec.program,
-                duration: Duration::from_secs(30),
-            }),
         }
     }
 
@@ -274,7 +224,6 @@ impl MockRunner {
         inner.invocations.push(RecordedInvocation {
             program: spec.program.clone(),
             args: spec.args.clone(),
-            kind: spec.kind,
             env: spec.env.clone(),
             env_clear: spec.env_clear,
             run_as: spec.run_as.clone(),
@@ -313,10 +262,6 @@ impl MockRunner {
 impl Trait for MockRunner {
     async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
         self.run_sync(spec)
-    }
-
-    async fn spawn_detached(&self, spec: CommandSpec) -> Result<DetachedHandle, ProcessError> {
-        self.spawn_detached_sync(spec)
     }
 }
 
@@ -396,21 +341,6 @@ mod tests {
             result,
             Err(ProcessError::OutputLimitExceeded { limit: 16, .. })
         ));
-    }
-
-    #[tokio::test]
-    async fn detached_returns_pid() {
-        let runner = MockRunner::new();
-        runner.expect(
-            SpecMatcher::ExactProgram("openvpn".into()),
-            ScriptedOutcome::Detached { pid: 12345 },
-        );
-        // xtask:allow-protocol-leak: mock-runner test fixture, not a real openvpn invocation
-        let handle = runner
-            .spawn_detached(CommandSpec::detached("openvpn", vec!["--daemon".into()]))
-            .await
-            .unwrap();
-        assert_eq!(handle.pid, 12345);
     }
 
     #[tokio::test]

@@ -13,7 +13,6 @@ pub mod importer;
 pub mod journal;
 pub mod killswitch;
 pub mod managed_wireguard;
-pub mod network_monitor;
 pub mod openvpn_routes;
 pub mod ports;
 pub mod profile;
@@ -26,7 +25,7 @@ pub mod state;
 pub mod telemetry;
 pub mod telemetry_http;
 
-pub use cidr::{claims_default_route_v4, claims_default_route_v6, Cidr};
+pub use cidr::{claims_default_route_v6, Cidr};
 pub use cidr_subtract::cidr_subtract;
 pub use scanner::{get_active_profiles, ActiveSession};
 pub use telemetry::{spawn_telemetry_worker, TelemetryUpdate};

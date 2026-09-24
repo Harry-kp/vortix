@@ -213,31 +213,6 @@ pub fn update_health(
     Ok(Some(prior))
 }
 
-/// Remove a display receipt only after a scanner pass proves this profile's
-/// interface absent. The receipt itself is never sufficient to tear down it.
-pub fn remove_after_absence(
-    config_dir: &Path,
-    profile_id: &ProfileId,
-    active: &[ActiveSession],
-) -> std::io::Result<bool> {
-    let _lock = acquire_lock(config_dir)?;
-    let Some(receipt) = load(config_dir, profile_id) else {
-        return Ok(false);
-    };
-    if active
-        .iter()
-        .any(|session| receipt.interface_name == session.interface)
-    {
-        return Ok(false);
-    }
-    let path = receipt_path(config_dir, profile_id);
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
 /// Remove after the caller has already established exact profile absence.
 pub fn remove_after_confirmed_absence(
     config_dir: &Path,
@@ -250,23 +225,6 @@ pub fn remove_after_confirmed_absence(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
-}
-
-/// Remove only when the platform's non-mutating interface resolver confirms
-/// that the profile no longer maps to a kernel `WireGuard` interface.
-pub fn remove_after_kernel_absence(
-    config_dir: &Path,
-    profile_id: &ProfileId,
-    profile_name: &str,
-) -> std::io::Result<bool> {
-    if crate::platform::current_platform()
-        .interface
-        .resolve_wireguard_interface(profile_name)
-        .is_some()
-    {
-        return Ok(false);
-    }
-    remove_after_confirmed_absence(config_dir, profile_id)
 }
 
 fn save(config_dir: &Path, receipt: &ManagedWireGuardReceipt) -> std::io::Result<()> {
@@ -439,30 +397,6 @@ mod tests {
         let mut wrong_interface = session.clone();
         wrong_interface.interface = "wg1".into();
         assert!(!receipt.validates(&profile, &wrong_interface));
-    }
-
-    #[test]
-    fn removal_requires_confirmed_absence() {
-        let dir = tempfile::tempdir().unwrap();
-        let profile = ProfileId::new("stable-profile");
-        let at = SystemTime::now();
-        issue(
-            dir.path(),
-            &profile,
-            "wg0".into(),
-            1,
-            evidence(1, at),
-            Vec::new(),
-        )
-        .unwrap();
-        let present = ActiveSession {
-            interface: "wg0".into(),
-            ..ActiveSession::default()
-        };
-        assert!(!remove_after_absence(dir.path(), &profile, &[present]).unwrap());
-        assert!(load(dir.path(), &profile).is_some());
-        assert!(remove_after_absence(dir.path(), &profile, &[]).unwrap());
-        assert!(load(dir.path(), &profile).is_none());
     }
 
     #[test]

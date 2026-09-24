@@ -11,7 +11,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use crate::core::ports::tunnel::{ParseError, ParsedProfile};
+use crate::core::ports::tunnel::ParseError;
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_PEERS: usize = 256;
@@ -84,16 +84,9 @@ enum Section {
     Peer,
 }
 
-impl ParsedProfile for WgParsedProfile {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn dns_servers(&self) -> Vec<String> {
-        self.dns_servers.clone()
-    }
-
-    fn dns_request(&self) -> crate::core::ports::dns::DnsRequest {
+impl WgParsedProfile {
+    #[must_use]
+    pub fn dns_request(&self) -> crate::core::ports::dns::DnsRequest {
         crate::core::ports::dns::DnsRequest {
             servers: self
                 .dns_servers

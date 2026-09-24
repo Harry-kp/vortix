@@ -10,11 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::profile::ProfileId;
 
-/// How long the engine waits for a connect/reconnect to succeed before
-/// declaring the retry budget exhausted. Per the brainstorm: 300s default,
-/// configurable via the settings `[engine] retry_budget_secs`.
-pub const DEFAULT_RETRY_BUDGET_SECS: u64 = 300;
-
 /// Why a previous connect or reconnect attempt ended in `Disconnected`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]

@@ -62,10 +62,6 @@ fn parse_scoped_id(value: &str, prefix: &str) -> Option<(u64, u64)> {
 #[serde(transparent)]
 pub struct AuthorityEpoch(pub u64);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PolicyDigest(pub String);
-
 /// Identity of one tunnel generation, recorded with its ownership receipts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TunnelRevision {

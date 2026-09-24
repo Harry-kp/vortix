@@ -83,7 +83,6 @@ pub(crate) fn process_group_has_live_members(_group_id: u32) -> std::io::Result<
 compile_error!("Vortix currently only supports macOS and Linux");
 
 // Re-export platform constants from the centralized constants module for convenience.
-pub use crate::constants::DEFAULT_VPN_INTERFACE;
 pub use crate::constants::KILLSWITCH_EMERGENCY_MSG;
 
 // Capability ports now live in `vortix-core::ports::*`.

@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::core::profile::{Profile, ProfileId, ProtocolKind};
+use crate::core::profile::{Profile, ProfileId};
 
 pub mod mock;
 
@@ -149,15 +149,6 @@ impl TunnelPeerStatus {
     }
 }
 
-/// Per-protocol introspection blob returned by [`Tunnel::status`].
-///
-/// Boxed so concrete protocols can carry their own peer / route shapes. Use
-/// the `as_any` downcast hook when the TUI needs to render per-protocol
-/// detail.
-pub trait ProtocolStatus: std::fmt::Debug + Send + Sync {
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
 /// Snapshot of the current tunnel state.
 #[derive(Debug)]
 pub struct TunnelStatus {
@@ -167,7 +158,6 @@ pub struct TunnelStatus {
     pub last_handshake: Option<SystemTime>,
     pub observed_at: SystemTime,
     pub peers: Vec<TunnelPeerStatus>,
-    pub detail: Box<dyn ProtocolStatus>,
 }
 
 /// Immutable handshake attempt fence captured before interface creation.
@@ -267,43 +257,6 @@ pub fn classify_peer_handshake_health(
     }
 }
 
-/// Compile-time capability advertisement, returned `const` per impl.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)] // capability struct is intentionally feature-flag-shaped
-pub struct TunnelCapabilities {
-    pub supports_split_tunnel: bool,
-    pub supports_ipv6: bool,
-    pub mtu_configurable: bool,
-    pub supports_reconnect_without_disconnect: bool,
-    pub requires_root: bool,
-    pub userspace: bool,
-}
-
-/// Parsed protocol-specific profile body.
-///
-/// Returned by [`Tunnel::parse_profile`]. The engine treats this as opaque;
-/// each protocol crate downcasts via `as_any` when it needs the concrete
-/// shape.
-pub trait ParsedProfile: std::fmt::Debug + Send + Sync {
-    fn as_any(&self) -> &dyn std::any::Any;
-
-    /// DNS servers this profile expects the system to apply (used to surface
-    /// `resolvconf` dependency hints before connect). Empty when the profile
-    /// has no `DNS = ...` directive.
-    fn dns_servers(&self) -> Vec<String> {
-        self.dns_request()
-            .servers
-            .into_iter()
-            .map(|server| server.to_string())
-            .collect()
-    }
-
-    /// Typed DNS intent extracted without applying platform state.
-    fn dns_request(&self) -> crate::core::ports::dns::DnsRequest {
-        crate::core::ports::dns::DnsRequest::default()
-    }
-}
-
 /// Errors a `Tunnel::up` / `down` / `status` call can return.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -337,20 +290,14 @@ pub enum TunnelError {
     Other(String),
 }
 
-/// Errors [`Tunnel::parse_profile`] can return.
+/// Errors a profile parser can return.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ParseError {
-    #[error("invalid encoding: {0}")]
-    Encoding(String),
-    #[error("missing required field `{0}`")]
-    MissingField(&'static str),
     #[error("malformed value for `{field}`: {detail}")]
     MalformedField { field: &'static str, detail: String },
     #[error("unsupported profile feature: {0}")]
     Unsupported(String),
-    #[error("{0}")]
-    Other(String),
 }
 
 /// The per-protocol adapter the engine drives.
@@ -377,22 +324,6 @@ pub trait Tunnel {
     ///
     /// Returns [`TunnelError`] when the underlying subprocess query fails.
     fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError>;
-
-    /// Parse raw profile bytes (typically a `.conf` or `.ovpn` file) into a
-    /// protocol-specific [`ParsedProfile`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ParseError`] on encoding errors, missing/malformed required
-    /// fields, or unsupported profile features.
-    fn parse_profile(&self, raw: &[u8]) -> Result<Box<dyn ParsedProfile>, ParseError>;
-
-    /// Capabilities of this protocol impl.
-    fn capabilities(&self) -> TunnelCapabilities;
-
-    /// Tag this impl reports — used by `TunnelHandle::kind` and by the engine
-    /// when dispatching back to the right `TunnelKind` variant.
-    fn kind_tag(&self) -> TunnelKindTag;
 }
 
 /// Marker contract for scanner evidence accepted for future ownership
@@ -465,17 +396,6 @@ impl AdoptionEvidence {
     pub fn protocol_attestation(&self) -> &str {
         &self.protocol_attestation
     }
-}
-
-/// Convenience: builds a [`Profile`] for tests / quick prototypes.
-#[must_use]
-pub fn test_profile(id: &str, protocol: ProtocolKind) -> Profile {
-    Profile::new(
-        ProfileId::new(id),
-        id,
-        protocol,
-        std::path::PathBuf::from(format!("/tmp/{id}.conf")),
-    )
 }
 
 // ───────────────────────────────────────────────────────────────────────────

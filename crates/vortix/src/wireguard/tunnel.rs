@@ -9,9 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::ports::tunnel::{
-    HandshakeAttempt, ParseError, ParsedProfile, ProbeReceipt, ProtocolStatus, Tunnel,
-    TunnelCapabilities, TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag,
-    TunnelPeerStatus, TunnelStatus, TunnelTeardownConfig,
+    HandshakeAttempt, ProbeReceipt, Tunnel, TunnelError, TunnelExecutionContext, TunnelHandle,
+    TunnelKindTag, TunnelPeerStatus, TunnelStatus, TunnelTeardownConfig,
 };
 use crate::core::profile::Profile;
 use crate::process::{CommandSpec, PrivilegeReq};
@@ -476,12 +475,6 @@ pub struct WgStatus {
     pub interface_public_key: String,
     pub listen_port: Option<u16>,
     pub peers: Vec<TunnelPeerStatus>,
-}
-
-impl ProtocolStatus for WgStatus {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 fn parse_unix_timestamp(
@@ -1113,22 +1106,6 @@ fn wait_for_interface_absence(interface_name: &str, timeout: Duration) -> bool {
     }
 }
 
-/// Select the first configured target covered by a peer route. Selection is
-/// deterministic and side-effect-free so split-tunnel preflight runs before
-/// `wg-quick up`.
-#[must_use]
-pub fn select_health_probe(
-    parsed: &crate::wireguard::parser::WgParsedProfile,
-    health_targets: &[IpAddr],
-) -> Option<IpAddr> {
-    parsed.peers.iter().find_map(|peer| {
-        health_targets
-            .iter()
-            .copied()
-            .find(|target| peer_covers_target(peer, *target))
-    })
-}
-
 /// Decide the kernel-visible interface name for a `WireGuard` tunnel
 /// based on the config basename and the platform port's
 /// `resolve_wireguard_interface` result.
@@ -1574,7 +1551,7 @@ impl Tunnel for WgTunnel {
             .iter()
             .filter_map(|peer| peer.latest_handshake)
             .max();
-        let peers = detail.peers.clone();
+        let peers = detail.peers;
         Ok(TunnelStatus {
             handle: handle.clone(),
             bytes_rx,
@@ -1582,30 +1559,7 @@ impl Tunnel for WgTunnel {
             last_handshake,
             observed_at,
             peers,
-            detail: Box::new(detail),
         })
-    }
-
-    fn parse_profile(&self, raw: &[u8]) -> Result<Box<dyn ParsedProfile>, ParseError> {
-        let text = std::str::from_utf8(raw)
-            .map_err(|e| ParseError::Encoding(format!("WireGuard .conf must be UTF-8: {e}")))?;
-        let parsed = parse_wg_conf(text)?;
-        Ok(Box::new(parsed))
-    }
-
-    fn capabilities(&self) -> TunnelCapabilities {
-        TunnelCapabilities {
-            supports_split_tunnel: false,
-            supports_ipv6: true,
-            mtu_configurable: true,
-            supports_reconnect_without_disconnect: true,
-            requires_root: true,
-            userspace: false,
-        }
-    }
-
-    fn kind_tag(&self) -> TunnelKindTag {
-        TunnelKindTag::WireGuard
     }
 }
 
@@ -1624,14 +1578,6 @@ mod tests {
         )
         .with_endpoint_resolutions(resolutions)
         .require_managed_endpoint_resolution()
-    }
-
-    #[test]
-    fn capabilities_match_kernel_wireguard() {
-        let caps = WgTunnel::new().capabilities();
-        assert!(caps.requires_root);
-        assert!(caps.supports_ipv6);
-        assert!(!caps.userspace);
     }
 
     #[test]

@@ -239,37 +239,6 @@ pub fn format_bytes_speed(bytes: u64) -> String {
     }
 }
 
-/// Checks if an IP address belongs to a private network range (RFC1918).
-///
-/// # Arguments
-///
-/// * `ip` - The IP address to check
-///
-/// # Returns
-///
-/// `true` if the IP is in a private range (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-#[must_use]
-pub fn is_private_ip(ip: &str) -> bool {
-    // Parse IP octets
-    let parts: Vec<&str> = ip.split('.').collect();
-    if parts.len() != 4 {
-        return false;
-    }
-
-    let octets: Result<Vec<u8>, _> = parts.iter().map(|p| p.parse::<u8>()).collect();
-    let Ok(octets) = octets else {
-        return false;
-    };
-
-    // Check private ranges
-    match octets[0] {
-        10 => true,                                    // 10.0.0.0/8
-        172 if (16..=31).contains(&octets[1]) => true, // 172.16.0.0/12
-        192 if octets[1] == 168 => true,               // 192.168.0.0/16
-        _ => false,
-    }
-}
-
 /// Returns the application configuration directory path.
 ///
 /// Reads from the process-wide config dir set at startup via
@@ -616,22 +585,6 @@ pub fn cleanup_openvpn_run_files(profile_key: &str) {
     }
 }
 
-/// Reads the PID from an `OpenVPN` pid file.
-#[must_use]
-pub fn read_openvpn_pid(profile_key: &str) -> Option<u32> {
-    let (pid_path, _) = get_openvpn_run_paths(profile_key).ok()?;
-    let content = std::fs::read_to_string(&pid_path).ok()?;
-    content.trim().parse::<u32>().ok()
-}
-
-/// Read a canonical ID-keyed PID, falling back to an unambiguous legacy
-/// name-keyed artifact created by an older Vortix release.
-#[must_use]
-pub fn read_openvpn_pid_compat(profile_id: &str, legacy_display_name: &str) -> Option<u32> {
-    read_openvpn_pid(profile_id)
-        .or_else(|| unambiguous_legacy_artifact_key(legacy_display_name).and_then(read_openvpn_pid))
-}
-
 /// Remove canonical ID-keyed run files and, when collision-free, legacy
 /// name-keyed files. Ambiguous sanitized legacy names are deliberately left
 /// for manual cleanup rather than risking another profile's active daemon.
@@ -642,76 +595,6 @@ pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &
             cleanup_openvpn_run_files(legacy_key);
         }
     }
-}
-
-/// Path of the transient SCRV1 envelope auth file used for
-/// static-challenge connects.
-///
-/// The connect path writes the envelope here, openvpn consumes it via
-/// `--auth-user-pass`, and the protocol layer deletes it immediately
-/// after the daemon fork. The canonical `<safe>.auth` is never
-/// touched during connect — no race window for async callers to lose
-/// against.
-///
-/// # Errors
-///
-/// Returns an error if the auth directory cannot be resolved or created.
-pub fn get_openvpn_scrv1_auth_path(profile_key: &str) -> std::io::Result<std::path::PathBuf> {
-    validate_openvpn_artifact_key(profile_key)?;
-    let root = get_app_config_dir()?;
-    let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
-
-    if !auth_dir.exists() {
-        create_user_dir(&auth_dir)?;
-    }
-
-    Ok(auth_dir.join(format!("{profile_key}.scrv1.auth")))
-}
-
-/// Write a transient 3-line credentials bundle for the `OpenVPN`
-/// management-socket auth flow. The protocol layer reads this file, drives the
-/// `--management` socket dance with the embedded user/pass/otp, then
-/// deletes the file. Each line is `<value>` followed by `\n`:
-///
-/// ```text
-/// <username>\n
-/// <password>\n
-/// <otp>\n
-/// ```
-///
-/// This is NOT an `OpenVPN` auth-user-pass file — `OpenVPN` 2.7 doesn't
-/// consult `--auth-user-pass <file>` for the static-challenge case
-/// (the prompt fires before the file is read; see the spike
-/// outcome in the plan). The credentials reach openvpn via the
-/// management socket, not via the file.
-///
-/// # Errors
-///
-/// Returns an error if the file write fails.
-#[cfg(unix)]
-pub fn write_openvpn_scrv1_auth_file(
-    profile_name: &str,
-    username: &str,
-    password: &str,
-    otp: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    use crate::core::secret_file::{write_secret_file, SecretFileError};
-
-    let auth_path = get_openvpn_scrv1_auth_path(profile_name)?;
-
-    match std::fs::remove_file(&auth_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-
-    let body = format!("{username}\n{password}\n{otp}\n");
-    write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
-        SecretFileError::Io(io) => io,
-        other => std::io::Error::other(other.to_string()),
-    })?;
-
-    Ok(auth_path)
 }
 
 /// Non-Unix fallback: same 3-line bundle, no chmod.
@@ -726,13 +609,6 @@ pub fn write_openvpn_scrv1_auth_file(
     let body = format!("{username}\n{password}\n{otp}\n");
     write_user_file(&auth_path, body)?;
     Ok(auth_path)
-}
-
-/// Delete the static-challenge SCRV1 auth file for a profile if present.
-pub fn delete_openvpn_scrv1_auth_file(profile_name: &str) {
-    if let Ok(auth_path) = get_openvpn_scrv1_auth_path(profile_name) {
-        let _ = std::fs::remove_file(&auth_path);
-    }
 }
 
 /// Read a .ovpn config and return the `static-challenge` prompt text if the
@@ -1714,44 +1590,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_private_ip_class_a() {
-        assert!(is_private_ip("10.0.0.1"));
-        assert!(is_private_ip("10.255.255.255"));
-        assert!(is_private_ip("10.1.2.3"));
-    }
-
-    #[test]
-    fn test_is_private_ip_class_b() {
-        assert!(is_private_ip("172.16.0.1"));
-        assert!(is_private_ip("172.31.255.255"));
-        assert!(is_private_ip("172.20.10.5"));
-    }
-
-    #[test]
-    fn test_is_private_ip_class_c() {
-        assert!(is_private_ip("192.168.0.1"));
-        assert!(is_private_ip("192.168.255.255"));
-        assert!(is_private_ip("192.168.1.100"));
-    }
-
-    #[test]
-    fn test_is_private_ip_public() {
-        assert!(!is_private_ip("8.8.8.8"));
-        assert!(!is_private_ip("1.2.3.4"));
-        assert!(!is_private_ip("172.15.0.1")); // Just outside 172.16.0.0/12
-        assert!(!is_private_ip("172.32.0.1")); // Just outside 172.16.0.0/12
-        assert!(!is_private_ip("192.169.0.1")); // Not 192.168
-    }
-
-    #[test]
-    fn test_is_private_ip_invalid() {
-        assert!(!is_private_ip("999.999.999.999"));
-        assert!(!is_private_ip("not.an.ip.address"));
-        assert!(!is_private_ip("10.0.0"));
-        assert!(!is_private_ip(""));
-    }
-
-    #[test]
     fn test_get_unique_path_no_collision() {
         let dir = tempfile::Builder::new()
             .prefix("vortix_test_")
@@ -1885,31 +1723,6 @@ mod tests {
             .unwrap();
         crate::config::set_config_dir(dir.path().to_path_buf());
         (dir, guard)
-    }
-
-    #[test]
-    fn scrub_deletes_scrv1_bundle_and_leaves_canonical_auth_alone() {
-        let _tmp = set_temp_config_dir();
-        // Plain canonical `<safe>.auth` (should survive scrub) and a
-        // transient `<safe>.scrv1.auth` bundle (should be deleted).
-        let auth_dir = get_app_config_dir()
-            .unwrap()
-            .join(crate::constants::OPENVPN_AUTH_DIR);
-        create_user_dir(&auth_dir).unwrap();
-        let plain = auth_dir.join("scrub-plain.auth");
-        std::fs::write(&plain, "u\np\n").unwrap();
-        let bundle = write_openvpn_scrv1_auth_file("scrub-bundle", "u", "p", "123456").unwrap();
-        assert!(plain.exists());
-        assert!(bundle.exists());
-
-        scrub_stale_scrv1_auth_files();
-
-        assert!(plain.exists(), "canonical .auth file must survive scrub");
-        assert!(
-            !bundle.exists(),
-            ".scrv1.auth bundle must be deleted by scrub"
-        );
-        std::fs::remove_file(plain).unwrap();
     }
 
     #[test]

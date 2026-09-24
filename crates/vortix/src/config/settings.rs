@@ -4,7 +4,7 @@
 //! user file (`${XDG_CONFIG_HOME}/vortix/settings.toml`, SUDO_USER-aware) →
 //! `VORTIX_*` env vars → CLI overrides.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
@@ -183,18 +183,6 @@ impl From<figment::Error> for SettingsError {
 }
 
 impl Settings {
-    /// Default loader: discover the user config path, merge in standard
-    /// system + env layers, return the resolved `Settings`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SettingsError`] when a layer fails to parse or the user
-    /// config dir cannot be resolved.
-    pub fn load() -> Result<Self, SettingsError> {
-        let user_path = user_config_path()?;
-        Self::load_from(None, Some(&user_path))
-    }
-
     /// Load settings from the already-resolved application configuration
     /// directory. This is the authoritative production entry point: the
     /// same `--config-dir` / `VORTIX_CONFIG_DIR` / sudo-user decision that
@@ -206,16 +194,6 @@ impl Settings {
     /// cannot be decoded.
     pub fn load_from_config_dir(config_dir: &Path) -> Result<Self, SettingsError> {
         Self::load_from(None, Some(&config_dir.join("settings.toml")))
-    }
-
-    /// Load settings with compatibility values supplied by the legacy
-    /// `config.toml` engine fields. Explicit `settings.toml` and
-    /// `VORTIX_ENGINE__*` values still win; the legacy values are only the
-    /// defaults layer. This is the migration bridge while `config.toml`
-    /// remains accepted by older installations.
-    pub fn load_with_engine_defaults(engine: EngineSettings) -> Result<Self, SettingsError> {
-        let user_path = user_config_path()?;
-        Self::load_from_with_engine_defaults(None, Some(&user_path), engine)
     }
 
     /// Load compatibility defaults and then layer the authoritative
@@ -232,7 +210,7 @@ impl Settings {
         Self::load_from_with_engine_defaults(None, Some(&config_dir.join("settings.toml")), engine)
     }
 
-    /// Same as [`Self::load`] but with explicit `system` and `user` paths
+    /// Load with explicit `system` and `user` paths
     /// (`None` skips that layer). Useful for tests.
     ///
     /// # Errors
@@ -272,37 +250,6 @@ impl Settings {
         validate_hooks(&s.hooks)?;
         Ok(s)
     }
-}
-
-/// Resolve `${XDG_CONFIG_HOME}/vortix/settings.toml` with `SUDO_USER` awareness.
-///
-/// When running under `sudo` we want the *invoking* user's config, not
-/// root's — mirrors the existing binary-side `resolve_config_dir`.
-pub fn user_config_path() -> Result<PathBuf, SettingsError> {
-    use directories::ProjectDirs;
-
-    // If we're root and SUDO_USER is set, resolve the user dir manually.
-    #[cfg(unix)]
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        if !sudo_user.is_empty() {
-            if let Some(home) = sudo_home(&sudo_user) {
-                return Ok(home.join(".config").join("vortix").join("settings.toml"));
-            }
-        }
-    }
-
-    let pd = ProjectDirs::from("", "", "vortix").ok_or(SettingsError::NoConfigDir)?;
-    Ok(pd.config_dir().join("settings.toml"))
-}
-
-#[cfg(unix)]
-fn sudo_home(user: &str) -> Option<PathBuf> {
-    // /etc/passwd-style lookup via getpwnam would be heavier; use `$HOME`
-    // fallback (the user's interactive shell sets it).
-    if std::env::var("USER").as_deref() == Ok(user) {
-        return std::env::var("HOME").ok().map(PathBuf::from);
-    }
-    None
 }
 
 #[cfg(not(unix))]

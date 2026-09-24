@@ -16,8 +16,7 @@ use zeroize::Zeroizing;
 use crate::core::ids::OperationId;
 use crate::core::ports::process::ManagedProcessId;
 use crate::core::ports::tunnel::{
-    ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
-    TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelStatus,
+    Tunnel, TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelStatus,
 };
 use crate::core::profile::{unambiguous_legacy_artifact_key, Profile, ProfileId};
 use crate::core::secret::Secret;
@@ -639,18 +638,6 @@ impl OvpnTunnel {
     }
 }
 
-/// `OpenVPN`-specific status (placeholder; richer parsing planned).
-#[derive(Debug, Default)]
-pub struct OvpnStatus {
-    pub pid: Option<u32>,
-}
-
-impl ProtocolStatus for OvpnStatus {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 /// Anchor phrases `OpenVPN` writes to its log when it brings the kernel
 /// interface up. The device name immediately follows the anchor and is
 /// extracted as a single whitespace-delimited token.
@@ -1257,30 +1244,7 @@ impl Tunnel for OvpnTunnel {
             last_handshake: None,
             observed_at: SystemTime::now(),
             peers: Vec::new(),
-            detail: Box::new(OvpnStatus { pid: handle.pid }),
         })
-    }
-
-    fn parse_profile(&self, raw: &[u8]) -> Result<Box<dyn ParsedProfile>, ParseError> {
-        let text = std::str::from_utf8(raw)
-            .map_err(|e| ParseError::Encoding(format!("OpenVPN .ovpn must be UTF-8: {e}")))?;
-        let parsed = parse_ovpn_conf(text)?;
-        Ok(Box::new(parsed))
-    }
-
-    fn capabilities(&self) -> TunnelCapabilities {
-        TunnelCapabilities {
-            supports_split_tunnel: false,
-            supports_ipv6: true,
-            mtu_configurable: false,
-            supports_reconnect_without_disconnect: false,
-            requires_root: true,
-            userspace: false,
-        }
-    }
-
-    fn kind_tag(&self) -> TunnelKindTag {
-        TunnelKindTag::OpenVpn
     }
 }
 
@@ -1300,14 +1264,6 @@ fn cleanup_startup_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn capabilities_match_openvpn() {
-        let caps = OvpnTunnel::default().capabilities();
-        assert!(caps.requires_root);
-        assert!(!caps.userspace);
-        assert!(!caps.supports_reconnect_without_disconnect);
-    }
 
     #[test]
     fn canonical_generation_and_operation_fence_standard_custodian_identity() {

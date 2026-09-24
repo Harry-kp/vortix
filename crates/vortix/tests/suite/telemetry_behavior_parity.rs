@@ -121,13 +121,6 @@ fn write_response(stream: &mut TcpStream, path: &str) {
     let _ = stream.flush();
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct MockJsonBody {
-    ip: String,
-    isp: String,
-    city: String,
-}
-
 #[test]
 fn get_text_returns_body_on_200() {
     let server = spawn_mock_server();
@@ -172,17 +165,6 @@ fn get_text_times_out_within_budget() {
         elapsed < Duration::from_millis(350),
         "timeout should fire within the 100ms budget, elapsed: {elapsed:?}"
     );
-}
-
-#[test]
-fn get_json_deserializes_typed_response() {
-    let server = spawn_mock_server();
-    let parsed: MockJsonBody =
-        telemetry_http::get_json_v4(&server.url("/json"), Duration::from_secs(2))
-            .expect("expected JSON deserialization");
-    assert_eq!(parsed.ip, "198.51.100.42");
-    assert_eq!(parsed.isp, "Acme ISP");
-    assert_eq!(parsed.city, "Townsville");
 }
 
 #[test]

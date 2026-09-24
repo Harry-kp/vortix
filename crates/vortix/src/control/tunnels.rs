@@ -22,9 +22,7 @@ use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 use crate::state::Protocol;
 
-use crate::core::ports::tunnel::{
-    ParseError, ParsedProfile, Tunnel, TunnelCapabilities, TunnelError, TunnelStatus,
-};
+use crate::core::ports::tunnel::{Tunnel, TunnelError, TunnelStatus};
 use crate::openvpn::OvpnTunnel;
 use crate::state::VpnProfile;
 use crate::wireguard::WgTunnel;
@@ -410,32 +408,6 @@ impl TunnelKind {
         }
     }
 
-    pub fn parse_profile(&self, raw: &[u8]) -> Result<Box<dyn ParsedProfile>, ParseError> {
-        match self {
-            Self::WireGuard(t) => t.parse_profile(raw),
-            Self::OpenVpn(t) => t.parse_profile(raw),
-            Self::Mock(t) => t.parse_profile(raw),
-        }
-    }
-
-    #[must_use]
-    pub fn capabilities(&self) -> TunnelCapabilities {
-        match self {
-            Self::WireGuard(t) => t.capabilities(),
-            Self::OpenVpn(t) => t.capabilities(),
-            Self::Mock(t) => t.capabilities(),
-        }
-    }
-
-    #[must_use]
-    pub fn kind_tag(&self) -> TunnelKindTag {
-        match self {
-            Self::WireGuard(t) => t.kind_tag(),
-            Self::OpenVpn(t) => t.kind_tag(),
-            Self::Mock(t) => t.kind_tag(),
-        }
-    }
-
     /// Compensate a protocol attempt that unwound before returning a handle.
     pub fn compensate_inflight(&mut self) -> Result<(), String> {
         match self {
@@ -513,15 +485,6 @@ impl crate::core::ports::tunnel::Tunnel for TunnelKind {
     }
     fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
         TunnelKind::status(self, handle)
-    }
-    fn parse_profile(&self, raw: &[u8]) -> Result<Box<dyn ParsedProfile>, ParseError> {
-        TunnelKind::parse_profile(self, raw)
-    }
-    fn capabilities(&self) -> TunnelCapabilities {
-        TunnelKind::capabilities(self)
-    }
-    fn kind_tag(&self) -> TunnelKindTag {
-        TunnelKind::kind_tag(self)
     }
 }
 

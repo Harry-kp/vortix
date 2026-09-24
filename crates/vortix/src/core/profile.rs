@@ -183,8 +183,7 @@ impl std::fmt::Display for ProtocolKind {
 ///
 /// The engine and app continue to hold the richer `VpnProfile`; they build a
 /// `Profile` view of it when invoking the trait. Protocol-specific parsed
-/// state lives in the per-protocol crate's `ParsedProfile` impl, attached
-/// here via the per-protocol crate's `ParsedProfile` impl.
+/// state lives in each protocol module's parser.
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub id: ProfileId,

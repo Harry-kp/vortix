@@ -9,4 +9,4 @@ pub mod parser;
 pub mod tunnel;
 
 pub use parser::WgParsedProfile;
-pub use tunnel::{select_health_probe, WgTunnel};
+pub use tunnel::WgTunnel;

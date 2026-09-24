@@ -253,21 +253,6 @@ pub fn err_not_found(profile: &str) -> CliError {
     }
 }
 
-/// Convenience: build a `CliError` for missing dependencies.
-#[must_use]
-pub fn err_dependency_missing(deps: &[String]) -> CliError {
-    CliError {
-        code: "dependency_missing",
-        message: format!("Missing dependencies: {}", deps.join(", ")),
-        hint: Some(
-            deps.iter()
-                .map(|d| format!("Install: {}", crate::platform::install_hint(d)))
-                .collect::<Vec<_>>()
-                .join("; "),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

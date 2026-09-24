@@ -10,13 +10,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::ports::process::{
-    CommandOutcome, CommandRunner as Trait, CommandSpec, DetachedHandle, ExitStatusInfo, Kind,
-    ManagedProcessId, PrivilegeReq, ProcessError, ProcessLifecycle, ProcessOwnership,
+    CommandOutcome, CommandRunner as Trait, CommandSpec, ExitStatusInfo, ManagedProcessId,
+    PrivilegeReq, ProcessError, ProcessLifecycle, ProcessOwnership,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::runtime::Runtime;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Production runner. Constructed once at startup and held in the engine actor.
 ///
@@ -519,15 +519,6 @@ impl RealRunner {
         self.runtime.block_on(<Self as Trait>::run(self, spec))
     }
 
-    /// Synchronous wrapper around [`Trait::spawn_detached`].
-    pub fn spawn_detached_blocking(
-        &self,
-        spec: CommandSpec,
-    ) -> Result<DetachedHandle, ProcessError> {
-        self.runtime
-            .block_on(<Self as Trait>::spawn_detached(self, spec))
-    }
-
     fn check_privilege(spec: &CommandSpec) -> Result<(), ProcessError> {
         if spec.requires_privilege == PrivilegeReq::Root && !crate::utils::is_root() {
             return Err(ProcessError::PrivilegeDenied {
@@ -574,12 +565,6 @@ impl RealRunner {
                     reason: "non-root caller cannot change supplementary groups".into(),
                 });
             }
-        }
-        if spec.terminate_process_group && spec.kind == Kind::DetachedSpawn {
-            return Err(ProcessError::InvalidCredentials {
-                program: spec.program.clone(),
-                reason: "contained process groups cannot use detached spawn".into(),
-            });
         }
         Ok(())
     }
@@ -716,7 +701,6 @@ impl Trait for RealRunner {
             program = %spec.program,
             args = ?redacted_args,
             requires_privilege = ?spec.requires_privilege,
-            kind = ?spec.kind,
             "subprocess.start"
         );
 
@@ -737,19 +721,8 @@ impl Trait for RealRunner {
         } else {
             Stdio::null()
         });
-        // Daemonizing subprocesses (e.g. `openvpn --daemon`) fork()+detach.
-        // The grandchild inherits the parent's pipe write-ends and may keep
-        // them open indefinitely, so `wait_with_output()` would block forever
-        // waiting for pipe EOF even after the parent exits cleanly. Route
-        // stdout/stderr to /dev/null instead — the caller is responsible for
-        // surfacing diagnostics via an alternate channel (e.g. `--log` file).
-        if spec.daemonizes {
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
-        } else {
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -780,39 +753,7 @@ impl Trait for RealRunner {
             }
         }
 
-        // Wait with optional timeout. Daemonizing subprocesses take the
-        // `wait()`-only path (we routed their stdio to /dev/null above, so
-        // there are no pipes to drain); everything else uses
-        // `wait_with_output()` to capture stdout/stderr.
-        let (status, stdout, stderr) = if spec.daemonizes {
-            let status = if let Some(timeout) = spec.timeout {
-                let Ok(result) = tokio::time::timeout(timeout, child.wait()).await else {
-                    warn!(
-                        target: "vortix::process",
-                        program = %spec.program,
-                        duration_ms = %timeout.as_millis(),
-                        "subprocess.timeout"
-                    );
-                    terminate_child(&mut child, spec.terminate_process_group).await;
-                    return Err(ProcessError::Timeout {
-                        program: spec.program.clone(),
-                        duration: timeout,
-                    });
-                };
-                result.map_err(|e| ProcessError::IoError {
-                    program: spec.program.clone(),
-                    source: e,
-                })?
-            } else {
-                child.wait().await.map_err(|e| ProcessError::IoError {
-                    program: spec.program.clone(),
-                    source: e,
-                })?
-            };
-            #[cfg(unix)]
-            process_group.contain_descendants();
-            (status, Vec::new(), Vec::new())
-        } else if let Some(limit) = spec.output_limit {
+        let (status, stdout, stderr) = if let Some(limit) = spec.output_limit {
             let stdout = child.stdout.take().ok_or_else(|| ProcessError::IoError {
                 program: spec.program.clone(),
                 source: std::io::Error::other("child stdout pipe unavailable"),
@@ -926,68 +867,6 @@ impl Trait for RealRunner {
             duration,
             started_at,
         })
-    }
-
-    async fn spawn_detached(&self, spec: CommandSpec) -> Result<DetachedHandle, ProcessError> {
-        Self::check_privilege(&spec)?;
-
-        if spec.kind != Kind::DetachedSpawn {
-            debug!(
-                target: "vortix::process",
-                "spawn_detached called on a OneShot spec; treating as detached anyway"
-            );
-        }
-
-        let spawned_at = SystemTime::now();
-        let redacted_args = redact_args(&spec.args, &spec.redact_in_audit);
-        info!(
-            target: "vortix::process",
-            program = %spec.program,
-            args = ?redacted_args,
-            requires_privilege = ?spec.requires_privilege,
-            "subprocess.spawn_detached"
-        );
-
-        let mut cmd = Command::new(&spec.program);
-        cmd.args(&spec.args);
-        if spec.env_clear {
-            cmd.env_clear();
-        }
-        for (k, v) in &spec.env {
-            cmd.env(k, v);
-        }
-        configure_owner_process(&mut cmd, &spec);
-        if let Some(cwd) = &spec.cwd {
-            cmd.current_dir(cwd);
-        }
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
-
-        let child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ProcessError::ProgramNotFound {
-                    program: spec.program.clone(),
-                }
-            } else {
-                ProcessError::IoError {
-                    program: spec.program.clone(),
-                    source: e,
-                }
-            }
-        })?;
-
-        let pid = child.id().ok_or_else(|| ProcessError::IoError {
-            program: spec.program.clone(),
-            source: std::io::Error::other("no pid available for spawned child"),
-        })?;
-
-        // Drop the Child handle without awaiting — on Unix the kernel keeps the
-        // detached child alive; vortix tracks liveness via subsequent `kill -0 <pid>`
-        // OneShot calls.
-        drop(child);
-
-        Ok(DetachedHandle { pid, spawned_at })
     }
 }
 

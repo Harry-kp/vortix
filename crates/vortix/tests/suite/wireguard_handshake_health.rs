@@ -5,19 +5,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use vortix::core::ports::dns::DnsRequest;
 use vortix::core::ports::tunnel::{
     classify_peer_handshake_health, HandshakeAttempt, PeerHandshakeHealth, PeerTrafficExpectation,
-    ProtocolStatus, TunnelHandle, TunnelKindTag, TunnelPeerStatus, TunnelStatus,
+    TunnelHandle, TunnelKindTag, TunnelPeerStatus, TunnelStatus,
 };
 use vortix::core::profile::ProfileId;
-use vortix::wireguard::parser::parse_wg_conf;
-use vortix::wireguard::tunnel::{parse_wg_dump, select_health_probe};
-
-#[derive(Debug)]
-struct Detail;
-impl ProtocolStatus for Detail {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
+use vortix::wireguard::tunnel::parse_wg_dump;
 
 fn at(seconds: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(seconds)
@@ -59,7 +50,6 @@ fn status(generation: u64, peers: Vec<TunnelPeerStatus>) -> TunnelStatus {
         last_handshake: peers.iter().filter_map(|peer| peer.latest_handshake).max(),
         observed_at: at(250),
         peers,
-        detail: Box::new(Detail),
     }
 }
 
@@ -148,22 +138,6 @@ fn fresh_handshake_clears_stale_health() {
         ),
         PeerHandshakeHealth::Healthy { .. }
     ));
-}
-
-#[test]
-fn split_tunnel_requires_covered_target_before_side_effects() {
-    let parsed = parse_wg_conf(
-        "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = peer\nAllowedIPs = 10.0.0.0/24\n",
-    )
-    .unwrap();
-    assert_eq!(
-        select_health_probe(&parsed, &[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]),
-        None
-    );
-    assert_eq!(
-        select_health_probe(&parsed, &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))]),
-        Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)))
-    );
 }
 
 #[test]

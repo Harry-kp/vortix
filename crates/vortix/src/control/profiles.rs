@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::cidr::Cidr;
 use crate::core::openvpn_routes::OpenVpnRedirectGateway;
-use crate::core::ports::tunnel::ParsedProfile as _;
 use crate::core::profile::{Profile, ProfileId, ProtocolKind, ResolvedEndpoint};
 use crate::state::{Protocol, VpnProfile};
 

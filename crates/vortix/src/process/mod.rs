@@ -20,9 +20,9 @@ pub use real::{RealProcessLifecycle, RealRunner};
 // Re-export the port types so callers don't have to depend on vortix-core directly
 // just to construct specs.
 pub use crate::core::ports::process::{
-    CommandOutcome, CommandRunner as CommandRunnerTrait, CommandSpec, DetachedHandle,
-    ExitStatusInfo, Kind, ManagedProcessId, PrivilegeReq, ProcessCredentials, ProcessError,
-    ProcessLifecycle, ProcessOwnership,
+    CommandOutcome, CommandRunner as CommandRunnerTrait, CommandSpec, ExitStatusInfo,
+    ManagedProcessId, PrivilegeReq, ProcessCredentials, ProcessError, ProcessLifecycle,
+    ProcessOwnership,
 };
 
 /// The enum carrier — held by value, dispatched statically.
@@ -41,13 +41,6 @@ impl CommandRunner {
         }
     }
 
-    pub async fn spawn_detached(&self, spec: CommandSpec) -> Result<DetachedHandle, ProcessError> {
-        match self {
-            CommandRunner::Real(r) => r.spawn_detached(spec).await,
-            CommandRunner::Mock(m) => m.spawn_detached(spec).await,
-        }
-    }
-
     /// Synchronous wrapper around `run`. Drives the async future via the
     /// runtime bundled in `RealRunner` (or directly for `MockRunner`, which
     /// never awaits). Use this from sync callers like the TUI loop and CLI
@@ -56,17 +49,6 @@ impl CommandRunner {
         match self {
             CommandRunner::Real(r) => r.run_blocking(spec),
             CommandRunner::Mock(m) => m.run_sync(spec),
-        }
-    }
-
-    /// Synchronous wrapper around `spawn_detached`. See [`Self::run_blocking`].
-    pub fn spawn_detached_blocking(
-        &self,
-        spec: CommandSpec,
-    ) -> Result<DetachedHandle, ProcessError> {
-        match self {
-            CommandRunner::Real(r) => r.spawn_detached_blocking(spec),
-            CommandRunner::Mock(m) => m.spawn_detached_sync(spec),
         }
     }
 
@@ -191,11 +173,6 @@ pub fn global_runner() -> &'static CommandRunner {
 /// Run a one-shot subprocess through the process-wide runner.
 pub fn run(spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
     global_runner().run_blocking(spec)
-}
-
-/// Spawn a detached subprocess through the process-wide runner.
-pub fn spawn_detached(spec: CommandSpec) -> Result<DetachedHandle, ProcessError> {
-    global_runner().spawn_detached_blocking(spec)
 }
 
 /// Adapter: run a spec and return an `std::process::Output`-shaped result.

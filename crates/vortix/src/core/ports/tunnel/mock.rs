@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use super::{
-    ParseError, ParsedProfile, ProtocolStatus, RecordedTunnelCall, Tunnel, TunnelCallLog,
-    TunnelCapabilities, TunnelError, TunnelHandle, TunnelKindTag, TunnelStatus,
+    RecordedTunnelCall, Tunnel, TunnelCallLog, TunnelError, TunnelHandle, TunnelKindTag,
+    TunnelStatus,
 };
 use crate::core::profile::Profile;
 
@@ -50,7 +50,6 @@ struct MockState {
 pub struct MockTunnel {
     state: Arc<Mutex<MockState>>,
     invocations: TunnelCallLog,
-    capabilities: TunnelCapabilities,
 }
 
 impl MockTunnel {
@@ -100,11 +99,6 @@ impl MockTunnel {
         self.state.lock().unwrap().status_peers = peers;
     }
 
-    /// Override the capabilities this mock reports.
-    pub fn set_capabilities(&mut self, caps: TunnelCapabilities) {
-        self.capabilities = caps;
-    }
-
     fn record(
         &self,
         method: &'static str,
@@ -116,24 +110,6 @@ impl MockTunnel {
             profile_id: profile_id.clone(),
             interface_name: iface.map(str::to_string),
         });
-    }
-}
-
-#[derive(Debug, Default)]
-struct MockProtocolStatus;
-
-impl ProtocolStatus for MockProtocolStatus {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-#[derive(Debug, Default)]
-struct MockParsedProfile;
-
-impl ParsedProfile for MockParsedProfile {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -245,41 +221,23 @@ impl Tunnel for MockTunnel {
             last_handshake: None,
             observed_at: SystemTime::now(),
             peers,
-            detail: Box::new(MockProtocolStatus),
         })
-    }
-
-    fn parse_profile(&self, _raw: &[u8]) -> Result<Box<dyn ParsedProfile>, ParseError> {
-        Ok(Box::new(MockParsedProfile))
-    }
-
-    fn capabilities(&self) -> TunnelCapabilities {
-        self.capabilities
-    }
-
-    fn kind_tag(&self) -> TunnelKindTag {
-        TunnelKindTag::Mock
-    }
-}
-
-impl Default for TunnelCapabilities {
-    fn default() -> Self {
-        Self {
-            supports_split_tunnel: false,
-            supports_ipv6: true,
-            mtu_configurable: false,
-            supports_reconnect_without_disconnect: false,
-            requires_root: false,
-            userspace: false,
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ports::tunnel::test_profile;
     use crate::core::profile::ProtocolKind;
+
+    fn test_profile(id: &str, protocol: ProtocolKind) -> Profile {
+        Profile::new(
+            crate::core::profile::ProfileId::new(id),
+            id,
+            protocol,
+            std::path::PathBuf::from(format!("/tmp/{id}.conf")),
+        )
+    }
 
     #[test]
     fn default_success_returns_handle() {

@@ -767,69 +767,6 @@ pub fn current() -> &'static Theme {
 // delegate to the built-in theme so nothing breaks. Phase 2 will migrate
 // call-sites to `theme::current().field` for runtime theme switching.
 
-// Backgrounds
-pub const WARM_BG: Color = SYNTHWAVE.warm_bg;
-pub const PANEL_BG: Color = SYNTHWAVE.panel_bg;
-pub const PANEL_BG_DARK: Color = SYNTHWAVE.panel_bg_dark;
-pub const PANEL_HEADER_BG: Color = SYNTHWAVE.panel_header_bg;
-
-// Accents
-pub const CYAN_PRIMARY: Color = SYNTHWAVE.accent_primary;
-pub const CYAN_LIGHT: Color = SYNTHWAVE.accent_secondary;
-pub const CYAN_DARK: Color = SYNTHWAVE.accent_dark;
-pub const TEAL_ACCENT: Color = SYNTHWAVE.teal_accent;
-
-// Status
-pub const EMERALD: Color = SYNTHWAVE.success;
-pub const CORAL_RED: Color = SYNTHWAVE.error;
-pub const AMBER: Color = SYNTHWAVE.warning;
-pub const YELLOW: Color = SYNTHWAVE.yellow;
-
-// Text
-pub const TEXT_WHITE: Color = SYNTHWAVE.text_primary;
-pub const TEXT_LIGHT: Color = SYNTHWAVE.text_light;
-pub const TEXT_MUTED: Color = SYNTHWAVE.text_secondary;
-pub const TEXT_DARK: Color = SYNTHWAVE.text_dark;
-
-// Legacy Nord compatibility
-pub const NORD_POLAR_NIGHT_3: Color = SYNTHWAVE.nord_polar_night_3;
-pub const NORD_POLAR_NIGHT_4: Color = SYNTHWAVE.nord_polar_night_4;
-pub const NORD_FROST_2: Color = SYNTHWAVE.accent_primary;
-pub const NORD_FROST_3: Color = SYNTHWAVE.nord_frost_3;
-pub const NORD_GREEN: Color = SYNTHWAVE.success;
-pub const NORD_RED: Color = SYNTHWAVE.error;
-pub const NORD_YELLOW: Color = SYNTHWAVE.yellow;
-pub const NORD_PURPLE: Color = SYNTHWAVE.nord_purple;
-
-// Semantic aliases
-pub const BG_COLOR: Color = SYNTHWAVE.warm_bg;
-pub const SURFACE_COLOR: Color = SYNTHWAVE.panel_bg;
-pub const TEXT_PRIMARY: Color = SYNTHWAVE.text_primary;
-pub const TEXT_SECONDARY: Color = SYNTHWAVE.text_secondary;
-pub const ACCENT_PRIMARY: Color = SYNTHWAVE.accent_primary;
-pub const ACCENT_SECONDARY: Color = SYNTHWAVE.accent_secondary;
-pub const SUCCESS: Color = SYNTHWAVE.success;
-pub const WARNING: Color = SYNTHWAVE.warning;
-pub const ERROR: Color = SYNTHWAVE.error;
-pub const INACTIVE: Color = SYNTHWAVE.inactive;
-
-// UI elements
-pub const BORDER_DEFAULT: Color = SYNTHWAVE.border_default;
-pub const BORDER_FOCUSED: Color = SYNTHWAVE.border_focused;
-pub const BORDER_ACCENT: Color = SYNTHWAVE.accent_primary;
-pub const ROW_SELECTED_BG: Color = SYNTHWAVE.row_selected_bg;
-pub const ROW_SELECTED_FG: Color = SYNTHWAVE.row_selected_fg;
-
-// Buttons
-pub const BTN_CONNECT_BG: Color = SYNTHWAVE.btn_connect_bg;
-pub const BTN_TERMINATE_BG: Color = SYNTHWAVE.btn_terminate_bg;
-pub const BTN_DEFAULT_BG: Color = SYNTHWAVE.btn_default_bg;
-
-// Footer
-pub const KEY_HINT: Color = SYNTHWAVE.key_hint;
-pub const KEY_HINT_DESC: Color = SYNTHWAVE.key_hint_desc;
-pub const SEPARATOR: Color = SYNTHWAVE.separator;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,34 +956,6 @@ mod tests {
                 choice
             );
         }
-    }
-
-    #[test]
-    fn const_aliases_match_theme_fields() {
-        assert_eq!(ACCENT_PRIMARY, SYNTHWAVE.accent_primary);
-        assert_eq!(ACCENT_SECONDARY, SYNTHWAVE.accent_secondary);
-        assert_eq!(EMERALD, SYNTHWAVE.success);
-        assert_eq!(CORAL_RED, SYNTHWAVE.error);
-        assert_eq!(AMBER, SYNTHWAVE.warning);
-        assert_eq!(YELLOW, SYNTHWAVE.yellow);
-        assert_eq!(NORD_YELLOW, SYNTHWAVE.yellow);
-        assert_eq!(PANEL_BG, SYNTHWAVE.panel_bg);
-        assert_eq!(TEXT_WHITE, SYNTHWAVE.text_primary);
-        assert_eq!(BORDER_DEFAULT, SYNTHWAVE.border_default);
-        assert_eq!(BORDER_FOCUSED, SYNTHWAVE.border_focused);
-        assert_eq!(KEY_HINT, SYNTHWAVE.key_hint);
-        assert_eq!(SEPARATOR, SYNTHWAVE.separator);
-    }
-
-    #[test]
-    fn nord_legacy_aliases_consistent() {
-        assert_eq!(NORD_GREEN, SYNTHWAVE.success);
-        assert_eq!(NORD_RED, SYNTHWAVE.error);
-        assert_eq!(NORD_FROST_2, SYNTHWAVE.accent_primary);
-        assert_eq!(NORD_FROST_3, SYNTHWAVE.nord_frost_3);
-        assert_eq!(NORD_PURPLE, SYNTHWAVE.nord_purple);
-        assert_eq!(NORD_POLAR_NIGHT_3, SYNTHWAVE.nord_polar_night_3);
-        assert_eq!(NORD_POLAR_NIGHT_4, SYNTHWAVE.nord_polar_night_4);
     }
 
     #[test]

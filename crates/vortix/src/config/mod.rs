@@ -7,7 +7,6 @@
 //! at startup, so that all utility functions (profile loading, auth, metadata, killswitch)
 //! use the correct path without requiring a parameter change on every call site.
 
-pub mod error;
 pub mod hooks_config;
 pub mod migration;
 pub mod openvpn_credentials;
@@ -15,7 +14,6 @@ pub mod owned_file;
 pub mod profile_store;
 pub mod settings;
 
-pub use error::ConfigError;
 pub use hooks_config::{HookConfigError, HookSpec};
 pub use migration::{migrate_legacy_profiles, MigrationStats};
 pub use profile_store::{ProfileStore, ProfileStoreError, ProfileSummary};
@@ -811,10 +809,6 @@ mod tests {
         assert_eq!(
             config.reconnect_operation_timeout_secs(crate::state::Protocol::OpenVPN),
             67
-        );
-        assert!(
-            config.reconnect_operation_timeout_secs(crate::state::Protocol::OpenVPN)
-                < crate::core::engine::state::DEFAULT_RETRY_BUDGET_SECS
         );
     }
 

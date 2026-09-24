@@ -31,18 +31,6 @@ pub enum PrivilegeReq {
     Root,
 }
 
-/// Lifetime of a subprocess invocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Kind {
-    /// Run-to-completion; the runner waits for stdout/stderr/exit.
-    #[default]
-    OneShot,
-    /// Fire-and-forget detached spawn (e.g., `openvpn --daemon`). Returns a
-    /// `DetachedHandle` carrying the PID; vortix manages liveness via subsequent
-    /// `OneShot` calls to `kill -0 <pid>`.
-    DetachedSpawn,
-}
-
 /// Explicit non-root identity for an owner-run subprocess.
 ///
 /// Supplying this never grants privilege: a non-root caller may name only
@@ -72,26 +60,10 @@ pub struct CommandSpec {
     /// deadlock on a full pipe, then returns a typed overflow error.
     pub output_limit: Option<usize>,
     pub requires_privilege: PrivilegeReq,
-    pub kind: Kind,
     /// Arg indices to redact in `tracing` audit logs. Used by callers that pass
     /// secret material (e.g., file paths in `/tmp/vortix-*.conf`) as args.
     /// No current callsite uses this; the field is reserved for future use.
     pub redact_in_audit: Vec<usize>,
-    /// When `true`, the process will fork+detach (e.g. `openvpn --daemon`).
-    /// The runner takes two precautions:
-    ///
-    /// - stdout/stderr are routed to `Stdio::null()` instead of pipes, so
-    ///   the daemonized grandchild can't keep pipe write-ends alive after
-    ///   the parent exits.
-    /// - The runner uses `child.wait()` instead of `wait_with_output()`,
-    ///   returning as soon as the parent exits (typically right after the
-    ///   fork) — no waiting for pipe EOF.
-    ///
-    /// Without this flag, daemonizing subprocesses can hang
-    /// `wait_with_output` indefinitely because the inherited pipe never
-    /// EOFs. Callers using `daemonizes` are responsible for surfacing errors
-    /// via an alternate channel (e.g., the daemon's own `--log` file).
-    pub daemonizes: bool,
     /// Verified non-root credentials applied before `exec`.
     #[serde(default)]
     pub run_as: Option<ProcessCredentials>,
@@ -114,19 +86,9 @@ impl CommandSpec {
             timeout: None,
             output_limit: None,
             requires_privilege: PrivilegeReq::None,
-            kind: Kind::OneShot,
             redact_in_audit: Vec::new(),
-            daemonizes: false,
             run_as: None,
             terminate_process_group: false,
-        }
-    }
-
-    /// Construct a default `DetachedSpawn` spec.
-    pub fn detached(program: impl Into<String>, args: Vec<String>) -> Self {
-        Self {
-            kind: Kind::DetachedSpawn,
-            ..Self::oneshot(program, args)
         }
     }
 
@@ -162,17 +124,6 @@ impl CommandSpec {
     #[must_use]
     pub fn redact_args(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
         self.redact_in_audit = indices.into_iter().collect();
-        self
-    }
-
-    /// Builder: declare that this subprocess will fork+detach. Routes its
-    /// stdout/stderr to `/dev/null` and uses `child.wait()` instead of
-    /// `wait_with_output()`, so the runner returns as soon as the parent
-    /// exits — without blocking on pipe EOF from the daemonized grandchild.
-    /// See the `daemonizes` field doc for the full rationale.
-    #[must_use]
-    pub fn daemonizes(mut self) -> Self {
-        self.daemonizes = true;
         self
     }
 
@@ -227,13 +178,6 @@ impl CommandOutcome {
     pub fn stderr_lossy(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.stderr)
     }
-}
-
-/// Handle to a detached child process.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DetachedHandle {
-    pub pid: u32,
-    pub spawned_at: SystemTime,
 }
 
 /// Stable ownership key for a foreground protocol child.
@@ -361,45 +305,4 @@ pub trait CommandRunner: Send + Sync {
         &self,
         spec: CommandSpec,
     ) -> impl std::future::Future<Output = Result<CommandOutcome, ProcessError>> + Send;
-
-    /// Spawn a detached child and return its PID.
-    ///
-    /// On Unix, the child survives the parent's `Child` handle being dropped. On
-    /// Windows (future), this requires `Child::forget()` — out of scope today.
-    fn spawn_detached(
-        &self,
-        spec: CommandSpec,
-    ) -> impl std::future::Future<Output = Result<DetachedHandle, ProcessError>> + Send;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Default-constructed `oneshot` specs must not daemonize — that's
-    /// the opt-in flag for `openvpn --daemon` and similar fork+detach
-    /// subprocesses. Regression guard: an accidental flip would route
-    /// every subprocess to `Stdio::null()` and silently drop stderr.
-    #[test]
-    fn oneshot_does_not_daemonize_by_default() {
-        let spec = CommandSpec::oneshot("ls", vec!["-la".into()]);
-        assert!(!spec.daemonizes, "oneshot must default to non-daemonizing");
-    }
-
-    #[test]
-    fn detached_does_not_daemonize_by_default() {
-        let spec = CommandSpec::detached("ls", vec!["-la".into()]);
-        assert!(!spec.daemonizes, "detached spawn ≠ daemonize");
-    }
-
-    /// The `.daemonizes()` builder flips the flag. Honoured by
-    /// `RealRunner` to route stdio to `/dev/null` + use `child.wait()`
-    /// instead of `wait_with_output()` (see the field's docstring for
-    /// why this matters for `openvpn --daemon`).
-    #[test]
-    fn daemonizes_builder_sets_flag() {
-        // xtask:allow-protocol-leak: test fixture exercises the builder API; no subprocess spawned
-        let spec = CommandSpec::oneshot("openvpn", vec!["--daemon".into()]).daemonizes();
-        assert!(spec.daemonizes);
-    }
 }

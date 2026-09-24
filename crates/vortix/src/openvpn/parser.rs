@@ -13,7 +13,7 @@ use crate::core::openvpn_routes::{
 
 use tracing::warn;
 
-use crate::core::ports::tunnel::{ParseError, ParsedProfile};
+use crate::core::ports::tunnel::ParseError;
 
 /// IP-family CIDR. Local until a shared helper introduces `core::cidr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,12 +116,9 @@ pub struct OvpnParsedProfile {
     pub raw: String,
 }
 
-impl ParsedProfile for OvpnParsedProfile {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn dns_request(&self) -> crate::core::ports::dns::DnsRequest {
+impl OvpnParsedProfile {
+    #[must_use]
+    pub fn dns_request(&self) -> crate::core::ports::dns::DnsRequest {
         crate::core::ports::dns::DnsRequest {
             servers: self.dns_servers.clone(),
             search_domains: self.dns_search_domains.clone(),
