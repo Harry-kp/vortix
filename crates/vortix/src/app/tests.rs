@@ -2599,3 +2599,40 @@ fn a_short_disconnect_stays_readable_then_resolves() {
     assert!(app.tunnel(&profile_id).is_none());
     assert!(app.held_snapshot.is_none());
 }
+
+/// A server can push its full route after the tunnel is up, so the switch is
+/// offered with both tunnels running. Declining must stop the new one, or it
+/// keeps carrying the traffic the dialog promised to leave with the old one.
+#[test]
+fn declining_a_late_takeover_disconnects_the_new_tunnel() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let declined = || {
+        crate::logger::get_logs().iter().any(|entry| {
+            entry
+                .message
+                .contains("Switch declined; disconnecting 'late03'")
+        })
+    };
+    let mut app = test_app();
+    set_connected(&mut app, "early01");
+    let open = |app: &mut App| {
+        app.input_mode = InputMode::ConfirmDefaultRouteTakeover {
+            from: "early01".into(),
+            to_profile_id: crate::profile::ProfileId::new("late03"),
+            to_name: "late03".into(),
+            confirm_selected: true,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    };
+
+    // Asked before connecting: nothing is running, so Cancel only closes.
+    open(&mut app);
+    assert!(matches!(app.input_mode, InputMode::Normal));
+    assert!(!declined());
+
+    // Asked after the server pushed the route: the new tunnel is up.
+    set_connected(&mut app, "late03");
+    open(&mut app);
+    assert!(matches!(app.input_mode, InputMode::Normal));
+    assert!(declined());
+}
