@@ -1064,7 +1064,7 @@ impl Engine {
         }
     }
 
-    fn need(&self, profile_id: &ProfileId) -> Need {
+    fn need(&mut self, profile_id: &ProfileId) -> Need {
         let ready = Need::Ready {
             credentials: None,
             used_saved: false,
@@ -1079,11 +1079,23 @@ impl Engine {
             return ready;
         }
         let otp_label = crate::openvpn::parser::static_challenge_prompt(path);
-        let saved = self
+        let loaded = self
             .credentials
             .lock()
-            .ok()
-            .and_then(|store| store.load(profile_id, &entry.profile.name).ok().flatten());
+            .map_err(|_| "credential store is unavailable".to_owned())
+            .and_then(|store| {
+                store
+                    .load(profile_id, &entry.profile.name)
+                    .map_err(|error| error.to_string())
+            });
+        let name = entry.profile.name.clone();
+        let saved = loaded.unwrap_or_else(|error| {
+            self.notice(
+                Level::Warning,
+                format!("Saved credentials for '{name}' were not used: {error}"),
+            );
+            None
+        });
         match (otp_label, saved) {
             (None, Some(saved)) => Need::Ready {
                 credentials: Some(OpenVpnStaticChallengeCredentials::new(
