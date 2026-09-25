@@ -605,6 +605,7 @@ fn run_tui(
         if let Some(receiver) = control_rx.as_ref() {
             match receiver.try_recv() {
                 Ok(Ok(control)) => {
+                    control.on_change(events.waker());
                     app.attach_control(control);
                     control_rx = None;
                 }
@@ -646,6 +647,7 @@ fn dispatch_event(app: &mut App, event: Event) {
         Event::Key(key_event) => app.handle_key(key_event),
         Event::Mouse(mouse_event) => app.handle_mouse(mouse_event),
         Event::Tick => app.on_tick(),
+        Event::Refresh => {}
         Event::Resize(w, h) => app.on_resize(w, h),
     }
 }
