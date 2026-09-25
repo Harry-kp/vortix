@@ -1169,9 +1169,10 @@ use std::sync::OnceLock;
 use ureq::config::{Config, IpFamily};
 use ureq::Agent;
 
-/// Lazy-init process-wide IPv4-only agent. Re-uses TCP connections + TLS
-/// sessions across telemetry calls. Configured with redirects disabled to
-/// match curl-without-`-L`.
+/// Lazy-init process-wide IPv4-only agent. Configured with redirects disabled
+/// to match curl-without-`-L`, and with no idle-connection pool: a connection
+/// opened before a tunnel came up keeps its original route on macOS, so a
+/// reused one reported the real IP as the VPN exit until the next poll.
 ///
 /// Pinned to IPv4 for two reasons that both showed up in the field:
 ///
@@ -1197,11 +1198,16 @@ fn ipv6_agent() -> &'static Agent {
 }
 
 fn build_agent(family: IpFamily) -> Agent {
+    agent_config(family).new_agent()
+}
+
+fn agent_config(family: IpFamily) -> Config {
     Config::builder()
         .max_redirects(0)
         .ip_family(family)
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
         .build()
-        .new_agent()
 }
 
 /// GET `url` over IPv4 with the given per-call timeout. Returns the
@@ -1351,5 +1357,16 @@ mod http_tests {
             "the IPv4 probe reached a v6-only endpoint; its answer could be an IPv6 address"
         );
         assert_eq!(result, Err(GetTextError::Transport));
+    }
+
+    /// Every probe must take the current route: a pooled connection from
+    /// before a tunnel came up reported the real IP as the exit.
+    #[test]
+    fn telemetry_agents_never_reuse_a_connection() {
+        for family in [IpFamily::Ipv4Only, IpFamily::Ipv6Only] {
+            let config = agent_config(family);
+            assert_eq!(config.max_idle_connections(), 0);
+            assert_eq!(config.max_idle_connections_per_host(), 0);
+        }
     }
 }
