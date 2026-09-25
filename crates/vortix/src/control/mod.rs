@@ -387,3 +387,28 @@ impl Drop for Control {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `OpenVPN` profile's file often has no default route: its server
+    /// pushes one. The conflict check must use the running tunnel's live
+    /// routes, or a second full tunnel slips past it.
+    #[test]
+    fn a_pushed_default_route_conflicts_with_another_full_tunnel() {
+        let running = ProfileId::new("ovpn-full");
+        let wanted = ProfileId::new("wg-full");
+        let default = || vec!["0.0.0.0/0".parse().unwrap()];
+        let mut view = crate::app::connection::test_view("ovpn-full", Phase::Up);
+        view.routes = default();
+        let mut snapshot = Snapshot::default();
+        snapshot.tunnels.push(view);
+        snapshot.routes.insert(running.clone(), Vec::new());
+        snapshot.routes.insert(wanted.clone(), default());
+        assert!(matches!(
+            snapshot.conflicts(&wanted).as_slice(),
+            [Conflict::DefaultRouteTakeover { current, .. }] if current == &running
+        ));
+    }
+}
