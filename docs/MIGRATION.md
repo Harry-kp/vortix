@@ -29,15 +29,29 @@ block and the Mac stays offline.
 ### Already upgraded while a VPN or the kill switch was on
 
 **Restart your computer once.** That ends any tunnel 0.4.3 left running, and
-macOS reloads its stock firewall rules at boot. Skip this if nothing was
-connected and the kill switch was off.
+macOS reloads its stock firewall rules at boot. Skip this if nothing was on.
 
-Without restarting:
+Cannot restart right now? Run these instead. Each is safe when there is
+nothing to clear; replace `NAME` with the profile name `sudo vortix status`
+shows as connected.
 
-| System | Commands |
-|---|---|
-| macOS | `sudo pfctl -f /etc/pf.conf` reloads the stock firewall rules; then `sudo pfctl -d` if you do not use pf yourself. Stop a tunnel `vortix down` refuses with `sudo kill <pid>` (the startup warning lists the pid). |
-| Linux (all) | `sudo vortix killswitch off` once: 0.4.4 removes 0.4.3's iptables rules. Stop a tunnel `vortix down` refuses with `sudo kill <pid>`. |
+macOS:
+
+```bash
+sudo pfctl -f /etc/pf.conf            # restore the Mac's stock firewall rules
+sudo pkill -f 'daemon vortix-'        # stop an OpenVPN tunnel 0.4.3 left running
+sudo kill $(sudo lsof -t /var/run/wireguard/$(cat /var/run/wireguard/NAME.name).sock)   # WireGuard
+```
+
+Linux:
+
+```bash
+sudo vortix killswitch off            # remove 0.4.3's firewall rules
+sudo pkill -f 'daemon vortix-'        # stop an OpenVPN tunnel 0.4.3 left running
+sudo ip link del NAME                 # WireGuard
+```
+
+Then set your kill switch mode again if you use one.
 
 ### Linux: the kill switch needs nftables
 

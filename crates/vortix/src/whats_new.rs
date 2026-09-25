@@ -30,9 +30,20 @@ pub enum Cmd {
     Install(&'static str),
 }
 
+/// When a step applies, so the popup lists only what this machine needs.
+#[derive(Debug)]
+pub enum When {
+    Always,
+    /// This command is not installed.
+    MissingTool(&'static str),
+    /// This file exists.
+    FileExists(&'static str),
+}
+
 #[derive(Debug)]
 pub struct Step {
     pub os: Os,
+    pub when: When,
     pub title: &'static str,
     pub why: &'static str,
     pub commands: &'static [Cmd],
@@ -50,38 +61,23 @@ pub const RELEASES: &[Release] = &[Release {
     steps: &[
         Step {
             os: Os::Any,
-            title: "If a VPN or the kill switch was on when you upgraded, restart your computer once",
-            why: "The previous version's tunnel and firewall rules can outlive it, and this version cannot stop them: `vortix down` reports them as not started by Vortix, and on macOS they can keep blocking your internet even after `vortix killswitch off`. A restart clears both. Skip this if nothing was connected.",
+            when: When::Always,
+            title: "If a VPN or the kill switch was on when you upgraded, restart your computer",
+            why: "The previous version's tunnel and firewall rules can outlive it, and this version cannot remove them; on a Mac they can keep blocking your internet. A restart clears them. Skip this if nothing was on. Cannot restart now? The commands are on the Details page.",
             commands: &[],
         },
         Step {
-            os: Os::MacOs,
-            title: "Or, instead of restarting, restore the Mac's firewall rules",
-            why: "The previous kill switch replaced the Mac's main firewall rules; this reloads the stock ones. Also stop any tunnel it left running (`sudo vortix down` names it).",
-            commands: &[Cmd::Run("sudo pfctl -f /etc/pf.conf")],
-        },
-        Step {
             os: Os::Linux,
-            title: "Or, instead of restarting, turn the kill switch off once",
-            why: "This removes the previous kill switch's firewall rules; set your mode again afterwards. Also stop any tunnel it left running (`sudo vortix down` names it).",
-            commands: &[Cmd::Run("sudo vortix killswitch off")],
-        },
-        Step {
-            os: Os::Linux,
-            title: "Make sure nftables is installed",
-            why: "The kill switch now uses nftables only; without `nft` it cannot turn on.",
+            when: When::MissingTool("nft"),
+            title: "Install nftables",
+            why: "The kill switch now needs it, and it is not installed.",
             commands: &[Cmd::Install("nftables")],
         },
         Step {
-            os: Os::Any,
-            title: "Move profile scripts into hooks",
-            why: "Profiles with WireGuard PreUp/PostUp/PreDown/PostDown or OpenVPN up/down/route-up scripts no longer connect, because those ran as root. Put the commands in [[hooks]] in settings.toml; see docs/MIGRATION.md.",
-            commands: &[],
-        },
-        Step {
             os: Os::Linux,
-            title: "If you set up `vortix daemon` as a service, remove it",
-            why: "The command no longer exists, so the service fails and restarts every few seconds.",
+            when: When::FileExists("/etc/systemd/system/vortix-daemon.service"),
+            title: "Remove the old `vortix daemon` service",
+            why: "That command no longer exists, so the service fails and restarts every few seconds.",
             commands: &[
                 Cmd::Run("sudo systemctl disable --now vortix-daemon"),
                 Cmd::Run("sudo rm /etc/systemd/system/vortix-daemon.service"),
@@ -89,8 +85,9 @@ pub const RELEASES: &[Release] = &[Release {
         },
         Step {
             os: Os::MacOs,
-            title: "If you set up `vortix daemon` as a service, remove it",
-            why: "The command no longer exists, so the service fails and restarts every few seconds.",
+            when: When::FileExists("/Library/LaunchDaemons/com.vortix.daemon.plist"),
+            title: "Remove the old `vortix daemon` service",
+            why: "That command no longer exists, so the service fails and restarts every few seconds.",
             commands: &[
                 Cmd::Run("sudo launchctl bootout system/com.vortix.daemon"),
                 Cmd::Run("sudo rm /Library/LaunchDaemons/com.vortix.daemon.plist"),
@@ -184,6 +181,11 @@ pub fn steps(releases: &[&'static Release]) -> Vec<&'static Step> {
         .iter()
         .flat_map(|release| release.steps)
         .filter(|step| step.os == Os::Any || step.os == os)
+        .filter(|step| match step.when {
+            When::Always => true,
+            When::MissingTool(tool) => !on_path(tool),
+            When::FileExists(path) => Path::new(path).exists(),
+        })
         .collect()
 }
 
@@ -191,6 +193,14 @@ pub fn steps(releases: &[&'static Release]) -> Vec<&'static Step> {
 #[must_use]
 pub fn needs_action(from: &str, current: &str) -> bool {
     !steps(&releases_since(from, current)).is_empty()
+}
+
+fn on_path(tool: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .chain(["/usr/sbin".into(), "/sbin".into()])
+            .any(|dir| dir.join(tool).is_file())
+    })
 }
 
 #[must_use]
