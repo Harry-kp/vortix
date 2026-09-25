@@ -6,208 +6,60 @@ All notable changes to this project will be documented in this file.
 
 ## [0.5.0] - 2026-09-25
 
-### Bug Fixes
+### Upgrading from 0.4.3
 
-- **tui:** Disconnect completes on kernel confirmation, not the worker's word ([#253](https://github.com/Harry-kp/vortix/pull/253))
-- Stabilize desktop integration, themes, and recovery ([#279](https://github.com/Harry-kp/vortix/pull/279))
-- **killswitch:** Fail closed across recovery and release ([#281](https://github.com/Harry-kp/vortix/pull/281))
-- **control:** Make VPN lifecycle transitions exact ([#282](https://github.com/Harry-kp/vortix/pull/282))
-- **tui:** Keep large profile imports within deadlines ([#283](https://github.com/Harry-kp/vortix/pull/283))
-- **tui:** Reopen the credential prompt after a rejected password
-- **control:** Stop replaying past profile imports as startup failures
-- Repair four defects found auditing a fresh Ubuntu install
-- Stop a sudo dashboard run from locking the user out, and stop panicking without a TTY
-- A missing VPN tool should warn once, not fail every poll
-- Create the config directory private, not at the caller's umask
-- **dns:** A link that is already gone is a finished release, not a failure
-- **wireguard:** Stage configs where a confined wg-quick can read them
-- **tui:** Stop rapid kill-switch presses timing out and reporting Degraded
-- Stop a WireGuard disconnect looking like a network failure
-- **killswitch:** Report the firewall's own truth, and stop degradation latching
-- **telemetry:** Never present a remembered or wrong-family reading as current
-- Create every Vortix directory private, whatever the umask
-- **killswitch:** Report the emergency block that block-on-drop engages
-- Clear the two Linux-only clippy errors failing CI
-- Repair directory permissions on an install that already exists
-- **cli:** Tell the user how to clear a stray profile metadata file
-- **test:** Stop the suite writing profiles into the real config directory
-- **tui:** Offer the takeover confirmation when a route conflict is refused
-- Terminalise a connect whose route conflict could not be retired
-- Give the real-IP cache gates the writers they lost
-- One undescribed peer no longer hides every other route conflict
-- Release supervisor ownership when the credential prompt is refused
-- A full tunnel beside a split tunnel is not a route overlap
-- **tui:** Say what the route-overlap dialog actually does
-- Admission agrees with the overlay about what a conflict is
-- Stop discarding the result of tightening file permissions
-- Clippy lints in the reproduction added by 52d6e1f
-- Stop a superseded teardown leaving a fence that times out every later operation
-- Show the profile name, not its digest, when routes overlap
-- Clippy clone-on-copy in the barrier diagnostic
-- Keep a live tunnel's fact fresh so later operations can complete
-- Stop a repeated tunnel fact tearing down protection
-- Stop the route-overlap dialog promising something the kernel cannot do
-- Stop one superseded reading discarding a whole system scan
-- Make failure messages say what broke, why, and what to do
-- Report a full-tunnel OpenVPN session as connected, not "no exit"
-- Stop a reconnect leaving the tunnel resolving through the LAN
-- Widen the resolved re-apply window past the interface churn
-- Say when an orphaned tunnel scratch directory cannot be removed
-- Let a replaced tunnel interface be programmed with the VPN's DNS
-- Settle the resolved read-back across the interface swap
-- Stop the headline saying PROTECTED over its own v6-exposed row
-- Stop a degraded kill switch describing protection it is not giving
-- The expired toast is the one the user sees, so explain it there
-- Engage block-on-drop for a tunnel that is gone, not only as it goes
-- Stop staged OpenVPN configs piling up beside the profiles
-- Clippy case-sensitive extension comparison in the staged-config sweep
-- Stop a refused rename printing a Rust variant at the user
-- Cast the signal handler through a pointer
-- Keep session journals in the user's config dir, not root's home
-- Count an OpenVPN profile imported as .conf in the right column
-- Open a topology transaction after a rollback moves the generation on
-- Clippy line limit from the recovery-start diagnostic
-- Keep looking for a lost tunnel after the first recovery is cancelled
-- Stop a refused profile change reporting only an operation id
-- Elect a primary tunnel again so a full tunnel stops reading "NO EXIT"
-- Stop three surfaces reporting a state the system is not in
-- Keep the protection row when the Security Guard runs out of height
-- Stop telling users their kill switch rules are missing when they are not
-- Shed the reader's own address before the protection rows
-- Two credential-prompt surfaces that misdirected the reader
-- Stop a reconnect deadlocking on the fence its own disconnect wrote
-- Keep the block-on-drop barrier up until a tunnel is actually back
-- Stop promising a Ctrl-C that cancels nothing
-- Stop a VPN Vortix did not start being recorded as the real IP
-- Hold the block-on-drop barrier until the VPN is actually back
-- A failing block-on-drop recovery must not fail open
-- Do not release the drop barrier on a reading taken before the drop
-- Require fresh drop evidence only where a drop happened
-- Never install a pre-tunnel barrier that allows no VPN path
-- Engage the kill switch on an unexpected drop
-- Say why an unprivileged profile change is refused
-- Tear down a tunnel whose daemon was still starting when the attempt died
-- Stop a test's env mutation from aborting the cli_integration binary
-- Onboarding details that misdirect a first-time Linux user
-- Backtick the distro names in the install-hint docs
-- Serialise the integration imports that share one profile store
-- Explain a refused connect when another service owns the resolver
-- Wait for the admission results the capacity test asserts on
-- Print the reason a connect was refused, and stop the sweep test flaking
-- Let a stranded user disconnect when the profile directory disagrees
-- Re-apply DNS on reconnect/recovery when the tunnel link is recreated ([#298](https://github.com/Harry-kp/vortix/pull/298))
-- Multi-tunnel default-route detection, DNS projection, and takeover modal ([#300](https://github.com/Harry-kp/vortix/pull/300))
-- Disconnect-all reaps a tunnel still awaiting observation ([#301](https://github.com/Harry-kp/vortix/pull/301))
-- MacOS multi-tunnel route binding + foreign-WireGuard startup ([#303](https://github.com/Harry-kp/vortix/pull/303))
-- A reconnect waits for the dropped tunnel's teardown
-- Pin IPv6 VPN servers to the physical IPv6 gateway
-- Redirect-gateway local no longer pins the server via the router
-- MacOS IPv6 route binds pass -inet6
-- Clean routes and DNS left by a tunnel that died while Vortix was off
-- Profile edits work when Vortix runs as real root without sudo
-- The TUI counts every drop and never reopens an answered prompt
-- Refuse OpenVPN TAP profiles instead of routing them on-link
-- The orphan warning names only processes Vortix started ([#320](https://github.com/Harry-kp/vortix/pull/320))
-- Every user-state file Vortix writes is private and user-owned
-- A missing VPN tool exits 5 with the install hint on every command
-- The WireGuard health-target hint names the setting that exists
-- An unprivileged status says it cannot see WireGuard, not Disconnected
-- Ctrl and Alt chords never type into a TUI text field
-- The exit-IP check never reuses a connection from before connect
-- CLI up gates on the engine's live routes and --yes really switches
-- The real IP is never recorded while a tunnel is connecting
-- Telemetry log lines from before a tunnel change are dropped too
-- Profile names are readable in the sidebar at 80 columns
-- Switching tunnels that share a server keeps the new one working
-- A Linux disconnect no longer reports DNS "not applied" for a link that just went away
-- A refused saved-credential file says why instead of looking absent
-- A kill switch that cannot reach pf says how to restore it
-- The dashboard shows Connecting and Disconnecting as they happen
-- Connecting and Disconnecting stay on screen long enough to read
-- Declining a late switch disconnects the tunnel that took over
-- Switching to a tunnel whose server pushes the full route stops the old one
-- Vortix up refuses a tunnel whose server pushes a conflicting route
-- Switching between tunnels with the same split routes works on Linux
+The first `sudo vortix` after upgrading shows what to do, once, and lists only the steps your machine needs. In short:
 
-### Documentation
+- **If a VPN or the kill switch was on when you upgraded, restart your computer.** 0.4.3's tunnel and firewall rules can outlive it, and 0.5.0 cannot remove them; on a Mac they can keep blocking your internet. Best of all, before upgrading run `sudo vortix down` and `sudo vortix killswitch off` with 0.4.3.
+- **Linux:** the kill switch now needs `nftables` (iptables support is gone).
+- **Profiles that run scripts** (WireGuard `PreUp`/`PostUp`/`PreDown`/`PostDown`, OpenVPN `up`/`down`/`route-up` and similar) no longer connect. Move the commands to `[[hooks]]` in `settings.toml`.
+- **`vortix daemon` is gone.** If you installed it as a service, remove the service.
 
-- **readme:** Fix broken star history chart ([#275](https://github.com/Harry-kp/vortix/pull/275))
-- Make README a concise project entry point ([#280](https://github.com/Harry-kp/vortix/pull/280))
-- Add independent Vortix features
-- Name the dormant Background mode so nobody re-derives it
-- Replace the manual-test backlog with a runnable release gate
-- Tell Arch users how to install the protocol tools
+Commands for each system are in [Upgrading from 0.4.3 to 0.5.0](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md#upgrading-from-043-to-050).
 
-### Features
+### Highlights
 
-- **control:** Establish canonical lifecycle authority ([#264](https://github.com/Harry-kp/vortix/pull/264))
-- **control:** Cut local CLI over to canonical service ([#267](https://github.com/Harry-kp/vortix/pull/267))
-- **control:** Cut TUI over to canonical service ([#269](https://github.com/Harry-kp/vortix/pull/269))
-- **control:** Add bounded background diagnostics ([#270](https://github.com/Harry-kp/vortix/pull/270))
-- **control:** Prepare dormant remote adapters ([#271](https://github.com/Harry-kp/vortix/pull/271))
-- **control:** Prepare background mode UX ([#272](https://github.com/Harry-kp/vortix/pull/272))
-- **helper:** Authenticate privileged execution ([#276](https://github.com/Harry-kp/vortix/pull/276))
-- **control:** Own exact policy and OpenVPN credentials ([#277](https://github.com/Harry-kp/vortix/pull/277))
-- **tui:** Reveal the password while typing it
-- The Logs panel shows each OpenVPN tunnel's daemon log ([#319](https://github.com/Harry-kp/vortix/pull/319))
-- One-time upgrade notes for 0.4.3 users, and honest messages ([#326](https://github.com/Harry-kp/vortix/pull/326))
+- **Linux works end to end.** On Debian and Ubuntu, AppArmor stopped `wg-quick` reading Vortix's configs, so every WireGuard connect timed out; configs are now staged in `/etc/wireguard/vortix/`. Verified on Ubuntu, Fedora 44, Arch and CachyOS. ([#292](https://github.com/Harry-kp/vortix/pull/292))
+- **Several VPNs at once behave correctly.** A full tunnel and a split tunnel run side by side. A second connect no longer drops the first tunnel's DNS. Switching brings the new tunnel up before stopping the old one, and a route conflict offers Switch or Cancel instead of an error. ([#296](https://github.com/Harry-kp/vortix/pull/296), [#300](https://github.com/Harry-kp/vortix/pull/300), [#303](https://github.com/Harry-kp/vortix/pull/303), [#307](https://github.com/Harry-kp/vortix/pull/307), [#327](https://github.com/Harry-kp/vortix/pull/327))
+- **The kill switch fails closed and reports what the firewall is really doing.** On macOS it lives in its own pf anchor and never replaces your pf rules; on Linux it uses nftables. If the rules cannot be verified it says Degraded, never Off, and tells you how to fix it. ([#281](https://github.com/Harry-kp/vortix/pull/281), [#292](https://github.com/Harry-kp/vortix/pull/292), [#325](https://github.com/Harry-kp/vortix/pull/325))
+- **See why an OpenVPN connection failed.** In the Logs panel, `f` now steps through each OpenVPN tunnel's own log, marked live or last session. ([#319](https://github.com/Harry-kp/vortix/pull/319))
+- **Profile files can no longer run commands as root.** Script directives are refused with an explanation; automation moves to `[[hooks]]`, which run without root and cannot block a connect. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- **A third smaller:** the macOS release binary is 4.1 MB, down from 6.1 MB. ([#284](https://github.com/Harry-kp/vortix/pull/284), [#305](https://github.com/Harry-kp/vortix/pull/305))
 
-### Miscellaneous
+### Fixed
 
-- **deps:** Bump base64 from 0.22.1 to 0.23.1 ([#266](https://github.com/Harry-kp/vortix/pull/266))
-- **deps:** Bump system-configuration from 0.7.0 to 0.8.0 ([#274](https://github.com/Harry-kp/vortix/pull/274))
+- **Disconnect and reconnect finish cleanly.** A disconnect no longer bounces back to Connected, Disconnect All no longer times out, and a reconnect on slower Linux hosts re-applies DNS instead of failing. ([#253](https://github.com/Harry-kp/vortix/pull/253), [#298](https://github.com/Harry-kp/vortix/pull/298), [#301](https://github.com/Harry-kp/vortix/pull/301), [#318](https://github.com/Harry-kp/vortix/pull/318))
+- **Connecting and Disconnecting show in the header** long enough to read, instead of skipping straight to the result. ([#327](https://github.com/Harry-kp/vortix/pull/327))
+- **Switching always leaves one tunnel.** Switching between two tunnels that carry the same networks works on Linux (it failed with "RTNETLINK answers: File exists"). When a server pushes a full-traffic route after connecting, Vortix now asks: Cancel disconnects the new tunnel, Switch stops the old one, and `vortix up` without `--yes` refuses with exit 4 and keeps the old tunnel. ([#327](https://github.com/Harry-kp/vortix/pull/327))
+- **Switching between two tunnels on the same server keeps the new one working**, instead of leaving it Connected with no internet on macOS. ([#321](https://github.com/Harry-kp/vortix/pull/321))
+- **Leftover routes and DNS from a tunnel that died while Vortix was closed** are removed the next time it starts. ([#318](https://github.com/Harry-kp/vortix/pull/318))
+- **The exit IP and leak display are accurate.** Right after connecting it shows the VPN's address, and the false "matches the pre-VPN address" warning is gone. ([#307](https://github.com/Harry-kp/vortix/pull/307), [#321](https://github.com/Harry-kp/vortix/pull/321))
+- **Credentials.** A wrong OpenVPN password is never saved, Ctrl+R shows the password while you type, Ctrl+U clears a field instead of typing a "u", and a saved-credential file Vortix refuses now says why. ([#284](https://github.com/Harry-kp/vortix/pull/284), [#321](https://github.com/Harry-kp/vortix/pull/321))
+- **IPv6 and unusual gateways.** IPv6 VPN servers are pinned to the physical gateway, `redirect-gateway local` works, and IPv6 routes apply on macOS. ([#318](https://github.com/Harry-kp/vortix/pull/318))
+- **Another WireGuard network on the machine** (Tailscale, a corporate mesh) no longer stops Vortix from starting, and the orphan warning lists only processes Vortix started. ([#303](https://github.com/Harry-kp/vortix/pull/303), [#320](https://github.com/Harry-kp/vortix/pull/320))
+- **Files stay yours under `sudo`.** Every file Vortix writes is private and owned by you, including logs and session journals, which now live in `~/.config/vortix`. ([#292](https://github.com/Harry-kp/vortix/pull/292), [#318](https://github.com/Harry-kp/vortix/pull/318), [#321](https://github.com/Harry-kp/vortix/pull/321))
+- **CLI.** `up --yes` really switches tunnels, a missing VPN tool exits 5 with the install command, and `status` without root says it cannot see WireGuard instead of claiming Disconnected. ([#321](https://github.com/Harry-kp/vortix/pull/321))
+- **TUI.** Profile names are readable at 80×24, a VPN Vortix did not start shows as "UNMANAGED VPN" instead of DISCONNECTED, and large imports finish instead of timing out. ([#283](https://github.com/Harry-kp/vortix/pull/283), [#321](https://github.com/Harry-kp/vortix/pull/321))
+- **Messages say what broke and what to do**, and claim only what happened: `release-killswitch` no longer says "Internet access restored" without checking. A second instance, or starting without a terminal, now exits with a clear sentence. ([#279](https://github.com/Harry-kp/vortix/pull/279), [#292](https://github.com/Harry-kp/vortix/pull/292))
 
-### Performance
+### Changed
 
-- Cut the release binary 42% and the test build 34%
-- Trim build graph and duplicate process test ([#304](https://github.com/Harry-kp/vortix/pull/304))
-- Cut build graph, test latency, and binary size ([#305](https://github.com/Harry-kp/vortix/pull/305))
+- **WireGuard shows Connected only after a real handshake** with the peer. The timeout and staleness are `wireguard_handshake_timeout_secs` and `wireguard_handshake_stale_secs` in `config.toml`; probe targets are `[engine].wireguard_health_targets` in `settings.toml`. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- **Vortix writes every OpenVPN route itself.** Route directives it cannot apply safely, and TAP (`dev tap`) profiles, are refused. ([#307](https://github.com/Harry-kp/vortix/pull/307), [#318](https://github.com/Harry-kp/vortix/pull/318))
+- **TUI keys.** In the sidebar `d` disconnects the selected profile and `D` all of them; a route conflict opens one Switch or Cancel dialog; `p` cycles seven color themes; `y` copies through the terminal (works over SSH). ([#279](https://github.com/Harry-kp/vortix/pull/279), [#282](https://github.com/Harry-kp/vortix/pull/282), [#300](https://github.com/Harry-kp/vortix/pull/300))
+- **`vortix up` waits as long as the protocol needs** (about 22 s for WireGuard, 37 s for OpenVPN); `--timeout` still overrides it. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- **`settings.toml` is read from the Vortix config directory**, the one `--config-dir` selects. ([#264](https://github.com/Harry-kp/vortix/pull/264))
 
-### Refactor
+### Removed
 
-- Remove internal plan vocabulary from code, comments, and examples ([#255](https://github.com/Harry-kp/vortix/pull/255))
-- Consolidate shared runtime plumbing ([#256](https://github.com/Harry-kp/vortix/pull/256))
-- **wireguard:** Stage in Vortix's own namespace under /etc/wireguard
-- Delete the remote profile staging that never had a backend
-- Delete three abstractions nothing constructs
-- Drop three abstractions that carry no weight
-- Remove the dormant remote-control-mutation path ([#297](https://github.com/Harry-kp/vortix/pull/297))
-- One engine for all connections; OpenVPN route authority; repo cleanup ([#307](https://github.com/Harry-kp/vortix/pull/307))
-- CLI down and reconnect read targets from the engine
-- The snapshot waker is set once, so a OnceLock replaces the mutex
-- Drop bookkeeping the transition hold never needed
-- One switch dialog for every route conflict
-- A route conflict is one struct, not two variants
-- The header names profiles through App::profile_display_name
+- **`vortix daemon`**, `vortix status --no-daemon` and `VORTIX_DAEMON_SOCKET`. The CLI and TUI run the engine themselves. ([#296](https://github.com/Harry-kp/vortix/pull/296), [#297](https://github.com/Harry-kp/vortix/pull/297))
+- **The iptables kill-switch backend.** Linux needs `nft`; 0.4.3's iptables rules are removed when you turn the kill switch off. ([#307](https://github.com/Harry-kp/vortix/pull/307))
 
-### Testing
+### Security
 
-- **telemetry:** Pin the two fixes nothing was holding
-- Reproduce the superseded-connect disconnect timeout
-- Tighten disconnect-all regression to exercise the filter directly ([#302](https://github.com/Harry-kp/vortix/pull/302))
-- A failed guardian READY handshake is killed and reaped
-
-### Diag
-
-- Name the convergence gate that leaves an operation to expire
-- Report the topology transaction and tunnel barrier decision
-- Name the profile that blocks the tunnel barrier
-- Record what resolved was asked for when a read-back disagrees
-- Say why an absent tunnel started no loss recovery
-- Record when a system scan is discarded or accepted
-- Record a reading skipped as superseded
-- Record the tunnel readings each scan publishes and any refusal
-- Name the operation that holds the loss-recovery gate shut
-- Report every desired-connected profile at the loss gate
-- Say why a service operation could not be reserved
-- Record when a loss recovery is actually started
-- Record how a loss recovery ends
-
-### Revert
-
-- The resolved read-back retry, which measured identical either way
-
-
+- Profile directives that could run commands as root are refused. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- Vortix directories are no longer group-writable, which had let a group member replace a profile. ([#292](https://github.com/Harry-kp/vortix/pull/292))
+- Bumped `rustls` 0.23.40 → 0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285). ([#292](https://github.com/Harry-kp/vortix/pull/292))
 
 ## [0.4.3] - 2026-07-18
 
