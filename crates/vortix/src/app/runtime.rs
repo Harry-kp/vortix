@@ -66,14 +66,6 @@ pub struct VpnRuntime {
     /// yet), and the wrong IP gets cached as `real_ip`.
     pub scanner_first_tick_done: bool,
 
-    /// Number of kernel-visible VPN sessions observed at the most
-    /// recent scanner tick. Reading raw kernel state (not the
-    /// engine snapshot) catches tunnels that have not yet been adopted —
-    /// e.g. an OVPN process running outside vortix on macOS where
-    /// adoption needs the lsof Method A probe to attribute the
-    /// iface to the PID. Real-IP caching requires this to be zero.
-    pub last_kernel_session_count: usize,
-
     // === Configuration ===
     pub config: AppConfig,
     pub config_dir: PathBuf,
@@ -145,7 +137,6 @@ impl VpnRuntime {
             last_security_check: None,
             ip_unchanged_warned: false,
             scanner_first_tick_done: false,
-            last_kernel_session_count: 0,
 
             config,
             config_dir,

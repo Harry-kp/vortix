@@ -518,7 +518,6 @@ mod message_routing {
 
         let mut app = test_app();
         app.runtime.scanner_first_tick_done = true;
-        app.runtime.last_kernel_session_count = 0;
 
         let ip = "2401:4900:1c61:23c4::1".to_string();
         app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(Some(

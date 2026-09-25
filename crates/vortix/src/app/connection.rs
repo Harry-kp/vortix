@@ -133,12 +133,6 @@ impl App {
         self.show_notices(&snapshot);
 
         self.runtime.scanner_first_tick_done = true;
-        self.runtime.last_kernel_session_count = snapshot
-            .tunnels
-            .iter()
-            .filter(|tunnel| tunnel.phase == Phase::Up)
-            .count()
-            + snapshot.external.len();
         let came_up = snapshot
             .tunnels
             .iter()

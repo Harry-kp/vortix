@@ -415,7 +415,6 @@ fn a_remembered_real_address_is_promoted_only_by_a_live_observation() {
     );
 
     app.runtime.scanner_first_tick_done = true;
-    app.runtime.last_kernel_session_count = 0;
     app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
         crate::telemetry::EgressIdentity {
             public_ip: "203.0.113.5".to_string(),
@@ -476,7 +475,6 @@ fn test_publicipv6_caches_real_ipv6_when_safe_to_cache() {
     use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     app.runtime.scanner_first_tick_done = true;
-    app.runtime.last_kernel_session_count = 0;
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(Some(
         "2401:4900::1".to_string(),
@@ -2077,7 +2075,6 @@ fn ip_only_refresh_for_changed_exit_clears_stale_location() {
 fn unavailable_egress_probe_never_replaces_the_real_ip_cache() {
     let mut app = test_app();
     app.runtime.scanner_first_tick_done = true;
-    app.runtime.last_kernel_session_count = 0;
     app.runtime.real_ip = Some("203.0.113.7".to_string());
 
     app.handle_message(Message::Telemetry(
@@ -2307,25 +2304,23 @@ fn scanner_statistics_refresh_the_dashboard_without_nudging_egress_telemetry() {
         .expect("a primary handoff must refresh egress telemetry");
 }
 
-/// Both real-IP cache gates read these fields, and for a long time nothing in
-/// production wrote either one: `scanner_first_tick_done` stayed false, so the
-/// address was never cached, and `last_kernel_session_count == 0` was
-/// vacuously true. The suite did not notice because the tests set the flags by
-/// hand. This asserts the control snapshot actually establishes them.
+/// A connecting tunnel already carries its routes, so a lookup that lands
+/// before it reaches Up sees the VPN exit. Caching that as the real IP made
+/// every later connect warn that the exit "matches the pre-VPN address".
 #[test]
-fn a_control_snapshot_establishes_the_real_ip_cache_gates() {
+fn a_connecting_tunnel_blocks_real_ip_caching() {
+    use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
-    assert!(!app.runtime.scanner_first_tick_done, "starts unproven");
-    set_connected(&mut app, "carrying-traffic");
-    assert!(
-        app.runtime.scanner_first_tick_done,
-        "a published snapshot proves the scan ran"
-    );
-    assert_eq!(
-        app.runtime.last_kernel_session_count, 1,
-        "an active tunnel must be counted, or the cache gate lets the VPN \
-         address be saved as the real one"
-    );
+    set_phase(&mut app, "wg08", crate::control::Phase::Starting);
+    assert!(app.runtime.scanner_first_tick_done);
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::telemetry::EgressIdentity {
+            public_ip: "198.51.100.9".to_string(),
+            isp: None,
+            location: None,
+        },
+    )));
+    assert!(app.runtime.real_ip.is_none());
 }
 
 /// The real-IP gate proved only that *Vortix* owned no tunnel. A VPN started

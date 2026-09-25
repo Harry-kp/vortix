@@ -662,16 +662,13 @@ impl App {
             }
             TelemetryUpdate::PublicIpv6(observed) => {
                 let is_connected = self.has_active_connection();
-                let disconnect_safe = self.runtime.scanner_first_tick_done
-                    && self.runtime.last_kernel_session_count == 0
-                    && !is_connected
-                    && !self.default_route_is_tunnel();
                 let no_tunnel_routes_v6 = is_connected
-                    && !self.control_snapshot.tunnels.iter().any(|tunnel| {
-                        tunnel.phase == crate::control::Phase::Up
-                            && crate::cidr::claims_default_route_v6(&tunnel.routes)
-                    });
-                let safe_to_cache = disconnect_safe || no_tunnel_routes_v6;
+                    && !self
+                        .control_snapshot
+                        .tunnels
+                        .iter()
+                        .any(|tunnel| crate::cidr::claims_default_route_v6(&tunnel.routes));
+                let safe_to_cache = self.no_tunnel_on_egress() || no_tunnel_routes_v6;
                 if safe_to_cache {
                     if let Some(ref ip) = observed {
                         let changed = self.runtime.real_ipv6.as_deref() != Some(ip.as_str());
@@ -765,13 +762,7 @@ impl App {
             }
         }
 
-        // Cache the real address only after the scanner, the engine snapshot and the
-        // kernel's own default route all agree no tunnel owns the egress path.
-        let safe_to_cache = self.runtime.scanner_first_tick_done
-            && self.runtime.last_kernel_session_count == 0
-            && !is_connected
-            && !self.default_route_is_tunnel();
-        if safe_to_cache {
+        if self.no_tunnel_on_egress() {
             let first_detection = self.runtime.real_ip.is_none();
             let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());
             if first_detection {
@@ -983,6 +974,16 @@ fn interface_is_tunnel(name: &str) -> bool {
 impl App {
     /// Whether the kernel's last observed default route leaves through a
     /// tunnel device, managed by Vortix or not.
+    /// Whether a public-IP reading is the real address: no tunnel in any
+    /// phase (a connecting one already carries routes), none outside Vortix,
+    /// and the default route is not on a tunnel.
+    pub(crate) fn no_tunnel_on_egress(&self) -> bool {
+        self.runtime.scanner_first_tick_done
+            && self.control_snapshot.tunnels.is_empty()
+            && self.control_snapshot.external.is_empty()
+            && !self.default_route_is_tunnel()
+    }
+
     pub(crate) fn default_route_is_tunnel(&self) -> bool {
         self.control_snapshot
             .default_route
