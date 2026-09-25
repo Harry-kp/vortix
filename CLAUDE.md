@@ -7,7 +7,8 @@ lints. It runs as root (`sudo vortix`); there is no helper or daemon.
 **Read [`STOPOVERENGINEERING.md`](STOPOVERENGINEERING.md) before writing code.**
 
 To fix a reported bug end to end (reproduce → fix → CI → PR → review → merge),
-run `/fix-bug <issue number, URL or description>`.
+run `/fix-bug <issue number, URL or description>`. Before a release, run
+`/release-qa` (the P0 gate, live on macOS and the Linux lab).
 
 ## How we work here
 
@@ -168,7 +169,7 @@ copy or commit them. Credentials are typed by the user.
   each) rebase-merges so each fix stays its own commit. `main` has no branch protection, so the green
   check is ours to enforce: merge only when every `gh pr checks` row is `pass`
   or `skipping` (release jobs always skip) and none is failing or pending.
-- Push only when asked, or as part of `/fix-bug`.
+- Push only when asked, or as part of `/fix-bug` or `/release-qa`.
 
 ## Build budget
 
