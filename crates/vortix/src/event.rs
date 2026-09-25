@@ -94,7 +94,7 @@ impl EventHandler {
     }
 
     /// A function that wakes [`Self::next`] with [`Event::Refresh`].
-    pub fn waker(&self) -> impl Fn() + Send + 'static {
+    pub fn waker(&self) -> impl Fn() + Send + Sync + 'static {
         let sender = self.sender.clone();
         move || {
             let _ = sender.send(Event::Refresh);

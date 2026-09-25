@@ -237,7 +237,7 @@ enum Msg {
 #[derive(Default)]
 pub(crate) struct Shared {
     snapshot: Mutex<Arc<Snapshot>>,
-    wake: Mutex<Option<Box<dyn Fn() + Send>>>,
+    wake: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Shared {
@@ -246,12 +246,7 @@ impl Shared {
             .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(snapshot);
-        if let Some(wake) = self
-            .wake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(wake) = self.wake.get() {
             wake();
         }
     }
@@ -327,12 +322,8 @@ impl Control {
 
     /// Call `wake` after every change the engine publishes, so a UI waiting
     /// for input redraws at once instead of on its next tick.
-    pub fn on_change(&self, wake: impl Fn() + Send + 'static) {
-        *self
-            .snapshot
-            .wake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(wake));
+    pub fn on_change(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let _ = self.snapshot.wake.set(Box::new(wake));
     }
 
     /// The latest snapshot, if it changed since the last call.
@@ -433,7 +424,7 @@ mod tests {
     fn publishing_a_snapshot_wakes_the_listener() {
         let shared = Shared::default();
         let (tx, rx) = mpsc::channel();
-        *shared.wake.lock().unwrap() = Some(Box::new(move || tx.send(()).unwrap()));
+        let _ = shared.wake.set(Box::new(move || tx.send(()).unwrap()));
         shared.publish(Snapshot::default());
         assert!(rx.try_recv().is_ok());
     }
