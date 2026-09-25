@@ -21,6 +21,9 @@
 # and P0_OVPN_OTP for a static challenge. Taken from the environment or asked
 # for with echo off; typed into the TUI through a tmux buffer, never saved.
 #
+# S6 and S7 cut this machine's internet for a few seconds on purpose; they run
+# only after a yes at the prompt, or with P0_ALLOW_BLOCKING=1.
+#
 # Prints PASS/FAIL/SKIP per check, writes target/p0-results.json, exits 1 on
 # any FAIL. Whatever happens, it leaves every tunnel down and the kill switch off.
 set -u
@@ -98,6 +101,10 @@ if [ -n "${P0_OVPN_AUTH:-}" ] && [ -z "${P0_OVPN_PASS:-}" ] && [ -t 0 ]; then
     read -r -p "  username: " P0_OVPN_USER
     [ -n "$P0_OVPN_USER" ] && { read -r -s -p "  password: " P0_OVPN_PASS; echo; read -r -s -p "  OTP (empty if none): " P0_OVPN_OTP; echo; }
 fi
+if [ -z "${P0_ALLOW_BLOCKING:-}" ] && [ -t 0 ]; then
+    read -r -p "S6/S7 block this machine's internet for a few seconds each. Run them? [y/N] " P0_ALLOW_BLOCKING
+    case $P0_ALLOW_BLOCKING in [yY]*) P0_ALLOW_BLOCKING=1 ;; *) P0_ALLOW_BLOCKING= ;; esac
+fi
 FULL=${P0_FULL:-} FULL2=${P0_FULL2:-} SPLIT=${P0_SPLIT:-} OVPN=${P0_OVPN:-} OVPN_AUTH=${P0_OVPN_AUTH:-}
 
 # ── host probes ─────────────────────────────────────────────────────────
@@ -120,9 +127,17 @@ drop_tunnel() { # simulate an unexpected drop of WireGuard profile $1, and only 
         ip link del "$1"
     fi
 }
+pf_reaches_vortix() { # macOS: the main ruleset must pass through the com.apple anchor
+    [ "$OS" != Darwin ] || pfctl -sr 2>/dev/null | grep -q '^anchor "com.apple/\*"'
+}
+may_block() { # id — gate for scenarios that cut egress on purpose
+    [ "${P0_ALLOW_BLOCKING:-}" = 1 ] || { record SKIP "$1" "blocks egress; answer yes or set P0_ALLOW_BLOCKING=1"; return 1; }
+    pf_reaches_vortix || { record SKIP "$1" "pf's main rules do not reach Vortix's; run: pfctl -f /etc/pf.conf"; return 1; }
+    [ "$(egress)" = 200 ] || { record SKIP "$1" "no baseline egress to example.com"; return 1; }
+}
 # An address that answers without a VPN; a probe that fails with no VPN proves nothing.
 PROBE_IP=$(curl -4 -s -m 5 -o /dev/null -w '%{remote_ip}' http://example.com 2>/dev/null)
-egress() { curl -4 -s -m 3 -o /dev/null -w '%{http_code}' -H Host:example.com "http://$PROBE_IP" 2>/dev/null || true; }
+egress() { curl -4 -s -m 2 -o /dev/null -w '%{http_code}' -H Host:example.com "http://$PROBE_IP" 2>/dev/null || true; }
 
 # ── TUI through a private tmux server ───────────────────────────────────
 tui_start() { # cols rows — returns once the VPN service is ready for keys
@@ -249,38 +264,37 @@ S5() { # exit IP and the real-IP cache: P0-29
     tui_stop
 }
 
-S6() { # vpn-only: P0-21
-    need S6 FULL || return
-    [ "$(egress)" = 200 ] || { record SKIP S6 "no baseline egress to example.com"; return; }
-    vx killswitch vpn-only >/dev/null
-    check S6 "vpn-only with no tunnel blocks egress" test "$(egress)" != 200
-    check S6 "vpn-only installs firewall rules" test "$(fw_rules)" -gt 0
+S6() { # vpn-only: P0-21 — one short blocked window, between down and off
+    need S6 FULL && may_block S6 || return
+    local start
     vx up "$FULL" >/dev/null 2>&1
+    vx killswitch vpn-only >/dev/null
     check S6 "vpn-only passes traffic through the tunnel" test "$(egress)" = 200
+    check S6 "vpn-only installs firewall rules" test "$(fw_rules)" -gt 0
     vx down >/dev/null 2>&1
-    check S6 "vpn-only blocks again after down" test "$(egress)" != 200
+    start=$SECONDS
+    check S6 "vpn-only with no tunnel blocks egress" test "$(egress)" != 200
     vx killswitch off >/dev/null
-    check S6 "off restores egress" test "$(egress)" = 200
+    check S6 "off restores egress (blocked for $((SECONDS - start)) s)" test "$(egress)" = 200
     check S6 "off leaves no rules" test "$(fw_rules)" = 0
 }
 
 S7() { # block-on-drop: P0-22 (WireGuard full tunnel)
-    need S7 FULL && need_tmux S7 || return
-    [ "$(egress)" = 200 ] || { record SKIP S7 "no baseline egress to example.com"; return; }
+    need S7 FULL && need_tmux S7 && may_block S7 || return
     vx killswitch block-on-drop >/dev/null
     tui_start 200 50
     tui_connect "$FULL" || { record SKIP S7 "$FULL is not on screen in the sidebar"; tui_stop; return; }
     check S7 "the TUI connects $FULL" connected "$FULL"
     check S7 "armed while healthy: no rules" test "$(fw_rules)" = 0
     drop_tunnel "$FULL" || { record SKIP S7 "could not find $FULL's WireGuard tunnel"; tui_stop; return; }
-    local blocked=0 recovered=0 i
+    local blocked=0 recovered=0 i start=$SECONDS
     for i in $(seq 20); do
         if [ "$(egress)" = 200 ]; then [ "$blocked" = 1 ] && recovered=1; else blocked=1; fi
         [ "$recovered" = 1 ] && break
         sleep 0.5
     done
     check S7 "a drop blocks egress" test "$blocked" = 1
-    check S7 "the automatic reconnect restores egress" test "$recovered" = 1
+    check S7 "the automatic reconnect restores egress (after $((SECONDS - start)) s)" test "$recovered" = 1
     DELAY=8 key c
     tui_stop
     vx killswitch off >/dev/null
