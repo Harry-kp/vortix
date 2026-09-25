@@ -319,7 +319,17 @@ impl App {
                             self.handle_message(Message::CloseOverlay);
                         }
                     }
-                    ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
+                    ConfirmAction::Cancelled => {
+                        // A server can push the full route after the tunnel is
+                        // up; declining the switch then means taking it down,
+                        // or it keeps carrying the traffic.
+                        if self.tunnel(&to_profile_id).is_some() {
+                            let name = self.profile_display_name(&to_profile_id);
+                            self.log(&format!("ACTION: Switch declined; disconnecting '{name}'"));
+                            self.send(crate::control::Command::Disconnect(to_profile_id));
+                        }
+                        self.handle_message(Message::CloseOverlay);
+                    }
                     ConfirmAction::None => {
                         if let InputMode::ConfirmDefaultRouteTakeover {
                             confirm_selected: cs,
