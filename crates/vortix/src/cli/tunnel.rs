@@ -215,46 +215,7 @@ pub(super) fn handle_up(
     // `--yes` bypasses the gate for scripted callers.
     if !yes {
         if let Some(conflict) = control.snapshot().conflicts(&target.id).into_iter().next() {
-            // Conflicts carry opaque profile IDs; the reader needs the name
-            // they typed, so resolve through the catalog before formatting.
-            let named = |id: &crate::profile::ProfileId| {
-                profiles
-                    .iter()
-                    .find(|profile| &profile.id == id)
-                    .map_or_else(|| id.to_string(), |profile| profile.name.clone())
-            };
-            let (code, message) = match &conflict {
-                crate::control::Conflict::DefaultRouteTakeover { current, new: _ } => (
-                    "state_conflict_default_route",
-                    format!(
-                        "Profile '{profile_name}' would take over the default route from '{}'",
-                        named(current)
-                    ),
-                ),
-                crate::control::Conflict::RouteOverlap {
-                    with,
-                    overlapping_cidrs,
-                } => (
-                    "state_conflict_route_overlap",
-                    format!(
-                        "Profile '{profile_name}' overlaps with '{}' on {} CIDR(s)",
-                        named(with),
-                        overlapping_cidrs.len()
-                    ),
-                ),
-            };
-            print_error_and_exit(
-                mode,
-                "up",
-                CliError {
-                    code,
-                    message,
-                    hint: Some(format!(
-                    "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
-                )),
-                },
-                ExitCode::StateConflict,
-            );
+            refuse_conflict(mode, &profiles, &profile_name, &conflict);
         }
     }
     // `--yes` is "switch to this tunnel": bring it up, then stop what it
@@ -264,10 +225,19 @@ pub(super) fn handle_up(
     } else {
         crate::control::Command::Connect(target.id.clone())
     };
-    if let Err(error) =
-        super::commands::run_on(&control, command, Duration::from_secs(timeout_secs))
-    {
-        engine_failure_or_exit(mode, "up", error);
+    let snapshot = super::commands::run_on(&control, command, Duration::from_secs(timeout_secs))
+        .unwrap_or_else(|error| engine_failure_or_exit(mode, "up", error));
+    // A server can push a full route the profile never declared; only now
+    // is the conflict known. Without --yes, keep the tunnel that was there.
+    if !yes {
+        if let Some(conflict) = snapshot.conflicts(&target.id).into_iter().next() {
+            let _ = super::commands::run_on(
+                &control,
+                crate::control::Command::Disconnect(target.id.clone()),
+                Duration::from_secs(config.disconnect_operation_timeout_secs()),
+            );
+            refuse_conflict(mode, &profiles, &profile_name, &conflict);
+        }
     }
     let data = UpData {
         state: "connected".into(),
@@ -288,6 +258,55 @@ pub(super) fn handle_up(
         OutputMode::Quiet => {}
     }
     0
+}
+
+/// Refuse an `up` that would conflict with a running tunnel (exit 4).
+fn refuse_conflict(
+    mode: OutputMode,
+    profiles: &[crate::config::profiles::VpnProfile],
+    profile_name: &str,
+    conflict: &crate::control::Conflict,
+) -> ! {
+    // Conflicts carry opaque profile IDs; the reader needs the name they
+    // typed, so resolve through the catalog before formatting.
+    let named = |id: &crate::profile::ProfileId| {
+        profiles
+            .iter()
+            .find(|profile| &profile.id == id)
+            .map_or_else(|| id.to_string(), |profile| profile.name.clone())
+    };
+    let (code, message) = match conflict {
+        crate::control::Conflict::DefaultRouteTakeover { current, new: _ } => (
+            "state_conflict_default_route",
+            format!(
+                "Profile '{profile_name}' would take over the default route from '{}'",
+                named(current)
+            ),
+        ),
+        crate::control::Conflict::RouteOverlap {
+            with,
+            overlapping_cidrs,
+        } => (
+            "state_conflict_route_overlap",
+            format!(
+                "Profile '{profile_name}' overlaps with '{}' on {} CIDR(s)",
+                named(with),
+                overlapping_cidrs.len()
+            ),
+        ),
+    };
+    print_error_and_exit(
+        mode,
+        "up",
+        CliError {
+            code,
+            message,
+            hint: Some(format!(
+                "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
+            )),
+        },
+        ExitCode::StateConflict,
+    )
 }
 
 #[derive(Serialize)]
