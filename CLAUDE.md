@@ -6,7 +6,8 @@ lints. It runs as root (`sudo vortix`); there is no helper or daemon.
 
 To fix a reported bug end to end (reproduce → fix → CI → PR → review → merge),
 run `/fix-bug <issue number, URL or description>`. Before a release, run
-`/release-qa` (the P0 gate, live on macOS and the Linux lab).
+`/release-qa` (the P0 gate, live on macOS and the Linux lab) and
+`/release-changelog` (user-facing notes, version and upgrade steps).
 
 ## How we work here
 
