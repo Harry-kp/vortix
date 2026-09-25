@@ -292,56 +292,7 @@ impl App {
                     }
                 }
             },
-            InputMode::ConfirmDefaultRouteTakeover {
-                to_profile_id,
-                mut confirm_selected,
-                ..
-            } => {
-                // Two default-route tunnels cannot coexist, so the only
-                // resolutions are:
-                //   [Y]/Enter  -> SwitchExclusiveAndConnect (disconnect
-                //                 current, then connect new)
-                //   [N]/Esc    -> Cancel
-                match handle_confirm_keys(key, &mut confirm_selected) {
-                    ConfirmAction::Confirmed => {
-                        // [Y]es fires the exclusive canonical switch. The
-                        // message still carries the selected row index; the
-                        // update boundary immediately resolves its stable
-                        // profile identity before admission.
-                        let idx = self
-                            .runtime
-                            .profiles
-                            .iter()
-                            .position(|p| p.id == to_profile_id);
-                        if let Some(i) = idx {
-                            self.handle_message(Message::SwitchExclusiveAndConnect { idx: i });
-                        } else {
-                            self.handle_message(Message::CloseOverlay);
-                        }
-                    }
-                    ConfirmAction::Cancelled => {
-                        // A server can push the full route after the tunnel is
-                        // up; declining the switch then means taking it down,
-                        // or it keeps carrying the traffic.
-                        if self.tunnel(&to_profile_id).is_some() {
-                            let name = self.profile_display_name(&to_profile_id);
-                            self.log(&format!("ACTION: Switch declined; disconnecting '{name}'"));
-                            self.send(crate::control::Command::Disconnect(to_profile_id));
-                        }
-                        self.handle_message(Message::CloseOverlay);
-                    }
-                    ConfirmAction::None => {
-                        if let InputMode::ConfirmDefaultRouteTakeover {
-                            confirm_selected: cs,
-                            ..
-                        } = &mut self.input_mode
-                        {
-                            *cs = confirm_selected;
-                        }
-                    }
-                }
-            }
-            InputMode::ConfirmRouteOverlap {
+            InputMode::ConfirmSwitch {
                 to_profile_id,
                 mut confirm_selected,
                 ..
@@ -353,14 +304,24 @@ impl App {
                         .iter()
                         .position(|p| p.id == to_profile_id);
                     if let Some(i) = idx {
-                        self.handle_message(Message::ConfirmRouteOverlap { idx: i });
+                        self.handle_message(Message::SwitchExclusiveAndConnect { idx: i });
                     } else {
                         self.handle_message(Message::CloseOverlay);
                     }
                 }
-                ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
+                ConfirmAction::Cancelled => {
+                    // A server can push its routes after the tunnel is up;
+                    // declining the switch then means taking it down, or it
+                    // keeps carrying the traffic.
+                    if self.tunnel(&to_profile_id).is_some() {
+                        let name = self.profile_display_name(&to_profile_id);
+                        self.log(&format!("ACTION: Switch declined; disconnecting '{name}'"));
+                        self.send(crate::control::Command::Disconnect(to_profile_id));
+                    }
+                    self.handle_message(Message::CloseOverlay);
+                }
                 ConfirmAction::None => {
-                    if let InputMode::ConfirmRouteOverlap {
+                    if let InputMode::ConfirmSwitch {
                         confirm_selected: cs,
                         ..
                     } = &mut self.input_mode

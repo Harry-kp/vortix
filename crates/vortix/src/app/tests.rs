@@ -167,10 +167,11 @@ fn add_stored_profile(
 // VPN switching tests
 // ====================================================================
 fn takeover_overlay(to: &str) -> InputMode {
-    InputMode::ConfirmDefaultRouteTakeover {
-        from: "vpn-a".to_string(),
+    InputMode::ConfirmSwitch {
+        current_id: crate::profile::ProfileId::new("vpn-a"),
         to_profile_id: crate::profile::ProfileId::new(to),
         to_name: to.to_string(),
+        shared: Vec::new(),
         confirm_selected: true,
     }
 }
@@ -188,10 +189,7 @@ fn takeover_overlay_ignores_the_b_key() {
         app.handle_key(key);
 
         assert!(
-            matches!(
-                app.input_mode,
-                InputMode::ConfirmDefaultRouteTakeover { .. }
-            ),
+            matches!(app.input_mode, InputMode::ConfirmSwitch { .. }),
             "[b]/[B] must be inert now; got {:?}",
             app.input_mode
         );
@@ -2616,10 +2614,11 @@ fn declining_a_late_takeover_disconnects_the_new_tunnel() {
     let mut app = test_app();
     set_connected(&mut app, "early01");
     let open = |app: &mut App| {
-        app.input_mode = InputMode::ConfirmDefaultRouteTakeover {
-            from: "early01".into(),
+        app.input_mode = InputMode::ConfirmSwitch {
+            current_id: crate::profile::ProfileId::new("early01"),
             to_profile_id: crate::profile::ProfileId::new("late03"),
             to_name: "late03".into(),
+            shared: Vec::new(),
             confirm_selected: true,
         };
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

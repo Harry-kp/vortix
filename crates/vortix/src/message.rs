@@ -76,15 +76,9 @@ pub enum Message {
     OpenDelete(Option<usize>),
     /// Confirm deletion
     ConfirmDelete,
-    /// User resolved the default-route takeover overlay by switching:
-    /// disconnect the current tunnel first, then connect the new one. Two
-    /// tunnels cannot both hold the default route, so switch is the only
-    /// way to proceed. Fired by the `[Y] Switch` choice on the overlay.
+    /// The user chose Switch in the conflict dialog: connect this profile
+    /// and stop the tunnels it conflicts with.
     SwitchExclusiveAndConnect { idx: usize },
-    /// Confirm route-overlap . User
-    /// accepted the AllowedIPs-overlap overlay; retry the connect with
-    /// `force=true`.
-    ConfirmRouteOverlap { idx: usize },
     /// disconnect one specific profile by
     /// index (the `d` keybinding on a Connected sidebar row). Distinct from
     /// the global `Disconnect` message which targets the legacy single-

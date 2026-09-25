@@ -90,13 +90,10 @@ impl App {
                     self.confirm_delete_profile(&profile_id);
                 }
             }
-            Message::SwitchExclusiveAndConnect { idx } | Message::ConfirmRouteOverlap { idx } => {
+            Message::SwitchExclusiveAndConnect { idx } => {
                 self.input_mode = InputMode::Normal;
                 if let Some(profile) = self.runtime.profiles.get(idx).cloned() {
-                    self.log(&format!(
-                        "ACTION: Switching to '{}'; conflicting tunnels stop once it is up",
-                        profile.name
-                    ));
+                    self.log(&format!("ACTION: Switching to '{}'", profile.name));
                     self.send(crate::control::Command::Switch(profile.id));
                 }
             }
