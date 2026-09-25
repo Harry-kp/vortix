@@ -47,8 +47,9 @@ pub struct Tunnel {
     /// Larger is newer; the newest full tunnel owns the default route.
     pub rank: u64,
     pub since: SystemTime,
-    /// Tunnels to stop once this one is up (a switch).
-    pub replaces: BTreeSet<ProfileId>,
+    /// `Some` for a switch: the tunnels to stop once this one is up. Those
+    /// its server's pushed routes turn out to conflict with are added then.
+    pub replaces: Option<BTreeSet<ProfileId>>,
     /// Reconnect attempt after an unexpected drop, while recovering.
     pub recovering: Option<u32>,
     /// Start again once stopped (a reconnect).
@@ -114,7 +115,7 @@ impl State {
         &mut self,
         spec: Spec,
         rank: u64,
-        replaces: BTreeSet<ProfileId>,
+        replaces: Option<BTreeSet<ProfileId>>,
         needs_credentials: bool,
     ) -> Result<(), Refusal> {
         if let Some(existing) = self.tunnels.get(&spec.profile_id) {
@@ -155,7 +156,7 @@ impl State {
                 interface: Some(interface),
                 rank,
                 since,
-                replaces: BTreeSet::new(),
+                replaces: None,
                 recovering: None,
                 restart: false,
                 draining: false,
@@ -192,10 +193,26 @@ impl State {
         }
         tunnel.since = SystemTime::now();
         tunnel.recovering = None;
-        let replaces = std::mem::take(&mut tunnel.replaces);
+        let Some(mut replaces) = tunnel.replaces.take() else {
+            return BTreeSet::new();
+        };
+        let spec = tunnel.spec.clone();
+        replaces.extend(self.conflicting_peers(&spec));
         replaces
             .into_iter()
             .filter(|peer| self.stop(peer))
+            .collect()
+    }
+
+    /// The running tunnels `spec` conflicts with.
+    #[must_use]
+    pub fn conflicting_peers(&self, spec: &Spec) -> BTreeSet<ProfileId> {
+        self.conflicts(spec)
+            .into_iter()
+            .map(|conflict| match conflict {
+                Conflict::DefaultRouteTakeover { current, .. } => current,
+                Conflict::RouteOverlap { with, .. } => with,
+            })
             .collect()
     }
 
@@ -452,29 +469,55 @@ mod tests {
         ProfileId::new(value)
     }
 
+    /// A server can push its full route only after connecting, so a switch
+    /// found nothing to replace and left the old full tunnel up beside it.
+    #[test]
+    fn a_switch_also_stops_what_its_pushed_route_conflicts_with() {
+        let mut state = State::default();
+        state
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
+            .unwrap();
+        state.came_up(&id("01"), "utun4".into(), [], [], None);
+
+        state
+            .begin(spec("03", "10.8.0.0/24"), 2, None, false)
+            .unwrap();
+        let full = ["0.0.0.0/0".parse::<Cidr>().unwrap()];
+        assert!(state
+            .came_up(&id("03"), "utun5".into(), full, [], None)
+            .is_empty());
+        assert_eq!(
+            state.get(&id("01")).unwrap().phase,
+            Phase::Up,
+            "a connect stops nothing"
+        );
+
+        state.stop(&id("03"));
+        state.stopped(&id("03"));
+        state
+            .begin(spec("03", "10.8.0.0/24"), 3, Some(BTreeSet::new()), false)
+            .unwrap();
+        let stopped = state.came_up(&id("03"), "utun5".into(), full, [], None);
+        assert_eq!(stopped, BTreeSet::from([id("01")]));
+        assert_eq!(state.get(&id("01")).unwrap().phase, Phase::Stopping);
+    }
+
     #[test]
     fn a_switch_stops_only_what_it_replaces_and_only_once_up() {
         let mut state = State::default();
         state
-            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
             .unwrap();
         state.came_up(&id("01"), "utun4".into(), [], [], None);
         state
-            .begin(spec("02", "10.250.0.0/24"), 2, BTreeSet::new(), false)
+            .begin(spec("02", "10.250.0.0/24"), 2, None, false)
             .unwrap();
         state.came_up(&id("02"), "utun5".into(), [], [], None);
 
         let target = spec("03", "0.0.0.0/0");
-        let replaces = state
-            .conflicts(&target)
-            .into_iter()
-            .map(|conflict| match conflict {
-                Conflict::DefaultRouteTakeover { current, .. } => current,
-                Conflict::RouteOverlap { with, .. } => with,
-            })
-            .collect::<BTreeSet<_>>();
+        let replaces = state.conflicting_peers(&target);
         assert_eq!(replaces, BTreeSet::from([id("01")]));
-        state.begin(target, 3, replaces, false).unwrap();
+        state.begin(target, 3, Some(replaces), false).unwrap();
         assert_eq!(
             state.get(&id("01")).unwrap().phase,
             Phase::Up,
@@ -491,14 +534,14 @@ mod tests {
     fn a_failed_switch_leaves_the_old_tunnel_alone() {
         let mut state = State::default();
         state
-            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
             .unwrap();
         state.came_up(&id("01"), "utun4".into(), [], [], None);
         state
             .begin(
                 spec("03", "0.0.0.0/0"),
                 2,
-                BTreeSet::from([id("01")]),
+                Some(BTreeSet::from([id("01")])),
                 false,
             )
             .unwrap();
@@ -513,7 +556,7 @@ mod tests {
             ..State::default()
         };
         state
-            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
             .unwrap();
         state.came_up(&id("01"), "utun4".into(), [], [], None);
         assert!(!state.plan_input().dropped);
@@ -535,7 +578,7 @@ mod tests {
     fn a_reconnect_waits_for_the_dropped_tunnels_teardown() {
         let mut state = State::default();
         state
-            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
             .unwrap();
         state.came_up(&id("01"), "wg0".into(), [], [], None);
         state.lost(&id("01"), Some(Instant::now()), true);
@@ -548,7 +591,7 @@ mod tests {
     fn a_disconnect_cancels_a_pending_reconnect() {
         let mut state = State::default();
         state
-            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
             .unwrap();
         state.came_up(&id("01"), "utun4".into(), [], [], None);
         assert!(state.restart(&id("01")));
@@ -563,7 +606,7 @@ mod tests {
     fn a_reconnect_while_stopping_schedules_nothing() {
         let mut state = State::default();
         state
-            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
             .unwrap();
         state.came_up(&id("01"), "utun4".into(), [], [], None);
         assert!(state.stop(&id("01")));
@@ -578,7 +621,7 @@ mod tests {
             ..State::default()
         };
         state
-            .begin(spec("01", "0.0.0.0/0"), 1, BTreeSet::new(), false)
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
             .unwrap();
         state.came_up(&id("01"), "utun4".into(), [], [], None);
         state.lost(&id("01"), None, false);
@@ -586,7 +629,7 @@ mod tests {
         let old = state.stopped(&id("01")).expect("restart requested");
         assert!(old.recovering.is_some());
         state
-            .begin(spec("01", "0.0.0.0/0"), 2, BTreeSet::new(), false)
+            .begin(spec("01", "0.0.0.0/0"), 2, None, false)
             .unwrap();
         state.resume_recovery(&id("01"));
         assert!(
@@ -627,15 +670,8 @@ mod tests {
                         0 => {
                             rank += 1;
                             let target = spec(name, route);
-                            let replaces = state
-                                .conflicts(&target)
-                                .into_iter()
-                                .map(|conflict| match conflict {
-                                    Conflict::DefaultRouteTakeover { current, .. } => current,
-                                    Conflict::RouteOverlap { with, .. } => with,
-                                })
-                                .collect();
-                            let _ = state.begin(target, rank, replaces, false);
+                            let replaces = state.conflicting_peers(&target);
+                            let _ = state.begin(target, rank, Some(replaces), false);
                         }
                         1 => {
                             let iface = format!("utun{rank}{name}");

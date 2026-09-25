@@ -295,26 +295,17 @@ impl Engine {
                 return;
             }
         };
-        let replaces = if switch {
+        let replaces = switch.then(|| {
             // A running tunnel knows the routes its server pushed.
             let known = self
                 .state
                 .get(&profile_id)
                 .map_or_else(|| spec.clone(), |tunnel| tunnel.spec.clone());
-            self.state
-                .conflicts(&known)
-                .into_iter()
-                .map(|conflict| match conflict {
-                    Conflict::DefaultRouteTakeover { current, .. } => current,
-                    Conflict::RouteOverlap { with, .. } => with,
-                })
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+            self.state.conflicting_peers(&known)
+        });
         let need = self.need(&profile_id);
         let rank = self.next_generation();
-        let replaces_again = replaces.clone();
+        let replaces_again = replaces.clone().unwrap_or_default();
         match self
             .state
             .begin(spec, rank, replaces, matches!(need, Need::Prompt(_)))
@@ -679,7 +670,7 @@ impl Engine {
             if let Some(spec) = spec {
                 if self
                     .state
-                    .begin(spec, rank, BTreeSet::new(), matches!(need, Need::Prompt(_)))
+                    .begin(spec, rank, None, matches!(need, Need::Prompt(_)))
                     .is_ok()
                 {
                     if restart.as_ref().is_some_and(|old| old.recovering.is_some()) {
