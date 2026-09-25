@@ -33,12 +33,10 @@
 //!
 //! ## Width discipline
 //!
-//! `fixed_cols = 2 + 4 + 10 + 3 = 19` (status, proto,
-//! time, inter-column gaps). The primary `*` suffix consumes 2 chars; at the
-//! 24-char inner-width boundary `name_budget = 24 - 19 - 2 = 3`, which is the
-//! minimum that still renders the status glyph plus a 3-char name stub. Below
-//! 24 chars of inner width, the `*` marker is hidden and the name collapses
-//! to a stub — the header retains the cross-surface primary signal.
+//! `fixed_cols = 2 + 4 + 7 + 3 = 16` (status, proto, time, inter-column
+//! gaps). The primary `*` suffix consumes 2 chars; at a 21-char inner width
+//! `name_budget = 21 - 16 - 2 = 3`. Narrower, the `*` marker is hidden and
+//! the name collapses to a stub — the header retains the primary signal.
 //!
 //! ## Accessibility note
 //!
@@ -127,7 +125,7 @@ fn has_risk_annotation(role: &Role, health: &crate::tunnel::ConnectionHealth) ->
 
 /// Should the primary `*` suffix render given the available name-cell width?
 ///
-/// at `inner.width == 24` → `name_cell_width = 5`,
+/// At `inner.width == 21` → `name_cell_width = 5`,
 /// `name_budget = 3` after the 2-char ` *` reserve, which is the minimum
 /// usable name stub. Below that the `*` hides; the header retains the
 /// cross-surface primary signal so no information is lost.
@@ -354,8 +352,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Column arithmetic: status(2) + proto(4) + time(10) + 3 inter-column gaps.
-    let fixed_cols: u16 = 2 + 4 + 10 + 3;
+    // Column arithmetic: status(2) + proto(4) + time(7) + 3 inter-column gaps.
+    let fixed_cols: u16 = 2 + 4 + 7 + 3;
     // Width budget available to the name cell before primary `*` reserve.
     let name_cell_width = inner.width.saturating_sub(fixed_cols) as usize;
     let items: Vec<Row> = app
@@ -378,10 +376,10 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let table = Table::new(
         items,
         [
-            Constraint::Length(2),  // Status: badge glyph (+ optional `!`)
-            Constraint::Min(3),     // Profile name (flex, with optional ` *`)
-            Constraint::Length(4),  // Protocol (WG/OV)
-            Constraint::Length(10), // Last used time
+            Constraint::Length(2), // Status: badge glyph (+ optional `!`)
+            Constraint::Min(3),    // Profile name (flex, with optional ` *`)
+            Constraint::Length(4), // Protocol (WG/OV)
+            Constraint::Length(7), // Last used time: "59m ago", "never"
         ],
     );
     frame.render_stateful_widget(table, inner, &mut app.profile_list_state);
@@ -416,7 +414,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 mod tests {
     //! Sidebar badge tests. Cover the badge taxonomy migration, primary `*`
     //! marker, `!` risk annotation for mode-mismatch (`AddressableSuppressed`),
-    //! and the narrow-width fallback at the 24-char inner-width boundary.
+    //! and the narrow-width fallback at the 21-char inner-width boundary.
     //! Earlier smoke tests (empty-state, row rendering) remain.
     use super::*;
     use crate::app::App;
@@ -485,6 +483,15 @@ mod tests {
             out.contains("No profiles yet"),
             "expected empty-state copy, got:\n{out}"
         );
+    }
+
+    /// The sidebar is 26 columns wide in an 80-column terminal.
+    #[test]
+    fn a_short_name_is_readable_at_80_columns() {
+        let mut app = App::new_test();
+        app.runtime.profiles = vec![make_profile("wg08")];
+        let out = render_to_string(&mut app, 26, 6);
+        assert!(out.contains("wg08"), "got:\n{out}");
     }
 
     #[test]
@@ -659,18 +666,13 @@ mod tests {
 
     #[test]
     fn primary_marker_shown_when_name_cell_width_is_five() {
-        // inner.width=24, fixed_cols=19 → name_cell_width=5 → name_budget=3
-        // after the 2-char reserve. This is the documented boundary case
-        // (line 971): "inner.width = 24 → name_budget = 3; primary `*`
-        // rendered".
+        // inner.width=21, fixed_cols=16 → name_cell_width=5 → name_budget=3.
         assert!(should_show_primary_marker(true, 5));
     }
 
     #[test]
     fn primary_marker_hidden_when_name_cell_width_is_four() {
-        // inner.width=23, fixed_cols=19 → name_cell_width=4 → name_budget=2
-        // after the 2-char reserve. "inner.width = 23 →
-        // name_budget = 2; primary `*` hidden".
+        // inner.width=20, fixed_cols=16 → name_cell_width=4 → name_budget=2.
         assert!(!should_show_primary_marker(true, 4));
     }
 
