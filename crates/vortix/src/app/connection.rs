@@ -12,10 +12,6 @@ use crate::profile::ProfileId;
 /// faster; people cannot read a label that lasts a tenth of a second.
 const TRANSITION_MIN_VISIBLE: std::time::Duration = std::time::Duration::from_millis(600);
 
-fn is_transition(phase: Phase) -> bool {
-    matches!(phase, Phase::Starting | Phase::Stopping)
-}
-
 pub(super) const CONTROL_STARTING_MESSAGE: &str =
     "The VPN service is still starting. Try again in a moment.";
 
@@ -118,15 +114,11 @@ impl App {
         let now = std::time::Instant::now();
         for tunnel in &snapshot.tunnels {
             let before = self.control_snapshot.tunnel(&tunnel.profile_id);
-            if is_transition(tunnel.phase) && before.map(|t| t.phase) != Some(tunnel.phase) {
+            let transition = matches!(tunnel.phase, Phase::Starting | Phase::Stopping);
+            if transition && before.map(|t| t.phase) != Some(tunnel.phase) {
                 self.transition_shown.insert(tunnel.profile_id.clone(), now);
             }
         }
-        self.transition_shown.retain(|profile_id, _| {
-            snapshot
-                .tunnel(profile_id)
-                .is_some_and(|tunnel| is_transition(tunnel.phase))
-        });
         self.sync_last_used(&snapshot);
         self.runtime.connection_drops = snapshot.drops;
 
