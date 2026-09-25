@@ -101,19 +101,11 @@ fn save_to(config_dir: &Path, file: &str, ip: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    {
+    if let Ok(mut f) = crate::config::owned_file::open_user_file(&path, false) {
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            let _ = f.write_all(content.as_bytes());
-            let _ = f.flush();
-        }
+        let _ = f.set_len(0);
+        let _ = f.write_all(content.as_bytes());
+        let _ = f.flush();
     }
 }
 
