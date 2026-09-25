@@ -50,7 +50,7 @@ Press `?` at any time for the complete in-app reference. The most frequently use
 | `A` | Clear saved OpenVPN credentials |
 | `Delete` | Delete the selected profile |
 
-The Connection Details panel follows the selected profile. When a tunnel is in flight, `c` cancels the connection attempt. The log panel uses `j` / `k` to scroll, `f` to filter, and `L` to clear the visible log.
+The Connection Details panel follows the selected profile. When a tunnel is in flight, `c` cancels the connection attempt. The log panel uses `j` / `k` to scroll, `f` to filter, and `L` to clear the visible log. After the level filters, `f` also steps through the OpenVPN daemon log of each active OpenVPN tunnel (with none active, the last connected profile's last session); the panel title says `LIVE` or `last session, ended HH:MM:SS`. Each profile keeps one log, `~/.config/vortix/run/<profile-id>.log`, until it next connects.
 
 ## Profiles
 

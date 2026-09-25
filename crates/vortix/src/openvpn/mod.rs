@@ -352,13 +352,13 @@ pub(crate) fn runtime_log_path(
         .unwrap_or_else(|| run_file(run_dir, profile_id, "log"))
 }
 
-/// Remove a profile's pid, log and management socket under every key it
-/// may use. Ambiguous legacy names are left for manual cleanup rather than
-/// risk another profile's live daemon.
+/// Remove a stopped profile's pid and management socket under every key it
+/// may use. The log stays as the last session until the next connect.
+/// Ambiguous legacy names are left for manual cleanup rather than risk
+/// another profile's live daemon.
 pub(crate) fn remove_run_files(run_dir: &std::path::Path, profile_id: &str, display_name: &str) {
     for key in run_file_keys(profile_id, display_name) {
         let _ = std::fs::remove_file(run_file(run_dir, key, "pid"));
-        let _ = std::fs::remove_file(run_file(run_dir, key, "log"));
         let _ = std::fs::remove_file(management_socket_path(run_dir, key));
     }
 }
@@ -383,11 +383,14 @@ pub fn tracked_openvpn_pids() -> Vec<u32> {
         .collect()
 }
 
-/// Remove a profile's run files from the config directory's run dir.
+/// Remove a deleted profile's run files, its last-session log included.
 pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &str) {
     if let Ok(root) = crate::config::get_config_dir() {
         let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
         remove_run_files(&run_dir, profile_id, legacy_display_name);
+        for key in run_file_keys(profile_id, legacy_display_name) {
+            let _ = std::fs::remove_file(run_file(&run_dir, key, "log"));
+        }
     }
 }
 
@@ -442,19 +445,22 @@ mod tests {
         // No assertion needed — the test passes by not panicking.
     }
 
+    /// A stop clears the daemon's runtime files but keeps its log as the
+    /// last session the Logs panel shows.
     #[test]
-    fn removing_run_files_takes_the_management_socket_too() {
+    fn a_stop_keeps_the_log_and_removes_the_rest() {
         let run_dir = tempfile::tempdir().unwrap();
         let id = "a".repeat(64);
-        let files = [
+        let log = run_file(run_dir.path(), &id, "log");
+        let runtime = [
             run_file(run_dir.path(), &id, "pid"),
-            run_file(run_dir.path(), &id, "log"),
             management_socket_path(run_dir.path(), &id),
         ];
-        for file in &files {
+        for file in runtime.iter().chain([&log]) {
             std::fs::write(file, b"x").unwrap();
         }
         remove_run_files(run_dir.path(), &id, "corp");
-        assert!(files.iter().all(|file| !file.exists()));
+        assert!(runtime.iter().all(|file| !file.exists()));
+        assert!(log.exists());
     }
 }

@@ -138,6 +138,8 @@ pub struct App {
     pub logs_auto_scroll: bool,
     pub logs_max_scroll: u16,
     pub log_level_filter: Option<crate::logger::LogLevel>,
+    pub(crate) logs_source: crate::app::state::LogsSource,
+    pub(crate) openvpn_log: Option<crate::app::state::OpenVpnLogFile>,
     /// Last network-quality category emitted to the Event Log. Raw telemetry
     /// remains dashboard state and only semantic transitions are logged.
     pub(crate) last_logged_network_quality: crate::app::state::QualityLevel,
@@ -206,6 +208,8 @@ impl App {
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
+            logs_source: crate::app::state::LogsSource::Events,
+            openvpn_log: None,
             last_logged_network_quality: crate::app::state::QualityLevel::Unknown,
 
             focused_panel: FocusedPanel::Sidebar,
@@ -351,6 +355,8 @@ impl App {
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
+            logs_source: crate::app::state::LogsSource::Events,
+            openvpn_log: None,
             last_logged_network_quality: crate::app::state::QualityLevel::Unknown,
 
             focused_panel: FocusedPanel::Sidebar,
