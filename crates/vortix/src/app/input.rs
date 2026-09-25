@@ -375,8 +375,42 @@ impl App {
                     }
                 }
             },
+            InputMode::WhatsNew { from, mut scroll } => {
+                let version = crate::constants::APP_VERSION;
+                let must_ack = crate::whats_new::needs_action(&from, version);
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
+                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    KeyCode::Char('y' | 'Y') if must_ack => {
+                        self.close_whats_new();
+                        return;
+                    }
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') if !must_ack => {
+                        self.close_whats_new();
+                        return;
+                    }
+                    _ if must_ack => self.show_toast(
+                        "Do the steps above, then press y. They show again next start until you do.".into(),
+                        ToastType::Warning,
+                    ),
+                    _ => {}
+                }
+                self.input_mode = InputMode::WhatsNew { from, scroll };
+            }
             InputMode::Normal => self.handle_normal_keys(key),
         }
+    }
+
+    /// Close the upgrade notes and record that this version has run here.
+    fn close_whats_new(&mut self) {
+        if let Err(error) =
+            crate::whats_new::record(&self.runtime.config_dir, crate::constants::APP_VERSION)
+        {
+            self.log(&format!(
+                "WARN: Could not record the Vortix version: {error}"
+            ));
+        }
+        self.handle_message(Message::CloseOverlay);
     }
 
     pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {

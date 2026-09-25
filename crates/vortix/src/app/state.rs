@@ -164,6 +164,13 @@ pub enum InputMode {
         /// Is "Yes" selected?
         confirm_selected: bool,
     },
+    /// What changed since the version that last ran here, shown once after
+    /// an upgrade.
+    WhatsNew {
+        /// The version that last ran here.
+        from: String,
+        scroll: u16,
+    },
     /// Help overlay showing all keybindings + glossaries.
     Help {
         /// Vertical scroll offset within the active tab. Reset to 0

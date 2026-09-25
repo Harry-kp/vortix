@@ -376,7 +376,7 @@ fn main() -> Result<()> {
             eprintln!("  - pid {} ({})", o.pid, o.command);
         }
         eprintln!(
-            "  These may be leftovers from a previous vortix crash. Run `sudo kill <pid>` to clean up, or `sudo vortix down --force` to tear down via vortix."
+            "  A crashed or earlier Vortix left them running, and this one cannot manage them. Stop each once with `sudo kill <pid>`."
         );
     }
 
@@ -401,8 +401,31 @@ fn main() -> Result<()> {
         cli::output::OutputMode::Human
     };
 
+    let history = vortix::whats_new::status(&config_dir, constants::APP_VERSION);
+    if let vortix::whats_new::Status::Downgraded { from } = &history {
+        eprintln!(
+            "warning: Vortix {from} last ran with {}; this is the older {}. If something fails, install {from} again.",
+            config_dir.display(),
+            constants::APP_VERSION
+        );
+    }
+
     // Handle CLI commands (import, update, info, status, up, down, etc.)
     if let Some(command) = &args.command {
+        if let vortix::whats_new::Status::Upgraded { from } = &history {
+            let releases = vortix::whats_new::releases_since(from, constants::APP_VERSION);
+            if !args.quiet {
+                eprintln!("{}\n", vortix::whats_new::plain_text(from, &releases));
+            }
+            // The steps need root; a plain `vortix list` must not mark them seen.
+            if !args.quiet
+                && (vortix::platform::is_root() || vortix::whats_new::steps(&releases).is_empty())
+            {
+                let _ = vortix::whats_new::record(&config_dir, constants::APP_VERSION);
+            }
+        } else if history == vortix::whats_new::Status::Current {
+            let _ = vortix::whats_new::record(&config_dir, constants::APP_VERSION);
+        }
         let exit_code = cli::commands::handle_command(
             command,
             &config_dir,
@@ -415,7 +438,16 @@ fn main() -> Result<()> {
 
     // Run the TUI application
     let terminal = init_terminal()?;
-    let result = run_tui(terminal, app_config, config_dir);
+    let upgraded_from = match &history {
+        vortix::whats_new::Status::Upgraded { from } => Some(from.clone()),
+        _ => None,
+    };
+    // An upgrade is recorded when its notes are closed, so a quit or a crash
+    // before then shows them again.
+    if history == vortix::whats_new::Status::Current {
+        let _ = vortix::whats_new::record(&config_dir, constants::APP_VERSION);
+    }
+    let result = run_tui(terminal, app_config, config_dir, upgraded_from);
     restore_terminal();
 
     result
@@ -499,6 +531,7 @@ fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     config: config::AppConfig,
     config_dir: std::path::PathBuf,
+    upgraded_from: Option<String>,
 ) -> Result<()> {
     terminal.draw(|frame| {
         use ratatui::layout::Alignment;
@@ -529,6 +562,9 @@ fn run_tui(
     })?;
     let tick_rate = config.tick_rate;
     let mut app = App::new(config, config_dir);
+    if let Some(from) = upgraded_from {
+        app.input_mode = vortix::app::InputMode::WhatsNew { from, scroll: 0 };
+    }
     let control_config = app.runtime.config.clone();
     let control_dir = app.runtime.config_dir.clone();
     let control_profiles = app.runtime.profiles.clone();

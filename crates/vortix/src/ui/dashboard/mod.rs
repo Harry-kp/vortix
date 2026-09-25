@@ -256,6 +256,9 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             count,
             confirm_selected,
         } => render_disconnect_all_confirm(frame, *count, *confirm_selected),
+        InputMode::WhatsNew { from, scroll } => {
+            super::overlays::whats_new::render(frame, from, *scroll);
+        }
         InputMode::Normal => {}
     }
 

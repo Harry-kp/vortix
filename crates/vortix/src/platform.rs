@@ -335,12 +335,14 @@ fn install_command(pkg: &str) -> Option<String> {
 pub fn install_hint(pkg: &str) -> String {
     // A package whose name differs per family, or which is not a package at
     // all, keeps its hand-written block below.
-    let uniform = matches!(pkg, "wg" | "wg-quick" | "wireguard-tools" | "openvpn");
+    let uniform = matches!(
+        pkg,
+        "wg" | "wg-quick" | "wireguard-tools" | "openvpn" | "nftables"
+    );
     if uniform {
-        let package = if pkg == "openvpn" {
-            "openvpn"
-        } else {
-            "wireguard-tools"
+        let package = match pkg {
+            "openvpn" | "nftables" => pkg,
+            _ => "wireguard-tools",
         };
         if let Some(command) = install_command(package) {
             return command;
