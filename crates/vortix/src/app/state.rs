@@ -199,32 +199,16 @@ pub enum InputMode {
         /// Cursor position in the query.
         cursor: usize,
     },
-    /// Confirmation dialog when connecting a new profile would take over the
-    /// default route from an already-active tunnel (formerly
-    /// `ConfirmSwitch`). On confirm the connect path retries
-    /// with `force=true`, inverting the primary.
-    ConfirmDefaultRouteTakeover {
-        /// Name of the profile currently holding the default route (display only).
-        from: String,
-        /// Profile id of the new tunnel attempting the takeover.
+    /// Confirm switching to a profile that conflicts with a running tunnel:
+    /// both want all traffic, or both want the same networks.
+    ConfirmSwitch {
+        /// The running tunnel a switch disconnects.
+        current_id: ProfileId,
+        /// The profile being connected.
         to_profile_id: ProfileId,
-        /// Display name of the new tunnel.
         to_name: String,
-        /// "Yes" button currently selected?
-        confirm_selected: bool,
-    },
-    /// Confirmation dialog when a new profile's `AllowedIPs` overlap with an
-    /// already-active tunnel's `AllowedIPs` on a non-default-route CIDR.
-    /// On confirm the connect path retries with `force=true`.
-    ConfirmRouteOverlap {
-        /// Profile id of the conflicting (already-active) tunnel.
-        with_profile_id: ProfileId,
-        /// The overlapping CIDRs reported by the engine's conflict detector.
-        overlapping_cidrs: Vec<Cidr>,
-        /// Profile id of the new tunnel attempting to connect.
-        to_profile_id: ProfileId,
-        /// Display name of the new tunnel.
-        to_name: String,
+        /// The networks both want; empty when both want all traffic.
+        shared: Vec<Cidr>,
         /// "Yes" button currently selected?
         confirm_selected: bool,
     },

@@ -232,26 +232,13 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
         InputMode::Search { query, cursor } => {
             super::overlays::search::render(frame, app, query, *cursor, app.runtime.profiles.len());
         }
-        InputMode::ConfirmDefaultRouteTakeover {
-            from,
+        InputMode::ConfirmSwitch {
+            current_id,
             to_name,
+            shared,
             confirm_selected,
             ..
-        } => render_default_route_takeover_confirm(frame, from, to_name, *confirm_selected),
-        InputMode::ConfirmRouteOverlap {
-            with_profile_id,
-            overlapping_cidrs,
-            to_name,
-            confirm_selected,
-            ..
-        } => render_route_overlap_confirm(
-            frame,
-            app,
-            with_profile_id,
-            overlapping_cidrs,
-            to_name,
-            *confirm_selected,
-        ),
+        } => render_switch_confirm(frame, app, current_id, shared, to_name, *confirm_selected),
         InputMode::ConfirmDisconnectAll {
             count,
             confirm_selected,
@@ -353,28 +340,50 @@ fn render_disconnect_all_confirm(frame: &mut Frame, count: usize, confirm_select
     );
 }
 
-/// The overlay offering to hand the default route to another profile.
-fn render_default_route_takeover_confirm(
+/// The dialog offering to switch to a profile that conflicts with a running
+/// tunnel: both want all traffic, or both want the same networks.
+fn render_switch_confirm(
     frame: &mut Frame,
-    from: &str,
+    app: &App,
+    current_id: &crate::profile::ProfileId,
+    shared: &[crate::cidr::Cidr],
     to_name: &str,
     confirm_selected: bool,
 ) {
     use super::overlays::confirm_dialog::{self, ConfirmDialogConfig};
 
-    // Both VPNs declare a default route (0.0.0.0/0), and only one can hold the
-    // kernel default route at a time, so the two cannot both be the exit.
-    // Switch (disconnect the old, connect the new) or cancel — there is no
-    // "keep both" here; a second full-tunnel cannot coexist with the first.
     let inner_width = usize::from(
         64_u16
             .min(frame.area().width.saturating_sub(4))
             .saturating_sub(2),
     );
-    let switch_from_width = inner_width.saturating_sub("[Y] Switch — disconnect ".width());
-    let cancel_from_width = inner_width.saturating_sub("[Esc] Cancel — keep ".width());
-    let switch_from = crate::ui::helpers::truncate_to_width(from, switch_from_width);
-    let cancel_from = crate::ui::helpers::truncate_to_width(from, cancel_from_width);
+    let current = app.profile_display_name(current_id);
+    let fit = |text: &str, prefix: &str| {
+        crate::ui::helpers::truncate_to_width(text, inner_width.saturating_sub(prefix.width()))
+    };
+    let muted = Style::default().fg(theme::current().text_secondary);
+    // Up to two networks inline; the rest collapse into "+N more".
+    let what = if shared.is_empty() {
+        "all your internet traffic.".to_owned()
+    } else {
+        let head = shared
+            .iter()
+            .take(2)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tail = if shared.len() > 2 {
+            format!(", +{} more", shared.len() - 2)
+        } else {
+            String::new()
+        };
+        format!("{}{tail}", fit(&head, &tail))
+    };
+    let to_line = if shared.is_empty() {
+        " also wants to handle"
+    } else {
+        " also wants to carry"
+    };
     confirm_dialog::render(
         frame,
         ConfirmDialogConfig {
@@ -382,18 +391,19 @@ fn render_default_route_takeover_confirm(
             body: vec![
                 Line::from(vec![
                     Span::styled(
-                        crate::ui::helpers::truncate_to_width(to_name, inner_width),
+                        fit(to_name, to_line),
                         Style::default().fg(theme::current().success),
                     ),
-                    Span::styled(
-                        " also wants to handle all",
-                        Style::default().fg(theme::current().text_secondary),
-                    ),
+                    Span::styled(to_line, muted),
                 ]),
-                Line::from(vec![Span::styled(
-                    "your internet traffic.",
-                    Style::default().fg(theme::current().text_secondary),
-                )]),
+                Line::from(Span::styled(
+                    what,
+                    if shared.is_empty() {
+                        muted
+                    } else {
+                        Style::default().fg(theme::current().warning)
+                    },
+                )),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled(
@@ -403,17 +413,14 @@ fn render_default_route_takeover_confirm(
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
                     Span::styled(
-                        switch_from,
+                        fit(&current, "[Y] Switch — disconnect "),
                         Style::default().fg(theme::current().accent_primary),
                     ),
                 ]),
                 Line::from(vec![
+                    Span::styled("[Esc] Cancel — keep ", muted),
                     Span::styled(
-                        "[Esc] Cancel — keep ",
-                        Style::default().fg(theme::current().text_secondary),
-                    ),
-                    Span::styled(
-                        cancel_from,
+                        fit(&current, "[Esc] Cancel — keep "),
                         Style::default().fg(theme::current().accent_primary),
                     ),
                 ]),
@@ -427,239 +434,85 @@ fn render_default_route_takeover_confirm(
     );
 }
 
-/// The overlay offering to drop a tunnel whose networks the new one needs.
-fn render_route_overlap_confirm(
-    frame: &mut Frame,
-    app: &App,
-    with_profile_id: &crate::profile::ProfileId,
-    overlapping_cidrs: &[crate::cidr::Cidr],
-    to_name: &str,
-    confirm_selected: bool,
-) {
-    use super::overlays::confirm_dialog::{self, ConfirmDialogConfig};
-
-    let inner_width = usize::from(
-        56_u16
-            .min(frame.area().width.saturating_sub(4))
-            .saturating_sub(2),
-    );
-    let with_name = app
-        .runtime
-        .profiles
-        .iter()
-        .find(|profile| profile.id == *with_profile_id)
-        .map_or_else(
-            || format!("ProfileMissing:{with_profile_id}"),
-            |profile| profile.name.clone(),
-        );
-    // Both names now share the first line as "<new> and <current>",
-    // so they split one budget rather than each owning a line.
-    let name_budget = inner_width.saturating_sub(" and ".width()) / 2;
-    let with_t = crate::ui::helpers::truncate_to_width(&with_name, name_budget);
-    let with_t2 = crate::ui::helpers::truncate_to_width(
-        &with_name,
-        inner_width.saturating_sub("connecting disconnects .".width()),
-    );
-    let to_t = crate::ui::helpers::truncate_to_width(to_name, name_budget);
-    // Display up to two overlapping CIDRs inline; the rest collapse
-    // into a "+N more" tail so a wide AllowedIPs set doesn't blow
-    // the dialog height.
-    let cidr_budget = inner_width.saturating_sub("both want to carry ".width());
-    let cidr_summary = if overlapping_cidrs.is_empty() {
-        String::from("(unknown)")
-    } else if overlapping_cidrs.len() > 2 {
-        let head = overlapping_cidrs
-            .iter()
-            .take(2)
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let tail = format!(", +{} more", overlapping_cidrs.len() - 2);
-        format!(
-            "{}{}",
-            crate::ui::helpers::truncate_to_width(&head, cidr_budget.saturating_sub(tail.width())),
-            tail
-        )
-    } else {
-        let summary = overlapping_cidrs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        crate::ui::helpers::truncate_to_width(&summary, cidr_budget)
-    };
-    confirm_dialog::render(
-        frame,
-        ConfirmDialogConfig {
-            // "Route Overlap" named the internal conflict kind, not
-            // the user's situation, and the three fragments below it
-            // never said what pressing Connect would do. The takeover
-            // dialog next door already speaks plainly; this one says
-            // the same three things it does — who is contending, over
-            // what, and what happens next.
-            title: " Already connected ",
-            body: vec![
-                Line::from(vec![
-                    Span::styled(to_t, Style::default().fg(theme::current().success)),
-                    Span::styled(
-                        " and ",
-                        Style::default().fg(theme::current().text_secondary),
-                    ),
-                    Span::styled(with_t, Style::default().fg(theme::current().accent_primary)),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "both want to carry ",
-                        Style::default().fg(theme::current().text_secondary),
-                    ),
-                    Span::styled(cidr_summary, Style::default().fg(theme::current().warning)),
-                ]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "Only one tunnel can carry a network, so",
-                    Style::default().fg(theme::current().text_secondary),
-                )]),
-                Line::from(vec![
-                    Span::styled(
-                        "connecting disconnects ",
-                        Style::default().fg(theme::current().text_secondary),
-                    ),
-                    Span::styled(
-                        with_t2,
-                        Style::default().fg(theme::current().accent_primary),
-                    ),
-                    Span::styled(".", Style::default().fg(theme::current().text_secondary)),
-                ]),
-            ],
-            border_color: theme::current().warning,
-            confirm_selected,
-            confirm_label: "Connect",
-            width: 56,
-            height: 10,
-        },
-    );
-}
-
 #[cfg(test)]
 mod overlay_tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
-    #[test]
-    fn takeover_dialog_offers_only_switch_or_cancel() {
-        let mut app = App::new_test();
-        app.input_mode = InputMode::ConfirmDefaultRouteTakeover {
-            from: "existing-primary-profile-with-a-deliberately-long-name".to_string(),
-            to_profile_id: crate::profile::ProfileId::new(
-                "incoming-primary-profile-with-a-deliberately-long-name",
-            ),
-            to_name: "incoming-primary-profile-with-a-deliberately-long-name".to_string(),
-            confirm_selected: true,
-        };
+    fn render(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render_overlays(frame, app)).unwrap();
         terminal
-            .draw(|frame| render_overlays(frame, &mut app))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let output = buffer
+            .backend()
+            .buffer()
             .content
             .iter()
             .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(output.contains("existing-primary-profile"), "{output}");
-        assert!(output.contains("incoming-primary-pro"), "{output}");
+            .collect()
+    }
+
+    fn switch(current: &str, to: &str, shared: Vec<crate::cidr::Cidr>) -> InputMode {
+        InputMode::ConfirmSwitch {
+            current_id: crate::profile::ProfileId::new(current),
+            to_profile_id: crate::profile::ProfileId::new(to),
+            to_name: to.to_string(),
+            shared,
+            confirm_selected: true,
+        }
+    }
+
+    #[test]
+    fn a_full_tunnel_conflict_offers_only_switch_or_cancel() {
+        let mut app = App::new_test();
+        app.input_mode = switch(
+            "existing-primary-profile-with-a-deliberately-long-name",
+            "incoming-primary-profile-with-a-deliberately-long-name",
+            Vec::new(),
+        );
+        let output = render(&mut app);
+        assert!(output.contains("existing-primary"), "{output}");
+        assert!(output.contains("incoming-primary"), "{output}");
+        assert!(output.contains("all your internet traffic"), "{output}");
         assert!(output.contains("[Y] Switch — disconnect"), "{output}");
         assert!(output.contains("[Esc] Cancel — keep"), "{output}");
-        // "Keep both" was removed: a second default-route tunnel cannot coexist.
         assert!(!output.contains("Keep both"), "{output}");
     }
 
-    /// The overlap dialog used to read "Route Overlap / Connect X / Overlaps
-    /// with Y / on 10.250.0.0/24?" — the internal conflict kind as a title,
-    /// three fragments, and no statement of what confirming would do. The one
-    /// fact that distinguishes it from a default-route takeover is that both
-    /// VPNs stay connected, and it never said so.
+    /// Both conflicts are the same choice, so they share one dialog; only the
+    /// line saying what is contended differs.
     #[test]
-    fn the_overlap_dialog_says_what_confirming_does() {
+    fn a_network_conflict_names_the_networks_in_the_same_dialog() {
         let mut app = App::new_test();
-        app.input_mode = InputMode::ConfirmRouteOverlap {
-            with_profile_id: crate::profile::ProfileId::new("held"),
-            overlapping_cidrs: vec!["10.250.0.0/24".parse().unwrap()],
-            to_profile_id: crate::profile::ProfileId::new("incoming"),
-            to_name: "wg07".to_string(),
-            confirm_selected: true,
-        };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| render_overlays(frame, &mut app))
-            .unwrap();
-        let output = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-
-        assert!(
-            !output.contains("Route Overlap"),
-            "the title named an internal conflict kind, not the situation: {output}"
-        );
-        assert!(
-            output.contains("both want to carry"),
-            "the dialog must name what is actually contended: {output}"
-        );
-        assert!(
-            output.contains("10.250.0.0/24"),
-            "the contended network must be shown: {output}"
-        );
-        assert!(
-            output.contains("connecting disconnects"),
-            "the dialog must say the other tunnel stops: {output}"
-        );
-        assert!(
-            !output.contains("Both stay connected"),
-            "two profiles cannot carry the same network, so nothing may promise they do: {output}"
-        );
+        app.input_mode = switch("held", "wg07", vec!["10.250.0.0/24".parse().unwrap()]);
+        let output = render(&mut app);
+        assert!(output.contains("also wants to carry"), "{output}");
+        assert!(output.contains("10.250.0.0/24"), "{output}");
+        assert!(output.contains("[Y] Switch — disconnect"), "{output}");
+        assert!(output.contains("[Esc] Cancel — keep"), "{output}");
+        assert!(!output.contains("Route Overlap"), "{output}");
     }
 
     #[test]
-    fn overlap_dialog_keeps_long_ipv6_details_and_choices_within_bounds() {
+    fn long_names_and_many_networks_stay_within_the_dialog() {
         let mut app = App::new_test();
-        let existing = crate::profile::ProfileId::new(
+        app.input_mode = switch(
             "existing-profile-with-a-name-that-is-far-too-long-for-the-dialog",
-        );
-        app.input_mode = InputMode::ConfirmRouteOverlap {
-            with_profile_id: existing,
-            overlapping_cidrs: vec![
-                "2001:db8:1234:5678:90ab:cdef:1234:5678/128"
-                    .parse()
-                    .unwrap(),
-                "2001:db8:ffff:eeee:dddd:cccc:bbbb:aaaa/128"
-                    .parse()
-                    .unwrap(),
-                "2001:db8:1::/64".parse().unwrap(),
-                "2001:db8:2::/64".parse().unwrap(),
-                "2001:db8:3::/64".parse().unwrap(),
-            ],
-            to_profile_id: crate::profile::ProfileId::new("incoming"),
-            to_name: "incoming-profile-with-an-equally-long-human-readable-name".to_string(),
-            confirm_selected: true,
-        };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| render_overlays(frame, &mut app))
-            .unwrap();
-        let output = terminal
-            .backend()
-            .buffer()
-            .content
+            "incoming-profile-with-an-equally-long-human-readable-name",
+            [
+                "2001:db8:1234:5678:90ab:cdef:1234:5678/128",
+                "2001:db8:ffff:eeee:dddd:cccc:bbbb:aaaa/128",
+                "2001:db8:1::/64",
+                "2001:db8:2::/64",
+                "2001:db8:3::/64",
+            ]
             .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
+            .map(|cidr| cidr.parse().unwrap())
+            .collect(),
+        );
+        let output = render(&mut app);
         assert!(output.contains("..."), "{output}");
         assert!(output.contains("+3 more"), "{output}");
-        assert!(output.contains("[Y] Connect"), "{output}");
+        assert!(output.contains("[Y] Switch"), "{output}");
         assert!(output.contains("[N] Cancel"), "{output}");
     }
 }

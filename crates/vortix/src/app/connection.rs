@@ -351,37 +351,29 @@ impl App {
         target_id: ProfileId,
         target_name: String,
     ) {
-        match conflict {
-            Conflict::DefaultRouteTakeover { current, new } => {
-                let current_name = self.profile_display_name(&current);
-                self.log(&format!(
-                    "ACTION: Connect to '{target_name}' blocked by default-route takeover ('{current_name}' holds 0/0)"
-                ));
-                self.input_mode = InputMode::ConfirmDefaultRouteTakeover {
-                    from: current_name,
-                    to_profile_id: new,
-                    to_name: target_name,
-                    confirm_selected: true,
-                };
-            }
+        let (current_id, shared) = match conflict {
+            Conflict::DefaultRouteTakeover { current, .. } => (current, Vec::new()),
             Conflict::RouteOverlap {
                 with,
                 overlapping_cidrs,
-            } => {
-                self.log(&format!(
-                    "ACTION: Connect to '{target_name}' blocked by route-overlap with '{}' ({} CIDR(s))",
-                    self.profile_display_name(&with),
-                    overlapping_cidrs.len()
-                ));
-                self.input_mode = InputMode::ConfirmRouteOverlap {
-                    with_profile_id: with,
-                    overlapping_cidrs,
-                    to_profile_id: target_id,
-                    to_name: target_name,
-                    confirm_selected: true,
-                };
-            }
-        }
+            } => (with, overlapping_cidrs),
+        };
+        let what = if shared.is_empty() {
+            "all traffic".to_owned()
+        } else {
+            format!("{} network(s)", shared.len())
+        };
+        self.log(&format!(
+            "ACTION: Connect to '{target_name}' conflicts with '{}' over {what}",
+            self.profile_display_name(&current_id)
+        ));
+        self.input_mode = InputMode::ConfirmSwitch {
+            current_id,
+            to_profile_id: target_id,
+            to_name: target_name,
+            shared,
+            confirm_selected: true,
+        };
     }
 
     /// Check for system-wide dependencies at startup and warn the user.
