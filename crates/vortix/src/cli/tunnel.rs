@@ -192,14 +192,29 @@ pub(super) fn handle_up(
         exit_if_missing_dependencies(mode, "up", profile);
     }
 
-    // route the CLI connect through the
-    // engine snapshot's conflict gate before invoking the legacy tunnel-up path.
-    // The CLI is headless and has no in-memory engine, so we build a
-    // transient one from the scanner's active-session snapshot and ask it
-    // whether the new profile's AllowedIPs collide with anything already
-    // up. `--yes` bypasses the gate for scripted callers.
+    let target = profiles
+        .iter()
+        .find(|profile| profile.name == profile_name)
+        .cloned()
+        .unwrap_or_else(|| {
+            print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
+        });
+    let timeout_secs = connect_operation_timeout_secs(timeout_secs, target.protocol, config);
+    let protocol = target.protocol.to_string();
+    show_lifecycle_progress(
+        mode,
+        "Connecting",
+        &target.name,
+        Some(&protocol),
+        timeout_secs,
+    );
+    let control = super::commands::start_engine(config, config_dir, profiles.clone())
+        .unwrap_or_else(|error| engine_failure_or_exit(mode, "up", error));
+    // The engine knows each running tunnel's live routes, including a default
+    // route its OpenVPN server pushed; the profile files alone do not.
+    // `--yes` bypasses the gate for scripted callers.
     if !yes {
-        if let Some(conflict) = detect_conflict_for_cli(&profiles, config_dir, &profile_name) {
+        if let Some(conflict) = control.snapshot().conflicts(&target.id).into_iter().next() {
             // Conflicts carry opaque profile IDs; the reader needs the name
             // they typed, so resolve through the catalog before formatting.
             let named = |id: &crate::profile::ProfileId| {
@@ -235,37 +250,23 @@ pub(super) fn handle_up(
                     code,
                     message,
                     hint: Some(format!(
-                        "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
-                    )),
+                    "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
+                )),
                 },
                 ExitCode::StateConflict,
             );
         }
     }
-
-    let target = profiles
-        .iter()
-        .find(|profile| profile.name == profile_name)
-        .cloned()
-        .unwrap_or_else(|| {
-            print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
-        });
-    let timeout_secs = connect_operation_timeout_secs(timeout_secs, target.protocol, config);
-    let protocol = target.protocol.to_string();
-    show_lifecycle_progress(
-        mode,
-        "Connecting",
-        &target.name,
-        Some(&protocol),
-        timeout_secs,
-    );
-    if let Err(error) = run_engine_command(
-        config,
-        config_dir,
-        profiles.clone(),
-        crate::control::Command::Connect(target.id.clone()),
-        Duration::from_secs(timeout_secs),
-    ) {
+    // `--yes` is "switch to this tunnel": bring it up, then stop what it
+    // conflicts with, as the TUI's Switch does.
+    let command = if yes {
+        crate::control::Command::Switch(target.id.clone())
+    } else {
+        crate::control::Command::Connect(target.id.clone())
+    };
+    if let Err(error) =
+        super::commands::run_on(&control, command, Duration::from_secs(timeout_secs))
+    {
         engine_failure_or_exit(mode, "up", error);
     }
     let data = UpData {
@@ -287,45 +288,6 @@ pub(super) fn handle_up(
         OutputMode::Quiet => {}
     }
     0
-}
-
-fn detect_conflict_for_cli(
-    profiles: &[crate::config::profiles::VpnProfile],
-    config_dir: &Path,
-    target_name: &str,
-) -> Option<crate::control::Conflict> {
-    let target_profile = profiles.iter().find(|p| p.name == target_name)?;
-    let specs = crate::control::specs::load(config_dir, profiles.to_vec());
-    let routes = |id: &crate::profile::ProfileId| {
-        specs
-            .get(id)
-            .and_then(|entry| entry.spec.as_ref().ok())
-            .map(|spec| spec.routes.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default()
-    };
-    let target_allowed = routes(&target_profile.id);
-
-    let active = crate::control::scanner::get_active_profiles(profiles);
-    for session in &active {
-        if session.name == target_name {
-            // Re-up of an already-up profile isn't a conflict — the
-            // connect path is idempotent here.
-            continue;
-        }
-        let Some(active_profile) = profiles.iter().find(|p| p.name == session.name) else {
-            continue;
-        };
-        let active_allowed = routes(&active_profile.id);
-        if let Some(conflict) = crate::control::classify_route_conflict(
-            &target_allowed,
-            &active_allowed,
-            &active_profile.id,
-            &target_profile.id,
-        ) {
-            return Some(conflict);
-        }
-    }
-    None
 }
 
 #[derive(Serialize)]

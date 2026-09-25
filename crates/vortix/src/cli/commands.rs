@@ -186,7 +186,28 @@ pub(super) fn run_engine_command(
     command: crate::control::Command,
     timeout: Duration,
 ) -> Result<std::sync::Arc<crate::control::Snapshot>, String> {
-    let control = crate::control::Control::start(config, config_dir, profiles)?;
+    run_on(
+        &start_engine(config, config_dir, profiles)?,
+        command,
+        timeout,
+    )
+}
+
+/// Start the engine: it adopts running tunnels and applies the plan once.
+pub(super) fn start_engine(
+    config: &AppConfig,
+    config_dir: &Path,
+    profiles: Vec<crate::config::profiles::VpnProfile>,
+) -> Result<crate::control::Control, String> {
+    crate::control::Control::start(config, config_dir, profiles)
+}
+
+/// Run one command to completion on a started engine.
+pub(super) fn run_on(
+    control: &crate::control::Control,
+    command: crate::control::Command,
+    timeout: Duration,
+) -> Result<std::sync::Arc<crate::control::Snapshot>, String> {
     let ticket = control.send(command);
     let expires = crate::platform::boot_elapsed_millis()
         .unwrap_or_default()
