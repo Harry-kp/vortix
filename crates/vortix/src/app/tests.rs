@@ -2566,3 +2566,36 @@ fn rename_first(app: &mut App, new_name: &str) {
     let profile_id = app.runtime.profiles[0].id.clone();
     app.rename_profile_by_id(&profile_id, new_name);
 }
+
+/// A disconnect finishes in about 0.1 s; without a minimum the Disconnecting
+/// label was drawn for one frame and nobody saw it.
+#[test]
+fn a_short_disconnect_stays_readable_then_resolves() {
+    let mut app = test_app();
+    set_connected(&mut app, "wg08");
+    set_phase(&mut app, "wg08", crate::control::Phase::Stopping);
+    let profile_id = crate::profile::ProfileId::new("wg08");
+    let mut gone = (*app.control_snapshot).clone();
+    gone.tunnels.clear();
+    gone.version += 1;
+    let gone = std::sync::Arc::new(gone);
+
+    app.apply_control_snapshot(std::sync::Arc::clone(&gone));
+    assert_eq!(
+        app.tunnel(&profile_id).map(|tunnel| tunnel.phase),
+        Some(crate::control::Phase::Stopping),
+        "the label must outlive a 0.1 s disconnect"
+    );
+    assert!(
+        app.has_active_animation(),
+        "the loop must keep polling to release it"
+    );
+
+    // Once the label has been visible long enough, the update goes through.
+    for shown in app.transition_shown.values_mut() {
+        *shown -= std::time::Duration::from_secs(1);
+    }
+    app.apply_control_snapshot(gone);
+    assert!(app.tunnel(&profile_id).is_none());
+    assert!(app.held_snapshot.is_none());
+}

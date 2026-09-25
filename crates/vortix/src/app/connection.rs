@@ -8,6 +8,14 @@ use crate::control::Conflict;
 use crate::control::{Command, Level, Phase, Snapshot, TunnelView};
 use crate::profile::ProfileId;
 
+/// A transition label shows at least this long, even when the change is
+/// faster; people cannot read a label that lasts a tenth of a second.
+const TRANSITION_MIN_VISIBLE: std::time::Duration = std::time::Duration::from_millis(600);
+
+fn is_transition(phase: Phase) -> bool {
+    matches!(phase, Phase::Starting | Phase::Stopping)
+}
+
 pub(super) const CONTROL_STARTING_MESSAGE: &str =
     "The VPN service is still starting. Try again in a moment.";
 
@@ -102,6 +110,26 @@ impl App {
     }
 
     pub fn apply_control_snapshot(&mut self, snapshot: Arc<Snapshot>) {
+        if let Some(until) = self.transition_hold(&snapshot) {
+            self.held_snapshot = Some((snapshot, until));
+            return;
+        }
+        self.held_snapshot = None;
+        let now = std::time::Instant::now();
+        for tunnel in &snapshot.tunnels {
+            let before = self
+                .control_snapshot
+                .tunnel(&tunnel.profile_id)
+                .map(|t| t.phase);
+            if is_transition(tunnel.phase) && before != Some(tunnel.phase) {
+                self.transition_shown.insert(tunnel.profile_id.clone(), now);
+            }
+        }
+        self.transition_shown.retain(|profile_id, _| {
+            snapshot
+                .tunnel(profile_id)
+                .is_some_and(|tunnel| is_transition(tunnel.phase))
+        });
         self.sync_last_used(&snapshot);
         self.runtime.connection_drops = snapshot.drops;
 
@@ -163,6 +191,20 @@ impl App {
         if egress_changed {
             self.refresh_telemetry();
         }
+    }
+
+    /// Until when to keep the current screen: a Connecting or Disconnecting
+    /// label that `snapshot` would end before anyone could read it.
+    fn transition_hold(&self, snapshot: &Snapshot) -> Option<std::time::Instant> {
+        self.transition_shown
+            .iter()
+            .filter(|(profile_id, _)| {
+                let old = self.control_snapshot.tunnel(profile_id).map(|t| t.phase);
+                old != snapshot.tunnel(profile_id).map(|t| t.phase)
+            })
+            .map(|(_, shown)| *shown + TRANSITION_MIN_VISIBLE)
+            .filter(|until| *until > std::time::Instant::now())
+            .max()
     }
 
     fn sync_last_used(&mut self, snapshot: &Snapshot) {
