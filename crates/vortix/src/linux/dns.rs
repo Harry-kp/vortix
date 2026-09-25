@@ -555,8 +555,14 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             ));
         }
         self.mutated_resolved.insert(interface.to_string());
-        write_resolved_state(&mut self.runner, interface, &owned.prior)?;
-        verify_resolved_state(&mut self.runner, interface, &owned.prior)?;
+        // The link can also vanish between that read and the restore.
+        if let Err(error) = write_resolved_state(&mut self.runner, interface, &owned.prior)
+            .and_then(|()| verify_resolved_state(&mut self.runner, interface, &owned.prior))
+        {
+            if interface_exists(interface) {
+                return Err(error);
+            }
+        }
         self.ownership.resolved.remove(interface);
         Ok(())
     }
@@ -1634,6 +1640,39 @@ mod tests {
             default_route: Some(false),
         };
         let mut runner = FakeDnsCommandRunner::default();
+        runner.resolved.insert("lo".into(), prior);
+        let mut engine = LinuxDnsPolicyEngine::new(runner);
+        let desired = policy(1, vec![assignment_for("lo", "1.1.1.1", DnsScope::CatchAll)]);
+        let applied = engine.apply(
+            LinuxDnsBackend::Resolved,
+            &desired,
+            None,
+            &DnsEffectiveState::default(),
+        );
+        engine
+            .runner
+            .fail("resolvectl", &["dns", "lo", "9.9.9.9"], 0);
+        let released = policy(2, Vec::new());
+        let effective = engine.apply(
+            LinuxDnsBackend::Resolved,
+            &released,
+            Some(&desired),
+            &applied,
+        );
+        assert_eq!(effective.status, DnsEffectiveStatus::Degraded);
+        assert_eq!(effective.owned.len(), 1);
+        assert_eq!(effective.owned[0].id, "resolved:lo");
+    }
+
+    /// `wg0` is not a live link here: the restore failed because it is gone.
+    #[test]
+    fn a_link_that_vanishes_mid_release_is_released() {
+        let prior = ResolvedLinkState {
+            servers: vec!["9.9.9.9".into()],
+            domains: vec!["lan.example".into()],
+            default_route: Some(false),
+        };
+        let mut runner = FakeDnsCommandRunner::default();
         runner.resolved.insert("wg0".into(), prior);
         let mut engine = LinuxDnsPolicyEngine::new(runner);
         let desired = policy(
@@ -1656,9 +1695,8 @@ mod tests {
             Some(&desired),
             &applied,
         );
-        assert_eq!(effective.status, DnsEffectiveStatus::Degraded);
-        assert_eq!(effective.owned.len(), 1);
-        assert_eq!(effective.owned[0].id, "resolved:wg0");
+        assert_eq!(effective.status, DnsEffectiveStatus::Released);
+        assert!(effective.owned.is_empty());
     }
 
     #[test]
