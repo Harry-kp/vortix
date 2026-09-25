@@ -42,9 +42,23 @@ pub struct StatusSnapshot {
     pub primary: Option<usize>,
     pub killswitch_mode: crate::control::killswitch::KillSwitchMode,
     pub killswitch_state: crate::control::killswitch::KillSwitchState,
+    /// False when the scan could not see every tunnel (without root,
+    /// `WireGuard` state cannot be read).
+    pub observation_complete: bool,
 }
 
+/// Printed instead of "Disconnected" when nothing was seen but the scan was
+/// incomplete: an unprivileged `status` cannot see `WireGuard` tunnels.
+const UNKNOWN_HEADLINE: &str =
+    "? Tunnel state unknown: WireGuard tunnels are only visible to root. Run: sudo vortix status";
+
 impl StatusSnapshot {
+    /// Nothing seen, but the scan could not see everything.
+    #[must_use]
+    pub fn state_unknown(&self) -> bool {
+        self.sessions.is_empty() && !self.observation_complete
+    }
+
     /// The tunnel a one-line summary describes: the primary, else the first.
     #[must_use]
     pub fn focus(&self) -> Option<&SessionStatus> {
@@ -66,7 +80,7 @@ pub fn scan_status(
     config_dir: &std::path::Path,
 ) -> StatusSnapshot {
     let (killswitch_mode, killswitch_state) = crate::control::killswitch::persisted();
-    let active = scanner::get_active_profiles(profiles);
+    let (active, observation_complete) = scanner::scan_active_profiles(profiles);
     let default_interface = if active.is_empty() {
         None
     } else {
@@ -88,6 +102,7 @@ pub fn scan_status(
         primary,
         killswitch_mode,
         killswitch_state,
+        observation_complete,
     }
 }
 
@@ -177,6 +192,7 @@ struct StatusData {
     #[serde(skip_serializing_if = "Option::is_none")]
     network: Option<StatusNetwork>,
     security: StatusSecurity,
+    observation_complete: bool,
 }
 
 #[derive(Serialize)]
@@ -225,7 +241,7 @@ pub(super) fn handle_status(
     match mode {
         OutputMode::Human => {
             if brief {
-                println!("{}", human_status_headline(focus));
+                println!("{}", snapshot_headline(&snap));
             } else if let Some(session) = focus.filter(|_| is_connected) {
                 let profile = session.profile.as_deref().unwrap_or("unknown");
                 let protocol = session.protocol.as_deref().unwrap_or("");
@@ -261,7 +277,7 @@ pub(super) fn handle_status(
                     println!("  Health       {}", connection_health_human(health));
                 }
             } else {
-                println!("{}", human_status_headline(focus));
+                println!("{}", snapshot_headline(&snap));
                 println!();
                 println!(
                     "  Kill Switch  {} ({})",
@@ -306,6 +322,7 @@ fn status_data(snap: &StatusSnapshot) -> StatusData {
         generation: session.generation,
     };
     StatusData {
+        observation_complete: snap.observation_complete,
         connections: snap.sessions.iter().map(entry).collect(),
         primary: snap
             .primary
@@ -351,7 +368,14 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                 let line = WatchLine {
                     ts: chrono_now(),
                     state: focus.map_or_else(
-                        || "disconnected".to_string(),
+                        || {
+                            if snap.state_unknown() {
+                                "unknown"
+                            } else {
+                                "disconnected"
+                            }
+                            .to_string()
+                        },
                         |session| session.connection_state.clone(),
                     ),
                     profile: focus.and_then(|session| session.profile.clone()),
@@ -378,7 +402,7 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                     }
                     print!("    ");
                 } else {
-                    print!("\r{}    ", human_status_headline(focus));
+                    print!("\r{}    ", snapshot_headline(&snap));
                 }
                 let _ = std::io::stdout().flush();
             }
@@ -415,6 +439,14 @@ fn other_tunnel_lines(snap: &StatusSnapshot) -> Vec<String> {
         ));
     }
     lines
+}
+
+fn snapshot_headline(snap: &StatusSnapshot) -> String {
+    if snap.state_unknown() {
+        UNKNOWN_HEADLINE.to_string()
+    } else {
+        human_status_headline(snap.focus())
+    }
 }
 
 pub(super) fn human_status_headline(session: Option<&SessionStatus>) -> String {
@@ -557,7 +589,19 @@ mod handshake_status_tests {
             primary,
             killswitch_mode: KillSwitchMode::Off,
             killswitch_state: KillSwitchState::Disabled,
+            observation_complete: true,
         }
+    }
+
+    /// Without root `wg show` fails, so an empty scan is not "Disconnected":
+    /// saying so while a `WireGuard` tunnel was up misreported protection.
+    #[test]
+    fn an_incomplete_empty_scan_is_unknown_not_disconnected() {
+        let mut snap = tunnels(Vec::new(), None);
+        assert_eq!(snapshot_headline(&snap), "○ Disconnected");
+        snap.observation_complete = false;
+        assert!(snapshot_headline(&snap).starts_with("? Tunnel state unknown"));
+        assert!(snapshot_headline(&snap).contains("sudo vortix status"));
     }
 
     fn session(name: &str, interface: &str) -> SessionStatus {
@@ -679,6 +723,7 @@ mod handshake_status_tests {
             generation: None,
         };
         let data = StatusData {
+            observation_complete: true,
             connections: vec![entry],
             primary: None,
             connection: None,
