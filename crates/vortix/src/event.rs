@@ -21,6 +21,8 @@ pub enum Event {
     Resize(u16, u16),
     /// Periodic tick for UI updates.
     Tick,
+    /// Something to redraw arrived (the engine published a change).
+    Refresh,
 }
 
 /// Handles terminal events in a background thread.
@@ -29,6 +31,7 @@ pub enum Event {
 /// a channel. Also generates periodic tick events for time-based updates.
 pub struct EventHandler {
     receiver: mpsc::Receiver<Event>,
+    sender: mpsc::Sender<Event>,
 }
 
 impl EventHandler {
@@ -41,6 +44,7 @@ impl EventHandler {
     pub fn new(tick_rate_ms: u64) -> Self {
         let tick_rate = Duration::from_millis(tick_rate_ms);
         let (sender, receiver) = mpsc::channel();
+        let waker = sender.clone();
 
         // Detached on purpose: the thread exits on its own once every
         // sender-side send fails, which is what dropping the receiver does.
@@ -83,7 +87,18 @@ impl EventHandler {
             }
         });
 
-        Self { receiver }
+        Self {
+            receiver,
+            sender: waker,
+        }
+    }
+
+    /// A function that wakes [`Self::next`] with [`Event::Refresh`].
+    pub fn waker(&self) -> impl Fn() + Send + 'static {
+        let sender = self.sender.clone();
+        move || {
+            let _ = sender.send(Event::Refresh);
+        }
     }
 
     /// Blocks until the next event is available.

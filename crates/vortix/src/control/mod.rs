@@ -233,9 +233,33 @@ enum Msg {
 }
 
 /// Handle to the engine thread.
+/// The engine's latest snapshot, and whom to wake when it changes.
+#[derive(Default)]
+pub(crate) struct Shared {
+    snapshot: Mutex<Arc<Snapshot>>,
+    wake: Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+
+impl Shared {
+    pub(crate) fn publish(&self, snapshot: Snapshot) {
+        *self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(snapshot);
+        if let Some(wake) = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            wake();
+        }
+    }
+}
+
 pub struct Control {
     tx: mpsc::Sender<Msg>,
-    snapshot: Arc<Mutex<Arc<Snapshot>>>,
+    snapshot: Arc<Shared>,
     seen: std::cell::Cell<u64>,
     next_ticket: std::sync::atomic::AtomicU64,
     credentials: Arc<Mutex<FsOpenVpnCredentialStore>>,
@@ -254,7 +278,7 @@ impl Control {
             config_dir, uid, gid,
         )));
         let (tx, rx) = mpsc::channel();
-        let snapshot = Arc::new(Mutex::new(Arc::new(Snapshot::default())));
+        let snapshot = Arc::new(Shared::default());
         let engine = engine::Engine::start(
             Config::from_app(config, config_dir),
             uid,
@@ -295,9 +319,20 @@ impl Control {
         Arc::clone(
             &self
                 .snapshot
+                .snapshot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Call `wake` after every change the engine publishes, so a UI waiting
+    /// for input redraws at once instead of on its next tick.
+    pub fn on_change(&self, wake: impl Fn() + Send + 'static) {
+        *self
+            .snapshot
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(wake));
     }
 
     /// The latest snapshot, if it changed since the last call.
@@ -391,6 +426,17 @@ impl Drop for Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The TUI waits for input between one-second ticks; without a wake-up a
+    /// short Connecting or Disconnecting phase was never drawn.
+    #[test]
+    fn publishing_a_snapshot_wakes_the_listener() {
+        let shared = Shared::default();
+        let (tx, rx) = mpsc::channel();
+        *shared.wake.lock().unwrap() = Some(Box::new(move || tx.send(()).unwrap()));
+        shared.publish(Snapshot::default());
+        assert!(rx.try_recv().is_ok());
+    }
 
     /// An `OpenVPN` profile's file often has no default route: its server
     /// pushes one. The conflict check must use the running tunnel's live

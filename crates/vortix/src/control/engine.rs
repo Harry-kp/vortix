@@ -86,7 +86,7 @@ pub(super) struct Engine {
     ownership: Arc<TunnelOwnershipStore>,
     credentials: Arc<Mutex<FsOpenVpnCredentialStore>>,
     tx: mpsc::Sender<Msg>,
-    shared: Arc<Mutex<Arc<Snapshot>>>,
+    shared: Arc<super::Shared>,
     published: Snapshot,
     scan: Option<ScannerResult>,
     scanning: bool,
@@ -111,7 +111,7 @@ impl Engine {
         profiles: Vec<crate::config::profiles::VpnProfile>,
         credentials: Arc<Mutex<FsOpenVpnCredentialStore>>,
         tx: mpsc::Sender<Msg>,
-        shared: Arc<Mutex<Arc<Snapshot>>>,
+        shared: Arc<super::Shared>,
     ) -> Result<Self, String> {
         let last_connected = profiles
             .iter()
@@ -995,10 +995,7 @@ impl Engine {
         }
         self.published = next;
         self.published.version += 1;
-        *self
-            .shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(self.published.clone());
+        self.shared.publish(self.published.clone());
     }
 
     fn next_wake(&self) -> Instant {
