@@ -18,9 +18,9 @@ as full-tunnel profiles and `02`/`04`/`06`/`wg07` as split-only profiles.
 | 1 | Connect F1 alone | F1 | F1 | Primary | — | — | F1's exit IP, ✓ | none |
 | 2 | Connect S alone | (no exit) | — (S has dot only, no `*`) | — | — | `Split tunnel (<cidrs>)` | "split-route — no exit" | none |
 | 3 | F1 up, then connect S (disjoint CIDR) | F1 | F1 | Primary | — | `Split tunnel (<cidrs>)` | F1's exit IP, ✓ | none (disjoint = no prompt) |
-| 4 | F1 up, then connect S where S's route overlaps F1's | F1 | F1 | Primary | — | `Split tunnel (<cidrs>)` | F1's exit IP, ✓ | ConfirmRouteOverlap → press Y |
-| 5 | F1 up, then connect F2, press Y on takeover (Switch) | F2 | F2 | — (disconnected; `… yielded)` only while F2 comes up) | Primary | — | F2's exit IP, ✓ | ConfirmDefaultRouteTakeover → Y |
-| 6 | F1 up, then connect F2, press N on takeover (Cancel) | F1 | F1 | Primary | — (not connected) | — | F1's exit IP, ✓ | ConfirmDefaultRouteTakeover → N |
+| 4 | F1 up, then connect S where S's route overlaps one of F1's, press Y (Switch) | (no exit) | — | — (disconnected before S starts) | — | `Split tunnel (<cidrs>)` | "split-route — no exit" | "Already connected", networks listed → Y |
+| 5 | F1 up, then connect F2, press Y on takeover (Switch) | F2 | F2 | — (disconnected; `… yielded)` only while F2 comes up) | Primary | — | F2's exit IP, ✓ | "Already connected", all traffic → Y |
+| 6 | F1 up, then connect F2, press N on takeover (Cancel) | F1 | F1 | Primary | — (not connected) | — | F1's exit IP, ✓ | "Already connected", all traffic → Esc |
 | 7 | From #3 state, disconnect S | F1 | F1 | Primary | — | — | F1's exit IP, ✓ | none |
 | 8 | From #3 state, disconnect F1 | (no exit) | — | — | — | `Split tunnel (<cidrs>)` | "split-route — no exit" | none |
 | 9 | Connect S, then connect F1 (S already up, no overlap) | F1 | F1 | Primary | — | `Split tunnel (<cidrs>)` | F1's exit IP, ✓ | none (no conflict — S didn't own default) |
