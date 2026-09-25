@@ -80,8 +80,9 @@ and after every change asks the pure planner (`plan.rs`) what routes, DNS and
 firewall the host should carry, then applies the difference (`net.rs`). The plan
 depends only on which tunnels are up and the kill switch mode — never on command
 order — so every path to the same tunnel set lands on the same host state. The
-newest full tunnel owns the default route and DNS; a switch brings the new
-tunnel up before stopping the ones it conflicts with.
+newest full tunnel owns the default route and DNS. A switch between full
+tunnels brings the new one up before stopping the old; tunnels that share
+split routes stop first, because Linux refuses a second identical route.
 
 TUI and CLI send `control::Command`s and read `control::Snapshot`s; nothing else
 touches routes, DNS or the firewall. The dashboard renders straight from the
@@ -203,6 +204,8 @@ build-time numbers live in [`docs/performance.md`](docs/performance.md).
 - Blanket regex renames hit enum variants and foreign imports. Let the
   compiler find call sites and review the diff.
 - Linux-only code broke only in Linux cross-clippy; macOS builds never see it.
+- Linux refuses a duplicate route (`RTNETLINK answers: File exists`); macOS
+  accepts it, so route-overlap bugs show only on the lab.
 - `cargo clippy` skips rustdoc lints; broken intra-doc links fail only in
   `cargo doc` with `-D warnings`.
 - pf rules for `vpn-only` need `flags any`, or existing flows lose connectivity.

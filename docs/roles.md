@@ -53,7 +53,7 @@ The Role line answers one question: **"if I open a new browser tab right now, wh
 
 **Meaning**: This tunnel declared `0.0.0.0/0` (it wanted to be your exit), but another full tunnel owns the default route.
 
-**When you see it**: Briefly during a switch. A switch brings the new tunnel up before stopping the one it replaces, so for a moment the old one shows `(yielded)` (or the new one does, until it takes over).
+**When you see it**: Briefly during a switch. A switch between two full tunnels brings the new one up before stopping the old, so for a moment the old one shows `(yielded)` (or the new one does, until it takes over).
 
 **Examples**:
 - `Split tunnel (yielded)` — wanted default route, didn't win, declares nothing else specific.
