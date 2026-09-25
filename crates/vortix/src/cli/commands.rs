@@ -177,32 +177,8 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
 
 // ── Connection ──────────────────────────────────────────────────────────
 
-/// Start the engine, run one command to completion, and answer credential
+/// Run one command to completion on a started engine, answering credential
 /// prompts on the terminal.
-pub(super) fn run_engine_command(
-    config: &AppConfig,
-    config_dir: &Path,
-    profiles: Vec<crate::config::profiles::VpnProfile>,
-    command: crate::control::Command,
-    timeout: Duration,
-) -> Result<std::sync::Arc<crate::control::Snapshot>, String> {
-    run_on(
-        &start_engine(config, config_dir, profiles)?,
-        command,
-        timeout,
-    )
-}
-
-/// Start the engine: it adopts running tunnels and applies the plan once.
-pub(super) fn start_engine(
-    config: &AppConfig,
-    config_dir: &Path,
-    profiles: Vec<crate::config::profiles::VpnProfile>,
-) -> Result<crate::control::Control, String> {
-    crate::control::Control::start(config, config_dir, profiles)
-}
-
-/// Run one command to completion on a started engine.
 pub(super) fn run_on(
     control: &crate::control::Control,
     command: crate::control::Command,
@@ -396,12 +372,14 @@ fn handle_killswitch(
         }
 
         let _lifecycle_lock = acquire_lifecycle_lock_or_exit(output_mode, "killswitch");
-        match run_engine_command(
-            config,
-            config_dir,
-            profiles.clone(),
-            crate::control::Command::SetKillSwitch(ks_mode),
-            Duration::from_secs(config.disconnect_operation_timeout_secs()),
+        match crate::control::Control::start(config, config_dir, profiles.clone()).and_then(
+            |control| {
+                run_on(
+                    &control,
+                    crate::control::Command::SetKillSwitch(ks_mode),
+                    Duration::from_secs(config.disconnect_operation_timeout_secs()),
+                )
+            },
         ) {
             Ok(snapshot) => {
                 mode = snapshot.kill_switch;
