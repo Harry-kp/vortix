@@ -2387,8 +2387,22 @@ fn an_egress_sample_from_before_a_tunnel_change_is_dropped() {
         })
     };
     tx.send((0, sample("139.59.71.126"))).unwrap();
+    tx.send((
+        0,
+        TelemetryUpdate::Log(
+            crate::logger::LogLevel::Info,
+            "stale-exit-198.51.100.4".into(),
+        ),
+    ))
+    .unwrap();
     app.process_telemetry();
     assert_ne!(app.runtime.public_ip, "139.59.71.126");
+    assert!(
+        !crate::logger::get_logs()
+            .iter()
+            .any(|entry| entry.message.contains("stale-exit-198.51.100.4")),
+        "a log line about the old path must not describe the new one"
+    );
     tx.send((1, sample("203.0.113.9"))).unwrap();
     app.process_telemetry();
     assert_eq!(app.runtime.public_ip, "203.0.113.9");
