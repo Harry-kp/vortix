@@ -162,7 +162,7 @@ tui_connect() { # profile — select its sidebar row and connect it; 1 if not on
     # A fresh TUI selects row 1, and the list wraps, so step down from there;
     # Connection Details names the selected profile, which proves the row.
     local i
-    for i in $(seq $((row - 1))); do DELAY=0.15 key j; done
+    for ((i = 1; i < row; i++)); do DELAY=0.15 key j; done
     contains "$(frame)" "Profile *: $1 " || return 1
     key c
 }
