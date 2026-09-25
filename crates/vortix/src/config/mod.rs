@@ -800,15 +800,9 @@ fn acquire_lifecycle_lock_at(
 fn acquire_nonblocking_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd as _;
 
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)?;
-
     // A root-owned lock left by the first `sudo vortix` would make every
-    // unprivileged launch fail on EACCES; a no-op when not root.
-    crate::config::fix_ownership(path);
+    // unprivileged launch fail on EACCES.
+    let file = crate::config::owned_file::open_user_file(path, false)?;
 
     // SAFETY: flock is a thin syscall wrapper over a valid owned fd; no
     // buffers, no aliasing. Same invariant analysis as libc::kill in the

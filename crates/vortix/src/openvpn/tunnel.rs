@@ -879,8 +879,10 @@ impl OvpnTunnel {
         let openvpn_binary = resolve_standard_openvpn_binary()?;
         self.remaining_connect_timeout()?;
 
+        // The run dir sits in the user's config dir and now keeps each
+        // profile's last-session log, so it is private and user-owned.
         if let Some(parent) = pid_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::config::owned_file::create_user_dir(parent)?;
         }
 
         // Refuse double-up: if the pidfile records a live daemon, a second
@@ -912,9 +914,11 @@ impl OvpnTunnel {
             }
         }
 
-        // Stale-file cleanup from any previous run.
+        // Stale-file cleanup from any previous run. The log is replaced, not
+        // removed: created here as the user, so the root daemon's `--log`
+        // truncates a file the user can read as its last session.
         let _ = std::fs::remove_file(&pid_path);
-        let _ = std::fs::remove_file(&log_path);
+        crate::config::owned_file::open_user_file(&log_path, false)?.set_len(0)?;
 
         info!(
             target: "vortix::control::tunnels::openvpn",

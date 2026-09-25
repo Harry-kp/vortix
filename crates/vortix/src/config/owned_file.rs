@@ -586,6 +586,27 @@ pub fn create_user_dir(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open a user-state file (lock, log, journal, cache), creating it if
+/// missing: never through a link, mode 0600 even if an older run left it
+/// wider, and owned by the sudo user rather than root.
+///
+/// # Errors
+///
+/// Returns the open, chmod or chown error.
+pub fn open_user_file(path: &std::path::Path, append: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(append)
+        .write(!append)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    crate::config::chown_to_invoking_user(&file)?;
+    Ok(file)
+}
+
 /// Drop group and world access from a directory that already exists.
 ///
 /// [`create_private_dir_all`] only sets the mode on directories it creates,
@@ -660,6 +681,34 @@ mod tests {
             resolve_owner(false, Some((502, 20)), Some((0, 0)), user),
             user
         );
+    }
+
+    /// Locks, logs, journals and caches were left at the umask (0644), and
+    /// root-owned under sudo; every user-state file opens 0600 and is
+    /// repaired when an older run left it wider.
+    #[test]
+    fn user_files_open_private_and_repair_a_wider_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.log");
+        drop(open_user_file(&fresh, true).unwrap());
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let old = dir.path().join("old.lock");
+        std::fs::write(&old, b"").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_user_file(&old, false).unwrap());
+        assert_eq!(
+            std::fs::metadata(&old).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        assert!(open_user_file(&link, true).is_err(), "never follows a link");
     }
 
     /// An install predating the 0700 rule keeps the umask's mode forever

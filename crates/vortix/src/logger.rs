@@ -256,15 +256,7 @@ pub(crate) fn append_to_file(
             current_len = 0;
         }
         if file.is_none() {
-            let is_new = !log_file.exists();
-            file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_file)
-                .ok();
-            if is_new && file.is_some() {
-                crate::config::fix_ownership(&log_file);
-            }
+            file = crate::config::owned_file::open_user_file(&log_file, true).ok();
         }
         let Some(writer) = file.as_mut() else {
             break;

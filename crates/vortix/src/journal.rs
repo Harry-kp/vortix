@@ -167,13 +167,8 @@ mod writer {
         failure_count: Arc<AtomicU64>,
         failure_events: watch::Sender<u64>,
     ) {
-        let mut file = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-        {
-            Ok(f) => f,
+        let mut file = match crate::config::owned_file::open_user_file(&path, true) {
+            Ok(f) => tokio::fs::File::from_std(f),
             Err(e) => {
                 record_failure(&failure_count, &failure_events);
                 warn!(
@@ -449,7 +444,7 @@ impl Journal {
             // Session journals record what was connected and when. Left at
             // the caller's umask these were 0775 on Debian derivatives, whose
             // default is 002 — parent included.
-            crate::config::owned_file::create_private_dir_all(&dir)?;
+            crate::config::owned_file::create_user_dir(&dir)?;
             Some(dir)
         } else {
             None
