@@ -100,12 +100,7 @@ impl State {
             .filter(|tunnel| tunnel.phase != Phase::Stopping)
             .filter_map(|tunnel| {
                 let existing = tunnel.spec.routes.iter().copied().collect::<Vec<_>>();
-                classify_route_conflict(
-                    &requested,
-                    &existing,
-                    &tunnel.spec.profile_id,
-                    &spec.profile_id,
-                )
+                classify_route_conflict(&requested, &existing, &tunnel.spec.profile_id)
             })
             .collect()
     }
@@ -207,13 +202,7 @@ impl State {
     /// The running tunnels `spec` conflicts with.
     #[must_use]
     pub fn conflicting_peers(&self, spec: &Spec) -> BTreeSet<ProfileId> {
-        self.conflicts(spec)
-            .into_iter()
-            .map(|conflict| match conflict {
-                Conflict::DefaultRouteTakeover { current, .. } => current,
-                Conflict::RouteOverlap { with, .. } => with,
-            })
-            .collect()
+        self.conflicts(spec).into_iter().map(|c| c.with).collect()
     }
 
     /// A start attempt failed. A fresh connect is forgotten; a recovery waits
@@ -384,21 +373,20 @@ impl State {
     }
 }
 
-/// What kind of conflict `detect_conflict` found.
+/// A running tunnel that cannot coexist with the one requested.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Conflict {
-    /// Two profiles both claim the kernel default route. The `current` holder
-    /// may be either Connected (already on the route) or Connecting (claimed
-    /// it but `tunnel.up` hasn't returned yet — the §7.3 in-flight rule).
-    DefaultRouteTakeover { current: ProfileId, new: ProfileId },
-    /// Non-default-route overlap. Reserved for the future v2 conflict surface
-    ///; not produced by the v1
-    /// `detect_conflict` which only inspects the default route.
-    RouteOverlap {
-        with: ProfileId,
-        overlapping_cidrs: Vec<Cidr>,
-    },
+pub struct Conflict {
+    pub with: ProfileId,
+    /// The networks both want; empty when both want all traffic.
+    pub shared: Vec<Cidr>,
+}
+
+impl Conflict {
+    /// Both tunnels want the default route.
+    #[must_use]
+    pub fn is_takeover(&self) -> bool {
+        self.shared.is_empty()
+    }
 }
 
 /// Whether two route sets collide, and how.
@@ -417,7 +405,6 @@ pub fn classify_route_conflict(
     requested: &[Cidr],
     existing: &[Cidr],
     existing_profile: &ProfileId,
-    requested_profile: &ProfileId,
 ) -> Option<Conflict> {
     let specific = |routes: &[Cidr]| {
         routes
@@ -427,16 +414,15 @@ pub fn classify_route_conflict(
             .collect::<Vec<_>>()
     };
     if crate::cidr::is_full(requested) && crate::cidr::is_full(existing) {
-        return Some(Conflict::DefaultRouteTakeover {
-            current: existing_profile.clone(),
-            new: requested_profile.clone(),
+        return Some(Conflict {
+            with: existing_profile.clone(),
+            shared: Vec::new(),
         });
     }
-    let overlapping_cidrs =
-        crate::cidr::overlapping_cidrs(&specific(requested), &specific(existing));
-    (!overlapping_cidrs.is_empty()).then(|| Conflict::RouteOverlap {
+    let shared = crate::cidr::overlapping_cidrs(&specific(requested), &specific(existing));
+    (!shared.is_empty()).then(|| Conflict {
         with: existing_profile.clone(),
-        overlapping_cidrs,
+        shared,
     })
 }
 

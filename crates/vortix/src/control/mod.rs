@@ -167,7 +167,7 @@ impl Snapshot {
             .iter()
             .filter(|tunnel| &tunnel.profile_id != profile_id && tunnel.phase != Phase::Stopping)
             .filter_map(|tunnel| {
-                classify_route_conflict(&requested, &tunnel.routes, &tunnel.profile_id, profile_id)
+                classify_route_conflict(&requested, &tunnel.routes, &tunnel.profile_id)
             })
             .collect()
     }
@@ -232,7 +232,6 @@ enum Msg {
     Shutdown,
 }
 
-/// Handle to the engine thread.
 /// The engine's latest snapshot, and whom to wake when it changes.
 #[derive(Default)]
 pub(crate) struct Shared {
@@ -252,6 +251,7 @@ impl Shared {
     }
 }
 
+/// Handle to the engine thread.
 pub struct Control {
     tx: mpsc::Sender<Msg>,
     snapshot: Arc<Shared>,
@@ -445,7 +445,7 @@ mod tests {
         snapshot.routes.insert(wanted.clone(), default());
         assert!(matches!(
             snapshot.conflicts(&wanted).as_slice(),
-            [Conflict::DefaultRouteTakeover { current, .. }] if current == &running
+            [conflict] if conflict.is_takeover() && conflict.with == running
         ));
     }
 }

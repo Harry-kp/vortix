@@ -170,7 +170,7 @@ impl App {
                 .control_snapshot
                 .conflicts(&profile_id)
                 .into_iter()
-                .find(|conflict| matches!(conflict, Conflict::DefaultRouteTakeover { .. }));
+                .find(Conflict::is_takeover);
             if let Some(conflict) = late {
                 if self.input_mode == InputMode::Normal {
                     self.fire_conflict_overlay(conflict, profile_id, name);
@@ -351,13 +351,10 @@ impl App {
         target_id: ProfileId,
         target_name: String,
     ) {
-        let (current_id, shared) = match conflict {
-            Conflict::DefaultRouteTakeover { current, .. } => (current, Vec::new()),
-            Conflict::RouteOverlap {
-                with,
-                overlapping_cidrs,
-            } => (with, overlapping_cidrs),
-        };
+        let Conflict {
+            with: current_id,
+            shared,
+        } = conflict;
         let what = if shared.is_empty() {
             "all traffic".to_owned()
         } else {

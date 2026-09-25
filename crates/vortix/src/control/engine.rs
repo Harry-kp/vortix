@@ -312,10 +312,8 @@ impl Engine {
                 .state
                 .conflicts(&known)
                 .into_iter()
-                .filter_map(|conflict| match conflict {
-                    Conflict::RouteOverlap { with, .. } => Some(with),
-                    Conflict::DefaultRouteTakeover { .. } => None,
-                })
+                .filter(|conflict| !conflict.is_takeover())
+                .map(|conflict| conflict.with)
                 .collect::<BTreeSet<_>>();
             // Linux refuses a second identical route, so a tunnel cannot come
             // up beside one with the same split routes: stop those first.
@@ -1190,10 +1188,8 @@ impl Engine {
             .state
             .conflicts(&spec)
             .into_iter()
-            .filter_map(|conflict| match conflict {
-                Conflict::DefaultRouteTakeover { current, .. } => Some(current),
-                Conflict::RouteOverlap { .. } => None,
-            })
+            .filter(Conflict::is_takeover)
+            .map(|conflict| conflict.with)
             .collect::<Vec<_>>();
         for holder in holders {
             let holder = self.name(&holder);
