@@ -119,6 +119,13 @@ pub struct App {
     pub(crate) control_starting: bool,
     /// Last snapshot received from the engine.
     pub control_snapshot: std::sync::Arc<crate::control::Snapshot>,
+    /// When each tunnel's Connecting or Disconnecting label was first drawn.
+    pub(crate) transition_shown:
+        std::collections::HashMap<crate::profile::ProfileId, std::time::Instant>,
+    /// An engine update held back until this instant so a short transition
+    /// stays on screen long enough to read.
+    pub(crate) held_snapshot:
+        Option<(std::sync::Arc<crate::control::Snapshot>, std::time::Instant)>,
     /// Engine prompt the credential overlay is answering.
     pub(crate) control_prompt: Option<u64>,
     /// Newest engine prompt already answered or cancelled.
@@ -196,6 +203,8 @@ impl App {
                 kill_switch_state,
                 ..crate::control::Snapshot::default()
             }),
+            transition_shown: std::collections::HashMap::new(),
+            held_snapshot: None,
             control_prompt: None,
             answered_prompt: 0,
             notices_seen: 0,
@@ -270,6 +279,14 @@ impl App {
             .and_then(crate::control::Control::changed)
         {
             self.apply_control_snapshot(snapshot);
+        } else if self
+            .held_snapshot
+            .as_ref()
+            .is_some_and(|(_, until)| std::time::Instant::now() >= *until)
+        {
+            if let Some((snapshot, _)) = self.held_snapshot.take() {
+                self.apply_control_snapshot(snapshot);
+            }
         }
         self.process_telemetry();
 
@@ -311,7 +328,7 @@ impl App {
     /// Whether any panel is currently mid-flip.
     #[must_use]
     pub fn has_active_animation(&self) -> bool {
-        self.flip_states.values().any(FlipState::is_animating)
+        self.held_snapshot.is_some() || self.flip_states.values().any(FlipState::is_animating)
     }
 
     /// Drive every flip state machine forward one tick. Call once per frame.
@@ -343,6 +360,8 @@ impl App {
             control: None,
             control_starting: false,
             control_snapshot: std::sync::Arc::default(),
+            transition_shown: std::collections::HashMap::new(),
+            held_snapshot: None,
             control_prompt: None,
             answered_prompt: 0,
             notices_seen: 0,
