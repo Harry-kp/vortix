@@ -41,6 +41,7 @@ cargo build -p vortix                 # debug build → target/debug/vortix (use
 cargo test -p vortix <filter>         # focused tests while iterating
 scripts/ci-local.sh --quick           # what CI runs (fmt, clippy, test, doc, xtask, Linux cross-clippy)
 scripts/ci-local.sh                   # same + release build; run before every push
+sudo scripts/p0.sh                    # live smoke set against real tunnels (release QA)
 ```
 
 `ci-local.sh` is the only pre-push check that counts; see

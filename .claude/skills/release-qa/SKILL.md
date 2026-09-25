@@ -31,7 +31,8 @@ skill has the exact `lab()` function and `git apply` sync). Stop on red.
 
 ## 2–4. Smoke, risk, explore
 
-Walk the P0.md smoke set on both machines, then the risk-mapped workflows,
+Run `sudo scripts/p0.sh` on both machines (the smoke set; on the Mac, in the
+root pane), then walk the risk-mapped workflows,
 then about 15 minutes per machine trying to break what changed. Run the whole
 file when the engine, a firewall or DNS backend, or a protocol layer changed
 broadly.
