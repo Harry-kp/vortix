@@ -471,7 +471,13 @@ impl Engine {
 
     fn stopped(&mut self, profile_id: &ProfileId, result: Result<(), (Live, String)>) {
         match result {
-            Ok(()) => self.finish_stop(profile_id),
+            Ok(()) => {
+                // A teardown can remove host state the plan still needs:
+                // `wg-quick down` deletes its endpoint route even when another
+                // tunnel uses the same server. Re-apply once it is done.
+                self.applied = None;
+                self.finish_stop(profile_id);
+            }
             Err((live, error)) => {
                 let name = self.name(profile_id);
                 self.live.insert(profile_id.clone(), live);
@@ -646,6 +652,8 @@ impl Engine {
     }
 
     fn drained(&mut self, profile_id: &ProfileId) {
+        // The teardown may have removed routes the plan needs, as in `stopped`.
+        self.applied = None;
         let stopping = self
             .state
             .get(profile_id)
