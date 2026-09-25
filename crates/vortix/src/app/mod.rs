@@ -279,14 +279,9 @@ impl App {
             .and_then(crate::control::Control::changed)
         {
             self.apply_control_snapshot(snapshot);
-        } else if self
-            .held_snapshot
-            .as_ref()
-            .is_some_and(|(_, until)| std::time::Instant::now() >= *until)
-        {
-            if let Some((snapshot, _)) = self.held_snapshot.take() {
-                self.apply_control_snapshot(snapshot);
-            }
+        } else if let Some((snapshot, _)) = self.held_snapshot.take() {
+            // Holds again on its own while the transition is still young.
+            self.apply_control_snapshot(snapshot);
         }
         self.process_telemetry();
 
