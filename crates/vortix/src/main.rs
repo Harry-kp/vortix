@@ -438,16 +438,12 @@ fn main() -> Result<()> {
 
     // Run the TUI application
     let terminal = init_terminal()?;
-    let upgraded_from = match &history {
-        vortix::whats_new::Status::Upgraded { from } => Some(from.clone()),
-        _ => None,
-    };
     // An upgrade is recorded when its notes are closed, so a quit or a crash
     // before then shows them again.
     if history == vortix::whats_new::Status::Current {
         let _ = vortix::whats_new::record(&config_dir, constants::APP_VERSION);
     }
-    let result = run_tui(terminal, app_config, config_dir, upgraded_from);
+    let result = run_tui(terminal, app_config, config_dir, history);
     restore_terminal();
 
     result
@@ -531,7 +527,7 @@ fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     config: config::AppConfig,
     config_dir: std::path::PathBuf,
-    upgraded_from: Option<String>,
+    history: vortix::whats_new::Status,
 ) -> Result<()> {
     terminal.draw(|frame| {
         use ratatui::layout::Alignment;
@@ -562,9 +558,7 @@ fn run_tui(
     })?;
     let tick_rate = config.tick_rate;
     let mut app = App::new(config, config_dir);
-    if let Some(from) = upgraded_from {
-        app.input_mode = vortix::app::InputMode::WhatsNew { from, scroll: 0 };
-    }
+    app.show_version_history(history);
     let control_config = app.runtime.config.clone();
     let control_dir = app.runtime.config_dir.clone();
     let control_profiles = app.runtime.profiles.clone();

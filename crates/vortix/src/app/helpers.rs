@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 
-use super::{App, FocusedPanel, Toast, ToastType};
+use super::{App, FocusedPanel, InputMode, Toast, ToastType};
 use crate::constants;
 use crate::logger::{self, LogLevel};
 
@@ -62,6 +62,24 @@ impl App {
             .tunnels
             .iter()
             .any(|tunnel| tunnel.phase == crate::control::Phase::Up)
+    }
+
+    /// Open the upgrade notes, or warn about a downgrade, at startup.
+    pub fn show_version_history(&mut self, history: crate::whats_new::Status) {
+        match history {
+            crate::whats_new::Status::Upgraded { from } => {
+                self.input_mode = InputMode::WhatsNew { from, scroll: 0 };
+            }
+            crate::whats_new::Status::Downgraded { from } => {
+                let warning = format!(
+                    "Vortix {from} last ran here; this is the older {}. If something fails, install {from} again.",
+                    crate::constants::APP_VERSION
+                );
+                self.log(&format!("WARN: {warning}"));
+                self.show_toast(warning, ToastType::Warning);
+            }
+            crate::whats_new::Status::Current => {}
+        }
     }
 
     /// Add a log message via centralized logger
