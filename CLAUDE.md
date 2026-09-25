@@ -4,8 +4,6 @@ Vortix is a terminal VPN manager (TUI + CLI) for WireGuard and OpenVPN on macOS
 and Linux. One Rust crate, `crates/vortix`, plus `crates/xtask` for boundary
 lints. It runs as root (`sudo vortix`); there is no helper or daemon.
 
-**Read [`STOPOVERENGINEERING.md`](STOPOVERENGINEERING.md) before writing code.**
-
 To fix a reported bug end to end (reproduce → fix → CI → PR → review → merge),
 run `/fix-bug <issue number, URL or description>`. Before a release, run
 `/release-qa` (the P0 gate, live on macOS and the Linux lab).
@@ -23,8 +21,18 @@ run `/fix-bug <issue number, URL or description>`. Before a release, run
   dead, read the *full* grep output — truncated output has fooled us twice.
 - **Comments:** default none; one short line when the *why* is not obvious.
   No plan IDs, ticket codes or phase names in code, help text or logs.
-- **No new dependencies, traits with one impl, builders, or Cargo features**
-  without asking.
+- **Search in this order before writing anything:** `std`, the crates already
+  in `Cargo.toml`, the owner in "Where things live". No new dependencies, Cargo
+  features, `unsafe` or proc macros without asking.
+- **Plain Rust.** Concrete types and owned data; a `.clone()` beats a lifetime
+  or `Cow`. No trait with one impl, generic with one instantiation, builder,
+  `Box<dyn>` for a known type, or macro where a function works. No `async`,
+  thread or channel where a direct call works.
+- **Errors:** use the module's existing type (`thiserror` enum or `String`).
+  Never drop an error the user needs to see: an `.ok().flatten()` once made a
+  refused credential file look like no credentials. No speculative `From` impls.
+- **Lints:** fix them; never add an `#[allow]`, and delete dead code rather
+  than allowing it. Do not reformat untouched files or bump dependencies on the side.
 
 ## Commands
 
@@ -112,6 +120,9 @@ summaries and overflow ladders fit the existing layout at 80×24 (see
 [`docs/manual-testing/multi-connection.md`](docs/manual-testing/multi-connection.md)).
 
 ## Tests
+
+Test real behaviour and edge cases; no mocks, and no trait added only to make
+something mockable.
 
 - Engine behaviour: unit tests in `control/plan.rs` and `control/state.rs`.
 - Rendering: `App::new_test()`, seed tunnels with `App::set_tunnels_for_test`

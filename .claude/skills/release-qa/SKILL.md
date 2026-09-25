@@ -40,27 +40,18 @@ Keep a running results table in `target/qa-results.md` (ID, check, macOS,
 Linux, note), updated after each area rather than at the end. That way a lost
 context or an interruption loses nothing.
 
-Harness lessons that each cost time in an earlier run:
+Follow P0.md's "Safety rules" and "Harness" literally. Beyond those:
 
-- **Write multi-step probes as a bash script in `$CLAUDE_JOB_DIR/tmp` and run
-  the script in the root pane.** The Mac root shell is zsh with aliases:
-  `wg`, `k` and `ls` do surprising things, and an aliased `wg` started a
-  watcher that had to be stopped with Ctrl-C. Use full paths
-  (`/opt/homebrew/bin/wg`, `/bin/ps`, `/usr/bin/grep`).
-- **Kill-switch checks:** follow P0.md's safety rules literally. Put the probe
-  and the `killswitch off` in the same script with `trap … EXIT`. Block for
-  seconds on the Mac, and do longer blocks only on the lab. Take a
-  no-VPN baseline probe first: `1.1.1.1` is unreachable from the home LAN, so
-  "blocked" against it proves nothing.
-- **Quit the TUI (`q`) before CLI lifecycle checks.** It holds the lifecycle
-  lock. Profiles imported while the TUI runs are not seen until it restarts.
+- **Write multi-step probes as a bash script in `$CLAUDE_JOB_DIR/tmp`** and run
+  it in the root pane, with the restore in a `trap … EXIT`. A script is one
+  approval, one blocked window and one guaranteed cleanup.
 - **After a rebuild, restart the TUI** before retesting. An old binary still
   running is the usual reason a fix "didn't work".
 - **Read evidence from logs as well as frames:** `~/.config/vortix/logs/` (by
   date) and `~/.config/vortix/run/*.log` (OpenVPN). Count secret-shaped
   matches, never print them, and redact public IPs in anything you report.
-- **Frames:** redact before quoting; cut columns (`cut -c…`) to read one panel;
-  use `grep -a` because frames contain braille, which grep treats as binary.
+- **Frames:** use `cut -c…` to read one panel, and `grep -a` because frames
+  contain braille, which grep treats as binary.
 
 ## When something fails
 
