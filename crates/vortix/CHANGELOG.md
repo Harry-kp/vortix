@@ -4,6 +4,63 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-25
+
+### Upgrading from 0.4.3
+
+The first `sudo vortix` after upgrading shows what to do, once, and lists only the steps your machine needs. In short:
+
+- **If a VPN or the kill switch was on when you upgraded, restart your computer.** 0.4.3's tunnel and firewall rules can outlive it, and 0.5.0 cannot remove them; on a Mac they can keep blocking your internet. Best of all, before upgrading run `sudo vortix down` and `sudo vortix killswitch off` with 0.4.3.
+- **Linux:** the kill switch now needs `nftables` (iptables support is gone).
+- **Profiles that run scripts** (WireGuard `PreUp`/`PostUp`/`PreDown`/`PostDown`, OpenVPN `up`/`down`/`route-up` and similar) no longer connect. Move the commands to `[[hooks]]` in `settings.toml`.
+- **`vortix daemon` is gone.** If you installed it as a service, remove the service.
+
+Commands for each system are in [Upgrading from 0.4.3 to 0.5.0](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md#upgrading-from-043-to-050).
+
+### Highlights
+
+- **Linux works end to end.** On Debian and Ubuntu, AppArmor stopped `wg-quick` reading Vortix's configs, so every WireGuard connect timed out; configs are now staged in `/etc/wireguard/vortix/`. Verified on Ubuntu, Fedora 44, Arch and CachyOS. ([#292](https://github.com/Harry-kp/vortix/pull/292))
+- **Several VPNs at once behave correctly.** A full tunnel and a split tunnel run side by side. A second connect no longer drops the first tunnel's DNS. Switching brings the new tunnel up before stopping the old one, and a route conflict offers Switch or Cancel instead of an error. ([#296](https://github.com/Harry-kp/vortix/pull/296), [#300](https://github.com/Harry-kp/vortix/pull/300), [#303](https://github.com/Harry-kp/vortix/pull/303), [#307](https://github.com/Harry-kp/vortix/pull/307), [#327](https://github.com/Harry-kp/vortix/pull/327))
+- **The kill switch fails closed and reports what the firewall is really doing.** On macOS it lives in its own pf anchor and never replaces your pf rules; on Linux it uses nftables. If the rules cannot be verified it says Degraded, never Off, and tells you how to fix it. ([#281](https://github.com/Harry-kp/vortix/pull/281), [#292](https://github.com/Harry-kp/vortix/pull/292), [#325](https://github.com/Harry-kp/vortix/pull/325))
+- **See why an OpenVPN connection failed.** In the Logs panel, `f` now steps through each OpenVPN tunnel's own log, marked live or last session. ([#319](https://github.com/Harry-kp/vortix/pull/319))
+- **Profile files can no longer run commands as root.** Script directives are refused with an explanation; automation moves to `[[hooks]]`, which run without root and cannot block a connect. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- **A third smaller:** the macOS release binary is 4.1 MB, down from 6.1 MB. ([#284](https://github.com/Harry-kp/vortix/pull/284), [#305](https://github.com/Harry-kp/vortix/pull/305))
+
+### Fixed
+
+- **Disconnect and reconnect finish cleanly.** A disconnect no longer bounces back to Connected, Disconnect All no longer times out, and a reconnect on slower Linux hosts re-applies DNS instead of failing. ([#253](https://github.com/Harry-kp/vortix/pull/253), [#298](https://github.com/Harry-kp/vortix/pull/298), [#301](https://github.com/Harry-kp/vortix/pull/301), [#318](https://github.com/Harry-kp/vortix/pull/318))
+- **Connecting and Disconnecting show in the header** long enough to read, instead of skipping straight to the result. ([#327](https://github.com/Harry-kp/vortix/pull/327))
+- **Switching always leaves one tunnel.** Switching between two tunnels that carry the same networks works on Linux (it failed with "RTNETLINK answers: File exists"). When a server pushes a full-traffic route after connecting, Vortix now asks: Cancel disconnects the new tunnel, Switch stops the old one, and `vortix up` without `--yes` refuses with exit 4 and keeps the old tunnel. ([#327](https://github.com/Harry-kp/vortix/pull/327))
+- **Switching between two tunnels on the same server keeps the new one working**, instead of leaving it Connected with no internet on macOS. ([#321](https://github.com/Harry-kp/vortix/pull/321))
+- **Leftover routes and DNS from a tunnel that died while Vortix was closed** are removed the next time it starts. ([#318](https://github.com/Harry-kp/vortix/pull/318))
+- **The exit IP and leak display are accurate.** Right after connecting it shows the VPN's address, and the false "matches the pre-VPN address" warning is gone. ([#307](https://github.com/Harry-kp/vortix/pull/307), [#321](https://github.com/Harry-kp/vortix/pull/321))
+- **Credentials.** A wrong OpenVPN password is never saved, Ctrl+R shows the password while you type, Ctrl+U clears a field instead of typing a "u", and a saved-credential file Vortix refuses now says why. ([#284](https://github.com/Harry-kp/vortix/pull/284), [#321](https://github.com/Harry-kp/vortix/pull/321))
+- **IPv6 and unusual gateways.** IPv6 VPN servers are pinned to the physical gateway, `redirect-gateway local` works, and IPv6 routes apply on macOS. ([#318](https://github.com/Harry-kp/vortix/pull/318))
+- **Another WireGuard network on the machine** (Tailscale, a corporate mesh) no longer stops Vortix from starting, and the orphan warning lists only processes Vortix started. ([#303](https://github.com/Harry-kp/vortix/pull/303), [#320](https://github.com/Harry-kp/vortix/pull/320))
+- **Files stay yours under `sudo`.** Every file Vortix writes is private and owned by you, including logs and session journals, which now live in `~/.config/vortix`. ([#292](https://github.com/Harry-kp/vortix/pull/292), [#318](https://github.com/Harry-kp/vortix/pull/318), [#321](https://github.com/Harry-kp/vortix/pull/321))
+- **CLI.** `up --yes` really switches tunnels, a missing VPN tool exits 5 with the install command, and `status` without root says it cannot see WireGuard instead of claiming Disconnected. ([#321](https://github.com/Harry-kp/vortix/pull/321))
+- **TUI.** Profile names are readable at 80×24, a VPN Vortix did not start shows as "UNMANAGED VPN" instead of DISCONNECTED, and large imports finish instead of timing out. ([#283](https://github.com/Harry-kp/vortix/pull/283), [#321](https://github.com/Harry-kp/vortix/pull/321))
+- **Messages say what broke and what to do**, and claim only what happened: `release-killswitch` no longer says "Internet access restored" without checking. A second instance, or starting without a terminal, now exits with a clear sentence. ([#279](https://github.com/Harry-kp/vortix/pull/279), [#292](https://github.com/Harry-kp/vortix/pull/292))
+
+### Changed
+
+- **WireGuard shows Connected only after a real handshake** with the peer. The timeout and staleness are `wireguard_handshake_timeout_secs` and `wireguard_handshake_stale_secs` in `config.toml`; probe targets are `[engine].wireguard_health_targets` in `settings.toml`. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- **Vortix writes every OpenVPN route itself.** Route directives it cannot apply safely, and TAP (`dev tap`) profiles, are refused. ([#307](https://github.com/Harry-kp/vortix/pull/307), [#318](https://github.com/Harry-kp/vortix/pull/318))
+- **TUI keys.** In the sidebar `d` disconnects the selected profile and `D` all of them; a route conflict opens one Switch or Cancel dialog; `p` cycles seven color themes; `y` copies through the terminal (works over SSH). ([#279](https://github.com/Harry-kp/vortix/pull/279), [#282](https://github.com/Harry-kp/vortix/pull/282), [#300](https://github.com/Harry-kp/vortix/pull/300))
+- **`vortix up` waits as long as the protocol needs** (about 22 s for WireGuard, 37 s for OpenVPN); `--timeout` still overrides it. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- **`settings.toml` is read from the Vortix config directory**, the one `--config-dir` selects. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+
+### Removed
+
+- **`vortix daemon`**, `vortix status --no-daemon` and `VORTIX_DAEMON_SOCKET`. The CLI and TUI run the engine themselves. ([#296](https://github.com/Harry-kp/vortix/pull/296), [#297](https://github.com/Harry-kp/vortix/pull/297))
+- **The iptables kill-switch backend.** Linux needs `nft`; 0.4.3's iptables rules are removed when you turn the kill switch off. ([#307](https://github.com/Harry-kp/vortix/pull/307))
+
+### Security
+
+- Profile directives that could run commands as root are refused. ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- Vortix directories are no longer group-writable, which had let a group member replace a profile. ([#292](https://github.com/Harry-kp/vortix/pull/292))
+- Bumped `rustls` 0.23.40 → 0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285). ([#292](https://github.com/Harry-kp/vortix/pull/292))
+
 ## [0.4.3] - 2026-07-18
 
 ### Highlights
