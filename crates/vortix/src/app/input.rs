@@ -646,6 +646,15 @@ impl crate::app::App {
                     text.remove(byte_idx);
                 }
             }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                text.clear();
+                *cursor = 0;
+            }
+            // Ctrl/Alt chords are shortcuts, never text.
+            KeyCode::Char(_)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
             KeyCode::Char(c) => {
                 let byte_idx = text
                     .char_indices()

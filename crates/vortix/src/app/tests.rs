@@ -777,6 +777,39 @@ fn test_text_field_multibyte_insert_and_backspace() {
     assert_eq!(cursor, 3);
 }
 
+/// Ctrl+U in the credential prompt was inserted as a literal `u`, so the
+/// server received "uvortix" and rejected the login.
+#[test]
+fn control_keys_never_type_into_a_text_field() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut text = "vortix".to_string();
+    let mut cursor: usize = 6;
+    App::handle_text_field_input(
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        &mut text,
+        &mut cursor,
+    );
+    App::handle_text_field_input(
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        &mut text,
+        &mut cursor,
+    );
+    assert_eq!((text.as_str(), cursor), ("vortix", 6));
+    App::handle_text_field_input(
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        &mut text,
+        &mut cursor,
+    );
+    assert_eq!((text.as_str(), cursor), ("", 0), "Ctrl+U clears the field");
+    App::handle_text_field_input(
+        KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+        &mut text,
+        &mut cursor,
+    );
+    assert_eq!(text, "A", "Shift still types");
+}
+
 #[test]
 fn test_text_field_cursor_movement_with_multibyte() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
