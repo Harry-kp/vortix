@@ -188,33 +188,8 @@ pub(super) fn handle_up(
         );
     }
 
-    // Check dependencies before attempting connection. Routes through
-    // `platform::check_dependencies` so the TUI and CLI refuse the
-    // same dep set — including the OpenVPN 2.4+ probe that the
-    // legacy inline CLI check used to skip.
     if let Some(profile) = profiles.iter().find(|p| p.name == profile_name) {
-        let missing = crate::platform::check_dependencies(profile.protocol, &profile.config_path);
-        if !missing.is_empty() {
-            let hint = missing
-                .iter()
-                .map(|tool| crate::platform::install_hint(tool))
-                .collect::<Vec<_>>()
-                .join("\n");
-            print_error_and_exit(
-                mode,
-                "up",
-                CliError {
-                    code: "dependency_missing",
-                    message: format!(
-                        "Missing dependencies: {}. Install with: {}",
-                        missing.join(", "),
-                        hint
-                    ),
-                    hint: None,
-                },
-                ExitCode::GeneralError,
-            );
-        }
+        exit_if_missing_dependencies(mode, "up", profile);
     }
 
     // route the CLI connect through the
@@ -561,19 +536,7 @@ pub(super) fn handle_reconnect(
             .iter()
             .find(|profile| &profile.name == name)
             .expect("reconnect targets were resolved from the profile catalog");
-        let missing = crate::platform::check_dependencies(profile.protocol, &profile.config_path);
-        if !missing.is_empty() {
-            print_error_and_exit(
-                mode,
-                "reconnect",
-                CliError {
-                    code: "dependency_missing",
-                    message: format!("Missing dependencies: {}", missing.join(", ")),
-                    hint: None,
-                },
-                ExitCode::DependencyMissing,
-            );
-        }
+        exit_if_missing_dependencies(mode, "reconnect", profile);
     }
 
     let requested_id = profile_filter.and_then(|name| {
@@ -656,6 +619,37 @@ pub(super) fn handle_reconnect(
         OutputMode::Quiet => {}
     }
     0
+}
+
+/// Refuse before connecting when a tool the profile needs is missing. Uses
+/// `platform::check_dependencies`, the same set the TUI refuses on.
+fn exit_if_missing_dependencies(
+    mode: OutputMode,
+    command: &str,
+    profile: &crate::config::profiles::VpnProfile,
+) {
+    let missing = crate::platform::check_dependencies(profile.protocol, &profile.config_path);
+    if missing.is_empty() {
+        return;
+    }
+    let hint = missing
+        .iter()
+        .map(|tool| crate::platform::install_hint(tool))
+        .collect::<Vec<_>>()
+        .join("\n");
+    print_error_and_exit(
+        mode,
+        command,
+        CliError {
+            code: "dependency_missing",
+            message: format!(
+                "Missing dependencies: {}. Install with: {hint}",
+                missing.join(", ")
+            ),
+            hint: None,
+        },
+        ExitCode::DependencyMissing,
+    );
 }
 
 #[cfg(test)]
