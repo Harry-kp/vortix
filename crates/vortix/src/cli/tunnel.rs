@@ -275,25 +275,20 @@ fn refuse_conflict(
             .find(|profile| &profile.id == id)
             .map_or_else(|| id.to_string(), |profile| profile.name.clone())
     };
-    let (code, message) = match conflict {
-        crate::control::Conflict::DefaultRouteTakeover { current, new: _ } => (
+    let with = named(&conflict.with);
+    let (code, message) = if conflict.is_takeover() {
+        (
             "state_conflict_default_route",
-            format!(
-                "Profile '{profile_name}' would take over the default route from '{}'",
-                named(current)
-            ),
-        ),
-        crate::control::Conflict::RouteOverlap {
-            with,
-            overlapping_cidrs,
-        } => (
+            format!("Profile '{profile_name}' would take over the default route from '{with}'"),
+        )
+    } else {
+        (
             "state_conflict_route_overlap",
             format!(
-                "Profile '{profile_name}' overlaps with '{}' on {} CIDR(s)",
-                named(with),
-                overlapping_cidrs.len()
+                "Profile '{profile_name}' overlaps with '{with}' on {} CIDR(s)",
+                conflict.shared.len()
             ),
-        ),
+        )
     };
     print_error_and_exit(
         mode,
