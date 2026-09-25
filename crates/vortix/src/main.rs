@@ -360,7 +360,13 @@ fn main() -> Result<()> {
     tracked_pids.extend(vortix::wireguard::receipt::tracked_wireguard_pids(
         &config_dir,
     ));
-    let orphans = vortix::process::filter_untracked(vortix::process::scan_orphans(), &tracked_pids);
+    let vortix_paths = std::iter::once(config_dir.as_path())
+        .chain(vortix::platform::wireguard_staging_dir())
+        .collect::<Vec<_>>();
+    let orphans = vortix::process::filter_untracked(
+        vortix::process::scan_orphans(&vortix_paths),
+        &tracked_pids,
+    );
     if !orphans.is_empty() && vortix::platform::is_root() {
         eprintln!(
             "Warning: detected {} possible orphan VPN process(es) from a previous session:",

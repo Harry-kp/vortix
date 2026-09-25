@@ -168,7 +168,7 @@ pub(crate) mod route_probe {
 ///
 /// `None` means the platform does not confine wg-quick and the caller may
 /// stage wherever it likes.
-pub(crate) fn wireguard_staging_dir() -> Option<&'static std::path::Path> {
+pub fn wireguard_staging_dir() -> Option<&'static std::path::Path> {
     #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: AppArmor confines wg-quick on Linux only
     const STAGING_DIR: Option<&str> = Some("/etc/wireguard/vortix");
     #[cfg(not(target_os = "linux"))] // xtask:allow-platform-cfg: see above
