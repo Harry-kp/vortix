@@ -783,7 +783,7 @@ impl WgTunnel {
                 .find(|target| peer_covers_target(peer, *target))
                 .ok_or_else(|| {
                     TunnelError::HandshakeFailed(format!(
-                        "WireGuard peer {} has no PersistentKeepalive and no configured health target covered by its AllowedIPs; add a covered ping_target",
+                        "WireGuard peer {} has no PersistentKeepalive and no health target inside its AllowedIPs; add PersistentKeepalive = 25 to the peer, or an address inside its AllowedIPs to wireguard_health_targets under [engine] in settings.toml",
                         peer.public_key
                     ))
                 })?;
