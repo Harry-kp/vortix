@@ -449,7 +449,7 @@ mod whats_new_tests {
 
     #[test]
     fn the_upgrade_popup_leads_with_the_steps_and_fits_80_columns() {
-        let lines = super::whats_new::lines("0.4.3", "0.4.4");
+        let lines = super::whats_new::lines("0.4.3", "0.5.0");
         let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
         assert_eq!(text[0], "Upgraded from 0.4.3.");
         assert_eq!(text[2], "Action needed");
@@ -464,7 +464,7 @@ mod whats_new_tests {
                 );
             })
             .unwrap();
-        assert!(super::whats_new::lines("0.4.4", "0.4.4")
+        assert!(super::whats_new::lines("0.5.0", "0.5.0")
             .iter()
             .all(|l| l.to_string() != "Action needed"));
     }

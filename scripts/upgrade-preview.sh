@@ -2,7 +2,7 @@
 # See the one-time upgrade notes exactly as a user upgrading will.
 #
 #   scripts/upgrade-preview.sh            # as if upgrading from 0.4.3
-#   scripts/upgrade-preview.sh 0.4.4      # from another version
+#   scripts/upgrade-preview.sh 0.5.0      # from another version
 #
 # Builds this checkout stamped with the newest version in
 # crates/vortix/src/whats_new.rs (a throwaway copy; nothing here changes),

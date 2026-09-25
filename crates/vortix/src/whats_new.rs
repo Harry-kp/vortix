@@ -14,7 +14,7 @@ const UNMARKED: &str = "0.4.3";
 pub const CHANGELOG_URL: &str =
     "https://github.com/Harry-kp/vortix/blob/main/crates/vortix/CHANGELOG.md";
 const UPGRADE_URL: &str =
-    "https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md#upgrading-from-043-to-044";
+    "https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md#upgrading-from-043-to-050";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -57,7 +57,7 @@ pub struct Release {
 }
 
 pub const RELEASES: &[Release] = &[Release {
-    version: "0.4.4",
+    version: "0.5.0",
     steps: &[
         Step {
             os: Os::Any,
@@ -249,11 +249,11 @@ mod tests {
     #[test]
     fn a_fresh_install_is_current_and_an_unmarked_one_is_an_upgrade_from_043() {
         let d = dir();
-        assert_eq!(status(d.path(), "0.4.4"), Status::Current);
+        assert_eq!(status(d.path(), "0.5.0"), Status::Current);
         std::fs::create_dir(d.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
         std::fs::write(d.path().join("profiles/wg0.conf"), "").unwrap();
         assert_eq!(
-            status(d.path(), "0.4.4"),
+            status(d.path(), "0.5.0"),
             Status::Upgraded {
                 from: "0.4.3".into()
             }
@@ -263,26 +263,26 @@ mod tests {
     #[test]
     fn the_marker_decides_upgrade_downgrade_and_current() {
         let d = dir();
-        record(d.path(), "0.4.4").unwrap();
-        assert_eq!(status(d.path(), "0.4.4"), Status::Current);
+        record(d.path(), "0.5.0").unwrap();
+        assert_eq!(status(d.path(), "0.5.0"), Status::Current);
         assert_eq!(
-            status(d.path(), "0.5.0"),
+            status(d.path(), "0.6.0"),
             Status::Upgraded {
-                from: "0.4.4".into()
+                from: "0.5.0".into()
             }
         );
         assert_eq!(
             status(d.path(), "0.4.3"),
             Status::Downgraded {
-                from: "0.4.4".into()
+                from: "0.5.0".into()
             }
         );
     }
 
     #[test]
     fn only_releases_after_the_recorded_version_are_shown() {
-        assert_eq!(releases_since("0.4.3", "0.4.4").len(), 1);
-        assert!(releases_since("0.4.4", "0.4.4").is_empty());
+        assert_eq!(releases_since("0.4.3", "0.5.0").len(), 1);
+        assert!(releases_since("0.5.0", "0.5.0").is_empty());
         assert!(releases_since("0.4.3", "0.4.3").is_empty());
     }
 

@@ -1,12 +1,12 @@
 # Upgrading Vortix
 
-Vortix 0.4.4 and later show these steps once, in the dashboard, the first time
+Vortix 0.5.0 and later show these steps once, in the dashboard, the first time
 you run `sudo vortix` after upgrading. This page is the full version.
 
-## Upgrading from 0.4.3 to 0.4.4
+## Upgrading from 0.4.3 to 0.5.0
 
-0.4.4 manages tunnels and the kill switch differently from 0.4.3. Anything
-0.4.3 left running when you upgraded is invisible to 0.4.4's controls, so let
+0.5.0 manages tunnels and the kill switch differently from 0.4.3. Anything
+0.4.3 left running when you upgraded is invisible to 0.5.0's controls, so let
 0.4.3 clean up first. Everything else (profiles, saved OpenVPN passwords, the
 kill switch mode, file ownership) moves over by itself.
 
@@ -20,9 +20,9 @@ sudo vortix killswitch off       # 0.4.3 removes its own firewall rules
 Then upgrade, run `sudo vortix`, and set your kill switch mode again if you
 want one. Nothing else is needed unless a section below applies to you.
 
-**Why:** 0.4.4 can see a tunnel 0.4.3 started but cannot stop it (`vortix down`
+**Why:** 0.5.0 can see a tunnel 0.4.3 started but cannot stop it (`vortix down`
 reports it as "not started by Vortix"). On macOS, 0.4.3's kill switch replaced
-the Mac's main firewall rules, and 0.4.4 only manages its own section of the
+the Mac's main firewall rules, and 0.5.0 only manages its own section of the
 firewall, so after upgrading `vortix killswitch off` cannot lift 0.4.3's
 block and the Mac stays offline.
 
@@ -55,7 +55,7 @@ Then set your kill switch mode again if you use one.
 
 ### Linux: the kill switch needs nftables
 
-0.4.4 dropped the iptables backend, so the kill switch cannot turn on without
+0.5.0 dropped the iptables backend, so the kill switch cannot turn on without
 `nft`. Check with `nft --version`; if it is missing:
 
 | Distribution | Install |
@@ -84,7 +84,7 @@ few seconds.
 
 ### Going back to 0.4.3
 
-0.4.3 cannot read settings that 0.4.4 writes (for example `theme` in
+0.4.3 cannot read settings that 0.5.0 writes (for example `theme` in
 `config.toml`). Remove those lines, or the file, before downgrading.
 
 ---
