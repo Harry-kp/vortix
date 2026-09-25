@@ -397,7 +397,10 @@ impl PfFirewall {
         let root_rules = String::from_utf8_lossy(&output.stdout);
         if !output.success() || !Self::root_traverses_anchor(&root_rules) {
             return Err(KillswitchError::CommandFailed(
-                "root pf ruleset does not traverse the Vortix anchor".to_string(),
+                "macOS pf's main rules no longer reach Vortix's rules (another app or a manual \
+                 pfctl change replaced them), so the kill switch cannot block. Restore the stock \
+                 rules with: sudo pfctl -f /etc/pf.conf"
+                    .to_string(),
             ));
         }
 
