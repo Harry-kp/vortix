@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use super::commands::{acquire_lifecycle_lock_or_exit, engine_failure_or_exit, run_engine_command};
+use super::commands::{acquire_lifecycle_lock_or_exit, engine_failure_or_exit};
 use crate::cli::output::{
     err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError, ExitCode,
     OutputMode,
@@ -208,7 +208,7 @@ pub(super) fn handle_up(
         Some(&protocol),
         timeout_secs,
     );
-    let control = super::commands::start_engine(config, config_dir, profiles.clone())
+    let control = crate::control::Control::start(config, config_dir, profiles.clone())
         .unwrap_or_else(|error| engine_failure_or_exit(mode, "up", error));
     // The engine knows each running tunnel's live routes, including a default
     // route its OpenVPN server pushed; the profile files alone do not.
@@ -319,12 +319,26 @@ pub(super) fn handle_down(
         }
     }
 
-    // Discover every active tunnel, then filter to the requested target.
-    let mut targets: Vec<crate::control::scanner::ActiveSession> =
-        crate::control::scanner::get_active_profiles(&profiles);
-    if let Some(name) = profile_filter {
-        targets.retain(|s| s.name == name);
+    if !crate::platform::is_root() {
+        print_error_and_exit(
+            mode,
+            "down",
+            err_permission_denied("vortix down"),
+            ExitCode::PermissionDenied,
+        );
     }
+    let control = match crate::control::Control::start(config, config_dir, profiles.clone()) {
+        Ok(control) => control,
+        Err(error) => engine_failure_or_exit(mode, "down", error),
+    };
+    let live = control.snapshot();
+    let targets: Vec<String> = live
+        .tunnels
+        .iter()
+        .map(|tunnel| tunnel.name.clone())
+        .chain(live.external.iter().cloned())
+        .filter(|name| profile_filter.is_none_or(|filter| filter == name))
+        .collect();
 
     let profile_id = profile_filter.and_then(|name| {
         profiles
@@ -333,8 +347,7 @@ pub(super) fn handle_down(
             .map(|profile| profile.id.clone())
     });
     if targets.is_empty() {
-        // Idempotent: already disconnected = success. Matches the
-        // scenario "vortix down corp with corp not active → exit 0".
+        // Idempotent: already disconnected = success.
         let data = DownData {
             state: "disconnected".into(),
             disconnected: Vec::new(),
@@ -345,15 +358,6 @@ pub(super) fn handle_down(
             OutputMode::Quiet => {}
         }
         return 0;
-    }
-
-    if !crate::platform::is_root() {
-        print_error_and_exit(
-            mode,
-            "down",
-            err_permission_denied("vortix down"),
-            ExitCode::PermissionDenied,
-        );
     }
 
     let _ = force;
@@ -369,21 +373,15 @@ pub(super) fn handle_down(
         None,
         timeout_secs,
     );
-    let snapshot = match run_engine_command(
-        config,
-        config_dir,
-        profiles.clone(),
-        command,
-        Duration::from_secs(timeout_secs),
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(error) => engine_failure_or_exit(mode, "down", error),
-    };
+    let snapshot =
+        match super::commands::run_on(&control, command, Duration::from_secs(timeout_secs)) {
+            Ok(snapshot) => snapshot,
+            Err(error) => engine_failure_or_exit(mode, "down", error),
+        };
 
     // Tunnels Vortix did not start are left running; never report them gone.
     let (unmanaged, disconnected): (Vec<String>, Vec<String>) = targets
-        .iter()
-        .map(|session| session.name.clone())
+        .into_iter()
         .partition(|name| snapshot.external.contains(name));
     if !unmanaged.is_empty() {
         print_error_and_exit(
@@ -454,12 +452,29 @@ pub(super) fn handle_reconnect(
     // - Without: every currently-Connected tunnel. If none are
     //   currently active, fall back to the last-used profile so the
     //   single-tunnel `vortix reconnect` muscle memory still works.
-    let active = crate::control::scanner::get_active_profiles(&profiles);
+    if !crate::platform::is_root() {
+        print_error_and_exit(
+            mode,
+            "reconnect",
+            err_permission_denied("vortix reconnect"),
+            ExitCode::PermissionDenied,
+        );
+    }
+    let control = match crate::control::Control::start(config, config_dir, profiles.clone()) {
+        Ok(control) => control,
+        Err(error) => engine_failure_or_exit(mode, "reconnect", error),
+    };
+    let active: Vec<String> = control
+        .snapshot()
+        .tunnels
+        .iter()
+        .map(|tunnel| tunnel.name.clone())
+        .collect();
 
     let to_cycle: Vec<String> = if let Some(name) = profile_filter {
         vec![name.to_string()]
     } else if !active.is_empty() {
-        active.iter().map(|s| s.name.clone()).collect()
+        active.clone()
     } else {
         // No active tunnels and no explicit target — fall back to
         // last-used (preserves the single-tunnel behaviour).
@@ -485,14 +500,6 @@ pub(super) fn handle_reconnect(
         }
     };
 
-    if !crate::platform::is_root() {
-        print_error_and_exit(
-            mode,
-            "reconnect",
-            err_permission_denied("vortix reconnect"),
-            ExitCode::PermissionDenied,
-        );
-    }
     for name in &to_cycle {
         let profile = profiles
             .iter()
@@ -537,10 +544,8 @@ pub(super) fn handle_reconnect(
         |id| vec![id],
     );
     for target in targets {
-        if let Err(error) = run_engine_command(
-            config,
-            config_dir,
-            profiles.clone(),
+        if let Err(error) = super::commands::run_on(
+            &control,
             crate::control::Command::Reconnect(target),
             Duration::from_secs(timeout_secs),
         ) {
