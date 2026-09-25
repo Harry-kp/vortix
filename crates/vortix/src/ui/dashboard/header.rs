@@ -61,10 +61,14 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // uses the `⚠ Real:` form because saying DISCONNECTED there
     // would be a lie (tunnels ARE up, just split-route only).
     if tunnel_count == 0 {
-        let line = with_startup_signal(
-            startup_label,
-            render_disconnected_line(app, ks_indicator.clone()),
-        );
+        // A VPN Vortix did not start can still carry all traffic; saying
+        // DISCONNECTED over it is false.
+        let body = if app.control_snapshot.external.is_empty() {
+            render_disconnected_line(app, ks_indicator.clone())
+        } else {
+            render_unmanaged_line(app, ks_indicator.clone())
+        };
+        let line = with_startup_signal(startup_label, body);
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -195,6 +199,35 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
                 .real_ip
                 .clone()
                 .unwrap_or_else(|| app.runtime.public_ip.clone()),
+            Style::default().fg(theme::current().text_primary),
+        ),
+        helpers::divider(),
+        ks_indicator,
+    ])
+}
+
+/// `● UNMANAGED VPN (name) │ Exit: <ip>`: a tunnel Vortix did not start.
+fn render_unmanaged_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> {
+    let external = &app.control_snapshot.external;
+    let names = match external.as_slice() {
+        [one] => one.clone(),
+        [first, rest @ ..] => format!("{first} +{}", rest.len()),
+        [] => String::new(),
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("\u{25cf} UNMANAGED VPN ({names})"),
+            Style::default()
+                .fg(theme::current().warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        helpers::divider_padded(),
+        Span::styled(
+            "Exit: ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(
+            app.runtime.public_ip.clone(),
             Style::default().fg(theme::current().text_primary),
         ),
         helpers::divider(),
@@ -890,6 +923,19 @@ mod tests {
         let out = render_to_string(&app, 100, 1);
         assert!(out.contains("203.0.113.7"), "{out}");
         assert!(!out.contains("139.59.71.126"), "{out}");
+    }
+
+    #[test]
+    fn a_vpn_vortix_did_not_start_is_not_reported_as_disconnected() {
+        let mut app = App::new_test();
+        app.runtime.public_ip = "198.51.100.4".to_string();
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .external
+            .push("wg08".into());
+        let out = render_to_string(&app, 80, 1);
+        assert!(!out.contains("DISCONNECTED"), "{out}");
+        assert!(out.contains("UNMANAGED VPN (wg08)"), "{out}");
+        assert!(out.contains("198.51.100.4"), "{out}");
     }
 
     #[test]
