@@ -117,11 +117,8 @@ impl App {
         self.held_snapshot = None;
         let now = std::time::Instant::now();
         for tunnel in &snapshot.tunnels {
-            let before = self
-                .control_snapshot
-                .tunnel(&tunnel.profile_id)
-                .map(|t| t.phase);
-            if is_transition(tunnel.phase) && before != Some(tunnel.phase) {
+            let before = self.control_snapshot.tunnel(&tunnel.profile_id);
+            if is_transition(tunnel.phase) && before.map(|t| t.phase) != Some(tunnel.phase) {
                 self.transition_shown.insert(tunnel.profile_id.clone(), now);
             }
         }
