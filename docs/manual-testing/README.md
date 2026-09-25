@@ -18,8 +18,8 @@ can answer the question, it is not a P0 workflow — see the coverage table at t
 
 ## When to run it
 
-- **Before every release** — walk `P0.md` top to bottom on both platforms and fill in the
-  results log. Sign off in the release PR description.
+- **Before every release** — run the four passes in `P0.md` (gate, smoke, risk, explore) on
+  both platforms, or `/release-qa`, and fill in the results log. Sign off in the release PR.
 - **When debugging a regression** — the gate is also a map of the product's observable surface.
 
 ## What this is not
