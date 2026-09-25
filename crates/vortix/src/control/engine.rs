@@ -75,6 +75,8 @@ pub(super) struct Engine {
     errors: BTreeMap<ProfileId, String>,
     prompts: BTreeMap<u64, Prompt>,
     waits: BTreeMap<u64, Wait>,
+    /// Switches waiting for the tunnels they share split routes with to stop.
+    after_stop: BTreeMap<ProfileId, (u64, BTreeSet<ProfileId>)>,
     outcomes: BTreeMap<u64, Outcome>,
     notices: VecDeque<Notice>,
     seq: u64,
@@ -153,6 +155,7 @@ impl Engine {
             errors: BTreeMap::new(),
             prompts: BTreeMap::new(),
             waits: BTreeMap::new(),
+            after_stop: BTreeMap::new(),
             outcomes: BTreeMap::new(),
             notices: VecDeque::new(),
             seq: 0,
@@ -240,6 +243,7 @@ impl Engine {
             Command::Connect(profile_id) => self.connect(ticket, profile_id, false),
             Command::Switch(profile_id) => self.connect(ticket, profile_id, true),
             Command::Disconnect(profile_id) => {
+                self.cancel_pending_switch(&profile_id);
                 if self.state.get(&profile_id).is_some() {
                     self.waits
                         .insert(ticket, Wait::Gone(BTreeSet::from([profile_id.clone()])));
@@ -249,6 +253,9 @@ impl Engine {
                 }
             }
             Command::DisconnectAll => {
+                for target in self.after_stop.keys().cloned().collect::<Vec<_>>() {
+                    self.cancel_pending_switch(&target);
+                }
                 let all = self
                     .state
                     .tunnels()
@@ -295,14 +302,32 @@ impl Engine {
                 return;
             }
         };
-        let replaces = switch.then(|| {
-            // A running tunnel knows the routes its server pushed.
-            let known = self
+        // A running tunnel knows the routes its server pushed.
+        let known = self
+            .state
+            .get(&profile_id)
+            .map_or_else(|| spec.clone(), |tunnel| tunnel.spec.clone());
+        if switch && self.state.get(&profile_id).is_none() {
+            let overlapping = self
                 .state
-                .get(&profile_id)
-                .map_or_else(|| spec.clone(), |tunnel| tunnel.spec.clone());
-            self.state.conflicting_peers(&known)
-        });
+                .conflicts(&known)
+                .into_iter()
+                .filter_map(|conflict| match conflict {
+                    Conflict::RouteOverlap { with, .. } => Some(with),
+                    Conflict::DefaultRouteTakeover { .. } => None,
+                })
+                .collect::<BTreeSet<_>>();
+            // Linux refuses a second identical route, so a tunnel cannot come
+            // up beside one with the same split routes: stop those first.
+            if !overlapping.is_empty() {
+                for peer in &overlapping {
+                    self.stop(peer);
+                }
+                self.after_stop.insert(profile_id, (ticket, overlapping));
+                return;
+            }
+        }
+        let replaces = switch.then(|| self.state.conflicting_peers(&known));
         let need = self.need(&profile_id);
         let rank = self.next_generation();
         let replaces_again = replaces.clone().unwrap_or_default();
@@ -474,6 +499,22 @@ impl Engine {
                 self.live.insert(profile_id.clone(), live);
                 self.state.stop_failed(profile_id);
                 self.errors.insert(profile_id.clone(), error.clone());
+                let blocked = self
+                    .after_stop
+                    .iter()
+                    .filter(|(_, (_, peers))| peers.contains(profile_id))
+                    .map(|(target, _)| target.clone())
+                    .collect::<Vec<_>>();
+                for target in blocked {
+                    if let Some((ticket, _)) = self.after_stop.remove(&target) {
+                        self.outcomes.insert(
+                            ticket,
+                            Outcome::Failed(format!(
+                                "could not switch: '{name}' did not disconnect: {error}"
+                            )),
+                        );
+                    }
+                }
                 // A reconnect waiting on this tunnel would otherwise see it
                 // Up again and report the cycle as done.
                 let reconnects = self
@@ -655,6 +696,29 @@ impl Engine {
         }
     }
 
+    fn cancel_pending_switch(&mut self, target: &ProfileId) {
+        if let Some((ticket, _)) = self.after_stop.remove(target) {
+            self.outcomes
+                .insert(ticket, Outcome::Failed("switch cancelled".into()));
+        }
+    }
+
+    /// Start the switches that were waiting only for `stopped` to go.
+    fn resume_switches(&mut self, stopped: &ProfileId) {
+        let ready = self
+            .after_stop
+            .iter_mut()
+            .filter_map(|(target, (ticket, peers))| {
+                peers.remove(stopped);
+                peers.is_empty().then(|| (target.clone(), *ticket))
+            })
+            .collect::<Vec<_>>();
+        for (target, ticket) in ready {
+            self.after_stop.remove(&target);
+            self.connect(ticket, target, true);
+        }
+    }
+
     fn finish_stop(&mut self, profile_id: &ProfileId) {
         self.up_at.remove(profile_id);
         let name = self.name(profile_id);
@@ -699,6 +763,7 @@ impl Engine {
         } else if !self.errors.contains_key(profile_id) {
             self.notice(Level::Info, format!("Disconnected '{name}'"));
         }
+        self.resume_switches(profile_id);
     }
 
     // ── workers ─────────────────────────────────────────────────────────
