@@ -51,12 +51,14 @@ build the previous tag and the current tree in release mode and compare
 
 ## 4. Pick the version
 
+The release-plz PR owns the version; never edit `Cargo.toml` for it.
 release-plz bumps the patch for any `fix:` or `feat:` before 1.0. If the
 release removes or breaks something an existing user relies on (a command,
 a flag, a settings key, a profile directive, a backend), it is breaking: ask
-the user, recommending the next minor. Set it in the root `Cargo.toml`
-(`[workspace.package] version`) in a PR to main; release-plz keeps a version
-that is not published yet.
+the user, recommending the next minor. Mark it on a commit that lands on
+main and touches `crates/vortix`: a squash-merged PR titled `feat!: …` (or
+`fix!: …`) with a `BREAKING CHANGE:` note. release-plz then proposes the
+next minor. Check the release PR's version after that merge.
 
 ## 5. Upgrade notes, when anything is breaking
 
