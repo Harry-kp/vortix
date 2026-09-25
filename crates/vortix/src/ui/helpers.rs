@@ -112,11 +112,15 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
     if sanitized_width <= max_width {
         return sanitized;
     }
-    if max_width <= 3 {
-        return ".".repeat(max_width);
+    if max_width == 0 {
+        return String::new();
     }
-
-    let content_width = max_width - 3;
+    // A cell too narrow for "..." keeps a prefix: "wg…" says more than "...".
+    let (content_width, ellipsis) = if max_width <= 3 {
+        (max_width - 1, "…")
+    } else {
+        (max_width - 3, "...")
+    };
     let mut width = 0;
     let mut truncated = String::new();
     for character in sanitized.chars() {
@@ -127,7 +131,7 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
         truncated.push(character);
         width += character_width;
     }
-    truncated.push_str("...");
+    truncated.push_str(ellipsis);
     truncated
 }
 
@@ -295,6 +299,13 @@ mod tests {
         let truncated = truncate_to_width("office-世界-network", 12);
         assert!(truncated.width() <= 12);
         assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn a_narrow_cell_keeps_a_prefix_of_the_name() {
+        assert_eq!(truncate_to_width("wg08", 3), "wg…");
+        assert_eq!(truncate_to_width("wg08", 1), "…");
+        assert_eq!(truncate_to_width("wg08", 0), "");
     }
 
     #[test]
