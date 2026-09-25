@@ -72,7 +72,11 @@ pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
     scan_active_profiles(profiles).0
 }
 
-fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
+/// Active sessions, and whether the scan could see every tunnel. `false`
+/// when a tool it needs failed (e.g. `wg show` without root), so an empty
+/// list does not mean nothing is connected.
+#[must_use]
+pub fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
     let mut active = Vec::new();
 
     // One protocol-owned, bounded `wg show all dump` replaces one subprocess
