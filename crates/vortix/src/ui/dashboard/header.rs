@@ -1,7 +1,6 @@
 use crate::app::state::QualityLevel;
 use crate::app::App;
 use crate::control::{Phase, TunnelView};
-use crate::profile::ProfileId;
 use crate::ui::helpers;
 use crate::{constants, ui::theme};
 use ratatui::{
@@ -12,14 +11,6 @@ use ratatui::{
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
-
-fn profile_display_name(app: &App, id: &ProfileId) -> String {
-    app.runtime
-        .profiles
-        .iter()
-        .find(|profile| &profile.id == id)
-        .map_or_else(|| format!("missing:{id}"), |profile| profile.name.clone())
-}
 
 /// Render the header bar from the engine snapshot's three states.
 ///
@@ -255,7 +246,7 @@ fn connected_line(
     ks_indicator: Span<'static>,
     area_width: u16,
 ) -> Line<'static> {
-    let profile_name = profile_display_name(app, &primary_snap.profile_id);
+    let profile_name = app.profile_display_name(&primary_snap.profile_id);
     // The dormant mode prefix used to reserve roughly 14 columns.
     // Keep the compact layout through normal 80-column terminals so
     // removing that prefix cannot clip the kill-switch signal.
@@ -370,7 +361,7 @@ fn render_primary_line(
 ) -> Line<'static> {
     match primary_snap.phase {
         Phase::Starting | Phase::Stopping | Phase::Waiting { .. } => {
-            let profile_name = profile_display_name(app, &primary_snap.profile_id);
+            let profile_name = app.profile_display_name(&primary_snap.profile_id);
             let elapsed = primary_snap.since.elapsed().map_or(0, |d| d.as_secs());
             let spinner_frames = ['◐', '◓', '◑', '◒'];
             #[allow(clippy::cast_possible_truncation)]
@@ -552,7 +543,7 @@ fn build_strip_inner(
         width += badge.width();
         let name = app.map_or_else(
             || snap.profile_id.as_str().to_string(),
-            |app| profile_display_name(app, &snap.profile_id),
+            |app| app.profile_display_name(&snap.profile_id),
         );
         if !name.is_empty() {
             width += name.width();
@@ -583,7 +574,7 @@ fn build_narrow_strip(
         // Cost of this tunnel: optional separator + badge + 1-char name.
         let name = app.map_or_else(
             || snap.profile_id.as_str().to_string(),
-            |app| profile_display_name(app, &snap.profile_id),
+            |app| app.profile_display_name(&snap.profile_id),
         );
         let first_char: String = name.chars().take(1).collect();
         let sep_cost = usize::from(idx != 0);
