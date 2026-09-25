@@ -793,7 +793,7 @@ pub mod help {
             &[
                 ("j / ↓", "Scroll down"),
                 ("k / ↑", "Scroll up"),
-                ("f", "Cycle log level filter"),
+                ("f", "Cycle level filter, then OpenVPN logs"),
                 ("L", "Clear logs"),
             ],
         ),

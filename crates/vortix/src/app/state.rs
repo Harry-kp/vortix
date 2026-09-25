@@ -296,6 +296,24 @@ pub fn help_max_scroll_for_terminal_height(terminal_height: u16, total_lines: u1
 
 pub use ratatui_flip_panel::FlipState;
 
+/// What the Logs panel shows. `OpenVpn(None)` is the step shown before any
+/// `OpenVPN` profile has connected.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum LogsSource {
+    #[default]
+    Events,
+    OpenVpn(Option<ProfileId>),
+}
+
+/// The tail of one `OpenVPN` log, re-read only when the file changes.
+#[derive(Debug)]
+pub struct OpenVpnLogFile {
+    pub path: std::path::PathBuf,
+    pub modified: Option<std::time::SystemTime>,
+    pub len: u64,
+    pub lines: Vec<String>,
+}
+
 /// Profile list sort ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ProfileSortOrder {

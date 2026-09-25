@@ -9,7 +9,7 @@ use super::{App, FocusedPanel, InputMode, ToastType};
 use crate::constants;
 use crate::logger;
 use crate::message::{Message, ScrollMove, SelectionMove};
-use crate::profile::ProtocolKind;
+use crate::profile::{ProfileId, ProtocolKind};
 use crate::telemetry::TelemetryUpdate;
 
 /// A `Message` handler taking longer than this is treated as a UI-thread
@@ -879,21 +879,89 @@ impl App {
     }
 
     fn handle_cycle_log_filter(&mut self) {
-        self.log_level_filter = match self.log_level_filter {
-            None => Some(crate::logger::LogLevel::Error),
-            Some(crate::logger::LogLevel::Error) => Some(crate::logger::LogLevel::Warning),
-            Some(crate::logger::LogLevel::Warning) => Some(crate::logger::LogLevel::Info),
-            _ => None,
+        use crate::app::state::LogsSource;
+        use crate::logger::LogLevel;
+        let steps = self.openvpn_log_steps();
+        let next_openvpn = |index: usize| steps.get(index).cloned().map(LogsSource::OpenVpn);
+        let next = match (&self.logs_source, self.log_level_filter) {
+            (LogsSource::Events, None) => (LogsSource::Events, Some(LogLevel::Error)),
+            (LogsSource::Events, Some(LogLevel::Error)) => {
+                (LogsSource::Events, Some(LogLevel::Warning))
+            }
+            (LogsSource::Events, Some(LogLevel::Warning)) => {
+                (LogsSource::Events, Some(LogLevel::Info))
+            }
+            (LogsSource::Events, Some(_)) => (next_openvpn(0).unwrap_or_default(), None),
+            (LogsSource::OpenVpn(current), _) => {
+                let position = steps.iter().position(|step| step == current);
+                let after = position.and_then(|index| next_openvpn(index + 1));
+                (after.unwrap_or_default(), None)
+            }
         };
-        let label = match self.log_level_filter {
-            Some(crate::logger::LogLevel::Error) => "Errors only",
-            Some(crate::logger::LogLevel::Warning) => "Warn+Error",
-            Some(crate::logger::LogLevel::Info) => "Info+Warn+Error",
-            None | Some(_) => "All",
-        };
+        (self.logs_source, self.log_level_filter) = next;
         self.logs_scroll = 0;
         self.logs_auto_scroll = true;
-        self.show_toast(format!("Log filter: {label}"), ToastType::Info);
+        let message = match (&self.logs_source, self.log_level_filter) {
+            (LogsSource::OpenVpn(Some(profile_id)), _) => {
+                let name = self
+                    .runtime
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.id == profile_id)
+                    .map_or("", |profile| profile.name.as_str());
+                let place = steps
+                    .iter()
+                    .position(|step| step.as_ref() == Some(profile_id));
+                match place {
+                    Some(index) if steps.len() > 1 => format!(
+                        "Showing: OpenVPN log ({name}), {} of {}",
+                        index + 1,
+                        steps.len()
+                    ),
+                    _ => format!("Showing: OpenVPN log ({name})"),
+                }
+            }
+            (LogsSource::OpenVpn(None), _) => "Showing: OpenVPN log".to_string(),
+            (LogsSource::Events, Some(LogLevel::Error)) => "Log filter: Errors only".into(),
+            (LogsSource::Events, Some(LogLevel::Warning)) => "Log filter: Warn+Error".into(),
+            (LogsSource::Events, Some(LogLevel::Info)) => "Log filter: Info+Warn+Error".into(),
+            (LogsSource::Events, _) => "Showing: all events".into(),
+        };
+        self.show_toast(message, ToastType::Info);
+    }
+
+    /// Connecting, up or reconnecting: the tunnel's log is still being written.
+    pub(crate) fn tunnel_is_active(&self, profile_id: &ProfileId) -> bool {
+        self.control_snapshot
+            .tunnel(profile_id)
+            .is_some_and(|tunnel| tunnel.phase != crate::control::Phase::Stopping)
+    }
+
+    /// The `OpenVPN` steps of the `f` cycle: every active `OpenVPN` tunnel in
+    /// sidebar order; with none active, the most recently connected `OpenVPN`
+    /// profile (or a placeholder before any has connected). Empty when there
+    /// are no `OpenVPN` profiles.
+    pub(crate) fn openvpn_log_steps(&self) -> Vec<Option<ProfileId>> {
+        let openvpn = || {
+            self.runtime
+                .profiles
+                .iter()
+                .filter(|profile| profile.protocol == ProtocolKind::OpenVpn)
+        };
+        let active = openvpn()
+            .filter(|profile| self.tunnel_is_active(&profile.id))
+            .map(|profile| Some(profile.id.clone()))
+            .collect::<Vec<_>>();
+        if !active.is_empty() {
+            return active;
+        }
+        if openvpn().next().is_none() {
+            return Vec::new();
+        }
+        vec![openvpn()
+            .filter(|profile| profile.last_used.is_some())
+            .max_by_key(|profile| profile.last_used)
+            .map(|profile| profile.id.clone())]
     }
 }
 

@@ -186,7 +186,7 @@ pub enum Message {
     OpenSearch,
     /// Open the help overlay
     OpenHelp,
-    /// Cycle the activity-log level filter (All → Errors → Warn → Info → All)
+    /// Cycle the Logs panel: All → Errors → Warn → Info → each `OpenVPN` log → All
     CycleLogFilter,
 }
 
@@ -263,7 +263,7 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
             });
             actions.push(ActionMenuItem {
                 key: "f",
-                label: "Filter Log Level",
+                label: "Filter Logs / OpenVPN Log",
                 message: Message::CycleLogFilter,
             });
         }
