@@ -346,6 +346,130 @@ pub mod auth {
         frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
     }
 }
+pub mod whats_new {
+    //! What changed since the version that last ran here.
+
+    use crate::ui::helpers::centered_rect;
+    use crate::ui::theme;
+    use crate::whats_new::{command_text, releases_since, steps, upgrade_url, CHANGELOG_URL};
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Paragraph, Wrap},
+        Frame,
+    };
+
+    #[must_use]
+    pub fn lines(from: &str, current: &str) -> Vec<Line<'static>> {
+        let t = theme::current();
+        let releases = releases_since(from, current);
+        let bold = |color| Style::default().fg(color).add_modifier(Modifier::BOLD);
+        let mut out = vec![Line::from(format!("Upgraded from {from}.")), Line::from("")];
+        let steps = steps(&releases);
+        if !steps.is_empty() {
+            out.push(Line::from(Span::styled("Action needed", bold(t.warning))));
+            for (n, step) in steps.iter().enumerate() {
+                out.push(Line::from(Span::styled(
+                    format!("{}. {}", n + 1, step.title),
+                    bold(t.text_primary),
+                )));
+                out.push(Line::from(Span::styled(
+                    format!("   Why: {}", step.why),
+                    Style::default().fg(t.text_secondary),
+                )));
+                for cmd in step.commands {
+                    out.push(Line::from(Span::styled(
+                        format!("   $ {}", command_text(cmd)),
+                        Style::default().fg(t.accent_primary),
+                    )));
+                }
+            }
+            out.push(Line::from(Span::styled(
+                format!("Details: {}", upgrade_url()),
+                Style::default().fg(t.text_secondary),
+            )));
+            out.push(Line::from(""));
+        }
+        out.push(Line::from(Span::styled(
+            "What's new",
+            bold(t.accent_primary),
+        )));
+        for release in &releases {
+            for highlight in release.highlights {
+                out.push(Line::from(format!("• {highlight}")));
+            }
+        }
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            format!("Full changelog: {CHANGELOG_URL}"),
+            Style::default().fg(t.text_secondary),
+        )));
+        out
+    }
+
+    pub fn render(frame: &mut Frame, from: &str, scroll: u16) {
+        let area = centered_rect(85, 85, frame.area());
+        crate::ui::helpers::clear_area(frame, area);
+        let version = crate::constants::APP_VERSION;
+        // Steps that must not be dismissed by habit: red, and only `y` closes.
+        let (border, title, keys) = if crate::whats_new::needs_action(from, version) {
+            (
+                theme::current().error,
+                format!(" Action needed: Vortix {version} "),
+                " [y] I've done these steps  [↑/↓] Scroll ",
+            )
+        } else {
+            (
+                theme::current().border_focused,
+                format!(" What's new in Vortix {version} "),
+                " [Enter/Esc] Close  [↑/↓] Scroll ",
+            )
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border).add_modifier(Modifier::BOLD))
+            .title(Span::styled(
+                title,
+                Style::default().fg(border).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::from(keys).centered());
+        frame.render_widget(
+            Paragraph::new(lines(from, crate::constants::APP_VERSION))
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            area,
+        );
+    }
+}
+
+#[cfg(test)]
+mod whats_new_tests {
+    use ratatui::{backend::TestBackend, widgets::Paragraph, widgets::Wrap, Terminal};
+
+    #[test]
+    fn the_upgrade_popup_leads_with_the_steps_and_fits_80_columns() {
+        let lines = super::whats_new::lines("0.4.3", "0.5.0");
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(text[0], "Upgraded from 0.4.3.");
+        assert_eq!(text[2], "Action needed");
+        assert!(text.iter().any(|l| l.starts_with("   Why: ")));
+        assert!(text.iter().any(|l| l == "What's new"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(lines).wrap(Wrap { trim: false }),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        assert!(super::whats_new::lines("0.5.0", "0.5.0")
+            .iter()
+            .all(|l| l.to_string() != "Action needed"));
+    }
+}
+
 pub mod config_viewer {
     //! Config file viewer overlay
 

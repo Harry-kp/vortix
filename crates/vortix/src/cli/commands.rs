@@ -477,7 +477,7 @@ pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
 
     match mode {
         OutputMode::Human => {
-            println!("Kill switch released. Internet access restored.");
+            println!("Kill switch released: Vortix's firewall rules are removed.");
         }
         OutputMode::Json => {
             print_success(

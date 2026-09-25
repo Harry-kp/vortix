@@ -393,7 +393,7 @@ pub(super) fn handle_down(
                     "Not started by Vortix, left running: {}",
                     unmanaged.join(", ")
                 ),
-                hint: Some("Stop it with the tool that started it (e.g. wg-quick down).".into()),
+                hint: Some("Stop it with the tool that started it. If an earlier Vortix version started it, restart the computer once.".into()),
             },
             ExitCode::StateConflict,
         );

@@ -30,5 +30,6 @@ pub mod profile;
 pub mod telemetry;
 pub mod tunnel;
 pub mod ui;
+pub mod whats_new;
 #[doc(hidden)]
 pub mod wireguard;
