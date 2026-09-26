@@ -364,11 +364,18 @@ impl State {
             .tunnels
             .values()
             .any(|tunnel| tunnel.recovering.is_some() && tunnel.phase != Phase::Stopping);
+        let releasing = self
+            .tunnels
+            .values()
+            .filter(|tunnel| tunnel.phase == Phase::Stopping)
+            .filter_map(|tunnel| tunnel.interface.clone())
+            .collect();
         PlanInput {
             live,
             pending_endpoints,
             pending_full_endpoints,
             dropped,
+            releasing,
             kill_switch: self.kill_switch,
         }
     }
@@ -497,6 +504,24 @@ mod tests {
         let stopped = state.came_up(&id("03"), "utun5".into(), full, [], None);
         assert_eq!(stopped, BTreeSet::from([id("01")]));
         assert_eq!(state.get(&id("01")).unwrap().phase, Phase::Stopping);
+    }
+
+    /// Deleting a stopping tunnel's routes one by one took 30 s for 1024 of
+    /// them and starved its own `wg-quick down`; its teardown removes them.
+    #[test]
+    fn a_stopping_tunnels_interface_is_released_not_unrouted() {
+        let mut state = State::default();
+        state
+            .begin(spec("01", "10.200.0.0/24"), 1, None, false)
+            .unwrap();
+        state.came_up(&id("01"), "utun4".into(), [], [], None);
+        assert!(crate::control::plan::plan(&state.plan_input())
+            .releasing
+            .is_empty());
+        state.stop(&id("01"));
+        let plan = crate::control::plan::plan(&state.plan_input());
+        assert!(plan.routes.is_empty());
+        assert_eq!(plan.releasing, BTreeSet::from(["utun4".to_owned()]));
     }
 
     /// Shutdown waits for these; a process exit mid-start left half a tunnel

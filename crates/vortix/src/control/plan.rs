@@ -51,6 +51,8 @@ pub struct PlanInput {
     pub pending_full_endpoints: BTreeSet<IpAddr>,
     /// A tunnel dropped without being asked to.
     pub dropped: bool,
+    /// Interfaces of tunnels being torn down.
+    pub releasing: BTreeSet<String>,
     pub kill_switch: KillSwitchMode,
 }
 
@@ -75,6 +77,8 @@ pub struct NetworkPlan {
     pub dns: Vec<DnsTunnelIntent>,
     pub firewall: Firewall,
     pub kill_switch_state: KillSwitchState,
+    /// Interfaces whose teardown removes their routes; Vortix does not.
+    pub releasing: BTreeSet<String>,
 }
 
 impl NetworkPlan {
@@ -192,6 +196,7 @@ pub fn plan(input: &PlanInput) -> NetworkPlan {
         dns,
         firewall,
         kill_switch_state,
+        releasing: input.releasing.clone(),
     }
 }
 

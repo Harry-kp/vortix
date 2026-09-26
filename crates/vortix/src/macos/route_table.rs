@@ -142,6 +142,28 @@ impl MacRouteTable {
         )
     }
 
+    /// [`Self::route_interface_for`] for many targets from one table read;
+    /// one `route get` each took 32 ms, 45 s for a 700-route tunnel.
+    #[must_use]
+    pub fn route_interfaces_for(targets: &[IpAddr]) -> Vec<DefaultRouteObservation> {
+        let table = crate::process::run(
+            // xtask:allow-shell-regression: `netstat -rn` lists the whole table in one read; `route get` answers one address per process.
+            CommandSpec::oneshot("netstat", vec!["-rn".into()])
+                .timeout(ROUTE_QUERY_TIMEOUT)
+                .output_limit(4 * 1024 * 1024),
+        )
+        .ok()
+        .filter(crate::process::CommandOutcome::success)
+        .map(|output| parse_route_table(&String::from_utf8_lossy(&output.stdout)));
+        targets
+            .iter()
+            .map(|target| match &table {
+                Some(table) => route_lookup(table, *target),
+                None => Self::route_interface_for(*target),
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
         let Some(text) = route_get(target) else {
@@ -152,6 +174,75 @@ impl MacRouteTable {
             DefaultRouteObservation::Interface,
         )
     }
+}
+
+/// The unscoped rows of `netstat -rn`: what `route get` matches against.
+fn parse_route_table(text: &str) -> Vec<(crate::cidr::Cidr, String)> {
+    let mut v6 = false;
+    text.lines()
+        .filter_map(|line| {
+            match line.trim() {
+                "Internet:" => v6 = false,
+                "Internet6:" => v6 = true,
+                _ => {}
+            }
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let (destination, flags, netif) = (fields.first()?, fields.get(2)?, fields.get(3)?);
+            if flags.contains('I') || !flags.contains('U') {
+                return None;
+            }
+            Some((parse_destination(destination, v6)?, (*netif).to_owned()))
+        })
+        .collect()
+}
+
+/// `default`, `10.200/24`, `192.168.1` (a /24), `fe80::%lo0/64`, `::1`.
+fn parse_destination(destination: &str, v6: bool) -> Option<crate::cidr::Cidr> {
+    use crate::cidr::Cidr;
+    let destination = match destination {
+        "default" if v6 => "::/0",
+        "default" => "0/0",
+        other => other,
+    };
+    let (address, prefix) = match destination.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix.parse::<u8>().ok()?)),
+        None => (destination, None),
+    };
+    let address = address.split('%').next()?;
+    if v6 {
+        let addr = address.parse::<std::net::Ipv6Addr>().ok()?;
+        let prefix_len = prefix.unwrap_or(128);
+        return (prefix_len <= 128).then_some(Cidr {
+            addr: IpAddr::from(addr),
+            prefix_len,
+        });
+    }
+    let octets = address
+        .split('.')
+        .map(|octet| octet.parse::<u8>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if octets.is_empty() || octets.len() > 4 {
+        return None;
+    }
+    let mut bytes = [0u8; 4];
+    bytes[..octets.len()].copy_from_slice(&octets);
+    let prefix_len = prefix.unwrap_or(u8::try_from(octets.len() * 8).ok()?);
+    (prefix_len <= 32).then_some(Cidr {
+        addr: IpAddr::from(bytes),
+        prefix_len,
+    })
+}
+
+/// Longest-prefix match, as the kernel does for a packet to `target`.
+fn route_lookup(table: &[(crate::cidr::Cidr, String)], target: IpAddr) -> DefaultRouteObservation {
+    let host = crate::cidr::Cidr::host(target);
+    table
+        .iter()
+        .filter(|(network, _)| network.intersects(&host))
+        .max_by_key(|(network, _)| network.prefix_len)
+        .map_or(DefaultRouteObservation::NoDefaultRoute, |(_, netif)| {
+            DefaultRouteObservation::Interface(netif.clone())
+        })
 }
 
 /// `add` the route; `change` it only when `add` reports that exact route already
@@ -512,5 +603,42 @@ default                                 fe80::1%en0                             
             unbind_host_route_args("198.51.100.7".parse().unwrap()),
             ["-n", "delete", "-inet", "-host", "198.51.100.7"]
         );
+    }
+
+    /// One table read must answer as `route get` would: the most specific
+    /// unscoped route wins, and `-ifscope` rows are not candidates.
+    #[test]
+    fn a_table_read_matches_route_get() {
+        let table = parse_route_table(
+            "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\n\
+default            192.168.1.1        UGScg                 en0\n\
+default            link#23            UCSIg               utun4\n\
+0/1                link#23            UCS                 utun4\n\
+127                127.0.0.1          UCS                   lo0\n\
+140.82.112/20      link#23            UCS                 utun4\n\
+192.168.1          link#11            UCS                   en0\n\
+192.168.1.1        aa:bb:cc:dd:ee:ff  UHLWIir               en0\n\
+10.200/24          link#23            UCS                 utun4\n\
+\nInternet6:\nDestination        Gateway            Flags               Netif Expire\n\
+default            fe80::%utun0       UGcIg               utun0\n\
+::1                ::1                UHL                   lo0\n\
+2606:50c0::/32     link#23            UCS                 utun4\n\
+fe80::%lo0/64      fe80::1%lo0        UcI                   lo0\n",
+        );
+        let via = |target: &str| route_lookup(&table, target.parse().unwrap());
+        let on = |netif: &str| DefaultRouteObservation::Interface(netif.into());
+        assert_eq!(via("140.82.112.3"), on("utun4"));
+        assert_eq!(via("10.200.0.1"), on("utun4"));
+        assert_eq!(via("1.1.1.1"), on("utun4"), "0/1 beats the default");
+        assert_eq!(via("192.168.1.7"), on("en0"));
+        assert_eq!(via("200.1.1.1"), on("en0"), "the unscoped default");
+        assert_eq!(via("127.0.0.9"), on("lo0"));
+        assert_eq!(via("2606:50c0::1"), on("utun4"));
+        assert_eq!(
+            via("2001:db8::1"),
+            DefaultRouteObservation::NoDefaultRoute,
+            "only scoped IPv6 defaults"
+        );
+        assert_eq!(parse_destination("10/33", false), None);
     }
 }
