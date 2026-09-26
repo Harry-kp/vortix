@@ -190,17 +190,20 @@ impl Engine {
     pub(super) fn run(mut self, rx: &mpsc::Receiver<Msg>) {
         loop {
             let wait = self.next_wake().saturating_duration_since(Instant::now());
-            match rx.recv_timeout(wait) {
-                Ok(Msg::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Ok(message) => self.handle(message),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
+            let first = match rx.recv_timeout(wait) {
+                Ok(message) => Some(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             let mut shutdown = false;
-            while let Ok(message) = rx.try_recv() {
-                if matches!(message, Msg::Shutdown) {
-                    shutdown = true;
-                } else {
-                    self.handle(message);
+            for message in first.into_iter().chain(rx.try_iter()) {
+                match message {
+                    Msg::Shutdown => shutdown = true,
+                    Msg::Settle(done) => {
+                        self.finish_transitions(rx);
+                        let _ = done.send(());
+                    }
+                    message => self.handle(message),
                 }
             }
             self.tick();
@@ -211,8 +214,45 @@ impl Engine {
                 break;
             }
         }
+        self.finish_transitions(rx);
         if let Some((runtime, hooks)) = self.hooks.take() {
             runtime.block_on(hooks.shutdown_bounded(Duration::from_secs(2)));
+        }
+    }
+
+    /// Before exiting, cancel starts still in progress and let every start
+    /// and stop finish, so none is left half done on the host. Bounded by one
+    /// start plus its rollback.
+    fn finish_transitions(&mut self, rx: &mpsc::Receiver<Msg>) {
+        let starting = self
+            .state
+            .tunnels()
+            .filter(|tunnel| matches!(tunnel.phase, Phase::Starting | Phase::AwaitingCredentials))
+            .map(|tunnel| tunnel.spec.profile_id.clone())
+            .collect::<Vec<_>>();
+        for profile_id in &starting {
+            self.stop(profile_id);
+        }
+        let deadline = Instant::now()
+            + 2 * self
+                .config
+                .openvpn_timeout
+                .max(self.config.wireguard_timeout);
+        while self.state.in_transition() && Instant::now() < deadline {
+            let wait = self
+                .next_wake()
+                .min(deadline)
+                .saturating_duration_since(Instant::now());
+            match rx.recv_timeout(wait) {
+                Ok(Msg::Shutdown | Msg::Command(..) | Msg::Settle(_))
+                | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(message) => self.handle(message),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            self.tick();
+            self.reconcile();
+            self.settle();
+            self.publish();
         }
     }
 
@@ -231,7 +271,7 @@ impl Engine {
                 Event::Scanned { result, started } => self.scanned(result, started),
                 Event::Drained { profile_id } => self.drained(&profile_id),
             },
-            Msg::Shutdown => {}
+            Msg::Settle(_) | Msg::Shutdown => {}
         }
     }
 

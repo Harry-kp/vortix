@@ -229,6 +229,8 @@ enum Msg {
     Command(u64, Command),
     Answer(u64, Option<Credentials>),
     Event(Box<engine::Event>),
+    /// Cancel starts in progress and finish every start and stop, then reply.
+    Settle(mpsc::Sender<()>),
     Shutdown,
 }
 
@@ -355,6 +357,12 @@ impl Control {
                 _ => {}
             }
             if Instant::now() >= deadline {
+                // Exiting mid-start left half a tunnel on the host.
+                let (done, settled) = mpsc::channel();
+                if self.tx.send(Msg::Settle(done)).is_ok() {
+                    let _ = settled.recv();
+                }
+                let snapshot = self.snapshot();
                 return Err(snapshot.net_error.as_ref().map_or_else(
                     || "timed out waiting for the VPN".into(),
                     |error| format!("network settings not applied: {error}"),
