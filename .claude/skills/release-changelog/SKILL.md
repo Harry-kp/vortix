@@ -12,7 +12,11 @@ version lists every internal fix and is not what ships.
 
 ## 1. Gather
 
+First find the release PR release-plz already opened: it holds the version and
+the changelog you will edit (step 7). Never open another PR for the changelog.
+
 ```bash
+gh pr list --state open --label release --json number,title,headRefName   # e.g. "chore: release v0.5.1"
 LAST=$(git describe --tags --abbrev=0 origin/main)
 git log -1 --format=%cI "$LAST"                      # the tag's date
 gh pr list --state merged --base main --limit 200 --search "merged:>$(git log -1 --format=%cs $LAST)" \
@@ -93,6 +97,17 @@ git commit -am "docs: user-facing changelog for X.Y.Z" && git push origin HEAD:<
 gh pr diff <number> -- crates/vortix/CHANGELOG.md     # check it landed
 ```
 
+Nothing else may merge to `main` until the release PR does: release-plz would
+regenerate its changelog and drop your edit. Hold other PRs (including skill
+or doc fixes) until after the release.
+
 Merging the release PR publishes the release, so leave that to the user
 unless they said to merge it. Tell them the PR number, the version, and
 anything in the changelog you could not verify.
+
+## 8. After the release
+
+`release-notes.yml` does not run: a release created with `GITHUB_TOKEN`
+triggers no other workflow. Check the GitHub release page, and if it shows
+only the install instructions, prepend the changelog section as
+`## Release Notes` with `gh release edit v<X.Y.Z> --notes-file <file>`.
