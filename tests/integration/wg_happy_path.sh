@@ -96,5 +96,4 @@ fi
 
 echo "OK: vortix WG handshake-gated valid + unreachable lifecycle"
 
-# TODO follow-up coverage (deferred): daemon-died-mid-session adoption
-# (depends on Background-mode IPC), DNS-leak guards under the tunnel.
+# Not covered yet: DNS-leak guards under the tunnel.

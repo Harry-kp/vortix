@@ -1,80 +1,38 @@
 # Releasing Vortix
 
-## Automated Release Pipeline
+The `release-changelog` skill (`.claude/skills/release-changelog/`) walks through a release
+step by step; this page is the pipeline it drives.
 
-Everything is automated. Just write code and merge PRs.
+## Pipeline
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  1. You push commits to main (or merge a PR)                    │
-│                           ↓                                     │
-│  2. release-plz automatically creates a Release PR              │
-│     - Bumps version in Cargo.toml (based on commit types)       │
-│     - Updates CHANGELOG.md                                      │
-│                           ↓                                     │
-│  3. You review and merge the Release PR                         │
-│                           ↓                                     │
-│  4. release-plz automatically:                                  │
-│     - Publishes to crates.io                                    │
-│     - Creates git tag (e.g., v0.2.0)                            │
-│                           ↓                                     │
-│  5. Git tag triggers cargo-dist which:                          │
-│     - Builds macOS (x86_64, arm64) and Linux gnu/musl           │
-│       (x86_64, aarch64) binaries                                │
-│     - Creates GitHub Release with binaries attached             │
-│     - Generates shell installer; publishes Homebrew and npm     │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. Every push to `main` makes **release-plz** open or update a release PR (`chore: release
+   vX.Y.Z`, label `release`): it bumps the version in `Cargo.toml` and writes
+   `crates/vortix/CHANGELOG.md` from the commit subjects.
+2. That generated changelog is replaced by hand with the user-facing one, as the last step
+   before merging, because release-plz rewrites it on every push to `main`. Nothing else merges
+   to `main` in between.
+3. Merging the release PR publishes to crates.io and pushes the tag `vX.Y.Z`.
+4. The tag runs **cargo-dist** (`release.yml`): macOS (x86_64, arm64) and Linux gnu and musl
+   (x86_64, aarch64) archives, the GitHub release, the shell installer, the Homebrew tap and
+   npm.
+5. After publishing, check the GitHub release page. A release created with `GITHUB_TOKEN`
+   triggers no other workflow, so `release-notes.yml` and the release trigger of
+   `install-sanity.yml` never run: prepend the changelog section as `## Release Notes` with
+   `gh release edit vX.Y.Z --notes-file <file>`.
 
-## Your Only Manual Step
+## Versions
 
-**Merge the Release PR** — that's it.
+Before 1.0, release-plz bumps the patch for `fix:` and `feat:`, and the minor for a breaking
+change (`feat!:` / `fix!:`, or a `BREAKING CHANGE:` footer) on a commit that touches
+`crates/vortix`. `docs:`, `test:`, `chore:` and `ci:` alone do not release.
 
-## Commit Message Guidelines
+## Secrets
 
-Use conventional commits to control version bumps:
+| Secret | Used by |
+|---|---|
+| `RELEASE_PLZ_TOKEN` | release-plz, to open PRs that trigger CI |
+| `CARGO_REGISTRY_TOKEN` | crates.io publish |
+| `HOMEBREW_TAP_TOKEN` | the Homebrew formula push to `Harry-kp/homebrew-tap` |
+| `NPM_TOKEN` | npm publish; publish tokens expire, and an expired one fails with a 404 |
 
-| Prefix | Version Bump | Example |
-|--------|--------------|---------|
-| `fix:` | Patch (0.0.X) | `fix: resolve connection timeout` |
-| `feat:` | Minor (0.X.0) | `feat: add kill switch toggle` |
-| `feat!:` or `BREAKING CHANGE:` | Major (X.0.0) | `feat!: redesign config format` |
-| `chore:`, `docs:`, `style:` | No bump | `docs: update README` |
-
-## Required Secrets
-
-Ensure these are set in GitHub repo settings → Secrets → Actions:
-
-| Secret | Purpose |
-|--------|---------|
-| `CARGO_REGISTRY_TOKEN` | Publish to crates.io |
-
-`GITHUB_TOKEN` is automatically provided by GitHub Actions.
-
-## Tools
-
-| Tool | Purpose |
-|------|---------|
-| **release-plz** | Version bumps, changelog, crates.io publishing, git tags |
-| **cargo-dist** | macOS + Linux (gnu/musl) binaries, GitHub releases, shell installer, Homebrew tap, npm |
-
-## Manual Release (if needed)
-
-If automation fails, you can trigger manually:
-
-1. Go to Actions → Release-plz → Run workflow
-2. After PR is merged, cargo-dist runs automatically on the tag
-
-## Troubleshooting
-
-**Release PR not created?**
-- Check if commits use conventional commit format
-- Check Actions tab for errors
-
-**Not published to crates.io?**
-- Verify `CARGO_REGISTRY_TOKEN` secret exists and is valid
-- Get new token from https://crates.io/settings/tokens
-
-**Binaries not built?**
-- Check if git tag was created (v0.X.X format)
-- Check Actions tab → Release workflow
+A failed publish job can be re-run alone: `gh run rerun <run-id> --failed`.
