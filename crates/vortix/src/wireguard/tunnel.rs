@@ -39,8 +39,6 @@ const MAX_HEALTH_TARGETS: usize = 64;
 const MAX_WG_DUMP_BYTES: usize = 1024 * 1024;
 const MAX_WG_INTERFACES: usize = 512;
 const MAX_WG_PEERS: usize = 256;
-const MAX_ROUTES_PER_PEER: usize = 256;
-const MAX_WG_FIELD_BYTES: usize = 4096;
 const MAX_WG_PROFILE_BYTES: usize = 1024 * 1024;
 const HANDSHAKE_FUTURE_TOLERANCE: Duration = Duration::from_secs(300);
 static NEXT_ATTEMPT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -480,7 +478,7 @@ pub fn parse_wg_dump(
         .next()
         .ok_or_else(|| TunnelError::MalformedStatus("WireGuard dump was empty".into()))?;
     let fields = interface.split('\t').collect::<Vec<_>>();
-    if fields.len() != 4 || fields.iter().any(|field| field.len() > MAX_WG_FIELD_BYTES) {
+    if fields.len() != 4 {
         return Err(TunnelError::MalformedStatus(
             "WireGuard interface dump shape".into(),
         ));
@@ -511,7 +509,7 @@ pub fn parse_wg_dump(
             });
         }
         let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() != 8 || fields.iter().any(|field| field.len() > MAX_WG_FIELD_BYTES) {
+        if fields.len() != 8 {
             return Err(TunnelError::MalformedStatus(
                 "WireGuard peer dump shape".into(),
             ));
@@ -527,12 +525,6 @@ pub fn parse_wg_dump(
                     .map_err(|_| TunnelError::MalformedStatus("WireGuard AllowedIPs".into()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if allowed_routes.len() > MAX_ROUTES_PER_PEER {
-            return Err(TunnelError::ResourceLimit {
-                resource: "WireGuard peer routes",
-                limit: MAX_ROUTES_PER_PEER,
-            });
-        }
         let bytes_rx = fields[5]
             .parse()
             .map_err(|_| TunnelError::MalformedStatus("WireGuard receive counter".into()))?;
@@ -590,8 +582,6 @@ pub fn parse_wg_all_dump(
     let mut current_interface: Option<String> = None;
     for line in dump.lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
-        // Oversized fields are caught per-block by parse_wg_dump, which skips
-        // just that interface.
         match fields.as_slice() {
             [interface, private_key, public_key, listen_port, fwmark] => {
                 if blocks.len() >= MAX_WG_INTERFACES || blocks.contains_key(*interface) {
@@ -2384,14 +2374,18 @@ mod tests {
     }
 
     #[test]
-    fn dump_parser_bounds_peer_and_route_cardinality() {
+    fn dump_parser_bounds_peer_count_but_not_routes() {
         let observed = UNIX_EPOCH + Duration::from_secs(1_000);
-        let routes = std::iter::repeat_n("10.0.0.0/24", MAX_ROUTES_PER_PEER + 1)
+        // The kernel's own list, capped only by the dump size: 250 routes
+        // made a connected tunnel look handshake-less and then invisible.
+        let routes = (0..2000)
+            .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
             .collect::<Vec<_>>()
             .join(",");
         let dump =
             format!("private\tpublic\t51820\toff\npeer\t(none)\t(none)\t{routes}\t900\t0\t0\t0\n");
-        assert!(parse_wg_dump("wg0", &dump, observed, 1).is_err());
+        let peers = parse_wg_dump("wg0", &dump, observed, 1).unwrap().peers;
+        assert_eq!(peers[0].allowed_routes.len(), 2000);
 
         let peer = "peer\t(none)\t(none)\t10.0.0.0/24\t900\t0\t0\t0\n";
         let dump = format!(
@@ -2436,12 +2430,11 @@ mod tests {
     }
 
     #[test]
-    fn all_dump_skips_foreign_interface_with_oversized_peer_table() {
+    fn all_dump_reads_foreign_interface_with_a_large_peer_table() {
         // NetBird, Tailscale and corporate meshes are WireGuard underneath and
-        // surface in `wg show all dump` with peer tables far larger than any
-        // vortix tunnel. Such an interface must be skipped, not fail the whole
-        // observation — which would report every real vortix tunnel
-        // unverifiable and refuse startup.
+        // surface in `wg show all dump` with large peer tables. They must not
+        // fail the whole observation, which would report every real vortix
+        // tunnel unverifiable and refuse startup.
         let huge_routes = "10.0.0.0/8,".repeat(600);
         let dump = format!(
             concat!(
@@ -2454,9 +2447,8 @@ mod tests {
         );
         let statuses =
             parse_wg_all_dump(&dump, SystemTime::now(), 0).expect("observation stays complete");
-        assert_eq!(statuses.len(), 1);
         assert!(statuses.contains_key("wg0"));
-        assert!(!statuses.contains_key("utun100"));
+        assert_eq!(statuses["utun100"].peers[0].allowed_routes.len(), 600);
     }
 
     #[test]

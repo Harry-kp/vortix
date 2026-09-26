@@ -16,8 +16,9 @@ use crate::tunnel::ParseError;
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_PEERS: usize = 256;
-const MAX_CONFIG_ROUTES_PER_PEER: usize = 256;
-const MAX_CONFIG_FIELD_BYTES: usize = 4096;
+/// Routes across all peers. Receipts copy them once more for the probes,
+/// so this also bounds their size.
+pub(crate) const MAX_ROUTES: usize = 1024;
 
 /// One `[Peer]` block from a `WireGuard` configuration.
 #[derive(Debug, Default, Clone)]
@@ -106,6 +107,7 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
     };
     let mut section = Section::None;
     let mut current_peer: Option<WgPeer> = None;
+    let mut routes = 0;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -141,12 +143,6 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
         };
         let key = key.trim();
         let value = value.trim();
-        if key.len() > MAX_CONFIG_FIELD_BYTES || value.len() > MAX_CONFIG_FIELD_BYTES {
-            return Err(ParseError::MalformedField {
-                field: "WireGuard directive",
-                detail: format!("field exceeds {MAX_CONFIG_FIELD_BYTES} bytes"),
-            });
-        }
 
         match section {
             Section::Interface => {
@@ -204,14 +200,13 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                             }
                             match entry.parse::<Cidr>().ok() {
                                 Some(cidr) => {
-                                    if peer.allowed_ips.len() >= MAX_CONFIG_ROUTES_PER_PEER {
+                                    if routes >= MAX_ROUTES {
                                         return Err(ParseError::MalformedField {
                                             field: "AllowedIPs",
-                                            detail: format!(
-                                                "peer exceeds {MAX_CONFIG_ROUTES_PER_PEER} routes"
-                                            ),
+                                            detail: format!("profile exceeds {MAX_ROUTES} routes"),
                                         });
                                     }
+                                    routes += 1;
                                     peer.allowed_ips.push(cidr);
                                 }
                                 None => {
@@ -632,6 +627,26 @@ Address = 10.0.0.2/32
 ";
         let p = parse_wg_conf(text).unwrap();
         assert_eq!(p.addresses, ["10.0.0.2/32"]);
+    }
+
+    /// GitHub's published ranges alone are over 300 routes and 6 KB on one
+    /// line; 0.5.0 refused them at 4096 bytes and 256 routes.
+    #[test]
+    fn a_large_split_tunnel_parses_up_to_the_route_limit() {
+        let routes = |n: usize| {
+            (0..n)
+                .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let conf = |n: usize| format!("[Peer]\nPublicKey = BBBB\nAllowedIPs = {}\n", routes(n));
+        assert!(routes(MAX_ROUTES).len() > 4096);
+        let parsed = parse_wg_conf(&conf(MAX_ROUTES)).unwrap();
+        assert_eq!(parsed.peers[0].allowed_ips.len(), MAX_ROUTES);
+        assert!(parse_wg_conf(&conf(MAX_ROUTES + 1)).is_err());
+        // Each peer's probe copies its routes, so the cap is for the profile.
+        let two = format!("{}{}", conf(600), conf(600));
+        assert!(parse_wg_conf(&two).is_err());
     }
 
     #[test]

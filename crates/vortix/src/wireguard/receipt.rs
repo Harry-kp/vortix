@@ -20,7 +20,7 @@ use crate::tunnel::{HandshakeEvidence, ProbeReceipt};
 const DIRECTORY: &str = "managed-wireguard";
 const LOCK_FILE: &str = "managed-wireguard.lock";
 const SCHEMA_VERSION: u8 = 1;
-const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+const MAX_RECEIPT_BYTES: u64 = 256 * 1024;
 const MAX_TRACKED_RECEIPTS: usize = 512;
 
 /// A successful, generation-bound `WireGuard` connect issued by Vortix.
@@ -378,6 +378,36 @@ mod tests {
             observed_at: at,
             allowed_routes: vec!["0.0.0.0/0".into()],
         }
+    }
+
+    /// A receipt copies the peer's routes for the handshake and its probe; at
+    /// the import limit it outgrew 64 KiB and then silently failed to load.
+    #[test]
+    fn a_receipt_at_the_route_limit_loads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = ProfileId::new("large-split");
+        let at = SystemTime::now() - Duration::from_secs(10);
+        let routes = (0..crate::wireguard::parser::MAX_ROUTES)
+            .map(|i| format!("2001:0db8:85a3:{i:04x}:0000:8a2e:0370:7334/128"))
+            .collect::<Vec<_>>();
+        let mut handshake = evidence(3, at);
+        handshake.allowed_routes.clone_from(&routes);
+        let probe = ProbeReceipt {
+            peer_public_key: "peer-a".into(),
+            target: "1.1.1.1".parse().unwrap(),
+            allowed_routes: routes,
+            issued_at: at,
+        };
+        issue(
+            dir.path(),
+            &profile,
+            "wg0".into(),
+            3,
+            handshake,
+            vec![probe],
+        )
+        .unwrap();
+        assert!(load(dir.path(), &profile).is_some());
     }
 
     #[test]
