@@ -63,6 +63,21 @@ Pull requests I will close:
 The project's rules (where code goes, comments, tests, boundaries) are in
 [CLAUDE.md](CLAUDE.md); they apply to people as much as to coding agents.
 
+## Labels
+
+An issue gets one type and, when it applies, any of the rest. Close duplicates and rejected
+ideas with GitHub's close reasons, not labels.
+
+| Label | Use |
+|---|---|
+| `bug` / `enhancement` | The type: something broken, or something new or better (UX included) |
+| `security`, `documentation`, `internal` | What it touches; `internal` means no user-visible change |
+| `linux` / `macos` | Only on that OS |
+| `priority` | Fix before the next release |
+| `deferred` | Open, but not planned for now |
+| `good first issue` | Small and well scoped for a newcomer |
+| `release`, `dependencies` | Set by release-plz and Dependabot |
+
 ## Questions?
 
 Open a [discussion](https://github.com/Harry-kp/vortix/discussions) or reach out on [Twitter/X](https://twitter.com/harrykp007).
