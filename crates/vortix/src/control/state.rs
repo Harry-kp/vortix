@@ -271,6 +271,17 @@ impl State {
         true
     }
 
+    /// Whether a tunnel is mid-start or mid-stop.
+    #[must_use]
+    pub fn in_transition(&self) -> bool {
+        self.tunnels.values().any(|tunnel| {
+            matches!(
+                tunnel.phase,
+                Phase::Starting | Phase::AwaitingCredentials | Phase::Stopping
+            )
+        })
+    }
+
     /// Stop and start again. Returns false, and schedules nothing, when the
     /// tunnel is absent or already stopping.
     pub fn restart(&mut self, profile_id: &ProfileId) -> bool {
@@ -486,6 +497,28 @@ mod tests {
         let stopped = state.came_up(&id("03"), "utun5".into(), full, [], None);
         assert_eq!(stopped, BTreeSet::from([id("01")]));
         assert_eq!(state.get(&id("01")).unwrap().phase, Phase::Stopping);
+    }
+
+    /// Shutdown waits for these; a process exit mid-start left half a tunnel
+    /// Vortix no longer owned.
+    #[test]
+    fn a_tunnel_mid_start_or_stop_is_in_transition() {
+        let mut state = State::default();
+        assert!(!state.in_transition());
+        state
+            .begin(spec("01", "0.0.0.0/0"), 1, None, false)
+            .unwrap();
+        assert!(state.in_transition(), "starting");
+        state.came_up(&id("01"), "utun4".into(), [], [], None);
+        assert!(!state.in_transition(), "up");
+        state.stop(&id("01"));
+        assert!(state.in_transition(), "stopping");
+        state.stopped(&id("01"));
+        assert!(!state.in_transition(), "gone");
+        state
+            .begin(spec("02", "10.0.0.0/24"), 2, None, true)
+            .unwrap();
+        assert!(state.in_transition(), "awaiting credentials");
     }
 
     #[test]
