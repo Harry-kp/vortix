@@ -522,6 +522,41 @@ mod tests {
         }
     }
 
+    /// The record copies the handshake's routes and each probe's; at the
+    /// profile's route limit it must still fit, or the connect fails.
+    #[test]
+    fn a_record_at_the_route_limit_fits() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = profile(temp.path(), 'a');
+        let store =
+            TunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a").unwrap();
+        let routes = (0..crate::wireguard::parser::MAX_ROUTES)
+            .map(|i| format!("2001:0db8:85a3:{i:04x}:0000:8a2e:0370:7334/128"))
+            .collect::<Vec<_>>();
+        let mut evidence = handshake(7);
+        evidence.allowed_routes.clone_from(&routes);
+        let probe = ProbeReceipt {
+            peer_public_key: evidence.peer_public_key.clone(),
+            target: "1.1.1.1".parse().unwrap(),
+            allowed_routes: routes,
+            issued_at: SystemTime::now(),
+        };
+        store
+            .issue_wireguard(
+                &profile,
+                TunnelRevision {
+                    authority_epoch: AuthorityEpoch(3),
+                    generation: 7,
+                },
+                serde_json::from_str("\"op-0000000000000003-0000000000000001\"").unwrap(),
+                "wg0",
+                &teardown_config(temp.path(), 'a'),
+                evidence,
+                vec![probe],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn exact_record_validates_and_is_removed_only_after_absence() {
         let temp = tempfile::tempdir().unwrap();
