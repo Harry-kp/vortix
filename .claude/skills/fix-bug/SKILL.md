@@ -47,10 +47,8 @@ changes, stop and tell the user rather than carrying them onto the branch.
 Before any test or theory, make the bug happen for real, with the released
 build the reporter used (`cargo install vortix --version <v> --root <tmp>` or
 the release's shell installer into a scratch folder) and the same inputs.
-Record the exact error or frame. A live run also shows what the report
-missed: in #330 the import error was the reported symptom, but the live
-connect showed the same limit made the tunnel look handshake-less and then
-invisible to Vortix.
+Record the exact error or frame. A live run also shows symptoms the report
+missed.
 
 - Use a scratch config directory (`vortix -C <tmp>`) so real profiles and
   state are untouched.
