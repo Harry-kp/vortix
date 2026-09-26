@@ -92,11 +92,9 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// The `VPN IP` row: tunnel address and the interface carrying it.
 fn vpn_ip_line(details: &DetailedConnectionInfo) -> Line<'_> {
     let iface_display = if details.interface.is_empty() {
-        "-".to_string()
-    } else if details.interface_authoritative {
-        details.interface.clone()
+        "-"
     } else {
-        format!("{} (external)", details.interface)
+        &details.interface
     };
     Line::from(vec![
         Span::styled(
@@ -111,11 +109,7 @@ fn vpn_ip_line(details: &DetailedConnectionInfo) -> Line<'_> {
         ),
         Span::styled(
             format!(" @ {iface_display}"),
-            Style::default().fg(if details.interface_authoritative {
-                theme::current().text_secondary
-            } else {
-                theme::current().inactive
-            }),
+            Style::default().fg(theme::current().text_secondary),
         ),
     ])
 }

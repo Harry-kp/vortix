@@ -201,7 +201,6 @@ copy or commit them. Credentials are typed by the user.
 - Branch from `main`; one branch per fix; conventional commit subjects
   (`fix:`, `refactor:`, `perf:`, `test:`, `docs:`). Commit with the configured
   identity — never pass `-c user.*`.
-- End commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - The pre-commit hook (`scripts/install-hooks.sh`) runs fmt, clippy, gitleaks
   (secret scan of staged changes) and tests. `.DS_Store` is ignored.
 - **Before every commit, run the `ponytail:ponytail-review` skill on the diff**

@@ -85,19 +85,7 @@ fn status_sigil_id(
 ) -> crate::ui::sigils::SigilId {
     use crate::ui::sigils::SigilId;
     match tunnel.phase {
-        Phase::Up => {
-            // the state-authority contract: Connected entries whose
-            // interface name vortix couldn't reliably attribute to a PID
-            // (current case: externally-started OpenVPN on macOS where
-            // the scanner's ifconfig-scan fallback collides across
-            // PIDs) render with a muted/dim treatment. They ARE up;
-            // vortix just can't verify their routing posture.
-            if tunnel.details.interface_authoritative {
-                SigilId::Connected
-            } else {
-                SigilId::ConnectedUnauthoritative
-            }
-        }
+        Phase::Up => SigilId::Connected,
         Phase::Starting => {
             if matches!(protocol, Some(crate::profile::ProtocolKind::WireGuard)) {
                 SigilId::Handshaking
@@ -111,13 +99,7 @@ fn status_sigil_id(
     }
 }
 
-/// Does this snapshot warrant a `!` risk annotation in the sidebar?
-///
-/// Today: `Role::AddressableSuppressed` — declared 0/0 `AllowedIPs` but did not
-/// win the kernel default route (mode-mismatch). A follow-up will extend this to
-/// also include WG-secondary-missing-FwMark while primary holds 0/0; the
-/// signature returns a `bool` so the predicate can grow without churning the
-/// render path.
+/// A yielded full tunnel or degraded health gets a `!` in the sidebar.
 fn has_risk_annotation(role: &Role, health: &crate::tunnel::ConnectionHealth) -> bool {
     matches!(role, Role::AddressableSuppressed { .. })
         || matches!(health, crate::tunnel::ConnectionHealth::Degraded { .. })
@@ -590,36 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthoritative_connected_badge_renders_dim_grey() {
-        // the state-authority contract: when a Connected tunnel's
-        // iface can't be reliably attributed to its PID (current case:
-        // externally-started OpenVPN on macOS where the scanner's
-        // ifconfig-scan fallback collides across PIDs), the row's
-        // status badge must visually distinguish from a fully-tracked
-        // Connected tunnel.
-        let mut snap = snap_connected("vpn1");
-        snap.details.interface_authoritative = false;
-        let (glyph, style) = status_badge_for(&snap, Some(ProtocolKind::WireGuard));
-        assert_eq!(glyph, "●", "still Connected — glyph stays a filled dot");
-        assert!(
-            style.add_modifier.contains(Modifier::DIM),
-            "unauthoritative Connected must dim to distinguish from fully-tracked Connected — got {style:?}"
-        );
-        // And the foreground color is INACTIVE rather than SUCCESS so
-        // monochrome / colorblind users still see the difference via
-        // value/lightness.
-        assert_eq!(
-            style.fg,
-            Some(theme::current().inactive),
-            "unauthoritative Connected must use the inactive color"
-        );
-    }
-
-    #[test]
-    fn authoritative_connected_badge_renders_bright_green_no_dim() {
-        // Inverse check: a normal Connected tunnel (interface_authoritative
-        // defaults to true) keeps the bright SUCCESS color and no DIM
-        // modifier.
+    fn connected_badge_renders_bright_green_no_dim() {
         let snap = snap_connected("vpn1");
         let (glyph, style) = status_badge_for(&snap, Some(ProtocolKind::WireGuard));
         assert_eq!(glyph, "●");

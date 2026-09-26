@@ -174,8 +174,8 @@ vortix completions zsh             # bash, zsh, fish, elvish, powershell
 vortix update                      # runs `cargo install vortix --force`
 ```
 
-`update` always uses Cargo. If you installed another way (Homebrew, pacman, npm, Nix), update
-that way instead.
+`update` works only for a copy in `~/.cargo/bin` (Cargo or the shell installer). For any other
+install it exits 1 and names the right way, such as `brew upgrade vortix`.
 
 ## JSON and exit codes
 
@@ -185,7 +185,8 @@ that way instead.
 plain text.
 
 In `status --json`, `data.connections` lists every tunnel, `data.primary` names the one that owns
-the default route (or `null`), and `data.connection` is the focused connected tunnel.
+the default route (or `null`), and `data.connection` is the primary (or, without one, the first tunnel) while it is connected,
+otherwise `null`.
 
 | Exit code | Meaning |
 |---|---|

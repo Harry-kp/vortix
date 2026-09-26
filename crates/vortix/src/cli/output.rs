@@ -16,26 +16,6 @@
 //! - Bump on any field rename, type change, or removal.
 //! - Do NOT bump on additive field additions (consumers must tolerate
 //!   unknown fields, per JSON convention).
-//!
-//! v0.3.0 shipped `schema_version = 1` with a single-tunnel
-//! `data.connection` block carrying `state`/`profile`/`protocol`/
-//! `uptime_secs`.
-//!
-//! ## v1 → v2 contract
-//!
-//! v0.4.0 bumps `schema_version` to `2` to admit multi-tunnel state in
-//! the `status` payload:
-//!
-//! - **v2 readers** SHOULD prefer `data.connections` (an array of
-//!   [`ConnectionEntry`]) and `data.primary` (the profile id of the
-//!   primary tunnel, or `null` if none is elected).
-//! - **v1 readers** see `data.connection`: the primary tunnel's entry
-//!   when a primary exists, or `null` when none does. The field is
-//!   retained verbatim for the primary-only case so v0.3.x scripts that
-//!   read `data.connection.state` keep working as long as a primary is
-//!   active. The only behavioural difference v0.3 → v0.4 in the
-//!   primary-only case is that `data.connection` is now `null` (instead
-//!   of `{ state: "disconnected" }`) when nothing is connected.
 
 use serde::Serialize;
 
@@ -46,18 +26,11 @@ use serde::Serialize;
 /// require a bump.
 ///
 /// - `1`: single-tunnel `data.connection` block.
-/// - `2`: adds `data.connections` (array)
-///   and `data.primary` (profile id, nullable). `data.connection` is
-///   retained as the primary's entry for v1 back-compat. See the module
-///   docs for the full v1 → v2 contract.
+/// - `2`: adds `data.connections` and `data.primary` to `status`; see
+///   `cli::status::StatusData`.
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// Per-tunnel snapshot used in the v2 `data.connections` array and
-/// (back-compat) `data.connection` field.
-///
-/// Field set matches the v1 `data.connection` block so v1 readers can
-/// keep accessing `data.connection.{state,profile,protocol,uptime_secs}`
-/// against the primary tunnel without changes.
+/// One tunnel in `status`'s `data.connections`, and `data.connection`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionEntry {
     pub state: String,

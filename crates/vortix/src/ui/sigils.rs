@@ -22,11 +22,8 @@ use ratatui::style::{Color, Modifier, Style};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SigilId {
     // ── Sidebar status badges (per-tunnel) ────────────────────────────
-    /// `●` bright green — Connected and authoritatively tracked.
+    /// `●` bright green — Connected.
     Connected,
-    /// `●` muted/dim — Connected but iface attribution is unreliable
-    /// (e.g., externally-started `OpenVPN` on macOS multi-tunnel).
-    ConnectedUnauthoritative,
     /// `◐` yellow — `OpenVPN` process/authentication setup in flight.
     Connecting,
     /// `◐` yellow — `WireGuard` awaits current-attempt peer evidence.
@@ -151,16 +148,6 @@ pub const CATALOG: &[Sigil] = &[
         color: success_color,
         bold: false,
         dim: false,
-        category: SigilCategory::Sidebar,
-    },
-    Sigil {
-        id: SigilId::ConnectedUnauthoritative,
-        glyph: "\u{25cf}",
-        label: "Connected (external)",
-        description: "Up but vortix can't reliably attribute the kernel interface to a PID — won't be elected as your exit.",
-        color: inactive_color,
-        bold: false,
-        dim: true,
         category: SigilCategory::Sidebar,
     },
     Sigil {
@@ -302,7 +289,6 @@ mod tests {
         // variant is added without a branch here.
         let all_ids = [
             SigilId::Connected,
-            SigilId::ConnectedUnauthoritative,
             SigilId::Connecting,
             SigilId::Handshaking,
             SigilId::Reconnecting,
@@ -325,7 +311,6 @@ mod tests {
         for id in &all_ids {
             match id {
                 SigilId::Connected => (),
-                SigilId::ConnectedUnauthoritative => (),
                 SigilId::Connecting => (),
                 SigilId::Handshaking => (),
                 SigilId::Reconnecting => (),

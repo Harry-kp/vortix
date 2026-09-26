@@ -89,6 +89,15 @@ esac
 
 "$VORTIX" killswitch >/dev/null 2>&1 || fail "read-only 'vortix killswitch' exited non-zero"
 
+# A build outside ~/.cargo/bin must refuse `update`, not start a minutes-long cargo install.
+if update="$("$VORTIX" update 2>&1)"; then
+    fail "vortix update ran from $BIN_DIR instead of refusing"
+fi
+case "$update" in
+*"only updates a \`cargo install\`"*) ;;
+*) fail "vortix update refusal did not explain itself, got: $update" ;;
+esac
+
 completions="$("$VORTIX" completions bash 2>/dev/null)" || fail "vortix completions bash exited non-zero"
 case "$completions" in
 *"_vortix()"*) ;;
@@ -127,6 +136,10 @@ if [ "$(id -u)" -ne 0 ]; then
     if grep -qiE "invalid invoking owner|backtrace|panicked" "$WORK/tui.err"; then
         fail "unprivileged launch leaked an internal error chain"
     fi
+
+    ks_rc=0
+    "$VORTIX" killswitch off >/dev/null 2>&1 || ks_rc=$?
+    [ "$ks_rc" -eq 2 ] || fail "unprivileged 'killswitch off' exited $ks_rc, expected 2 (permission denied)"
 fi
 
 # --- binary size budget ------------------------------------------------------

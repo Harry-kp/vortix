@@ -174,13 +174,11 @@ gh pr create --base main --title "<same subject>" --body "<body>"
 ```
 
 Commit message: a `fix:` subject under ~70 chars, a body explaining the root
-cause and why the fix is at the right place, ending with
-`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+cause and why the fix is at the right place.
 
 PR body: **Problem** (`Fixes #<n>` closes the issue; no labels needed),
 **Root cause**, **Fix**, **Tests** (the new test and the `ci-local.sh` result),
 **Live check** (macOS and Linux: what was observed, or why it was skipped).
-End it with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 
 ## 10. Watch CI
 

@@ -870,6 +870,7 @@ pub mod help {
                 ("Tab/S-Tab", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),
+                ("f", "Flip Chart / Details / Security panel"),
                 ("x", "Action menu"),
                 ("b", "Bulk action menu"),
                 ("p", "Switch color theme"),
@@ -908,7 +909,10 @@ pub mod help {
         (
             "Switch-VPN overlay",
             &[
-                ("Y / Enter", "Switch — disconnect current, then connect new"),
+                (
+                    "Y / Enter",
+                    "Switch — stop the conflicting tunnel, keep the new one",
+                ),
                 ("N / Esc", "Cancel"),
             ],
         ),
@@ -948,44 +952,20 @@ pub mod help {
     /// the overlay so paragraph length is unlimited.
     const ROLE_GLOSSARY: &[(&str, &str)] = &[
     (
-        "Primary",
-        "Your active exit. Internet traffic flows through this tunnel — the kernel routes its default route here, so any new outbound connection goes via this tunnel's server.",
-    ),
-    (
-        "Primary (10.0.0.0/8)",
-        "Same as Primary, with the declared subnet shown in parens. Don't read this as 'only routes that subnet' — it IS the exit; the CIDR is just what the profile config declares.",
-    ),
-    (
-        "Primary (multi)",
-        "Same as Primary; the profile declares multiple subnets. Shown when the config has more than one declared CIDR (rare but possible).",
-    ),
-    (
-        "Split tunnel",
-        "Connected but NOT your exit. Only carries the routes the profile declared (its AllowedIPs for WireGuard, or `route` directives for OpenVPN). Internet traffic still uses your normal connection. Example: a corporate VPN routing only 10.0.0.0/8 so you can reach internal services without your browsing going through work.",
+        "Primary (0.0.0.0/0)",
+        "Your exit: it owns the default route, so all traffic without a more specific route goes through it. `multi` instead of a CIDR means the profile has more than one route. The newest full tunnel is the primary.",
     ),
     (
         "Split tunnel (10.0.0.0/8)",
-        "Same; the listed CIDR is the only subnet this tunnel routes. Everything else goes via your normal internet.",
+        "Carries only the routes its profile declares (WireGuard AllowedIPs, OpenVPN `route` lines); everything else leaves as before. Example: a work VPN for internal hosts while browsing stays on your normal connection.",
     ),
     (
-        "Split tunnel (multi)",
-        "Same; the profile declares multiple non-default subnets.",
-    ),
-    (
-        "Split tunnel (yielded)",
-        "Declares 0.0.0.0/0 but another tunnel currently owns the default route, so it carries only traffic nothing else claims. You see it for a moment during a switch, before Vortix stops the tunnel being replaced.",
-    ),
-    (
-        "Split tunnel (multi, yielded)",
-        "Same as yielded; the profile declares several subnets including 0/0. Another tunnel is the exit.",
-    ),
-    (
-        "(external) suffix",
-        "Tunnel detected as up but started outside vortix (e.g., `sudo openvpn ...` from another terminal) AND on a platform where vortix can't reliably attribute its kernel interface to its PID. On macOS this happens with multi-OpenVPN. Vortix won't elect an (external) tunnel as your Primary even if its routes would qualify — start the tunnel through vortix to get full tracking.",
+        "Split tunnel (…, yielded)",
+        "A full tunnel whose default route a newer full tunnel took. You see it briefly during a switch, before Vortix stops the tunnel being replaced.",
     ),
     (
         "Reconnecting via …",
-        "A connected tunnel dropped and vortix is automatically retrying. The 'via X' part names what its role was before the drop, so you know what to expect when it comes back.",
+        "The tunnel dropped unexpectedly and Vortix is waiting for the next reconnect attempt. `via` names the role it had before the drop.",
     ),
 ];
 
@@ -1354,7 +1334,7 @@ pub mod help {
                     acc
                 });
             assert!(blob.contains("Disconnect ALL"));
-            assert!(blob.contains("Switch — disconnect current"));
+            assert!(blob.contains("Switch — stop the conflicting tunnel"));
             assert!(!blob.contains("Connect both"));
         }
 
@@ -1372,11 +1352,9 @@ pub mod help {
         fn role_glossary_covers_every_label_role_line_can_emit() {
             let labels: Vec<&str> = ROLE_GLOSSARY.iter().map(|(k, _)| *k).collect();
             for expected in [
-                "Primary",
-                "Split tunnel",
-                "Split tunnel (yielded)",
-                "Split tunnel (multi, yielded)",
-                "(external) suffix",
+                "Primary (0.0.0.0/0)",
+                "Split tunnel (10.0.0.0/8)",
+                "Split tunnel (…, yielded)",
                 "Reconnecting via …",
             ] {
                 assert!(
