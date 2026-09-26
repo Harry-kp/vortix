@@ -191,15 +191,15 @@ impl AppConfig {
         protocol_gate.saturating_add(crate::constants::CONTROL_COMPLETION_GRACE_SECS)
     }
 
-    /// This config with the connect budget for `protocol` set to `secs`, so
-    /// an explicit `--timeout` bounds the connect as well as the wait.
+    /// This config with `secs` as the connect budget, as `--timeout` asks.
     #[must_use]
     pub fn with_connect_budget(&self, protocol: crate::profile::ProtocolKind, secs: u64) -> Self {
         let gate = secs.saturating_sub(crate::constants::CONTROL_COMPLETION_GRACE_SECS);
         let mut config = self.clone();
         match protocol {
             crate::profile::ProtocolKind::WireGuard => {
-                config.wireguard_handshake_timeout_secs = gate.max(1);
+                config.wireguard_handshake_timeout_secs =
+                    gate.clamp(1, crate::wireguard::tunnel::MAX_HANDSHAKE_TIMEOUT.as_secs());
             }
             crate::profile::ProtocolKind::OpenVpn => config.connect_timeout = gate.max(1),
         }
@@ -879,6 +879,11 @@ mod tests {
             let tiny = config.with_connect_budget(protocol, 2);
             assert!(tiny.wireguard_handshake_timeout_secs >= 1 && tiny.connect_timeout >= 1);
         }
+        let huge = config.with_connect_budget(ProtocolKind::WireGuard, 400);
+        assert!(
+            huge.wireguard_handshake_timeout_secs <= 300,
+            "WireGuard accepts at most 300 s"
+        );
     }
 
     #[test]

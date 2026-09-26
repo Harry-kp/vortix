@@ -200,7 +200,7 @@ impl Engine {
                 match message {
                     Msg::Shutdown => shutdown = true,
                     Msg::Settle(done) => {
-                        self.finish_transitions(rx);
+                        shutdown |= self.finish_transitions(rx);
                         let _ = done.send(());
                     }
                     message => self.handle(message),
@@ -220,34 +220,44 @@ impl Engine {
         }
     }
 
-    /// Before exiting, cancel starts still in progress and let every start
-    /// and stop finish, so none is left half done on the host. Bounded by one
-    /// start plus its rollback.
-    fn finish_transitions(&mut self, rx: &mpsc::Receiver<Msg>) {
-        let starting = self
-            .state
-            .tunnels()
-            .filter(|tunnel| matches!(tunnel.phase, Phase::Starting | Phase::AwaitingCredentials))
-            .map(|tunnel| tunnel.spec.profile_id.clone())
-            .collect::<Vec<_>>();
-        for profile_id in &starting {
-            self.stop(profile_id);
+    /// Cancel starts and pending switches, and wait (bounded) for every stop.
+    fn finish_transitions(&mut self, rx: &mpsc::Receiver<Msg>) -> bool {
+        for target in self.after_stop.keys().cloned().collect::<Vec<_>>() {
+            self.cancel_pending_switch(&target);
         }
         let deadline = Instant::now()
             + 2 * self
                 .config
                 .openvpn_timeout
                 .max(self.config.wireguard_timeout);
-        while self.state.in_transition() && Instant::now() < deadline {
+        let mut shutdown = false;
+        loop {
+            let starting = self
+                .state
+                .tunnels()
+                .filter(|tunnel| {
+                    matches!(tunnel.phase, Phase::Starting | Phase::AwaitingCredentials)
+                })
+                .map(|tunnel| tunnel.spec.profile_id.clone())
+                .collect::<Vec<_>>();
+            for profile_id in &starting {
+                self.stop(profile_id);
+            }
+            if !self.state.in_transition() || Instant::now() >= deadline {
+                return shutdown;
+            }
             let wait = self
                 .next_wake()
                 .min(deadline)
                 .saturating_duration_since(Instant::now());
             match rx.recv_timeout(wait) {
-                Ok(Msg::Shutdown | Msg::Command(..) | Msg::Settle(_))
-                | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(Msg::Shutdown) => shutdown = true,
+                Ok(Msg::Settle(done)) => {
+                    let _ = done.send(());
+                }
                 Ok(message) => self.handle(message),
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return true,
             }
             self.tick();
             self.reconcile();
