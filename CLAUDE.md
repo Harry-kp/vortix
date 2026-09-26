@@ -206,6 +206,13 @@ build-time numbers live in [`docs/performance.md`](docs/performance.md).
 - Linux-only code broke only in Linux cross-clippy; macOS builds never see it.
 - Linux refuses a duplicate route (`RTNETLINK answers: File exists`); macOS
   accepts it, so route-overlap bugs show only on the lab.
+- `print_error_and_exit` ends the process with `process::exit`, which skips
+  `Drop`: engine work that must finish goes through `Control::wait`'s settle,
+  not only `Control::drop`.
+- `wg-quick` parses its config in shell, seconds per kilobyte of one line on
+  macOS; the staged copy splits long `AllowedIPs` lines.
+- One macOS `route get` costs ~30 ms; check many routes from one
+  `netstat -rn` read (`Routes::route_interfaces_for`).
 - `cargo clippy` skips rustdoc lints; broken intra-doc links fail only in
   `cargo doc` with `-D warnings`.
 - pf rules for `vpn-only` need `flags any`, or existing flows lose connectivity.
