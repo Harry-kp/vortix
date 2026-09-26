@@ -1,6 +1,6 @@
 ---
 name: fix-bug
-description: End-to-end bug fix for the vortix repo — reproduce with a failing test, fix at the root, pass the full CI parity check, verify live on macOS and the Linux lab, review, open a PR, watch CI, and squash-merge when everything is green. Use whenever the user hands over a bug (GitHub issue number or URL, pasted error, log excerpt, screenshot of the TUI, or "X is broken") and wants it fixed, even if they don't say "PR" or "merge".
+description: End-to-end bug fix for the vortix repo — reproduce live, capture it in a failing test, name the root cause, fix it there, pass the full CI parity check, verify live on macOS and the Linux lab, review, open a PR, watch CI, and squash-merge when everything is green. Use whenever the user hands over a bug (GitHub issue number or URL, pasted error, log excerpt, screenshot of the TUI, or "X is broken") and wants it fixed, even if they don't say "PR" or "merge".
 ---
 
 # Fix a vortix bug end to end
