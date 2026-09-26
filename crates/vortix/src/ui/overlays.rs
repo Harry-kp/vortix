@@ -989,8 +989,7 @@ pub mod help {
     ),
 ];
 
-    const ROLE_GLOSSARY_FOOTER: &str =
-        "Full guide with examples + common confusions: docs/roles.md on GitHub.";
+    const ROLE_GLOSSARY_FOOTER: &str = "More in docs/usage.md (Connection Details) on GitHub.";
 
     // ────────────────────────────── Guard tab ───────────────────────────────
 
