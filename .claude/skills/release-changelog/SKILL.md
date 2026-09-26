@@ -50,8 +50,7 @@ git diff "$LAST"..origin/main -- crates/vortix/src/cli/args.rs crates/vortix/src
 Every sentence must be true of the code at `origin/main`: grep for the flag,
 the setting name, the file path, the key binding. Measure numbers yourself —
 build the previous tag and the current tree in release mode and compare
-`stat` sizes. A number from a PR body or a subagent is wrong until measured
-(0.5.0's draft said "45% smaller"; the measurement was 32%).
+`stat` sizes. A number from a PR body or a subagent is wrong until measured.
 
 ## 4. Pick the version
 
@@ -72,9 +71,9 @@ next minor. Check the release PR's version after that merge.
   few; prefer one step that fixes everything (a restart) over a manual.
 - Add "Upgrading from X to Y" to `docs/MIGRATION.md` with the full commands
   per OS and distribution, and point `UPGRADE_URL` at its anchor.
-- Check the steps actually work: the `release-qa` skill's upgrade test
-  (previous tag creates the state, the new build takes over), and
-  `scripts/upgrade-preview.sh` for how the popup looks on each OS.
+- Check the steps actually work on each OS: `scripts/upgrade-preview.sh <old>` builds this
+  tree stamped with the new version over a config the old version last used, for both the CLI
+  notice and the popup; then follow the steps on a machine the old version really ran on.
 
 ## 6. Write it
 
@@ -94,7 +93,7 @@ gh pr list --label release --json number,headRefName
 git fetch origin <branch> && git switch -c release-edit origin/<branch>
 # replace the generated `## [X.Y.Z]` section in crates/vortix/CHANGELOG.md
 git commit -am "docs: user-facing changelog for X.Y.Z" && git push origin HEAD:<branch>
-gh pr diff <number> -- crates/vortix/CHANGELOG.md     # check it landed
+gh pr diff <number> | grep -A5 '^+## \[X.Y.Z\]'       # check it landed
 ```
 
 Nothing else may merge to `main` until the release PR does: release-plz would
