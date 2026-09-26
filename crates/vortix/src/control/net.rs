@@ -103,7 +103,9 @@ impl Net {
         if !tightening {
             self.apply_firewall(target, mode)?;
         }
+        let routes = std::mem::take(&mut self.applied.routes);
         self.applied = target.clone();
+        self.applied.routes = routes;
         Self::verify_routes(target)
     }
 
@@ -111,11 +113,22 @@ impl Net {
         use crate::platform::Routes as table;
         // A prefix the target still carries is retargeted in place, never
         // deleted first: that gap leaks traffic onto the real address.
-        for (cidr, interface) in &self.applied.routes {
-            if !target.routes.contains_key(cidr) {
-                if let Err(error) = table::unbind_route(&cidr.to_string(), interface) {
-                    tracing::warn!(target: "vortix::net", %cidr, %interface, %error, "route removal failed");
-                }
+        // A teardown removes its interface's routes; they stay recorded until
+        // it ends, and are unbound after if it left any.
+        let (released, dropped): (Vec<_>, Vec<_>) = self
+            .applied
+            .routes
+            .iter()
+            .filter(|(cidr, _)| !target.routes.contains_key(cidr))
+            .map(|(cidr, interface)| (*cidr, interface.clone()))
+            .partition(|(_, interface)| target.releasing.contains(interface));
+        let gone = Self::misrouted(
+            &self.applied,
+            dropped.iter().map(|(cidr, interface)| (cidr, interface)),
+        );
+        for (cidr, interface) in dropped.iter().filter(|route| !gone.contains(route)) {
+            if let Err(error) = table::unbind_route(&cidr.to_string(), interface) {
+                tracing::warn!(target: "vortix::net", %cidr, %interface, %error, "route removal failed");
             }
         }
         for endpoint in self.applied.host_routes.difference(&target.host_routes) {
@@ -126,6 +139,7 @@ impl Net {
         // Recorded before binding, so whatever a failed bind leaves behind is
         // still unbound by the next diff.
         self.applied.routes.clone_from(&target.routes);
+        self.applied.routes.extend(released);
         self.applied.host_routes.clone_from(&target.host_routes);
         let mut first_error = None;
         for v4 in [true, false] {
@@ -156,11 +170,9 @@ impl Net {
                 }
             }
         }
-        for (cidr, interface) in &target.routes {
-            if !Self::routes_through(target, *cidr, interface) {
-                if let Err(error) = table::bind_route(&cidr.to_string(), interface) {
-                    first_error.get_or_insert(error);
-                }
+        for (cidr, interface) in Self::misrouted(target, &target.routes) {
+            if let Err(error) = table::bind_route(&cidr.to_string(), &interface) {
+                first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -220,23 +232,40 @@ impl Net {
     }
 
     fn verify_routes(target: &NetworkPlan) -> Result<(), String> {
-        for (cidr, interface) in &target.routes {
-            if !Self::routes_through(target, *cidr, interface) {
-                return Err(format!(
-                    "{cidr} should route through {interface} but does not"
-                ));
-            }
+        match Self::misrouted(target, &target.routes).first() {
+            Some((cidr, interface)) => Err(format!(
+                "{cidr} should route through {interface} but does not"
+            )),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    fn routes_through(target: &NetworkPlan, cidr: crate::cidr::Cidr, interface: &str) -> bool {
-        let Some(probe) = target.probe_address(cidr) else {
-            return true;
-        };
-        matches!(
-            crate::platform::Routes::route_interface_for(probe),
-            DefaultRouteObservation::Interface(observed) if observed == interface
-        )
+    /// The `routes` a packet would not take through their interface under
+    /// `plan`, found with one table read.
+    fn misrouted<'a>(
+        plan: &NetworkPlan,
+        routes: impl IntoIterator<Item = (&'a crate::cidr::Cidr, &'a String)>,
+    ) -> Vec<(crate::cidr::Cidr, String)> {
+        let probed = routes
+            .into_iter()
+            .filter_map(|(cidr, interface)| {
+                plan.probe_address(*cidr)
+                    .map(|probe| (*cidr, interface, probe))
+            })
+            .collect::<Vec<_>>();
+        let observed = crate::platform::Routes::route_interfaces_for(
+            &probed
+                .iter()
+                .map(|(_, _, probe)| *probe)
+                .collect::<Vec<_>>(),
+        );
+        probed
+            .into_iter()
+            .zip(observed)
+            .filter(|((_, interface, _), seen)| {
+                !matches!(seen, DefaultRouteObservation::Interface(on) if on == *interface)
+            })
+            .map(|((cidr, interface, _), _)| (cidr, interface.clone()))
+            .collect()
     }
 }

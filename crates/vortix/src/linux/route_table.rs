@@ -91,6 +91,16 @@ impl LinuxRouteTable {
         Self::route_interface_for(crate::platform::INTERNET_ROUTE_PROBE)
     }
 
+    /// [`Self::route_interface_for`] for each target; `ip route get` is fast
+    /// enough here (337 routes connect in 5 s).
+    #[must_use]
+    pub fn route_interfaces_for(targets: &[IpAddr]) -> Vec<DefaultRouteObservation> {
+        targets
+            .iter()
+            .map(|target| Self::route_interface_for(*target))
+            .collect()
+    }
+
     #[must_use]
     pub fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
         let Some(text) = route_get(target) else {

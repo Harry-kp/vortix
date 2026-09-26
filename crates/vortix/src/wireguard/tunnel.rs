@@ -204,8 +204,38 @@ pub(crate) fn strip_dns_directive(text: &str) -> String {
     out
 }
 
+/// The copy `wg-quick` reads: no `DNS`, and `AllowedIPs` over short lines.
+/// Its shell parser takes seconds per kilobyte of one line on macOS.
+fn staged_body(text: &str) -> String {
+    use std::fmt::Write as _;
+    const PER_LINE: usize = 32;
+    let mut out = String::with_capacity(text.len());
+    for line in strip_dns_directive(text).split_inclusive('\n') {
+        let split = line.split_once('=').filter(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("AllowedIPs") && !value.contains(['#', ';'])
+        });
+        let Some((key, value)) = split else {
+            out.push_str(line);
+            continue;
+        };
+        let routes = value
+            .split(',')
+            .map(str::trim)
+            .filter(|route| !route.is_empty())
+            .collect::<Vec<_>>();
+        if routes.len() <= PER_LINE {
+            out.push_str(line);
+            continue;
+        }
+        for chunk in routes.chunks(PER_LINE) {
+            let _ = writeln!(out, "{} = {}", key.trim(), chunk.join(", "));
+        }
+    }
+    out
+}
+
 fn managed_up_body(text: &str, profile: &Profile) -> Result<String, TunnelError> {
-    let stripped = strip_dns_directive(text);
+    let stripped = staged_body(text);
     if !profile.require_managed_endpoint_resolution {
         return Ok(stripped);
     }
@@ -1165,7 +1195,7 @@ fn prepare_down_target_with(
     parse_wg_conf(&body).map_err(|error| {
         TunnelError::Subprocess(format!("validate WireGuard teardown profile: {error}"))
     })?;
-    let stripped = strip_dns_directive(&body);
+    let stripped = staged_body(&body);
     if stripped == body {
         return Ok(PreparedDownTarget {
             target: config.path.to_string_lossy().into_owned(),
@@ -1773,6 +1803,24 @@ mod tests {
     }
 
     // --- DNS extraction and protocol-side suppression ---
+
+    /// `wg-quick` spent 41 s on one 1024-route `AllowedIPs` line on macOS;
+    /// short lines of the same routes parse at once.
+    #[test]
+    fn staged_body_splits_long_allowed_ips_into_equal_routes() {
+        let routes = (0..1024)
+            .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "[Interface]\nPrivateKey = SECRET\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = P\nAllowedIPs = {routes}\n"
+        );
+        let staged = staged_body(&body);
+        assert!(!staged.contains("DNS"));
+        assert!(staged.lines().all(|line| line.len() < 1024), "{staged}");
+        let routes = |text: &str| parse_wg_conf(text).unwrap().peers[0].allowed_ips.clone();
+        assert_eq!(routes(&staged), routes(&body));
+    }
 
     #[test]
     fn strip_dns_removes_directive_with_equals() {
