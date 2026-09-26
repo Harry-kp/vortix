@@ -7,7 +7,8 @@ lints. It runs as root (`sudo vortix`); there is no helper or daemon.
 To fix a reported bug end to end (reproduce → fix → CI → PR → review → merge),
 run `/fix-bug <issue number, URL or description>`. Before a release, run
 `/release-qa` (the P0 gate, live on macOS and the Linux lab) and
-`/release-changelog` (user-facing notes, version and upgrade steps).
+`/release-changelog` (user-facing notes, version and upgrade steps); the pipeline itself is in
+[`RELEASING.md`](RELEASING.md).
 
 ## How we work here
 
@@ -45,11 +46,11 @@ scripts/ci-local.sh                   # same + release build; run before every p
 sudo scripts/p0.sh                    # live smoke set against real tunnels (release QA)
 ```
 
-`ci-local.sh` is the only pre-push check that counts; see
-[`docs/ci-parity.md`](docs/ci-parity.md) for why each step exists. Linux-only
-code (`linux/`, `cfg(target_os = "linux")`) is only compiled by its Linux
-cross-clippy step and only *run* by CI's Docker integration tests. Release
-builds only when asked.
+`ci-local.sh` is the only pre-push check that counts; [`docs/ci-parity.md`](docs/ci-parity.md)
+maps it to every CI job. On a Mac, Linux-only code (`linux/`, `cfg(target_os = "linux")`) is
+compiled only by its Linux-target clippy and rustdoc steps; it *runs* in CI's Linux test and
+integration jobs and on the lab. Test with debug builds; the full `ci-local.sh` builds
+release itself.
 
 ## Where things live
 
@@ -59,14 +60,18 @@ builds only when asked.
 | Which routes / DNS / firewall the host should have | `control/plan.rs` (pure), applied by `control/net.rs` |
 | Kill switch modes and persisted state | `control/killswitch.rs`; firewalls in `macos/firewall.rs` (pf), `linux/firewall.rs` (nftables) |
 | DNS | `control/dns.rs` (policy and its persisted receipt), `macos/dns.rs`, `linux/dns.rs` |
+| Reading and writing kernel routes | `macos/route_table.rs`, `linux/route_table.rs` (`route_interfaces_for` answers many checks from one read) |
 | Detecting running tunnels | `control/scanner.rs` |
 | Starting protocol processes | `control/tunnels.rs` → `wireguard/tunnel.rs`, `openvpn/tunnel.rs`; supervision in `process/custodian.rs` |
-| Config parsing | `wireguard/parser.rs`, `openvpn/parser.rs` (the only readers of profile files) |
+| Config parsing | `wireguard/parser.rs`, `openvpn/parser.rs` (the only readers of profile files); a profile becomes a tunnel spec (routes, DNS, servers) in `control/specs.rs` |
 | Profiles on disk, import, rename, delete | `config/profiles.rs`, `config/profile_store.rs`, `config/import.rs` |
-| Settings, config dir, file ownership under sudo | `config/settings.rs`, `config/mod.rs`, `config/owned_file.rs`, `config/secret.rs` |
-| TUI state and keys | `app/` (`input.rs` keys, `update.rs` messages, `connection.rs` engine snapshot → render view) |
-| TUI rendering | `ui/dashboard/*`, `ui/overlays.rs`, `ui/theme.rs`, `ui/helpers.rs` (formatting) |
-| CLI | `cli/args.rs` (clap), `cli/commands.rs` (dispatch), `cli/tunnel.rs`, `cli/status.rs`, `cli/profiles.rs`, `cli/output.rs` (JSON envelope) |
+| Settings, config dir, file ownership under sudo | `config/settings.rs`, `config/mod.rs`, `config/owned_file.rs`, `config/secret.rs`; old profile storage upgraded by `config/migration.rs` |
+| Saved OpenVPN credentials | `config/openvpn_credentials.rs` |
+| Lifecycle hooks, session journal | `hooks.rs`, `journal.rs` |
+| One-time upgrade notes (popup and CLI) | `whats_new.rs` (`RELEASES`, `UPGRADE_URL`) |
+| TUI state and keys | `app/` (`input.rs` keys, `update.rs` messages, `connection.rs` engine snapshot → render view, `runtime.rs` telemetry state) |
+| TUI rendering | `ui/dashboard/*`, `ui/overlays.rs` (help, dialogs, upgrade popup), `ui/theme.rs`, `ui/sigils.rs` (status glyphs), `ui/footer.rs`, `ui/helpers.rs` (formatting) |
+| CLI | `cli/args.rs` (clap), `cli/commands.rs` (dispatch), `cli/tunnel.rs`, `cli/status.rs`, `cli/profiles.rs`, `cli/report.rs` (`vortix report`), `cli/output.rs` (JSON envelope) |
 | Public IP, ISP, latency | `telemetry/` |
 | Every subprocess | `process/` (`process::run`, `CommandSpec`) |
 | OS differences | `platform.rs` re-exports the per-OS type (`platform::Firewall`, `platform::Dns`, …) |
@@ -119,13 +124,13 @@ code instead.
 ## TUI density
 
 Density via signalling, not duplication. Never add a panel per tunnel; one-line
-summaries and overflow ladders fit the existing layout at 80×24 (see
-[`docs/manual-testing/multi-connection.md`](docs/manual-testing/multi-connection.md)).
+summaries and overflow ladders fit the existing layout at 80×24 (P0-18b and P0-32 in
+[`docs/manual-testing/P0.md`](docs/manual-testing/P0.md)).
 
 ## Tests
 
-Test real behaviour and edge cases; no mocks, and no trait added only to make
-something mockable.
+Test real behaviour and edge cases. No mocks beyond `process::MockRunner` (canned subprocess
+output), and no trait added only to make something mockable.
 
 - Engine behaviour: unit tests in `control/plan.rs` and `control/state.rs`.
 - Rendering: `App::new_test()`, seed tunnels with `App::set_tunnels_for_test`
@@ -157,7 +162,9 @@ An Ubuntu lab laptop is on the LAN: `ssh -i ~/.ssh/vortix_lab_ed25519
 harrykp@192.168.1.97`, checkout at `~/vortix`, profiles already imported. It
 has passwordless sudo and the user allows using it **there** (never on the
 Mac). Sync with `git fetch origin <branch> && git checkout -B lab FETCH_HEAD`
-(or `scp` a changed file), build with `cargo build -p vortix`, and run as
+(or `scp` a changed file), build with `cargo build -p vortix`, test with
+`umask 022 && cargo test -p vortix` (the login umask 002 makes the file-safety tests refuse
+their temp dirs), and run as
 `sudo -n env SUDO_UID=1000 SUDO_GID=1000 SUDO_USER=harrykp ./target/debug/vortix …`.
 tmux session `vxlinux` has root windows 1 and 2 for the TUI. Check host state
 with `ip -4 route`, `resolvectl dns`, `nft list table inet vortix_killswitch`.
@@ -182,14 +189,16 @@ copy or commit them. Credentials are typed by the user.
 - PRs squash-merge into `main`; a PR that fixes several issues (one commit
   each) rebase-merges so each fix stays its own commit. `main` has no branch protection, so the green
   check is ours to enforce: merge only when every `gh pr checks` row is `pass`
-  or `skipping` (release jobs always skip) and none is failing or pending.
+  or `skipping` (the release `plan` job runs on every PR; its publish jobs skip) and none is
+  failing or pending.
 - Push only when asked, or as part of `/fix-bug` or `/release-qa`.
 
 ## Build budget
 
-`[profile.release]` uses `opt-level = "z"`. **Never set `panic = "abort"`**:
-`catch_unwind` isolates panics in tunnels, hooks and background tasks. Size and
-build-time numbers live in [`docs/performance.md`](docs/performance.md).
+`[profile.release]` uses `opt-level = "z"`, repeated in `crates/vortix/Cargo.toml` for
+`cargo install`: keep the two identical. **Never set `panic = "abort"`**: `catch_unwind`
+isolates panics in tunnels, hooks and background tasks. The size budget and the other rules
+are in [`docs/performance.md`](docs/performance.md).
 
 ## Removed on purpose — do not reintroduce
 
@@ -203,7 +212,6 @@ build-time numbers live in [`docs/performance.md`](docs/performance.md).
 
 - Blanket regex renames hit enum variants and foreign imports. Let the
   compiler find call sites and review the diff.
-- Linux-only code broke only in Linux cross-clippy; macOS builds never see it.
 - Linux refuses a duplicate route (`RTNETLINK answers: File exists`); macOS
   accepts it, so route-overlap bugs show only on the lab.
 - `print_error_and_exit` ends the process with `process::exit`, which skips

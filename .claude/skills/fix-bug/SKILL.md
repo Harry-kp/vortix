@@ -116,14 +116,12 @@ run the tests, which also runs Linux-only code for real:
 # a function, not a variable: the shell here is zsh, which does not split $L
 lab() { ssh -i ~/.ssh/vortix_lab_ed25519 -o BatchMode=yes harrykp@192.168.1.97 "$@"; }
 lab 'cd ~/vortix && git fetch -q origin main && git checkout -q -f -B lab FETCH_HEAD'
-git diff origin/main -- crates scripts | lab 'cd ~/vortix && git apply --index'
+git add -A crates scripts tests      # so new files travel too
+git diff --cached origin/main -- crates scripts tests | lab 'cd ~/vortix && git apply --index'
 lab 'cd ~/vortix && umask 022 && cargo build -p vortix && cargo test -p vortix'
 ```
 
-The lab's login umask is 002. Tests build config dirs with `tempfile`, which
-inherits it, and the owned-file checks refuse a group-writable directory, so
-without `umask 022` about 20 file-safety tests fail for reasons unrelated to
-the change.
+`umask 022` matters; see CLAUDE.md "Live testing (Linux)".
 
 **Live check** when the change affects runtime behaviour (connect, routes, DNS,
 kill switch, TUI frames), on both machines:
