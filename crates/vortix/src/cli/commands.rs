@@ -363,8 +363,7 @@ fn handle_killswitch(
             );
         };
 
-        if !crate::platform::is_root() && ks_mode != crate::control::killswitch::KillSwitchMode::Off
-        {
+        if !crate::platform::is_root() {
             print_error_and_exit(
                 output_mode,
                 "killswitch",
@@ -591,6 +590,24 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
 }
 
 fn handle_update(mode: OutputMode) {
+    let method = crate::cli::report::detect_install_method();
+    if method != "cargo install" {
+        let how = match method.as_str() {
+            "homebrew" => "run: brew upgrade vortix".to_string(),
+            "built from source" => "pull and rebuild the checkout".to_string(),
+            other => format!("update it the way you installed it ({other})"),
+        };
+        print_error_and_exit(
+            mode,
+            "update",
+            CliError {
+                code: "update_unsupported",
+                message: format!("`vortix update` only updates a `cargo install`; {how}"),
+                hint: None,
+            },
+            ExitCode::GeneralError,
+        );
+    }
     if matches!(mode, OutputMode::Human) {
         println!("Updating vortix...");
     }

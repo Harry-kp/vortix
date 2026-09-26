@@ -80,17 +80,15 @@ pub enum Commands {
     /// profile if no name is given. Blocks until the connection is
     /// established or times out.
     ///
-    /// MULTI-TUNNEL CONFLICT GATE: connecting a profile that claims the
-    /// kernel default route while another tunnel already holds it (or
-    /// whose `AllowedIPs` overlap an active tunnel's routes) exits with
-    /// code 4 (`StateConflict`). Pass `--yes` to bypass for scripted /
-    /// non-interactive callers.
+    /// A profile that conflicts with a running tunnel (both want all
+    /// traffic, or both route the same networks) exits with code 4.
+    /// `--yes` switches: the new tunnel replaces the conflicting one.
     ///
     /// EXAMPLES:
     ///     sudo vortix up work-vpn               Connect to 'work-vpn'
     ///     sudo vortix up work-vpn --json        Connect and get JSON result
     ///     sudo vortix up work-vpn --timeout 60  Connect with 60s timeout
-    ///     sudo vortix up vpn-b --yes            Bypass conflict gate (scripts)
+    ///     sudo vortix up vpn-b --yes            Replace a conflicting tunnel
     ///     sudo vortix up                        Reconnect to last used profile
     #[command(visible_alias = "connect")]
     Up {
@@ -167,20 +165,15 @@ pub enum Commands {
     /// Displays the current VPN connection status, network statistics, and
     /// security posture. Use --watch for continuous monitoring.
     ///
-    /// JSON OUTPUT (v2 envelope, multi-tunnel aware):
-    ///     data.connections  array of every active tunnel (one entry
-    ///                       each for Connected / Connecting /
-    ///                       Disconnecting profiles)
-    ///     data.primary      profile name owning the kernel default
-    ///                       route, or null
-    ///     data.connection   back-compat single-tunnel object,
-    ///                       populated only when exactly one tunnel is
-    ///                       Connected (mirrors `data.connections[0]`);
-    ///                       null in any other case
+    /// JSON OUTPUT:
+    ///     data.connections  every tunnel, whatever its state
+    ///     data.primary      profile that owns the default route, or null
+    ///     data.connection   the primary (or else the first tunnel) while
+    ///                       it is connected; null otherwise
     ///
     /// EXAMPLES:
     ///     vortix status                          Human-readable status
-    ///     vortix status --json                   Full v2 status envelope
+    ///     vortix status --json                   Status as JSON
     ///     vortix status --brief                  One-line summary
     ///     vortix status --watch                  Live updates every 2s
     ///     vortix status --watch --json           NDJSON stream for monitoring
@@ -336,7 +329,7 @@ pub enum Commands {
     ///     vortix info --json
     Info,
 
-    /// Update vortix to the latest version from crates.io
+    /// Update a `cargo install` of vortix to the latest version from crates.io
     ///
     /// EXAMPLES:
     ///     vortix update

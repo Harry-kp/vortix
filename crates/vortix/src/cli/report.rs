@@ -207,7 +207,7 @@ fn persisted_killswitch_summary(
 
 // ── Install method detection ────────────────────────────────────────────────
 
-fn detect_install_method() -> String {
+pub(crate) fn detect_install_method() -> String {
     let exe = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().to_string(),
         Err(_) => return "unknown".to_string(),
