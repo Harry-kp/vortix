@@ -96,7 +96,7 @@ pub const RELEASES: &[Release] = &[Release {
     ],
     highlights: &[
         "Linux works end to end: Ubuntu, Debian, Fedora, Arch and CachyOS.",
-        "Several VPNs at once: a switch brings the new tunnel up before stopping the old one.",
+        "Several VPNs at once: a full tunnel beside split ones, and a switch leaves only one.",
         "The kill switch reports what the firewall is really doing, and fails closed.",
         "The Logs panel shows each OpenVPN tunnel's own log (press f).",
         "Clearer messages that say what broke and what to do, and a smaller binary.",
