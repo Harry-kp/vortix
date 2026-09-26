@@ -3,3 +3,9 @@ contact_links:
   - name: Questions & Discussions
     url: https://github.com/Harry-kp/vortix/discussions
     about: Ask questions and discuss ideas here instead of opening an issue
+  - name: Troubleshooting guide
+    url: https://github.com/Harry-kp/vortix/blob/main/docs/troubleshooting.md
+    about: Startup, permissions, DNS, WireGuard, OpenVPN and firewall fixes
+  - name: Security vulnerability
+    url: https://github.com/Harry-kp/vortix/security/policy
+    about: Please report privately, not in a public issue
