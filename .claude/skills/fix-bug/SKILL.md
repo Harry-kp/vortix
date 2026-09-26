@@ -7,16 +7,16 @@ description: End-to-end bug fix for the vortix repo — reproduce with a failing
 
 The user invoked this to get from a bug report to a merged fix without
 supervision: create a branch, commit, push it, open a PR, and squash-merge once
-the gate in step 9 passes. Never `sudo` on the Mac, force-push, push to `main`,
+the gate in step 11 passes. Never `sudo` on the Mac, force-push, push to `main`,
 or touch other branches or PRs. Read `CLAUDE.md` first; it is the rulebook.
 
 `git push` and `gh pr merge` still ask for approval (`.claude/settings.json`).
-Keep it to one push and one merge: finish both reviews (step 6) and
+Keep it to one push and one merge: finish both reviews (step 8) and
 `scripts/ci-local.sh` before the first push. If a prompt is denied or nobody
 answers, stop and report the branch name and the exact command left to run.
 
 **Several issues at once:** one branch and one PR for all of them, with one
-commit per issue (each ending `Fixes #<n>`). Run steps 1–6 per issue and
+commit per issue (each ending `Fixes #<n>`). Run steps 1–8 per issue and
 commit it before starting the next; push and open the PR once, after the last.
 Merge that PR with `gh pr merge --rebase --delete-branch` so every issue keeps
 its own commit on `main`.
@@ -42,7 +42,26 @@ git fetch origin && git switch -c fix/<short-slug> origin/main
 Ignore `.DS_Store` and `target/`. If the working tree has any other unrelated
 changes, stop and tell the user rather than carrying them onto the branch.
 
-## 3. Reproduce with a failing test
+## 3. Reproduce it live
+
+Before any test or theory, make the bug happen for real, with the released
+build the reporter used (`cargo install vortix --version <v> --root <tmp>` or
+the release's shell installer into a scratch folder) and the same inputs.
+Record the exact error or frame. A live run also shows what the report
+missed: in #330 the import error was the reported symptom, but the live
+connect showed the same limit made the tunnel look handshake-less and then
+invisible to Vortix.
+
+- Use a scratch config directory (`vortix -C <tmp>`) so real profiles and
+  state are untouched.
+- Prefer the Linux lab for anything that connects. When the bug needs a
+  profile shape nobody has, derive it from a lab profile with a script that
+  never prints the file, keep it on that machine with mode 600, and delete it
+  (and any staged copy) when done. Real endpoints and keys stay out of the
+  repo, logs and chat.
+- If it truly cannot happen outside CI or a user's machine, say so and why.
+
+## 4. Capture it in a failing test
 
 A fix without a test that failed first is a guess. Put the test where the
 behaviour is owned:
@@ -55,14 +74,20 @@ behaviour is owned:
 - CLI/JSON: `crates/vortix/tests/suite/` — add a `mod` line to `suite/main.rs`
   or the file silently never runs.
 
-Run it and confirm it fails for the reason in the report:
-`cargo test -p vortix <test_name>`.
+One test per symptom seen live. Run them against the unchanged code and
+confirm each fails for the reason seen live: `cargo test -p vortix <name>`.
+Only a real kernel, terminal or VPN server that no test can stand in for goes
+to P0 instead.
 
-If the bug needs a real kernel, VPN server or terminal and no automated test
-can express it, say so, reproduce it live instead (step 5), and add a P0
-workflow only if nothing automated can ever cover it.
+## 5. Root cause
 
-## 4. Fix at the root
+Write down, in a few lines, why each symptom happens: the file and line, and
+why that code exists. `rg` every copy of the rule (limits, checks, parsers are
+often duplicated) and every place that stores or re-reads the same data. The
+fix follows from this; do not start it until every live symptom is explained.
+
+## 6. Fix at the root
+
 
 - Fix once where every caller's path meets, not in the caller the report
   happened to name. Grep for sibling paths with the same flaw.
@@ -71,11 +96,12 @@ workflow only if nothing automated can ever cover it.
 - Keep user-visible behaviour identical apart from the bug.
 - Linux-only code (`linux/`, `cfg(target_os = "linux")`) is compiled locally
   only by the Linux cross-clippy in `ci-local.sh`; run its tests on the lab
-  laptop (step 5).
+  laptop (step 7).
 
-Re-run the new test (now passing) and the module's tests.
+Re-run the new tests (now passing) and the module's tests, then repeat the
+live reproduction from step 3 with this build: it must now pass.
 
-## 5. Verify
+## 7. Verify
 
 ```bash
 scripts/ci-local.sh
@@ -124,7 +150,7 @@ Safety, so a check never cuts off this session:
   appears, skip that check and note it in the PR — credentials are typed by
   the user.
 
-## 6. Review before committing
+## 8. Review before committing
 
 Two passes over `git diff origin/main` (staged and unstaged), both required:
 
@@ -140,7 +166,7 @@ Two passes over `git diff origin/main` (staged and unstaged), both required:
 Fix real findings, then re-run `scripts/ci-local.sh`. Commit only after both
 passes; if a later change lands on the branch, review that change the same way.
 
-## 7. Commit, push once, open the PR
+## 9. Commit, push once, open the PR
 
 ```bash
 git add <files you changed>          # never .DS_Store, profiles or keys
@@ -158,7 +184,7 @@ PR body: **Problem** (`Fixes #<n>` closes the issue; no labels needed),
 **Live check** (macOS and Linux: what was observed, or why it was skipped).
 End it with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 
-## 8. Watch CI
+## 10. Watch CI
 
 ```bash
 gh pr checks --watch
@@ -166,19 +192,19 @@ gh pr checks --watch
 
 For a failure: `gh run view <run-id> --log-failed`, fix the cause (Linux
 failures usually come from `cfg(target_os = "linux")` code or scripts under
-`tests/integration/`), re-run step 5, push, watch again. A failure that does
+`tests/integration/`), re-run step 7, push, watch again. A failure that does
 not reproduce locally or on the lab gets one `gh run rerun <run-id> --failed`;
 if it fails again it is real — fix it or stop and report. Never merge over a
 red check.
 
-## 9. Merge
+## 11. Merge
 
 `main` has no branch protection, so this gate is the only one. Merge only when
 all of these hold:
 
 - every `gh pr checks` row is `pass` or `skipping` — none `fail`, `pending` or
   `cancel` (release and dependabot jobs always show `skipping`);
-- the review in step 6 has no unresolved findings;
+- the review in step 8 has no unresolved findings;
 - the new test failed before the fix and passes after.
 
 ```bash
@@ -188,7 +214,7 @@ gh pr merge --squash --delete-branch
 Never use `--auto`: with no required checks it merges immediately. If any
 condition can't be met, leave the PR open and tell the user what is blocking.
 
-## 10. Report
+## 12. Report
 
 Tell the user in a few short lines: the root cause, the fix, the PR link, the
 CI result, whether it was merged, and anything noticed but not fixed.
