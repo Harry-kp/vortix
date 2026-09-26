@@ -14,7 +14,7 @@ step "fmt";       cargo fmt --all -- --check
 step "clippy";    cargo clippy --workspace --all-targets -- -D warnings
 step "test";      cargo test --workspace
 step "doc";       RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
-step "xtask";     for check in check-subprocess check-platform-leak check-protocol-leak check-no-shell-regressions; do
+step "xtask";     for check in check-subprocess check-platform-leak check-protocol-leak check-no-shell-regressions check-docs; do
                     cargo xtask "$check"
                   done
 

@@ -3,6 +3,10 @@
 One engine drives the tunnels, routes, DNS and firewall; the dashboard (`sudo vortix`) and the
 CLI (`vortix <command>`) are two ways to talk to it.
 
+Every command takes `-j`/`--json` (see [JSON and exit codes](#json-and-exit-codes)),
+`-q`/`--quiet` (errors only; the exit code says the rest), `-v`/`--verbose` (debug details) and
+`-C`/`--config-dir <DIR>` (see [configuration](configuration.md#config-directory)).
+
 ## Root and the one-instance rule
 
 Tunnel, route, DNS and firewall changes need root, so the dashboard and every command that

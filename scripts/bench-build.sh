@@ -87,6 +87,6 @@ rm -rf target
 step "doc --workspace --no-deps (cold)" env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps
 rm -rf target
 for task in check-subprocess check-platform-leak check-protocol-leak \
-            check-no-shell-regressions check-control-boundaries; do
+            check-no-shell-regressions check-docs; do
     step "xtask $task" cargo xtask "$task"
 done

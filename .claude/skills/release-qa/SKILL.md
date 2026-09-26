@@ -67,7 +67,7 @@ Treat every finding as a bug fix, on the release branch:
 3. Fix at the root. If the TUI and CLI disagree, one of them kept its own copy
    of a rule the engine owns: delete the copy and read the snapshot (P0-39).
 4. Green test, then `cargo clippy --workspace --all-targets -- -D warnings`, then re-verify live on both
-   machines. Run the mandatory `ponytail:ponytail-review` on the diff, then
+   machines. Run the mandatory `ponytail:ponytail-review` and `docs-review` on the diff, then
    make one `fix:` commit per finding.
 5. Log it: `FAIL→fixed` in the results table, plus the one-line cause.
 

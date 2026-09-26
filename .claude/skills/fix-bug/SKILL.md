@@ -148,18 +148,20 @@ Safety, so a check never cuts off this session:
 
 ## 8. Review before committing
 
-Two passes over `git diff origin/main` (staged and unstaged), both required:
+Three passes over `git diff origin/main` (staged and unstaged), all required:
 
 1. **Simplicity (mandatory):** run the `ponytail:ponytail-review` skill on the
    diff. Apply every `delete`/`yagni`/`shrink` finding, or say in the PR why
    it stays. A fix that grew a second mechanism "to be safe" usually shows up
    here; keep the one that covers every path.
-2. **Correctness:** run `/code-review` if available, otherwise read the diff
+2. **Docs (mandatory):** run the `docs-review` skill. A changed flag, key,
+   message, setting or default updates its doc in this commit.
+3. **Correctness:** run `/code-review` if available, otherwise read the diff
    and check correctness, missed sibling callers, test strength, and CLAUDE.md
    rules (boundaries, kill switch vocabulary, no plan IDs in comments, no stray
    `#[allow]`).
 
-Fix real findings, then re-run `scripts/ci-local.sh`. Commit only after both
+Fix real findings, then re-run `scripts/ci-local.sh`. Commit only after all three
 passes; if a later change lands on the branch, review that change the same way.
 
 ## 9. Commit, push once, open the PR
