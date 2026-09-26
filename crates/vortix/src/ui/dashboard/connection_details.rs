@@ -692,7 +692,7 @@ fn fwmark_warning_line(app: &App, snap: &TunnelView) -> Option<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "See docs/multi-tunnel-fwmark.md",
+            "See docs/usage.md",
             Style::default().fg(theme::current().text_secondary),
         ),
     ]))
@@ -1290,7 +1290,7 @@ mod tests {
             .expect("warning expected when primary holds default");
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert!(s.contains("Fwmark"));
-        assert!(s.contains("docs/multi-tunnel-fwmark.md"));
+        assert!(s.contains("docs/usage.md"));
         let _ = (Duration::from_secs(0), SystemTime::now());
     }
 

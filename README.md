@@ -99,22 +99,22 @@ vortix status
 sudo vortix down work
 ```
 
-Tunnel and firewall changes require root. Read-only commands such as `list`, `show`, and `status` do not. If `sudo vortix` cannot find a Cargo-installed binary on Linux, link it once with `sudo ln -s ~/.cargo/bin/vortix /usr/local/bin/vortix`.
+Changing tunnels, routes, DNS or the firewall needs root; `list`, `show` and `status` do not. If `sudo vortix` is not found after `cargo install` or the shell installer, link it once: `sudo ln -s ~/.cargo/bin/vortix /usr/local/bin/vortix`.
 
-See the [usage guide](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md) for command and keybinding references.
+Every command, key and panel is in the [usage guide](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md).
 
 ## Highlights
 
 | Area | What Vortix provides |
 |---|---|
-| [Protocols](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#profiles) | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles |
-| [Multi-tunnel](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#multi-tunnel-behavior) | Concurrent tunnels, default-route ownership, split routes, conflict checks, and per-profile state |
-| [Telemetry](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#status) | Throughput, latency, jitter, packet loss, public IP, ISP, and location |
-| [Security Guard](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#security-guard) | IPv4/IPv6 exposure, active DNS policy, encryption posture, and kill-switch state |
-| [Kill switch](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#kill-switch) | `off`, `block-on-drop`, and `vpn-only`, using PF on macOS or atomic nftables on Linux |
-| [Automation](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#json-and-automation) | Human output, a versioned JSON envelope, NDJSON watch streams, and shell completions |
-| [Diagnostics](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#diagnostics-and-system-commands) | Event logs, session journals, per-process socket audit, and `vortix report` |
-| [Appearance](https://github.com/Harry-kp/vortix/blob/main/docs/configuration.md#themes) | Seven built-in themes, including terminal-native light/dark colors |
+| [Protocols](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#profiles) | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles, up to 1024 routes each |
+| [Multi-tunnel](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#several-tunnels-at-once) | Full and split tunnels side by side, one default-route owner, and a Switch or Cancel choice on conflicts |
+| [Telemetry](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#panels) | Throughput, latency, jitter, packet loss, public IP, ISP, and location |
+| [Security Guard](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#security-guard) | IPv4/IPv6 exposure, DNS, encryption and kill-switch state, with one verdict |
+| [Kill switch](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#kill-switch) | `off`, `block-on-drop`, and `vpn-only`, using PF on macOS or nftables on Linux |
+| [Automation](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#json-and-exit-codes) | A versioned JSON envelope, NDJSON watch streams, stable exit codes, shell completions and [hooks](https://github.com/Harry-kp/vortix/blob/main/docs/configuration.md#hooks) |
+| [Diagnostics](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#diagnostics) | Event logs, OpenVPN daemon logs, session journals, per-process socket audit, and `vortix report` |
+| [Appearance](https://github.com/Harry-kp/vortix/blob/main/docs/configuration.md#configtoml) | Seven built-in themes, including one that follows your terminal's colors |
 
 ## Platform support
 
@@ -122,85 +122,40 @@ See the [usage guide](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md
 |---|---|---|
 | VPN tools | Homebrew `wireguard-tools`, `openvpn` | Distribution `wireguard-tools`, `openvpn` |
 | Kill switch | PF (`pfctl`) | nftables (`nft`) |
-| DNS integration | System Configuration | systemd-resolved, NetworkManager, resolvconf, or `/etc/resolv.conf` fallback |
-| CI coverage | macOS | Ubuntu and Fedora |
+| DNS | System Configuration | systemd-resolved or `resolvconf` |
+| CI | macOS | Ubuntu and Fedora |
 
-macOS is the primary development platform. Linux is tested continuously, but distributions vary in resolver, firewall, kernel, and privilege configuration. Reports from other distributions are valuable—include `vortix report` when possible.
+macOS is the primary development platform; Linux is tested on every change and live before each release. Reports from other distributions help: include `vortix report`.
 
-Source builds require Rust 1.85 or newer. Linux kernel 5.6 or newer is recommended for native WireGuard.
+Source builds need Rust 1.85 or newer. Linux 5.6 or newer is recommended for in-kernel WireGuard.
 
-## Security model
-
-Vortix runs privileged only because tunnel, route, DNS, and firewall mutation require it. The privileged path is intentionally narrow:
-
-- Protocol execution stays in protocol-specific adapters around the installed `wg`, `wg-quick`, and `openvpn` binaries.
-- Platform adapters own firewall, DNS, route, and kernel inspection behavior.
-- Profile identity, process ownership, durable operations, and read-back checks fail closed when Vortix cannot prove the state it is managing.
-- Sensitive profile and credential material is bounded, owner-checked, and kept out of normal logs and JSON output.
-- Telemetry uses public IP/geolocation providers; Vortix has no hosted control plane or DNS-test service.
-
-Kill-switch rules survive a Vortix restart within the same boot, but the OS may flush them during reboot. Re-arm `vpn-only` after each boot.
-
-For trust assumptions and known risks, read [SECURITY.md](https://github.com/Harry-kp/vortix/blob/main/SECURITY.md).
-
-## Command overview
-
-```text
-vortix import <PATH|URL>       Add one profile or a directory
-vortix list                    List profiles
-vortix show <PROFILE>          Inspect a profile with secrets masked
-sudo vortix up <PROFILE>       Connect
-sudo vortix down [PROFILE]     Disconnect one or every active tunnel
-sudo vortix reconnect [NAME]   Reconnect one or every active tunnel
-vortix status [--watch]        Show or stream state
-vortix killswitch [MODE]       Inspect or set off/block-on-drop/vpn-only
-vortix audit                   Inspect process sockets and tunnel routing
-vortix report                  Generate diagnostics for a bug report
-```
-
-Every command supports `--json`; watch commands emit NDJSON. Run `vortix <COMMAND> --help` for authoritative options.
-
-Common TUI keys:
-
-| Key | Action | Key | Action |
-|---|---|---|---|
-| `j` / `k` | Move through profiles | `c` / `Enter` | Connect or disconnect |
-| `Tab` / `Shift-Tab` | Move between panels | `x` | Context action menu |
-| `b` | Bulk action menu | `p` | Switch color theme |
-| `i` | Import profile | `K` | Cycle kill-switch mode |
-| `/` | Search profiles | `?` | Full in-app help |
-| `q` | Quit | `z` | Zoom focused panel |
+Vortix runs as root only to change tunnels, routes, DNS and the firewall, never runs commands from a profile, and has no server of its own. What it does with privilege and data is in [SECURITY.md](https://github.com/Harry-kp/vortix/blob/main/SECURITY.md).
 
 ## Documentation
 
-### For users
-
-| Guide | Covers |
+| For users | |
 |---|---|
-| [Usage](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md) | TUI keys, CLI commands, JSON, multi-tunnel behavior, and automation |
-| [Configuration](https://github.com/Harry-kp/vortix/blob/main/docs/configuration.md) | Paths, files, themes, settings, DNS integration, and precedence |
-| [Troubleshooting](https://github.com/Harry-kp/vortix/blob/main/docs/troubleshooting.md) | Startup, permissions, DNS, WireGuard, OpenVPN, firewall, and reporting |
-| [Migration](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) | Upgrade and profile-storage changes |
-| [P0 release gate](https://github.com/Harry-kp/vortix/blob/main/docs/manual-testing/P0.md) | Real-kernel and real-terminal checks that must pass before every release |
+| [Usage](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md) | Commands, keys, panels, multiple tunnels, the kill switch, JSON |
+| [Configuration](https://github.com/Harry-kp/vortix/blob/main/docs/configuration.md) | Files, `config.toml`, `settings.toml`, hooks, DNS |
+| [Troubleshooting](https://github.com/Harry-kp/vortix/blob/main/docs/troubleshooting.md) | What an error means and what to do |
+| [Upgrading](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) | Steps when upgrading from an older version |
 
-### For contributors and agents
-
-| Guide | Covers |
+| For contributors | |
 |---|---|
-| [Contributing](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md) | Development workflow and contribution entry points |
-| [CI parity](https://github.com/Harry-kp/vortix/blob/main/docs/ci-parity.md) | The exact checks to run before pushing |
-| [Project board](https://github.com/users/Harry-kp/projects/6) | Active and planned work |
+| [Contributing](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md) | How to build, test and send a change |
+| [CLAUDE.md](https://github.com/Harry-kp/vortix/blob/main/CLAUDE.md) | The project's rules and architecture, for people and coding agents |
+| [Project board](https://github.com/users/Harry-kp/projects/6) | Planned and active work |
 
 ## Contributing
 
 Contributions and real-world testing are welcome:
 
 - Start with a [good first issue](https://github.com/Harry-kp/vortix/labels/good%20first%20issue).
-- Run a scenario from the [P0 release gate](https://github.com/Harry-kp/vortix/blob/main/docs/manual-testing/P0.md).
+- Run a scenario from the [release test plan](https://github.com/Harry-kp/vortix/blob/main/docs/manual-testing/P0.md).
 - Share Linux results in the [Linux tester discussion](https://github.com/Harry-kp/vortix/discussions/184).
 - Use [Discussions](https://github.com/Harry-kp/vortix/discussions) for questions and ideas.
 
-Development starts with `cargo build`, `cargo test`, and the full [CI parity](https://github.com/Harry-kp/vortix/blob/main/docs/ci-parity.md) suite before pushing. Nix users can run `nix develop` for the project shell.
+See [CONTRIBUTING.md](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md) to get started; Nix users can run `nix develop`.
 
 ## Featured in
 

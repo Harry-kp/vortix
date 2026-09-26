@@ -1,180 +1,75 @@
 # Troubleshooting Vortix
 
-Start with:
+`vortix report` prints a block with versions, your system and Vortix's configuration; attach it
+to any issue after removing endpoint addresses you consider private.
 
-```bash
-vortix info
-vortix report
-```
+## Starting Vortix
 
-`vortix report` is the preferred attachment for an issue. Review the generated report before posting if your VPN provider treats endpoint addresses as sensitive.
-
-## Quick diagnosis
-
-| Symptom | Likely cause | First action |
-|---|---|---|
-| `sudo: vortix: command not found` | `sudo` does not include the install directory in `PATH` | Link the binary into `/usr/local/bin` |
-| A second Vortix instance exits | Another process owns the lifecycle lock | Use or close the running instance |
-| Profile import rejects a name | Invalid or overlong WireGuard interface name | Rename the source file and import it again |
-| Connect stays transitional | The tunnel has not finished coming up | Check `vortix status` |
-| Connected split tunnel does not change public IP | The profile does not own the default route | Test a destination included in its declared routes |
-| Connected tunnel cannot resolve names | DNS application, read-back, or resolver routing failed | Inspect the DNS section below |
-| Kill switch blocks all traffic | `vpn-only` is active without an effective tunnel | Connect a VPN or use `release-killswitch` in an emergency |
-| Full-tunnel WireGuard fails on Linux | Missing kernel networking/firewall capability | Check nftables and kernel support |
-| Desktop popup "Activation of network connection failed" | NetworkManager adopted the tunnel interface, then saw it removed | Nothing to fix; see the WireGuard section to silence it |
-
-## Installation and privileges
-
-### Cargo install is not visible to `sudo`
-
-Linux commonly omits `~/.cargo/bin` from sudo's secure path:
+**`sudo: vortix: command not found`.** `cargo install` and the shell installer put Vortix in
+`~/.cargo/bin`, which `sudo` usually does not search. Link it once:
 
 ```bash
 sudo ln -s ~/.cargo/bin/vortix /usr/local/bin/vortix
 ```
 
-Homebrew, pacman, npm global installs, and packaged release binaries normally install into an already-visible path.
+**The dashboard exits without root.** It changes routes, DNS and the firewall, so it needs
+`sudo vortix`. Read-only commands (`list`, `show`, `status`, `info`) work without it.
 
-### A build directory became root-owned
+**"Another Vortix process is managing VPN state" (exit 4).** Only one Vortix may change state
+at a time; the dashboard holds that role while it is open. Quit it (`q`) or wait for the other
+command to finish.
 
-Build as your user. If an earlier `sudo cargo build` changed ownership:
+**"Vortix found a profile metadata file it has no record of".** Vortix keeps a list of the
+profiles it manages and refuses to act while `profiles/` holds a file it did not create. Move
+the named file out of `~/.config/vortix/profiles/` and import it with `vortix import`; never
+copy files into that directory by hand.
 
-```bash
-sudo chown -R "$(id -un):$(id -gn)" target
-cargo build --bin vortix
-sudo ./target/debug/vortix
-```
-
-### Running without root exits
-
-The interactive dashboard owns tunnel lifecycle and must be started with `sudo vortix`. Read-only CLI commands remain available without root.
-
-## Profiles and upgrades
-
-Vortix validates the managed profile inventory and identity sidecars to avoid adopting the wrong secret file after an interrupted migration or external edit.
-
-- Import from outside `~/.config/vortix/profiles/`.
-- Do not place `.vortix-*` runtime files or hand-written sidecars in the managed directory.
-- If startup reports an unexplained sidecar or changed inventory, stop and inspect the directory rather than deleting files blindly.
-- Follow [Migration](MIGRATION.md) for release-specific recovery steps.
-
-If files were created under the wrong account, restore invoking-user ownership:
+**Files in `~/.config/vortix` owned by root.** Give them back:
 
 ```bash
 sudo chown -R "$(id -un):$(id -gn)" ~/.config/vortix
 ```
 
-## Connection state
+## Connecting
 
-### A CLI command timed out
+**`up` times out.** The connect is rolled back and nothing is left running. A slow server or a
+large profile may need longer: `sudo vortix up <profile> --timeout 60`.
 
-A timeout does not cancel the connect; it carries on. Check `vortix status`.
+**"This profile needs saved credentials".** The CLI cannot type an OpenVPN username and
+password. Save them once in the dashboard (`a` on the profile).
 
-Do not repeatedly submit the same connect or disconnect while the earlier one is still in progress. If the TUI and CLI appear different, ensure both were built from and are running the same binary and config directory.
+**"Not started by Vortix, left running".** `down` found a tunnel Vortix did not start: another
+VPN tool's, or one an earlier Vortix version left behind. Stop it with the tool that started
+it; for a leftover from Vortix 0.4.3, restart the computer once (see
+[Upgrading](MIGRATION.md)).
 
-### Split-route tunnel shows the normal public IP
-
-This is expected if the profile does not claim `0.0.0.0/0` or `::/0`. Verify a routed destination instead:
-
-```bash
-route -n get 10.250.0.1        # macOS example
-ip route get 10.250.0.1        # Linux example
-ping -c 3 10.250.0.1
-```
-
-The Security Guard should describe a split-route tunnel as having no exit rather than treating the unchanged public IP as a leak.
-
-## DNS
-
-Vortix treats DNS as a policy transition, not just a line in a profile. A successful connection requires the intended resolver state to be applied and read back safely; on failure Vortix restores the previous network settings.
-
-### Inspect the active resolver
+**A split tunnel connects but the public IP does not change.** Expected: it carries only its
+own routes. Security Guard shows `split-route — no exit`. Check a routed address instead:
 
 ```bash
-# macOS
-scutil --dns
-
-# systemd-resolved Linux
-resolvectl status
-
-# NetworkManager Linux
-nmcli device show | grep -i dns
-
-# Generic fallback
-cat /etc/resolv.conf
+route -n get 10.250.0.1        # macOS
+ip route get 10.250.0.1        # Linux
 ```
 
-Then test the intended VPN resolver directly:
+**A profile name is refused.** WireGuard names become interface names: 1–15 characters of
+letters, numbers, `_`, `.` or `-`. Rename the file (`work.conf`) and import it again.
 
-```bash
-dig +time=3 +tries=1 @<VPN_DNS_IP> example.com
-```
-
-Direct `dig` success proves the server is reachable; it does not prove the operating system's ordinary resolver selected it. Test both ordinary resolution and fixed-IP HTTPS to separate DNS from data-plane failures:
-
-```bash
-curl -4 --max-time 15 https://cloudflare.com/cdn-cgi/trace
-curl -4 --max-time 15 \
-  --resolve cloudflare.com:443:104.16.132.229 \
-  https://cloudflare.com/cdn-cgi/trace
-```
-
-### Linux resolver dependencies
-
-- systemd-resolved: Vortix uses per-link DNS; no resolvconf shim should be necessary.
-- Hosts without resolved: install `openresolv` or the distribution equivalent if the profile declares `DNS =`.
-- Non-systemd systems: confirm the guarded `/etc/resolv.conf` fallback is permitted and that another manager is not immediately replacing it.
-
-If system DNS is externally managed by device policy, another VPN client, or enterprise software, Vortix may be unable to prove safe replacement. This is a host-policy conflict, not an authentication failure.
+**A profile with scripts is refused.** `PreUp`/`PostUp`/`PreDown`/`PostDown` and OpenVPN
+`up`/`down`-style directives never run; move the commands to
+[hooks](configuration.md#hooks).
 
 ## WireGuard
 
-### Profile name rejected
+**No handshake.** The server never answered. Check the endpoint address and port, both keys
+and any preshared key, and that UDP to the server is not blocked. `sudo wg show` shows what the
+kernel sees.
 
-WireGuard interface names have platform length and character constraints. Vortix validates them during import and again before connection. Rename the source file to a short identifier such as `work.conf`, then import it again.
+**"Fwmark hijack risk".** See [the Role line](usage.md#connection-details-the-role-line).
 
-### No handshake
-
-Compare Vortix with the system tool using the same profile:
-
-```bash
-sudo wg show
-```
-
-Check the endpoint, peer public key, local private key, preshared key, and UDP reachability. A configured interface without a recent handshake is not considered connected.
-
-### Desktop reports "Activation of network connection failed"
-
-On a NetworkManager desktop, connecting or disconnecting a WireGuard tunnel can
-raise a system notification reading "Connection failed — Activation of network
-connection failed", while Vortix reports success and the tunnel works normally.
-
-Nothing has failed. NetworkManager adopts any interface it did not create as an
-"external" connection and marks it activated. When the interface is removed
-again, NM ends that assumed connection and the desktop shell presents it as a
-failed activation.
-
-This is not specific to Vortix. Reproduce it with the tools alone, no Vortix
-involved:
-
-```bash
-sudo cp your-profile.conf /etc/wireguard/nmtest.conf
-sudo wg-quick up nmtest
-sudo wg-quick down nmtest
-```
-
-The same notification appears. Confirm what actually happened from the journal
-rather than from the popup:
-
-```bash
-journalctl -u NetworkManager -n 40 | grep -E 'wg|assumed|unmanaged'
-```
-
-`connection-assumed` followed by `unmanaged` is an ordinary adopt-and-release
-cycle, not an error. Vortix's own view of the tunnel is authoritative — check
-`vortix status` and the Event Log.
-
-To silence it, tell NetworkManager not to adopt WireGuard interfaces at all:
+**Linux desktop: "Activation of network connection failed".** Harmless. NetworkManager adopts
+any interface it did not create and reports its removal as a failed activation; plain
+`wg-quick up`/`down` does the same. To stop it, tell NetworkManager to leave WireGuard
+interfaces alone (this also covers ones Vortix does not manage):
 
 ```ini
 # /etc/NetworkManager/conf.d/99-wireguard-unmanaged.conf
@@ -186,67 +81,53 @@ unmanaged-devices=interface-name:wg*
 sudo systemctl reload NetworkManager
 ```
 
-Vortix does not install this for you. It is a system-wide change that also
-covers WireGuard interfaces Vortix does not manage, so it is yours to make
-deliberately. Interfaces already marked unmanaged are unaffected by it, and
-NetworkManager still manages every other device.
-
-### `AllowedIPs` behavior
-
-`AllowedIPs` controls both peer selection and routing:
-
-```ini
-AllowedIPs = 0.0.0.0/0, ::/0       # full tunnel
-AllowedIPs = 10.0.0.0/8            # split tunnel
-AllowedIPs = 10.0.0.0/8, 192.168.0.0/16
-```
-
-Full-tunnel setup may require nftables support on Linux. Restricted containers or custom kernels may not expose the required capabilities; use a normal host kernel or a split-route profile appropriate to the environment.
-
 ## OpenVPN
 
-OpenVPN runtime logs live under `~/.config/vortix/run/` while a session exists. Look for the exact server or management response:
+Each profile's daemon log is `~/.config/vortix/run/<profile-id>.log`, also shown in the
+dashboard's Logs panel (`f` until the title names the profile).
+
+- `AUTH_FAILED`: the server rejected the credentials or the one-time code. A saved password
+  that is rejected is removed.
+- TLS timeout: the server is unreachable, or the certificates or protocol do not match.
+- Connected but no traffic: the server's pushed routes, forwarding or NAT.
+
+## DNS
+
+**Names do not resolve, or DNS shows `Unverified`.** The tunnel's resolvers could not be
+applied; the tunnel stays up and Vortix keeps retrying. On Linux, Vortix needs systemd-resolved
+or `resolvconf` for a profile that carries DNS (see [DNS](configuration.md#dns)). Inspect the
+resolver in use:
 
 ```bash
-vortix info
-sudo find ~/.config/vortix/run -name '*.log' -maxdepth 1 -print
+scutil --dns                   # macOS
+resolvectl status              # Linux with systemd-resolved
 ```
 
-Common distinctions:
+To tell a DNS problem from a routing one, query the VPN's resolver directly and fetch a page by
+fixed IP:
 
-- `AUTH_FAILED`: credentials or challenge response were rejected by the server.
-- TLS timeout: endpoint reachability, certificates, protocol, or server configuration.
-- Initialization succeeds but traffic fails: inspect pushed routes, DNS policy, forwarding, and NAT on the VPN server.
-- A management hold that never releases: report it with the runtime log; Vortix should surface a terminal error rather than leave the profile indefinitely connecting.
+```bash
+dig +time=3 +tries=1 @<VPN_DNS_IP> example.com
+curl -4 --max-time 15 --resolve cloudflare.com:443:104.16.132.229 https://cloudflare.com/cdn-cgi/trace
+```
 
-To isolate orchestration from a provider/server problem, test the same profile with the installed `openvpn` binary. Remove Vortix-specific runtime state from the comparison; do not rewrite the profile semantics just to make the test pass.
+Device-management software or another VPN client that owns DNS can stop Vortix from applying
+its resolvers.
 
-## Firewall and kill switch
+## Kill switch
 
-Vortix uses PF on macOS and an atomic nftables `inet` transaction on Linux. If `vpn-only` leaves you without connectivity after a crash:
+**No internet after a crash or with `vpn-only` and no tunnel.** Connect a profile, or remove
+Vortix's rules and set the mode to `off`:
 
 ```bash
 sudo vortix release-killswitch
 ```
 
-The legacy spelling `release-kill-switch` remains accepted for compatibility.
-The release command removes only Vortix-owned firewall rules, verifies their
-absence, and saves mode `off` so a later startup cannot restore `vpn-only`.
-
-On Linux, verify `nft` is present and supported by the running kernel. Vortix still removes legacy Vortix-owned iptables chains during emergency cleanup, but it does not engage a new split-family iptables policy because IPv4 and IPv6 cannot be replaced atomically together.
-
-Kill-switch rules may be flushed by reboot. Check and re-arm the desired mode after boot.
+It touches only Vortix's own rules. On Linux it also removes iptables chains left by Vortix
+0.4.x. The kill switch needs `nft` on Linux.
 
 ## Reporting a problem
 
-Include:
-
-```bash
-vortix report
-vortix --version
-uname -a
-```
-
-Linux reports should also include `/etc/os-release`, resolver choice, and firewall backend. Describe whether the same profile works with `wg-quick` or `openvpn` directly, and whether it is full-tunnel or split-route.
-
-Open an [issue](https://github.com/Harry-kp/vortix/issues) for reproducible defects or use [Discussions](https://github.com/Harry-kp/vortix/discussions) when you are unsure whether observed behavior is expected.
+[Open an issue](https://github.com/Harry-kp/vortix/issues/new/choose) with the `vortix report`
+output; say whether the same profile works with `wg-quick` or `openvpn` directly. Questions go
+to [Discussions](https://github.com/Harry-kp/vortix/discussions).
