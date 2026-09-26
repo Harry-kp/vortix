@@ -387,7 +387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let profile = ProfileId::new("large-split");
         let at = SystemTime::now() - Duration::from_secs(10);
-        let routes = (0..crate::wireguard::parser::MAX_ROUTES_PER_PEER)
+        let routes = (0..crate::wireguard::parser::MAX_ROUTES)
             .map(|i| format!("2001:0db8:85a3:{i:04x}:0000:8a2e:0370:7334/128"))
             .collect::<Vec<_>>();
         let mut handshake = evidence(3, at);

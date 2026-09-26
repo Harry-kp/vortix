@@ -16,8 +16,9 @@ use crate::tunnel::ParseError;
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_PEERS: usize = 256;
-/// Receipts copy a peer's routes, so this also bounds their size.
-pub(crate) const MAX_ROUTES_PER_PEER: usize = 1024;
+/// Routes across all peers. Receipts copy them once more for the probes,
+/// so this also bounds their size.
+pub(crate) const MAX_ROUTES: usize = 1024;
 
 /// One `[Peer]` block from a `WireGuard` configuration.
 #[derive(Debug, Default, Clone)]
@@ -106,6 +107,7 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
     };
     let mut section = Section::None;
     let mut current_peer: Option<WgPeer> = None;
+    let mut routes = 0;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -198,14 +200,13 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                             }
                             match entry.parse::<Cidr>().ok() {
                                 Some(cidr) => {
-                                    if peer.allowed_ips.len() >= MAX_ROUTES_PER_PEER {
+                                    if routes >= MAX_ROUTES {
                                         return Err(ParseError::MalformedField {
                                             field: "AllowedIPs",
-                                            detail: format!(
-                                                "peer exceeds {MAX_ROUTES_PER_PEER} routes"
-                                            ),
+                                            detail: format!("profile exceeds {MAX_ROUTES} routes"),
                                         });
                                     }
+                                    routes += 1;
                                     peer.allowed_ips.push(cidr);
                                 }
                                 None => {
@@ -639,10 +640,13 @@ Address = 10.0.0.2/32
                 .join(", ")
         };
         let conf = |n: usize| format!("[Peer]\nPublicKey = BBBB\nAllowedIPs = {}\n", routes(n));
-        assert!(routes(MAX_ROUTES_PER_PEER).len() > 4096);
-        let parsed = parse_wg_conf(&conf(MAX_ROUTES_PER_PEER)).unwrap();
-        assert_eq!(parsed.peers[0].allowed_ips.len(), MAX_ROUTES_PER_PEER);
-        assert!(parse_wg_conf(&conf(MAX_ROUTES_PER_PEER + 1)).is_err());
+        assert!(routes(MAX_ROUTES).len() > 4096);
+        let parsed = parse_wg_conf(&conf(MAX_ROUTES)).unwrap();
+        assert_eq!(parsed.peers[0].allowed_ips.len(), MAX_ROUTES);
+        assert!(parse_wg_conf(&conf(MAX_ROUTES + 1)).is_err());
+        // Each peer's probe copies its routes, so the cap is for the profile.
+        let two = format!("{}{}", conf(600), conf(600));
+        assert!(parse_wg_conf(&two).is_err());
     }
 
     #[test]
