@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-26
+
+### Documentation
+
+- Structured bug form, question routing and a clearer README ([#337](https://github.com/Harry-kp/vortix/pull/337))
+- Explain the Security Guard panel ([#339](https://github.com/Harry-kp/vortix/pull/339))
+- User docs describe what Vortix actually does
+- Drop what no user needs: old upgrade paths, the roadmap, stale asset notes
+
+
+
 ## [0.5.1] - 2026-09-26
 
 ### Fixed
