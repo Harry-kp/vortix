@@ -170,6 +170,27 @@ tmux session `vxlinux` has root windows 1 and 2 for the TUI. Check host state
 with `ip -4 route`, `resolvectl dns`, `nft list table inet vortix_killswitch`.
 Anything verified live on macOS should be verified here too.
 
+## Docs
+
+A change that alters what a user or contributor sees updates its doc **in the same PR**. Each
+fact has one owner; everything else links to it.
+
+| Change | Owner |
+|---|---|
+| CLI command, flag, key binding, panel text, exit code, JSON field | `docs/usage.md` |
+| `config.toml` / `settings.toml` key, hooks, config dir, DNS behaviour | `docs/configuration.md` |
+| A new error message or failure a user can hit | `docs/troubleshooting.md` |
+| Something an upgrading user must do | `docs/MIGRATION.md` and `whats_new.rs` |
+| Privilege, credentials, network calls, trust | `SECURITY.md` |
+| CI job, local check | `docs/ci-parity.md`; release pipeline `RELEASING.md` |
+| Live-only workflow | `docs/manual-testing/P0.md` |
+| Module ownership, a rule, a lesson | this file |
+
+`README.md` only summarises and links. A key change touches three places: `app/input.rs`, the
+in-app help (`HELP_TEXT` in `ui/overlays.rs`) and `docs/usage.md`. `cargo xtask check-docs` (CI and `ci-local.sh`) fails on a broken link or anchor, an
+undocumented subcommand or flag, or an undocumented config key. Everything else is caught by the
+`docs-review` skill, which is mandatory before every commit alongside ponytail.
+
 ## Secrets
 
 Profiles contain private keys and passwords, on both machines: never print,
@@ -186,6 +207,8 @@ copy or commit them. Credentials are typed by the user.
 - **Before every commit, run the `ponytail:ponytail-review` skill on the diff**
   and apply its cuts (or note in the PR why one stays). It is a skill, so no
   git hook can run it; it is still mandatory.
+- **Then run the `docs-review` skill on the same diff** and put its doc edits in the same
+  commit.
 - PRs squash-merge into `main`; a PR that fixes several issues (one commit
   each) rebase-merges so each fix stays its own commit. `main` has no branch protection, so the green
   check is ours to enforce: merge only when every `gh pr checks` row is `pass`

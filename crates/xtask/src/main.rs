@@ -23,6 +23,11 @@ const TASKS: &[(&str, &str, Task)] = &[
         check_protocol_leak,
     ),
     (
+        "check-docs",
+        "Verify doc links and anchors resolve and every CLI flag and config key is documented.",
+        check_docs,
+    ),
+    (
         "check-no-shell-regressions",
         "Verify no shell-outs to system binaries that the `CommandRunner` port replaced.",
         check_no_shell_regressions,
@@ -68,9 +73,9 @@ fn print_usage(out: &mut impl Write) {
     }
 }
 
-/// Every `.rs` file under `dir`, skipping build output and the local-only
-/// profile fixtures — the two things `.gitignore` hides inside the workspace.
-fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+/// Every `.<ext>` file under `dir`, skipping build output, local-only profile
+/// fixtures, agent worktrees and hidden directories other than `.github` and `.claude`.
+fn sources(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -83,10 +88,13 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
             // symlinked source file is still scanned, as it was before.
             if path.is_dir() {
                 let name = entry.file_name();
-                if name != "target" && name != "test-profiles" {
+                let name = name.to_string_lossy();
+                let hidden = name.starts_with('.') && name != ".github" && name != ".claude";
+                let skipped = ["target", "test-profiles", "worktrees"];
+                if !skipped.contains(&name.as_ref()) && !hidden {
                     stack.push(path);
                 }
-            } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            } else if path.is_file() && path.extension().is_some_and(|found| found == ext) {
                 files.push(path);
             }
         }
@@ -109,7 +117,7 @@ fn check_subprocess() -> Result<(), Box<dyn std::error::Error>> {
     let src_dir = crates_dir.join("vortix/src");
     let mut violations = Vec::new();
 
-    for path in rust_sources(&crates_dir) {
+    for path in sources(&crates_dir, "rs") {
         let path = path.as_path();
         if is_allowlisted_file(path, &workspace_root) {
             continue;
@@ -187,7 +195,7 @@ fn check_platform_leak() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut violations = Vec::new();
 
-    for path in rust_sources(&crates_dir) {
+    for path in sources(&crates_dir, "rs") {
         let path = path.as_path();
         if is_platform_leak_allowlisted(path, &workspace_root) {
             continue;
@@ -277,7 +285,7 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut violations = Vec::new();
 
-    for path in rust_sources(&crates_dir) {
+    for path in sources(&crates_dir, "rs") {
         let path = path.as_path();
         let Some(rel_str) = path
             .strip_prefix(&workspace_root)
@@ -395,7 +403,7 @@ fn check_no_shell_regressions() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut violations = Vec::new();
 
-    for path in rust_sources(&crates_dir) {
+    for path in sources(&crates_dir, "rs") {
         let path = path.as_path();
         // Self-exclude: the lint mentions every forbidden name in its
         // own source.
@@ -474,4 +482,260 @@ fn workspace_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         .ok_or("CARGO_MANIFEST_DIR has no grandparent")?
         .to_path_buf();
     Ok(root)
+}
+
+/// The docs must stay true of the code: every link and heading anchor resolves (including the
+/// GitHub URLs the app itself shows), every subcommand and long flag is in `docs/usage.md`, and
+/// every `config.toml` and `settings.toml` key is in `docs/configuration.md`.
+fn check_docs() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    let mut errors = Vec::new();
+    check_links(&root, &mut errors);
+    let usage = std::fs::read_to_string(root.join("docs/usage.md"))?;
+    let args = std::fs::read_to_string(root.join("crates/vortix/src/cli/args.rs"))?;
+    for (what, name) in cli_surface(&args) {
+        let documented = match what {
+            "command" => usage.contains(&format!("vortix {name}")),
+            _ => usage.contains(&format!("--{name}")),
+        };
+        if !documented {
+            errors.push(format!("docs/usage.md: {what} `{name}` is not documented"));
+        }
+    }
+    let configuration = std::fs::read_to_string(root.join("docs/configuration.md"))?;
+    for (file, section) in [
+        ("crates/vortix/src/config/mod.rs", "pub struct AppConfig"),
+        (
+            "crates/vortix/src/config/settings.rs",
+            "pub struct EngineSettings",
+        ),
+        (
+            "crates/vortix/src/config/settings.rs",
+            "pub struct JournalSettings",
+        ),
+        (
+            "crates/vortix/src/config/settings.rs",
+            "pub struct HookSpec",
+        ),
+    ] {
+        let source = std::fs::read_to_string(root.join(file))?;
+        for key in struct_fields(&source, section) {
+            if !configuration.contains(&format!("{key} =")) {
+                errors.push(format!(
+                    "docs/configuration.md: `{key}` ({section}) is not documented"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        println!("xtask check-docs: ok");
+        return Ok(());
+    }
+    for error in &errors {
+        eprintln!("{error}");
+    }
+    Err(format!(
+        "xtask check-docs: {} problem(s); update the docs in this change",
+        errors.len()
+    )
+    .into())
+}
+
+const REPO_BLOB: &str = "https://github.com/Harry-kp/vortix/blob/main/";
+
+/// Relative links in Markdown, and this repo's `blob/main` URLs in Markdown and Rust.
+fn check_links(root: &Path, errors: &mut Vec<String>) {
+    let mut anchors = std::collections::HashMap::new();
+    let files = sources(root, "md")
+        .into_iter()
+        .chain(sources(&root.join("crates"), "rs"));
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let is_markdown = file.extension().is_some_and(|ext| ext == "md");
+        let shown = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        for target in link_targets(&text, is_markdown) {
+            let (path, anchor) = target.split_once('#').unwrap_or((target.as_str(), ""));
+            let resolved = if let Some(repo_path) = path.strip_prefix(REPO_BLOB) {
+                root.join(repo_path)
+            } else if path.is_empty() {
+                file.clone()
+            } else {
+                file.parent().unwrap_or(root).join(path)
+            };
+            if !resolved.exists() {
+                errors.push(format!("{shown}: link to missing `{target}`"));
+                continue;
+            }
+            if anchor.is_empty() || resolved.extension().is_none_or(|ext| ext != "md") {
+                continue;
+            }
+            let known = anchors.entry(resolved.clone()).or_insert_with(|| {
+                heading_anchors(&std::fs::read_to_string(&resolved).unwrap_or_default())
+            });
+            if !known.contains(anchor) {
+                errors.push(format!("{shown}: no heading `#{anchor}` in `{path}`"));
+            }
+        }
+    }
+}
+
+/// Link targets outside code blocks: `](…)` in Markdown, repo URLs anywhere.
+fn link_targets(text: &str, is_markdown: bool) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut in_code = false;
+    for line in text.lines() {
+        if is_markdown && line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        if is_markdown {
+            for piece in line.split("](").skip(1) {
+                if let Some(end) = piece.find(')') {
+                    let target = &piece[..end];
+                    let external = target.contains("://") || target.starts_with("mailto:");
+                    if !external || target.starts_with(REPO_BLOB) {
+                        targets.push(target.to_string());
+                    }
+                }
+            }
+        } else {
+            for piece in line.split(REPO_BLOB).skip(1) {
+                let end = piece.find(['"', ')', ' ', '`']).unwrap_or(piece.len());
+                targets.push(format!("{REPO_BLOB}{}", &piece[..end]));
+            }
+        }
+    }
+    targets
+}
+
+/// GitHub's anchor for every heading outside code blocks, with `-1`, `-2` for repeats.
+fn heading_anchors(text: &str) -> std::collections::HashSet<String> {
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    let mut anchors = std::collections::HashSet::new();
+    let mut in_code = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        let Some(title) = line
+            .strip_prefix('#')
+            .map(|rest| rest.trim_start_matches('#'))
+        else {
+            continue;
+        };
+        if in_code || !title.starts_with(' ') {
+            continue;
+        }
+        let slug = title
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+            .map(|c| if c == ' ' { '-' } else { c })
+            .collect::<String>();
+        let count = seen.entry(slug.clone()).or_default();
+        anchors.insert(if *count == 0 {
+            slug.clone()
+        } else {
+            format!("{slug}-{count}")
+        });
+        *count += 1;
+    }
+    anchors
+}
+
+/// `("command", name)` for each subcommand and `("flag", name)` for each visible long flag
+/// declared in `cli/args.rs`.
+fn cli_surface(args: &str) -> Vec<(&'static str, String)> {
+    let mut surface = Vec::new();
+    let mut in_commands = false;
+    let mut renamed: Option<String> = None;
+    let mut pending_flag: Option<Option<String>> = None;
+    let mut attribute: Option<String> = None;
+    for line in args.lines() {
+        let trimmed = line.trim();
+        if line.starts_with("pub enum Commands") {
+            in_commands = true;
+            continue;
+        }
+        if in_commands && line.starts_with('}') {
+            in_commands = false;
+        }
+        if trimmed.starts_with("#[command(") {
+            renamed = attr_value(trimmed, "name");
+            continue;
+        }
+        if trimmed.starts_with("#[arg(") || attribute.is_some() {
+            let text = attribute.get_or_insert_with(String::new);
+            text.push_str(trimmed);
+            if trimmed.ends_with(")]") {
+                let text = attribute.take().unwrap_or_default();
+                let long = text.contains("long") && !text.contains("hide = true");
+                pending_flag = long.then(|| attr_value(&text, "long"));
+            }
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if in_commands && indent == 4 && trimmed.starts_with(char::is_uppercase) {
+            let variant = trimmed.split([' ', ',', '{']).next().unwrap_or_default();
+            surface.push(("command", renamed.take().unwrap_or_else(|| kebab(variant))));
+            continue;
+        }
+        if let Some(explicit) = pending_flag.take() {
+            if let Some((field, _)) = trimmed.split_once(':') {
+                surface.push((
+                    "flag",
+                    explicit.unwrap_or_else(|| {
+                        field.trim().trim_start_matches("pub ").replace('_', "-")
+                    }),
+                ));
+            }
+        }
+    }
+    surface
+}
+
+/// `key = "value"` inside an attribute, if present.
+fn attr_value(attribute: &str, key: &str) -> Option<String> {
+    let start = attribute.find(&format!("{key} = \""))? + key.len() + 4;
+    let end = attribute[start..].find('"')? + start;
+    Some(attribute[start..end].to_string())
+}
+
+fn kebab(variant: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in variant.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push('-');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Field names of `pub struct <name>` in `source`, up to its closing brace.
+fn struct_fields(source: &str, header: &str) -> Vec<String> {
+    let Some(start) = source.find(header) else {
+        return Vec::new();
+    };
+    source[start..]
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.starts_with('}'))
+        .filter_map(|line| line.trim().strip_prefix("pub "))
+        .filter_map(|rest| {
+            rest.split_once(':')
+                .map(|(name, _)| name.trim().to_string())
+        })
+        .collect()
 }

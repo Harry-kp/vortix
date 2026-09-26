@@ -1,19 +1,10 @@
 name: Boundary
 
 on:
-  # Doc-only changes skip Boundary — xtask checks grep Rust source for
-  # protocol-binary mentions; markdown can't introduce a leak.
+  # Runs on docs-only changes too: check-docs keeps docs and code in step.
   push:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE"
-      - "CHANGELOG.md"
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE"
-      - "CHANGELOG.md"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,3 +28,5 @@ jobs:
         run: cargo xtask check-protocol-leak
       - name: Shell-regression guard
         run: cargo xtask check-no-shell-regressions
+      - name: Docs match the code
+        run: cargo xtask check-docs
