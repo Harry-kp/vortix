@@ -233,7 +233,9 @@ pub(super) fn engine_failure_or_exit(mode: OutputMode, command: &str, message: S
         CliError {
             code,
             message,
-            hint: None,
+            hint: (code == "timeout" && command == "up").then(|| {
+                "Nothing was left running. To wait longer: sudo vortix up <profile> --timeout 60".to_owned()
+            }),
         },
         exit,
     )
