@@ -106,15 +106,13 @@ pub const RELEASES: &[Release] = &[Release {
 /// What the config directory's history says about this run.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Status {
-    /// Fresh install, or the same version as last time.
+    /// Fresh install, the same version as last time, or an upgrade past
+    /// releases with no notes.
     Current,
-    Upgraded {
-        from: String,
-    },
+    /// An older Vortix last wrote these files, and a release since has notes.
+    Upgraded { from: String },
     /// A newer Vortix last wrote these files.
-    Downgraded {
-        from: String,
-    },
+    Downgraded { from: String },
 }
 
 fn parse(version: &str) -> Option<(u64, u64, u64)> {
@@ -131,7 +129,9 @@ pub fn status(config_dir: &Path, current: &str) -> Status {
         None => return Status::Current,
     };
     match (parse(&from), parse(current)) {
-        (Some(old), Some(new)) if old < new => Status::Upgraded { from },
+        (Some(old), Some(new)) if old < new && !releases_since(&from, current).is_empty() => {
+            Status::Upgraded { from }
+        }
         (Some(old), Some(new)) if old > new => Status::Downgraded { from },
         _ => Status::Current,
     }
@@ -263,14 +263,17 @@ mod tests {
     #[test]
     fn the_marker_decides_upgrade_downgrade_and_current() {
         let d = dir();
-        record(d.path(), "0.5.0").unwrap();
-        assert_eq!(status(d.path(), "0.5.0"), Status::Current);
+        record(d.path(), "0.4.3").unwrap();
         assert_eq!(
-            status(d.path(), "0.6.0"),
+            status(d.path(), "0.5.1"),
             Status::Upgraded {
-                from: "0.5.0".into()
+                from: "0.4.3".into()
             }
         );
+        record(d.path(), "0.5.0").unwrap();
+        assert_eq!(status(d.path(), "0.5.0"), Status::Current);
+        // No release in between has notes: nothing to show.
+        assert_eq!(status(d.path(), "0.5.1"), Status::Current);
         assert_eq!(
             status(d.path(), "0.4.3"),
             Status::Downgraded {
