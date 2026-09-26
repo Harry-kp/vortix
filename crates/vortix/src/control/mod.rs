@@ -363,6 +363,9 @@ impl Control {
                     let _ = settled.recv();
                 }
                 let snapshot = self.snapshot();
+                if snapshot.outcomes.get(&ticket) == Some(&Outcome::Done) {
+                    return Ok(());
+                }
                 return Err(snapshot.net_error.as_ref().map_or_else(
                     || "timed out waiting for the VPN".into(),
                     |error| format!("network settings not applied: {error}"),

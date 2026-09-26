@@ -199,6 +199,7 @@ pub(super) fn handle_up(
         .unwrap_or_else(|| {
             print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
         });
+    let engine_config = timeout_secs.map(|secs| config.with_connect_budget(target.protocol, secs));
     let timeout_secs = connect_operation_timeout_secs(timeout_secs, target.protocol, config);
     let protocol = target.protocol.to_string();
     show_lifecycle_progress(
@@ -208,8 +209,12 @@ pub(super) fn handle_up(
         Some(&protocol),
         timeout_secs,
     );
-    let control = crate::control::Control::start(config, config_dir, profiles.clone())
-        .unwrap_or_else(|error| engine_failure_or_exit(mode, "up", error));
+    let control = crate::control::Control::start(
+        engine_config.as_ref().unwrap_or(config),
+        config_dir,
+        profiles.clone(),
+    )
+    .unwrap_or_else(|error| engine_failure_or_exit(mode, "up", error));
     // The engine knows each running tunnel's live routes, including a default
     // route its OpenVPN server pushed; the profile files alone do not.
     // `--yes` bypasses the gate for scripted callers.

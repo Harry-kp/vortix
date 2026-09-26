@@ -191,6 +191,21 @@ impl AppConfig {
         protocol_gate.saturating_add(crate::constants::CONTROL_COMPLETION_GRACE_SECS)
     }
 
+    /// This config with the connect budget for `protocol` set to `secs`, so
+    /// an explicit `--timeout` bounds the connect as well as the wait.
+    #[must_use]
+    pub fn with_connect_budget(&self, protocol: crate::profile::ProtocolKind, secs: u64) -> Self {
+        let gate = secs.saturating_sub(crate::constants::CONTROL_COMPLETION_GRACE_SECS);
+        let mut config = self.clone();
+        match protocol {
+            crate::profile::ProtocolKind::WireGuard => {
+                config.wireguard_handshake_timeout_secs = gate.max(1);
+            }
+            crate::profile::ProtocolKind::OpenVpn => config.connect_timeout = gate.max(1),
+        }
+        config
+    }
+
     /// Bound for one teardown plus control publication.
     #[must_use]
     pub const fn disconnect_operation_timeout_secs(&self) -> u64 {
@@ -849,6 +864,21 @@ mod tests {
             config.geolocation_api_fallback,
             crate::constants::DEFAULT_GEOLOCATION_API_FALLBACK
         );
+    }
+
+    /// `vortix up --timeout 60` must give the connect itself 60 s, not only
+    /// the wait: the engine stopped a 1024-route connect at its own 30 s.
+    #[test]
+    fn an_explicit_connect_budget_reaches_the_engine() {
+        use crate::profile::ProtocolKind;
+        let config = AppConfig::default();
+        for protocol in [ProtocolKind::WireGuard, ProtocolKind::OpenVpn] {
+            let longer = config.with_connect_budget(protocol, 90);
+            assert_eq!(longer.connect_operation_timeout_secs(protocol), 90);
+            // A tiny --timeout still leaves a valid config; the wait stops it.
+            let tiny = config.with_connect_budget(protocol, 2);
+            assert!(tiny.wireguard_handshake_timeout_secs >= 1 && tiny.connect_timeout >= 1);
+        }
     }
 
     #[test]
