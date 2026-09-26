@@ -13,7 +13,7 @@ cargo build -p vortix && sudo ./target/debug/vortix
 ## Ways to Contribute
 
 - 🐛 **Report bugs** — Open an issue with steps to reproduce
-- 💡 **Suggest features** — Check the [roadmap](ROADMAP.md) first, then open an issue
+- 💡 **Suggest features** — Check the [project board](https://github.com/users/Harry-kp/projects/6) first, then open an issue
 - 📖 **Improve docs** — README, code comments, examples
 - 🧪 **Add tests** — Unit tests, integration tests
 - 🐧 **Linux support** — Test and fix Linux distro differences

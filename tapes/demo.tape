@@ -13,7 +13,7 @@
 #      wg07.conf to wg-split.conf, wg14.conf to wg-dns-leak.conf, and
 #      04-openvpn-tcp-static-challenge.ovpn to ovpn-totp.ovpn in the clean
 #      demo profile directory, then import that directory into vortix.
-#   3. Configure sudo NOPASSWD for vortix    (see README "Linux: setting up sudo access")
+#   3. Allow vortix through sudo without a password (a NOPASSWD sudoers rule)
 #      — without this the tape stalls at the password prompt.
 #   4. Render the tape:                      vhs tapes/demo.tape
 #

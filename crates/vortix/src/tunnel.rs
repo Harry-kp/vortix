@@ -318,7 +318,7 @@ pub enum DegradedReason {
 ///
 /// `Unknown` is the initial state immediately after a successful `up` —
 /// telemetry hasn't reported yet. The TUI renders "Measuring…" in that
-/// window (v0.1.7 ROADMAP item).
+/// window.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ConnectionHealth {
