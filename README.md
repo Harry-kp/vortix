@@ -5,10 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/vortix.svg)](https://crates.io/crates/vortix)
 [![Homebrew](https://img.shields.io/badge/Homebrew-tap-orange?logo=homebrew)](https://github.com/Harry-kp/homebrew-tap)
 [![Arch Linux](https://img.shields.io/badge/Arch_Linux-extra-1793D1?logo=archlinux&logoColor=white)](https://archlinux.org/packages/extra/x86_64/vortix/)
-[![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)](https://github.com/Harry-kp/vortix)
-[![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://github.com/Harry-kp/vortix)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/Harry-kp/vortix?style=social)](https://github.com/Harry-kp/vortix)
 
 Terminal UI for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and leak guarding.
 
@@ -110,14 +107,14 @@ See the [usage guide](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md
 
 | Area | What Vortix provides |
 |---|---|
-| Protocols | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles |
-| Multi-tunnel | Concurrent tunnels, default-route ownership, split routes, conflict checks, and per-profile state |
-| Telemetry | Throughput, latency, jitter, packet loss, public IP, ISP, and location |
+| [Protocols](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#profiles) | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles |
+| [Multi-tunnel](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#multi-tunnel-behavior) | Concurrent tunnels, default-route ownership, split routes, conflict checks, and per-profile state |
+| [Telemetry](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#status) | Throughput, latency, jitter, packet loss, public IP, ISP, and location |
 | Security Guard | IPv4/IPv6 exposure, active DNS policy, encryption posture, and kill-switch state |
-| Kill switch | `off`, `block-on-drop`, and `vpn-only`, using PF on macOS or atomic nftables on Linux |
-| Automation | Human output, a versioned JSON envelope, NDJSON watch streams, and shell completions |
-| Diagnostics | Event logs, session journals, per-process socket audit, and `vortix report` |
-| Appearance | Seven built-in themes, including terminal-native light/dark colors |
+| [Kill switch](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#kill-switch) | `off`, `block-on-drop`, and `vpn-only`, using PF on macOS or atomic nftables on Linux |
+| [Automation](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#json-and-automation) | Human output, a versioned JSON envelope, NDJSON watch streams, and shell completions |
+| [Diagnostics](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#diagnostics-and-system-commands) | Event logs, session journals, per-process socket audit, and `vortix report` |
+| [Appearance](https://github.com/Harry-kp/vortix/blob/main/docs/configuration.md#themes) | Seven built-in themes, including terminal-native light/dark colors |
 
 ## Platform support
 
@@ -216,3 +213,7 @@ Development starts with `cargo build`, `cargo test`, and the full [CI parity](ht
 ## Star history
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=Harry-kp/vortix&type=Date)](https://star-history.dera.page/#Harry-kp/vortix&Date)
+
+---
+
+WireGuard® is a registered trademark of Jason A. Donenfeld. OpenVPN® is a registered trademark of OpenVPN Inc. Vortix is not affiliated with either.

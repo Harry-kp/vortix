@@ -30,6 +30,17 @@ Ways Linux contributors can help:
 
 If you regularly use Vortix on Linux and want to help more deeply, start in the [Linux tester discussion](https://github.com/Harry-kp/vortix/discussions/184) with your distro and what you are willing to test.
 
+## Before You Open a Pull Request
+
+**For anything bigger than a small fix, open an issue first** and wait for a reply, so neither
+of us spends time on a change that will not land.
+
+Pull requests I will close:
+- New dependencies, Cargo features or `unsafe` code that were not agreed in an issue first
+- A background daemon or privileged helper (removed on purpose)
+- Reformatting or renaming in files the change does not otherwise touch
+- A behaviour change or bug fix with no test that fails without it
+
 ## Development Workflow
 
 1. Fork the repo

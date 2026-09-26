@@ -1,0 +1,65 @@
+name: Bug report
+description: Something Vortix does wrong on your machine
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Most connection, DNS and permission problems are covered in the
+        [troubleshooting guide](https://github.com/Harry-kp/vortix/blob/main/docs/troubleshooting.md);
+        questions go to [Discussions](https://github.com/Harry-kp/vortix/discussions).
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you post
+      options:
+        - label: I searched existing issues, including closed ones.
+          required: true
+        - label: I removed private keys, passwords, server endpoints and public IPs from everything below.
+          required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      placeholder: "`sudo vortix up work` printed ... ; I expected it to connect."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. vortix import ./work.conf
+        2. sudo vortix up work
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Did this work in an earlier version?
+      options:
+        - "No, or I never tried an earlier version"
+        - "Yes (say which version below)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: report
+    attributes:
+      label: Output of `vortix report`
+      description: Version, OS, terminal, dependencies and config in one block. Run it on the affected machine.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Error messages, log lines, the earlier version that worked, or whether it happens every time.
