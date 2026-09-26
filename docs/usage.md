@@ -109,7 +109,35 @@ vortix status --brief
 vortix status --watch
 ```
 
-If a blocking CLI command times out the connect carries on; check `vortix status`.
+If `vortix up` times out, the connect is rolled back and nothing is left running; to wait
+longer, pass `--timeout <seconds>`.
+
+## Security Guard
+
+The dashboard's Security Guard panel checks whether traffic is actually protected, instead of
+trusting that a tunnel is up. Its first line is the verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `PROTECTED` | A full tunnel is up, your real address is hidden, DNS goes through the tunnel, the kill switch is on and working, and the cipher is not broken |
+| `PARTIAL` | A tunnel is up but something above fails, or only split tunnels are up (your default traffic still leaves directly) |
+| `⚠ EXPOSED` | No tunnel is up: sites see your real address |
+
+Each row ends in a mark: `✓` fine, `⚠` needs attention, `✗` a problem, `─` not applicable or
+not measured yet.
+
+| Row | Shows |
+|---|---|
+| Real IP / Real IPv4 / IPv6 | Your address without the VPN. Greyed with `last known` when carried over from an earlier session |
+| Exit IP / Exit IPv4 / IPv6 | The address sites see now. `✗ real IPv4 exposed` (or `v6 exposed — matches real IPv6`) when it equals your real one; `split-route — no exit` when only split tunnels are up |
+| Location | Where the exit address geolocates |
+| DNS | The resolver in use. `Unverified` means the tunnel's resolvers could not be applied; `Not provided` means the profile sets none, so queries use your normal resolver |
+| Killswitch | The mode. `VPN dropped` (`block-on-drop` is blocking after a drop; press `r` to reconnect), `Degraded` (the firewall rules could not be verified), or `off — not protecting` |
+| Encryption | The tunnel cipher and its grade: `modern AEAD`, `strong`, `deprecated` (upgrade to AES-GCM or ChaCha20-Poly1305) or `INSECURE` |
+
+The footer says how old the readings are (`Updated 12s ago`); a reading too old to trust shows
+`unavailable` instead of a value. Addresses come from public IP lookups (see
+[SECURITY.md](../SECURITY.md)); there is no Vortix server involved.
 
 ## Kill switch
 

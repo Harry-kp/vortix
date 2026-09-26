@@ -110,7 +110,7 @@ See the [usage guide](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md
 | [Protocols](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#profiles) | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles |
 | [Multi-tunnel](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#multi-tunnel-behavior) | Concurrent tunnels, default-route ownership, split routes, conflict checks, and per-profile state |
 | [Telemetry](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#status) | Throughput, latency, jitter, packet loss, public IP, ISP, and location |
-| Security Guard | IPv4/IPv6 exposure, active DNS policy, encryption posture, and kill-switch state |
+| [Security Guard](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#security-guard) | IPv4/IPv6 exposure, active DNS policy, encryption posture, and kill-switch state |
 | [Kill switch](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#kill-switch) | `off`, `block-on-drop`, and `vpn-only`, using PF on macOS or atomic nftables on Linux |
 | [Automation](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#json-and-automation) | Human output, a versioned JSON envelope, NDJSON watch streams, and shell completions |
 | [Diagnostics](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#diagnostics-and-system-commands) | Event logs, session journals, per-process socket audit, and `vortix report` |
