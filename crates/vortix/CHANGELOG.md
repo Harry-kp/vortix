@@ -6,25 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ## [0.5.1] - 2026-09-26
 
-### Bug Fixes
+### Fixed
 
-- WireGuard split tunnels with hundreds of routes import and connect ([#331](https://github.com/Harry-kp/vortix/pull/331))
-- An upgrade past releases with no notes shows no popup
-- The upgrade notes describe switching as it works
-- A timed-out or interrupted connect leaves nothing behind
-- Vortix up --timeout covers the connect, not only the wait
-- Settle and route clean-up handle what review found
+- **WireGuard split tunnels with hundreds of routes work again.** A profile carrying GitHub's published ranges (about 340 routes, 6 KB on one `AllowedIPs` line) was refused at import, and a slightly smaller one failed to connect with "no handshake" and was left running where Vortix could not see it. Profiles may now hold up to 1024 routes in total. ([#331](https://github.com/Harry-kp/vortix/pull/331))
+- **Connecting either finishes or leaves nothing behind.** A connect that runs out of time, or a dashboard quit while connecting, now rolls back fully; before, it could leave half a tunnel running that `vortix down` refused to remove. ([#334](https://github.com/Harry-kp/vortix/pull/334))
+- **Large WireGuard profiles connect and disconnect in seconds.** On macOS a 337-route profile took 23 s to connect and 26 s to disconnect, and 1024 routes could do neither; it is now 4 s and 1 s, and 1024 routes take 9 s and 3 s. ([#334](https://github.com/Harry-kp/vortix/pull/334))
 
-### Performance
+### Changed
 
-- Large WireGuard profiles connect and disconnect in seconds
-
-### Testing
-
-- The ownership record fits a profile at the route limit
-- One route generator for the route-limit tests
-
-
+- **`vortix up --timeout` sets how long the connect itself may take**, not only how long the command waits, so a larger value now helps. A timed-out `up` says nothing was left running and how to wait longer. ([#334](https://github.com/Harry-kp/vortix/pull/334))
 
 ## [0.5.0] - 2026-09-25
 
