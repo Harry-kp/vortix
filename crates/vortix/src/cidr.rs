@@ -297,6 +297,20 @@ fn covers_full_u128(ranges: &mut [(u128, u128)]) -> bool {
     cur_end == u128::MAX
 }
 
+/// `n` distinct routes for tests: `/24`s in 10/8, or the longest IPv6 form.
+#[cfg(test)]
+pub(crate) fn test_routes(n: usize, v6: bool) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            if v6 {
+                format!("2001:0db8:85a3:{i:04x}:0000:8a2e:0370:7334/128")
+            } else {
+                format!("10.{}.{}.0/24", i / 256, i % 256)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

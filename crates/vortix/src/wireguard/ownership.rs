@@ -530,9 +530,7 @@ mod tests {
         let profile = profile(temp.path(), 'a');
         let store =
             TunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a").unwrap();
-        let routes = (0..crate::wireguard::parser::MAX_ROUTES)
-            .map(|i| format!("2001:0db8:85a3:{i:04x}:0000:8a2e:0370:7334/128"))
-            .collect::<Vec<_>>();
+        let routes = crate::cidr::test_routes(crate::wireguard::parser::MAX_ROUTES, true);
         let mut evidence = handshake(7);
         evidence.allowed_routes.clone_from(&routes);
         let probe = ProbeReceipt {

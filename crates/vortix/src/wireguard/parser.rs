@@ -633,12 +633,7 @@ Address = 10.0.0.2/32
     /// line; 0.5.0 refused them at 4096 bytes and 256 routes.
     #[test]
     fn a_large_split_tunnel_parses_up_to_the_route_limit() {
-        let routes = |n: usize| {
-            (0..n)
-                .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let routes = |n| crate::cidr::test_routes(n, false).join(", ");
         let conf = |n: usize| format!("[Peer]\nPublicKey = BBBB\nAllowedIPs = {}\n", routes(n));
         assert!(routes(MAX_ROUTES).len() > 4096);
         let parsed = parse_wg_conf(&conf(MAX_ROUTES)).unwrap();

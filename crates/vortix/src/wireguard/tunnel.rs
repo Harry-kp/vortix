@@ -1808,10 +1808,7 @@ mod tests {
     /// short lines of the same routes parse at once.
     #[test]
     fn staged_body_splits_long_allowed_ips_into_equal_routes() {
-        let routes = (0..1024)
-            .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let routes = crate::cidr::test_routes(1024, false).join(", ");
         let body = format!(
             "[Interface]\nPrivateKey = SECRET\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = P\nAllowedIPs = {routes}\n"
         );
@@ -2426,10 +2423,7 @@ mod tests {
         let observed = UNIX_EPOCH + Duration::from_secs(1_000);
         // The kernel's own list, capped only by the dump size: 250 routes
         // made a connected tunnel look handshake-less and then invisible.
-        let routes = (0..2000)
-            .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
-            .collect::<Vec<_>>()
-            .join(",");
+        let routes = crate::cidr::test_routes(2000, false).join(",");
         let dump =
             format!("private\tpublic\t51820\toff\npeer\t(none)\t(none)\t{routes}\t900\t0\t0\t0\n");
         let peers = parse_wg_dump("wg0", &dump, observed, 1).unwrap().peers;
