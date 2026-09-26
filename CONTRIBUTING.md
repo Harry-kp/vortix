@@ -43,46 +43,25 @@ Pull requests I will close:
 
 ## Development Workflow
 
-1. Fork the repo
-2. Create a feature branch: `git checkout -b feat/my-feature`
-3. Make your changes
-4. Run what CI runs:
+1. Fork the repo and branch from `main`.
+2. Build and run as your user; only the binary needs root:
    ```bash
-   scripts/ci-local.sh           # full set
-   scripts/ci-local.sh --quick   # skips the release build
+   cargo build -p vortix && sudo ./target/debug/vortix
    ```
-   See [docs/ci-parity.md](docs/ci-parity.md) for the individual steps.
-5. Commit with [conventional commits](https://www.conventionalcommits.org/):
-   - `feat:` new feature
-   - `fix:` bug fix
-   - `docs:` documentation
-   - `refactor:` code refactoring
-6. Push and open a PR
+   Never `sudo cargo`. If an earlier one left `target/` owned by root:
+   `sudo chown -R "$(id -un):$(id -gn)" target`.
+3. Make the change with a test that fails without it.
+4. Run what CI runs, which must end with `All checks passed.`:
+   ```bash
+   scripts/ci-local.sh           # full set, before you push
+   scripts/ci-local.sh --quick   # without the release build, while iterating
+   ```
+   [docs/ci-parity.md](docs/ci-parity.md) maps it to each CI job.
+5. Commit with a [conventional commit](https://www.conventionalcommits.org/) subject
+   (`fix:`, `feat:`, `docs:`, `refactor:`, `test:`) and open a PR.
 
-## Code Style
-
-- `scripts/ci-local.sh` must pass before you push
-- Keep functions small and focused
-- Add doc comments for public APIs
-
-## Testing
-
-Vortix requires root for VPN operations. For testing:
-
-```bash
-# Run unit tests (no root needed)
-cargo test -p vortix
-
-# Run the debug build (never `sudo cargo`)
-cargo build -p vortix && sudo ./target/debug/vortix
-```
-
-For Linux bug reports, include as much of the following as possible:
-- distro + version
-- kernel version
-- install method (`cargo`, Homebrew, npm, package manager, binary installer)
-- `vortix report`
-- whether your system uses `iptables`, `nftables`, `firewalld`, `NetworkManager`, or `systemd-resolved`
+The project's rules (where code goes, comments, tests, boundaries) are in
+[CLAUDE.md](CLAUDE.md); they apply to people as much as to coding agents.
 
 ## Questions?
 
