@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-26
+
+### Bug Fixes
+
+- WireGuard split tunnels with hundreds of routes import and connect ([#331](https://github.com/Harry-kp/vortix/pull/331))
+- An upgrade past releases with no notes shows no popup
+- The upgrade notes describe switching as it works
+- A timed-out or interrupted connect leaves nothing behind
+- Vortix up --timeout covers the connect, not only the wait
+- Settle and route clean-up handle what review found
+
+### Performance
+
+- Large WireGuard profiles connect and disconnect in seconds
+
+### Testing
+
+- The ownership record fits a profile at the route limit
+- One route generator for the route-limit tests
+
+
+
 ## [0.5.0] - 2026-09-25
 
 ### Upgrading from 0.4.3
