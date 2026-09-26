@@ -113,8 +113,7 @@ impl Net {
         use crate::platform::Routes as table;
         // A prefix the target still carries is retargeted in place, never
         // deleted first: that gap leaks traffic onto the real address.
-        // A teardown removes its interface's routes; they stay recorded until
-        // it ends, and are unbound after if it left any.
+        // A teardown removes its interface's routes; they stay recorded until then.
         let (released, dropped): (Vec<_>, Vec<_>) = self
             .applied
             .routes
@@ -122,11 +121,10 @@ impl Net {
             .filter(|(cidr, _)| !target.routes.contains_key(cidr))
             .map(|(cidr, interface)| (*cidr, interface.clone()))
             .partition(|(_, interface)| target.releasing.contains(interface));
-        let gone = Self::misrouted(
-            &self.applied,
-            dropped.iter().map(|(cidr, interface)| (cidr, interface)),
-        );
-        for (cidr, interface) in dropped.iter().filter(|route| !gone.contains(route)) {
+        for (cidr, interface) in dropped
+            .iter()
+            .filter(|(_, interface)| crate::platform::interface_exists(interface))
+        {
             if let Err(error) = table::unbind_route(&cidr.to_string(), interface) {
                 tracing::warn!(target: "vortix::net", %cidr, %interface, %error, "route removal failed");
             }
@@ -240,8 +238,7 @@ impl Net {
         }
     }
 
-    /// The `routes` a packet would not take through their interface under
-    /// `plan`, found with one table read.
+    /// The `routes` a packet would not take through their interface.
     fn misrouted<'a>(
         plan: &NetworkPlan,
         routes: impl IntoIterator<Item = (&'a crate::cidr::Cidr, &'a String)>,

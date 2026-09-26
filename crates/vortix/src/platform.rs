@@ -23,6 +23,19 @@ pub use crate::macos::{
     MacNetworkStats as NetworkStats, MacRouteTable as Routes, PfFirewall as Firewall,
 };
 
+/// Whether a network interface exists; `if_nametoindex` is POSIX.
+#[must_use]
+pub fn interface_exists(interface: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(interface) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
+    // call. `if_nametoindex` only reads it and returns 0 for an unknown link.
+    #[allow(unsafe_code)]
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    index != 0
+}
+
 /// Live network-interface names; empty when enumeration fails, which
 /// callers must read as "unknown", not "none present".
 #[must_use]

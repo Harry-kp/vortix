@@ -416,7 +416,7 @@ impl Control {
 }
 
 impl Drop for Control {
-    /// Stop the engine; tunnels keep running and the next start adopts them.
+    /// Stop the engine after starts roll back and stops finish; up tunnels stay.
     fn drop(&mut self) {
         let _ = self.tx.send(Msg::Shutdown);
         if let Some(thread) = self.thread.take() {

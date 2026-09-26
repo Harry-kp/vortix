@@ -142,10 +142,12 @@ impl MacRouteTable {
         )
     }
 
-    /// [`Self::route_interface_for`] for many targets from one table read;
-    /// one `route get` each took 32 ms, 45 s for a 700-route tunnel.
+    /// [`Self::route_interface_for`] for many targets from one table read.
     #[must_use]
     pub fn route_interfaces_for(targets: &[IpAddr]) -> Vec<DefaultRouteObservation> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
         let table = crate::process::run(
             // xtask:allow-shell-regression: `netstat -rn` lists the whole table in one read; `route get` answers one address per process.
             CommandSpec::oneshot("netstat", vec!["-rn".into()])

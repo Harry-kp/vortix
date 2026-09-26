@@ -21,7 +21,7 @@ impl MacInterface {
                 std::fs::read_to_string(&pid_file)
                     .map_or_else(|_| name.to_string(), |s| s.trim().to_string()),
             )
-        } else if interface_exists(name) {
+        } else if crate::platform::interface_exists(name) {
             Some(name.to_string())
         } else {
             None
@@ -54,11 +54,6 @@ impl MacInterface {
         let (ip, mtu) = get_interface_addr_and_mtu(interface);
         (ip.unwrap_or_default(), mtu.unwrap_or_default())
     }
-}
-
-fn interface_exists(name: &str) -> bool {
-    let (address, mtu) = get_interface_addr_and_mtu(name);
-    address.is_some() || mtu.is_some()
 }
 
 /// Read both IPv4 address and MTU for `interface` from `libc::getifaddrs`.

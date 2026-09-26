@@ -31,7 +31,7 @@ const WG_QUICK_DOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STATUS_POLL: Duration = Duration::from_millis(250);
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
 const MIN_STATUS_POLL: Duration = Duration::from_millis(10);
 const MAX_STATUS_POLL: Duration = Duration::from_secs(5);
 const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -204,8 +204,7 @@ pub(crate) fn strip_dns_directive(text: &str) -> String {
     out
 }
 
-/// The copy `wg-quick` reads: no `DNS`, and `AllowedIPs` over short lines.
-/// Its shell parser takes seconds per kilobyte of one line on macOS.
+/// The copy `wg-quick` reads: no `DNS`; long `AllowedIPs` split (its parser is slow on long lines).
 fn staged_body(text: &str) -> String {
     use std::fmt::Write as _;
     const PER_LINE: usize = 32;

@@ -542,7 +542,7 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
         let current = match read_resolved_state(&mut self.runner, interface) {
             Ok(current) => current,
             Err(error) => {
-                if interface_exists(interface) {
+                if crate::platform::interface_exists(interface) {
                     return Err(error);
                 }
                 self.ownership.resolved.remove(interface);
@@ -559,7 +559,7 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
         if let Err(error) = write_resolved_state(&mut self.runner, interface, &owned.prior)
             .and_then(|()| verify_resolved_state(&mut self.runner, interface, &owned.prior))
         {
-            if interface_exists(interface) {
+            if crate::platform::interface_exists(interface) {
                 return Err(error);
             }
         }
@@ -615,7 +615,7 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
                 // a real rollback failure. Checking existence before
                 // attempting the write would skip the rollback entirely
                 // whenever the name is not a live link on this host.
-                if interface_exists(interface) {
+                if crate::platform::interface_exists(interface) {
                     errors.push(format!("rollback DNS on {interface}: {error}"));
                 }
             }
@@ -631,7 +631,7 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
                     verify_resolved_state(&mut self.runner, interface, &previous.applied)
                 })
             {
-                if interface_exists(interface) {
+                if crate::platform::interface_exists(interface) {
                     errors.push(format!("rollback released DNS on {interface}: {error}"));
                 }
             }
@@ -1139,22 +1139,6 @@ fn try_get_dns_nmcli() -> Option<String> {
 fn try_get_dns_resolv_conf() -> Option<String> {
     let content = std::fs::read_to_string(RESOLV_CONF_PATH).ok()?;
     parse_resolv_conf_server(&content)
-}
-
-/// Whether a network interface still exists on this host.
-///
-/// `if_nametoindex` is POSIX, so this holds on every distribution and inside
-/// containers or namespaces where `/sys` may be absent or restricted. Matching
-/// `resolvectl`'s error text would have been neither stable nor portable.
-fn interface_exists(interface: &str) -> bool {
-    let Ok(name) = std::ffi::CString::new(interface) else {
-        return false;
-    };
-    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
-    // call. `if_nametoindex` only reads it and returns 0 for an unknown link.
-    #[allow(unsafe_code)]
-    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-    index != 0
 }
 
 /// Check whether `resolvconf` is installed and functional.
