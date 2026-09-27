@@ -33,11 +33,14 @@ change (`feat!:` / `fix!:`, or a `BREAKING CHANGE:` footer) on a commit that tou
 | Secret | Used by |
 |---|---|
 | `RELEASE_PLZ_TOKEN` | release-plz, to open PRs that trigger CI |
-| `CARGO_REGISTRY_TOKEN` | crates.io publish |
 | `HOMEBREW_TAP_TOKEN` | the Homebrew formula push to `Harry-kp/homebrew-tap` |
 
-npm needs no secret: `npm-publish.yml` uses npm trusted publishing. Its one-time setup is on
-npmjs.com, under the package's Settings → Trusted publisher: GitHub Actions, repository
-`Harry-kp/vortix`, workflow `release.yml` (the caller, not `npm-publish.yml`).
+crates.io and npm need no secret: both use trusted publishing, where the registry checks the
+workflow's GitHub identity token. One-time setup, as the package owner:
+
+- crates.io: the crate's Settings → Trusted Publishing → add GitHub: owner `Harry-kp`,
+  repository `vortix`, workflow `release-plz.yml`, no environment.
+- npmjs.com: the package's Settings → Trusted publisher → GitHub Actions: `Harry-kp/vortix`,
+  workflow `release.yml` (the caller, not `npm-publish.yml`).
 
 A failed publish job can be re-run alone: `gh run rerun <run-id> --failed`.

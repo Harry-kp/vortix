@@ -3,6 +3,8 @@ name: Release-plz
 permissions:
   pull-requests: write
   contents: write
+  # crates.io trusted publishing: release-plz trades this token for a publish token.
+  id-token: write
 
 on:
   # Trigger on push to main - this handles both:
@@ -35,4 +37,3 @@ jobs:
         uses: MarcoIeni/release-plz-action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
