@@ -61,7 +61,7 @@
         "guid": "six-month-grant",
         "status": "active",
         "name": "Six months of development",
-        "description": "1. Months 1-2: start at boot, with the kill switch on before the network comes up (issues #16, #250). 2. Months 3-4: automated OpenVPN and DNS-leak tests in CI. 3. Months 5-6: exclude the LAN or chosen networks from a tunnel from the dashboard (issue #15). Budget: maintainer time, about 10-12 hours a week for 26 weeks (INR 2,55,000); two VPN test servers for a year (INR 24,000); an ARM64 Linux test device (INR 12,000); an Apple Developer account to sign the macOS builds (INR 9,000). A short report after each milestone; all work stays MIT-licensed and public.",
+        "description": "Months 1-2: start at boot with the kill switch on before the network (#16, #250). Months 3-4: OpenVPN and DNS-leak tests in CI. Months 5-6: exclude LAN or chosen networks from a tunnel (#15). Budget (INR): maintainer time 2,55,000; two VPN test servers for a year 24,000; ARM64 test device 12,000; Apple Developer account 9,000. A report after each milestone; all work stays MIT-licensed.",
         "amount": 300000,
         "currency": "INR",
         "frequency": "one-time",
