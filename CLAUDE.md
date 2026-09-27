@@ -231,6 +231,9 @@ are in [`docs/performance.md`](docs/performance.md).
 - The `vortix secrets` command, `metadata.json`, the iptables backend (nftables
   only; legacy chains are just cleaned up), `core/`, `utils.rs`, the TUI's
   separate tunnel registry and its `Connection`/`TunnelSnapshot` render model.
+- cargo-dist's npm installer (`"npm"` in `installers`): its package downloads the binary in
+  `postinstall`, which npm 11+ global installs, pnpm and Bun skip, leaving users with EACCES.
+  `scripts/npm-package.sh` ships the binaries instead.
 
 ## Lessons that cost a CI cycle or a bug
 
