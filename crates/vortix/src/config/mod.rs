@@ -776,14 +776,15 @@ pub struct LifecycleLock {
 
 /// Turn a lifecycle-lock failure into concise, actionable user-facing copy.
 #[must_use]
-pub fn lifecycle_lock_user_message(error: &std::io::Error) -> String {
+pub fn lifecycle_lock_user_message(error: &std::io::Error, config_dir: &std::path::Path) -> String {
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return "Another Vortix process is managing VPN state. Close the running Vortix session or wait for its command to finish, then try again."
             .to_string();
     }
     if error.kind() == std::io::ErrorKind::PermissionDenied {
+        let dir = config_dir.display().to_string().replace('\'', "'\\''");
         return format!(
-            "Vortix cannot open its session lock: {error}\n  hint: The lock file is owned by another user. Run: sudo chown -R $(id -u):$(id -g) \"${{XDG_CONFIG_HOME:-$HOME/.config}}/vortix\""
+            "Vortix cannot open its session lock: {error}\n  hint: The lock file is owned by another user. Run: sudo chown -R $(id -u):$(id -g) '{dir}'"
         );
     }
     format!("Vortix could not open its session lock: {error}")
@@ -1417,13 +1418,26 @@ mod private_config_dir_tests {
     fn busy_lifecycle_lock_has_a_plain_user_message() {
         let error = std::io::Error::from(std::io::ErrorKind::WouldBlock);
 
-        let message = lifecycle_lock_user_message(&error);
+        let message = lifecycle_lock_user_message(&error, std::path::Path::new("/unused"));
 
         assert_eq!(
             message,
             "Another Vortix process is managing VPN state. Close the running Vortix session or wait for its command to finish, then try again."
         );
         assert!(!message.contains("Resource temporarily unavailable"));
+    }
+
+    #[test]
+    fn lock_owned_by_another_user_hints_the_config_dir_in_use() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let message = lifecycle_lock_user_message(&error, std::path::Path::new("/srv/it's vortix"));
+
+        assert!(
+            message.contains(r"sudo chown -R $(id -u):$(id -g) '/srv/it'\''s vortix'"),
+            "{message}"
+        );
+        assert!(!message.contains("XDG_CONFIG_HOME"), "{message}");
     }
 
     #[test]

@@ -99,7 +99,10 @@ fn main() -> Result<()> {
         Some(match vortix::config::acquire_lifecycle_lock() {
             Ok(lock) => lock,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                eprintln!("{}", vortix::config::lifecycle_lock_user_message(&error));
+                eprintln!(
+                    "{}",
+                    vortix::config::lifecycle_lock_user_message(&error, &config_dir)
+                );
                 std::process::exit(cli::output::ExitCode::StateConflict.code());
             }
             Err(error) => {
@@ -107,7 +110,10 @@ fn main() -> Result<()> {
                 // cleanly; this one returned an eyre error, so a lock the
                 // user simply could not open came with a source location and
                 // backtrace hints attached.
-                eprintln!("{}", vortix::config::lifecycle_lock_user_message(&error));
+                eprintln!(
+                    "{}",
+                    vortix::config::lifecycle_lock_user_message(&error, &config_dir)
+                );
                 let exit = if error.kind() == std::io::ErrorKind::PermissionDenied {
                     cli::output::ExitCode::PermissionDenied
                 } else {

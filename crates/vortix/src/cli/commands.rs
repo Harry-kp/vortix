@@ -261,8 +261,11 @@ pub(super) fn acquire_lifecycle_lock_or_exit(
                     } else {
                         "lock_failed"
                     },
-                    message: crate::config::lifecycle_lock_user_message(&error),
-                    hint: (!busy).then(|| "Check ownership of the Vortix config directory.".into()),
+                    message: crate::config::lifecycle_lock_user_message(
+                        &error,
+                        &crate::config::get_config_dir().unwrap_or_default(),
+                    ),
+                    hint: None,
                 },
                 if busy {
                     ExitCode::StateConflict
