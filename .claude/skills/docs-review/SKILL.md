@@ -12,11 +12,11 @@ the fix goes in the same commit.
 ## 1. Run the mechanical check
 
 ```bash
-cargo xtask check-docs
+cargo xtask check-docs && cargo test -p vortix --test suite docs_match_code
 ```
 
-It covers links and anchors, the subcommands and flags in `docs/usage.md`, and the config keys
-in `docs/configuration.md`. Fix every failure before going on.
+The first covers links and anchors; the second, the subcommands and flags in `docs/usage.md`
+and the config keys in `docs/configuration.md`. Fix every failure before going on.
 
 ## 2. Map the diff to its owners
 

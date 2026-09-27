@@ -12,6 +12,7 @@ mod control_scenarios;
 
 mod cli_profile_mutation;
 mod dns_policy;
+mod docs_match_code;
 mod json_v2_envelope;
 mod openvpn_credential_store;
 mod profile_identity;

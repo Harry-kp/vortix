@@ -187,8 +187,8 @@ fact has one owner; everything else links to it.
 | Module ownership, a rule, a lesson | this file |
 
 `README.md` only summarises and links. A key change touches three places: `app/input.rs`, the
-in-app help (`HELP_TEXT` in `ui/overlays.rs`) and `docs/usage.md`. `cargo xtask check-docs` (CI and `ci-local.sh`) fails on a broken link or anchor, an
-undocumented subcommand or flag, or an undocumented config key. Everything else is caught by the
+in-app help (`HELP_TEXT` in `ui/overlays.rs`) and `docs/usage.md`. `cargo xtask check-docs` fails on a broken link or anchor, and `tests/suite/docs_match_code.rs`
+on an undocumented subcommand, flag or config key; CI runs both even on docs-only PRs. Everything else is caught by the
 `docs-review` skill, which is mandatory before every commit alongside ponytail.
 
 ## Secrets

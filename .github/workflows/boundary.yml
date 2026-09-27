@@ -1,7 +1,7 @@
 name: Boundary
 
 on:
-  # Runs on docs-only changes too: check-docs keeps docs and code in step.
+  # Runs on docs-only changes too: the docs checks keep docs and code in step.
   push:
     branches: [main]
   pull_request:
@@ -28,5 +28,7 @@ jobs:
         run: cargo xtask check-protocol-leak
       - name: Shell-regression guard
         run: cargo xtask check-no-shell-regressions
-      - name: Docs match the code
+      - name: Doc links and anchors resolve
         run: cargo xtask check-docs
+      - name: Docs name every command, flag and config key
+        run: cargo test -p vortix --test suite docs_match_code
