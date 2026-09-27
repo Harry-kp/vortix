@@ -83,9 +83,9 @@ jobs:
           chmod +x vortix-x86_64-unknown-linux-musl/vortix
           sudo cp vortix-x86_64-unknown-linux-musl/vortix /usr/local/bin/vortix
 
-      - name: Install from Homebrew tap
+      - name: Install from Homebrew
         if: matrix.method == 'homebrew'
-        run: brew install Harry-kp/tap/vortix
+        run: brew install vortix
 
       - name: Install from npm
         if: matrix.method == 'npm-install'

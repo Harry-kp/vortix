@@ -3,7 +3,7 @@
 [![Test](https://github.com/Harry-kp/vortix/actions/workflows/test.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/test.yml)
 [![Lint](https://github.com/Harry-kp/vortix/actions/workflows/lint.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/lint.yml)
 [![Crates.io](https://img.shields.io/crates/v/vortix.svg)](https://crates.io/crates/vortix)
-[![Homebrew](https://img.shields.io/badge/Homebrew-tap-orange?logo=homebrew)](https://github.com/Harry-kp/homebrew-tap)
+[![Homebrew](https://img.shields.io/homebrew/v/vortix?logo=homebrew)](https://formulae.brew.sh/formula/vortix)
 [![Arch Linux](https://img.shields.io/badge/Arch_Linux-extra-1793D1?logo=archlinux&logoColor=white)](https://archlinux.org/packages/extra/x86_64/vortix/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
 
@@ -79,7 +79,7 @@ Then install Vortix using your preferred channel:
 
 | Channel | Install |
 |---|---|
-| Homebrew | `brew install Harry-kp/tap/vortix` |
+| Homebrew (macOS, Linux) | `brew install vortix` (also installs `wireguard-tools` and `openvpn`) |
 | Debian / Ubuntu | Download the `.deb` from [Releases](https://github.com/Harry-kp/vortix/releases), then `sudo apt install ./vortix_*_amd64.deb` (or `arm64`) |
 | Fedora / RHEL | Download the `.rpm` from [Releases](https://github.com/Harry-kp/vortix/releases), then `sudo dnf install ./vortix-*.x86_64.rpm` (or `aarch64`) |
 | Arch Linux | `sudo pacman -S vortix` |

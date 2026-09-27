@@ -13,8 +13,8 @@ step by step; this page is the pipeline it drives.
    to `main` in between.
 3. Merging the release PR publishes to crates.io and pushes the tag `vX.Y.Z`.
 4. The tag runs **cargo-dist** (`release.yml`): macOS (x86_64, arm64) and Linux gnu and musl
-   (x86_64, aarch64) archives, the GitHub release, the shell installer, the Homebrew tap and
-   npm. The release notes are that version's `CHANGELOG.md` section, which cargo-dist reads
+   (x86_64, aarch64) archives, the GitHub release, the shell installer and npm. Homebrew needs
+   nothing: homebrew-core's bot bumps the `vortix` formula when it sees the new tag. The release notes are that version's `CHANGELOG.md` section, which cargo-dist reads
    only from the repo root. Its `custom-linux-packages` job runs `linux-packages.yml`, which builds `.deb` and
    `.rpm` from the musl binaries with nfpm (`scripts/nfpm.yaml`), installs them on Ubuntu, Debian
    and Fedora images, and attaches them to the release. To add them to an older release:
@@ -33,7 +33,6 @@ change (`feat!:` / `fix!:`, or a `BREAKING CHANGE:` footer) on a commit that tou
 | Secret | Used by |
 |---|---|
 | `RELEASE_PLZ_TOKEN` | release-plz, to open PRs that trigger CI |
-| `HOMEBREW_TAP_TOKEN` | the Homebrew formula push to `Harry-kp/homebrew-tap` |
 
 crates.io and npm need no secret: both use trusted publishing, where the registry checks the
 workflow's GitHub identity token. One-time setup, as the package owner:
