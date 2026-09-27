@@ -8,8 +8,7 @@
     "email": "chaudharyharshit9@gmail.com",
     "description": "Developer in India. I build and maintain Vortix alone, alongside a full-time job, and test every release by hand on a real Mac and a Linux machine against real VPN servers.",
     "webpageUrl": {
-      "url": "https://github.com/Harry-kp/vortix",
-      "wellKnown": "https://github.com/Harry-kp/vortix/blob/main/.well-known/funding-manifest-urls"
+      "url": "https://github.com/Harry-kp/vortix"
     }
   },
   "projects": [
@@ -18,12 +17,10 @@
       "name": "Vortix",
       "description": "A terminal app, written in Rust, for running WireGuard and OpenVPN on Linux and macOS. It runs several tunnels at once, and has a kill switch that blocks traffic if a VPN drops, so the user's real IP never leaks. It's packaged in Arch Linux extra, Homebrew, crates.io and npm, ships .deb/.rpm packages, and is listed in awesome-rust and awesome-tuis.",
       "webpageUrl": {
-        "url": "https://github.com/Harry-kp/vortix",
-        "wellKnown": "https://github.com/Harry-kp/vortix/blob/main/.well-known/funding-manifest-urls"
+        "url": "https://github.com/Harry-kp/vortix"
       },
       "repositoryUrl": {
-        "url": "https://github.com/Harry-kp/vortix",
-        "wellKnown": "https://github.com/Harry-kp/vortix/blob/main/.well-known/funding-manifest-urls"
+        "url": "https://github.com/Harry-kp/vortix"
       },
       "licenses": [
         "spdx:MIT"
