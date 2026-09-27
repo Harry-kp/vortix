@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-27
+
+### Bug Fixes
+
+- In-app help and CLI text say what Vortix does
+- Release notes come from cargo-dist's own changelog support
+
+### Documentation
+
+- Structured bug form, question routing and a clearer README ([#337](https://github.com/Harry-kp/vortix/pull/337))
+- Explain the Security Guard panel ([#339](https://github.com/Harry-kp/vortix/pull/339))
+- User docs describe what Vortix actually does
+- Drop what no user needs: old upgrade paths, the roadmap, stale asset notes
+- Cargo binstall installs the prebuilt release binary ([#344](https://github.com/Harry-kp/vortix/pull/344))
+
+### Features
+
+- .deb and .rpm packages on every release
+
+### Refactor
+
+- Docs check reads the CLI and config from clap and serde
+
+
+
 ## [0.5.1] - 2026-09-26
 
 ### Fixed
