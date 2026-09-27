@@ -24,14 +24,17 @@ jobs:
           pattern: artifacts-*
           path: npm/
           merge-multiple: true
+      # No registry-url: setup-node would write a placeholder token that npm
+      # falls back to when the trusted-publishing exchange fails, hiding why.
       - uses: actions/setup-node@v4
         with:
           node-version: "24.x"
-          registry-url: "https://registry.npmjs.org"
       - run: npm install -g npm@11
       - name: Publish
         env:
           PLAN: ${{ inputs.plan }}
+          # Shows the trusted-publishing token exchange, which npm logs only at verbose.
+          NPM_CONFIG_LOGLEVEL: verbose
         run: |
           for pkg in $(echo "$PLAN" | jq -r '.releases[].artifacts[] | select(endswith("-npm-package.tar.gz"))'); do
             npm publish --access public "./npm/$pkg"
