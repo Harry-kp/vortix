@@ -1,0 +1,38 @@
+name: npm publish
+
+# Publishes cargo-dist's npm package with npm trusted publishing: npm checks
+# this workflow's identity token, so there is no NPM_TOKEN to expire. The
+# release workflow calls it after publishing. npm matches the *calling* workflow,
+# so the trusted publisher on npmjs.com names release.yml.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch npm packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: npm/
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install -g npm@11
+      - name: Publish
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          for pkg in $(echo "$PLAN" | jq -r '.releases[].artifacts[] | select(endswith("-npm-package.tar.gz"))'); do
+            npm publish --access public "./npm/$pkg"
+          done

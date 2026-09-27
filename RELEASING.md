@@ -35,6 +35,9 @@ change (`feat!:` / `fix!:`, or a `BREAKING CHANGE:` footer) on a commit that tou
 | `RELEASE_PLZ_TOKEN` | release-plz, to open PRs that trigger CI |
 | `CARGO_REGISTRY_TOKEN` | crates.io publish |
 | `HOMEBREW_TAP_TOKEN` | the Homebrew formula push to `Harry-kp/homebrew-tap` |
-| `NPM_TOKEN` | npm publish; publish tokens expire, and an expired one fails with a 404 |
+
+npm needs no secret: `npm-publish.yml` uses npm trusted publishing. Its one-time setup is on
+npmjs.com, under the package's Settings → Trusted publisher: GitHub Actions, repository
+`Harry-kp/vortix`, workflow `release.yml` (the caller, not `npm-publish.yml`).
 
 A failed publish job can be re-run alone: `gh run rerun <run-id> --failed`.

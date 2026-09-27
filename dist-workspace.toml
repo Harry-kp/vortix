@@ -11,9 +11,10 @@ ci = "github"
 installers = ["shell", "homebrew", "npm"]
 tap = "Harry-kp/homebrew-tap"
 npm-scope = "@harry-kp"
-publish-jobs = ["homebrew", "npm", "./linux-packages"]
+# npm publishes through ./npm-publish (trusted publishing, no token), not dist's own job
+publish-jobs = ["homebrew", "./npm-publish", "./linux-packages"]
 # The Linux packages job attaches its .deb and .rpm to the release
-github-custom-job-permissions = { "linux-packages" = { contents = "write" } }
+github-custom-job-permissions = { "linux-packages" = { contents = "write" }, "npm-publish" = { "id-token" = "write" } }
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "aarch64-apple-darwin",
