@@ -29,10 +29,6 @@
       "Bash(tmux capture-pane:*)",
       "Bash(tmux send-keys:*)"
     ],
-    "ask": [
-      "Bash(git push:*)",
-      "Bash(gh pr merge:*)"
-    ],
     "deny": [
       "Bash(sudo:*)",
       "Bash(git push --force:*)",
@@ -40,6 +36,10 @@
       "Bash(git push origin main:*)",
       "Bash(git reset --hard:*)",
       "Read(~/.config/vortix/profiles/**)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(gh pr merge:*)"
     ]
   },
   "hooks": {
@@ -54,5 +54,8 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "harry-kp@harry-kp-skills": true
   }
 }

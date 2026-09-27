@@ -6,28 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ## [0.5.2] - 2026-09-27
 
-### Bug Fixes
+### Highlights
 
-- In-app help and CLI text say what Vortix does
-- Release notes come from cargo-dist's own changelog support
+- **Packages for Debian, Ubuntu and Fedora.** Each release now carries `.deb` and `.rpm` packages for amd64 and arm64. They install Vortix to `/usr/bin`, so `sudo vortix` works without a symlink, and bring `wireguard-tools` and `openvpn` with them. Download them from the release page and install with `sudo apt install ./vortix_*.deb` or `sudo dnf install ./vortix-*.rpm`. ([#345](https://github.com/Harry-kp/vortix/pull/345))
 
-### Documentation
+### Fixed
 
-- Structured bug form, question routing and a clearer README ([#337](https://github.com/Harry-kp/vortix/pull/337))
-- Explain the Security Guard panel ([#339](https://github.com/Harry-kp/vortix/pull/339))
-- User docs describe what Vortix actually does
-- Drop what no user needs: old upgrade paths, the roadmap, stale asset notes
-- Cargo binstall installs the prebuilt release binary ([#344](https://github.com/Harry-kp/vortix/pull/344))
+- **The in-app help matches the dashboard.** The Roles tab lists the labels the Connection Details panel really shows, the Keys tab includes `f` (flip a panel), and the switch entry says the conflicting tunnel is stopped and the new one kept. `up --help` and `status --help` describe what they do today, including what `data.connection` holds in `status --json`. ([#341](https://github.com/Harry-kp/vortix/pull/341))
+- **`vortix killswitch off` without root asks for sudo.** It failed with an internal ownership error and exit code 1; it now exits 2 with "Re-run with: sudo vortix killswitch off", like every other mode change. ([#341](https://github.com/Harry-kp/vortix/pull/341))
 
-### Features
+### Changed
 
-- .deb and .rpm packages on every release
-
-### Refactor
-
-- Docs check reads the CLI and config from clap and serde
-
-
+- **`vortix update` only updates a Cargo install.** It used to run `cargo install` whatever the install method; for Homebrew, a package, npm or a source checkout it now exits 1 and names the right way to update, such as `brew upgrade vortix`. ([#341](https://github.com/Harry-kp/vortix/pull/341))
 
 ## [0.5.1] - 2026-09-26
 
