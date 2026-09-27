@@ -46,6 +46,8 @@ pub struct Tunnel {
     pub interface: Option<String>,
     /// Larger is newer; the newest full tunnel owns the default route.
     pub rank: u64,
+    /// When the current phase began: uptime while `Up`, otherwise how long
+    /// the connect, disconnect or reconnect wait has run.
     pub since: SystemTime,
     /// `Some` for a switch: the tunnels to stop once this one is up. Those
     /// its server's pushed routes turn out to conflict with are added then.
@@ -232,6 +234,7 @@ impl State {
             .filter(|tunnel| tunnel.phase == Phase::Up)
         {
             tunnel.phase = Phase::Waiting { retry_at };
+            tunnel.since = SystemTime::now();
             tunnel.interface = None;
             tunnel.recovering = Some(0);
             tunnel.draining = draining;
@@ -268,6 +271,7 @@ impl State {
             return false;
         }
         tunnel.phase = Phase::Stopping;
+        tunnel.since = SystemTime::now();
         true
     }
 
@@ -471,6 +475,36 @@ mod tests {
 
     fn id(value: &str) -> ProfileId {
         ProfileId::new(value)
+    }
+
+    /// The header counts Disconnecting and Reconnecting from `since`, which
+    /// still held the connect time, so an hour-long session showed 3600s.
+    #[test]
+    fn stopping_or_losing_a_tunnel_restarts_its_phase_clock() {
+        let an_hour_ago = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let fresh = |state: &State, id: &ProfileId| {
+            state.get(id).unwrap().since.elapsed().unwrap() < std::time::Duration::from_secs(60)
+        };
+        let mut state = State::default();
+        state.adopt(spec("01", "0.0.0.0/0"), "utun4".into(), 1, an_hour_ago);
+        state.adopt(spec("02", "10.250.0.0/24"), "utun5".into(), 2, an_hour_ago);
+
+        state.stop(&id("01"));
+        state.lost(&id("02"), None, false);
+
+        assert_eq!(state.get(&id("01")).unwrap().phase, Phase::Stopping);
+        assert!(
+            fresh(&state, &id("01")),
+            "Disconnecting counts from the stop"
+        );
+        assert!(matches!(
+            state.get(&id("02")).unwrap().phase,
+            Phase::Waiting { .. }
+        ));
+        assert!(
+            fresh(&state, &id("02")),
+            "Reconnecting counts from the drop"
+        );
     }
 
     /// A server can push its full route only after connecting, so a switch
