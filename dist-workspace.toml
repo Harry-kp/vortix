@@ -8,12 +8,12 @@ cargo-dist-version = "0.30.3"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "npm"]
-npm-scope = "@harry-kp"
-# npm publishes through ./npm-publish (trusted publishing, no token), not dist's own job
+installers = ["shell"]
+# npm-publish builds and publishes the npm package itself (binaries included, no
+# install script, trusted publishing); dist no longer builds one
 publish-jobs = ["./npm-publish", "./linux-packages"]
 # The Linux packages job attaches its .deb and .rpm to the release
-github-custom-job-permissions = { "linux-packages" = { contents = "write" }, "npm-publish" = { "id-token" = "write" } }
+github-custom-job-permissions = { "linux-packages" = { contents = "write" }, "npm-publish" = { "contents" = "read", "id-token" = "write" } }
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "aarch64-apple-darwin",

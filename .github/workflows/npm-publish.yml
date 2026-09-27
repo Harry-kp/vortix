@@ -1,6 +1,7 @@
 name: npm publish
 
-# Publishes cargo-dist's npm package with npm trusted publishing: npm checks
+# Publishes the npm package (scripts/npm-package.sh: the release's binaries, no
+# install script) with npm trusted publishing: npm checks
 # this workflow's identity token, so there is no NPM_TOKEN to expire. The
 # release workflow calls it after publishing. npm matches the *calling* workflow,
 # so the trusted publisher on npmjs.com names release.yml.
@@ -12,30 +13,30 @@ on:
         type: string
 
 permissions:
+  contents: read
   id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Fetch npm packages
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          pattern: artifacts-*
-          path: npm/
-          merge-multiple: true
+          persist-credentials: false
       # No registry-url: setup-node would write a placeholder token that npm
       # falls back to when the trusted-publishing exchange fails, hiding why.
       - uses: actions/setup-node@v4
         with:
           node-version: "24.x"
       - run: npm install -g npm@11
-      - name: Publish
+      - name: Build the package from the release's binaries
         env:
           PLAN: ${{ inputs.plan }}
+        run: scripts/npm-package.sh "$(echo "$PLAN" | jq -r '.announcement_tag')" npm-out
+      - name: Publish
+        env:
           # Shows the trusted-publishing token exchange, which npm logs only at verbose.
           NPM_CONFIG_LOGLEVEL: verbose
-        run: |
-          for pkg in $(echo "$PLAN" | jq -r '.releases[].artifacts[] | select(endswith("-npm-package.tar.gz"))'); do
-            npm publish --access public "./npm/$pkg"
-          done
+        run: npm publish --access public npm-out/*.tgz

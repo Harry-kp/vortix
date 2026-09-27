@@ -11,8 +11,8 @@ user gets:
 
 | Channel | Profile |
 |---|---|
-| Shell installer, Homebrew, npm, static musl (cargo-dist) | `dist`, which inherits `release` |
-| `cargo build --release` in a checkout | `release` |
+| Shell installer, npm, static musl, `.deb`/`.rpm` (the cargo-dist release archives) | `dist`, which inherits `release` |
+| Homebrew (homebrew-core builds from the source tarball), `cargo build --release` in a checkout | `release` |
 | `cargo install vortix`, docs.rs | `crates/vortix/Cargo.toml`'s own `[profile.release]` |
 
 Cargo ignores profiles in a workspace member, so `crates/vortix/Cargo.toml` repeats

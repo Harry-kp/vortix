@@ -38,7 +38,8 @@ jobs:
         if: matrix.method == 'npm-install'
         uses: actions/setup-node@v6
         with:
-          node-version: '20.x'
+          # npm 11+ blocks global install scripts, the case the npm package must survive.
+          node-version: '24.x'
 
       - name: Install Homebrew (Linux only — macOS ships it)
         if: matrix.method == 'homebrew' && runner.os == 'Linux'

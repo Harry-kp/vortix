@@ -13,7 +13,9 @@ step by step; this page is the pipeline it drives.
    to `main` in between.
 3. Merging the release PR publishes to crates.io and pushes the tag `vX.Y.Z`.
 4. The tag runs **cargo-dist** (`release.yml`): macOS (x86_64, arm64) and Linux gnu and musl
-   (x86_64, aarch64) archives, the GitHub release, the shell installer and npm. Homebrew needs
+   (x86_64, aarch64) archives, the GitHub release and the shell installer. Its
+   `custom-npm-publish` job (`npm-publish.yml`) packs those binaries into the npm package
+   (`scripts/npm-package.sh`: no install script, nothing downloaded) and publishes it. Homebrew needs
    nothing: homebrew-core's bot bumps the `vortix` formula when it sees the new tag. The release notes are that version's `CHANGELOG.md` section, which cargo-dist reads
    only from the repo root. Its `custom-linux-packages` job runs `linux-packages.yml`, which builds `.deb` and
    `.rpm` from the musl binaries with nfpm (`scripts/nfpm.yaml`), installs them on Ubuntu, Debian
