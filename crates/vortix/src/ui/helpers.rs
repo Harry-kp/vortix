@@ -219,9 +219,8 @@ fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
     // SAFETY: localtime_r writes into our stack-allocated `tm` and is
     // thread-safe (unlike localtime). We pass a valid pointer to both args.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // time_t is i64 on most platforms; u64→i64 is safe until year 2262
-    #[allow(clippy::cast_possible_wrap)]
-    let time_t = secs as libc::time_t;
+    // The type comes from localtime_r, so the (deprecated on musl) libc::time_t alias is never named.
+    let time_t = secs.try_into().ok()?;
     let result =
         unsafe { libc::localtime_r(std::ptr::from_ref(&time_t), std::ptr::from_mut(&mut tm)) };
     if result.is_null() {
