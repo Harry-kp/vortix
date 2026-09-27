@@ -81,7 +81,7 @@ Then install Vortix using your preferred channel:
 |---|---|
 | Homebrew | `brew install Harry-kp/tap/vortix` |
 | Arch Linux | `sudo pacman -S vortix` |
-| Cargo | `cargo install vortix` |
+| Cargo | `cargo binstall vortix` (prebuilt binary) or `cargo install vortix` (builds from source, needs about 4 GB of memory) |
 | npm | `npm install -g @harry-kp/vortix` |
 | Nix | `nix profile install github:Harry-kp/vortix` |
 | Shell installer | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/releases/latest/download/vortix-installer.sh \| sh` |
@@ -99,7 +99,7 @@ vortix status
 sudo vortix down work
 ```
 
-Changing tunnels, routes, DNS or the firewall needs root; `list`, `show` and `status` do not. If `sudo vortix` is not found after `cargo install` or the shell installer, link it once: `sudo ln -s ~/.cargo/bin/vortix /usr/local/bin/vortix`.
+Changing tunnels, routes, DNS or the firewall needs root; `list`, `show` and `status` do not. If `sudo vortix` is not found after a Cargo install or the shell installer, link it once: `sudo ln -s ~/.cargo/bin/vortix /usr/local/bin/vortix`.
 
 Every command, key and panel is in the [usage guide](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md).
 

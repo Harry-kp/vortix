@@ -5,7 +5,7 @@ to any issue after removing endpoint addresses you consider private.
 
 ## Starting Vortix
 
-**`sudo: vortix: command not found`.** `cargo install` and the shell installer put Vortix in
+**`sudo: vortix: command not found`.** `cargo install`, `cargo binstall` and the shell installer put Vortix in
 `~/.cargo/bin`, which `sudo` usually does not search. Link it once:
 
 ```bash
