@@ -11,8 +11,7 @@ const MARKER: &str = "state-version";
 /// Older versions wrote no marker; a config directory with profiles but no
 /// marker was last run by one of them.
 const UNMARKED: &str = "0.4.3";
-pub const CHANGELOG_URL: &str =
-    "https://github.com/Harry-kp/vortix/blob/main/crates/vortix/CHANGELOG.md";
+pub const CHANGELOG_URL: &str = "https://github.com/Harry-kp/vortix/blob/main/CHANGELOG.md";
 const UPGRADE_URL: &str =
     "https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md#upgrading-from-043-to-050";
 

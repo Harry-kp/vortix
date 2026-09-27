@@ -16,6 +16,8 @@ publish = true
 
 [[package]]
 name = "vortix"
+# At the root, where cargo-dist reads it for the GitHub release notes.
+changelog_path = "CHANGELOG.md"
 # cargo-semver-checks only works with library crates; vortix is a binary.
 # Version bumps are determined by conventional commits automatically:
 #   fix: -> patch (0.1.5 -> 0.1.6)

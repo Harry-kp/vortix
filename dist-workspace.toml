@@ -11,9 +11,9 @@ ci = "github"
 installers = ["shell", "homebrew", "npm"]
 tap = "Harry-kp/homebrew-tap"
 npm-scope = "@harry-kp"
-publish-jobs = ["homebrew", "npm", "./linux-packages", "./release-notes"]
-# Both custom jobs edit the release: one attaches .deb/.rpm, one adds the notes
-github-custom-job-permissions = { "linux-packages" = { contents = "write" }, "release-notes" = { contents = "write" } }
+publish-jobs = ["homebrew", "npm", "./linux-packages"]
+# The Linux packages job attaches its .deb and .rpm to the release
+github-custom-job-permissions = { "linux-packages" = { contents = "write" } }
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "aarch64-apple-darwin",

@@ -91,7 +91,7 @@ only after everything else for the release has merged:
 ```bash
 gh pr list --label release --json number,headRefName
 git fetch origin <branch> && git switch -c release-edit origin/<branch>
-# replace the generated `## [X.Y.Z]` section in crates/vortix/CHANGELOG.md
+# replace the generated `## [X.Y.Z]` section in CHANGELOG.md (repo root)
 git commit -am "docs: user-facing changelog for X.Y.Z" && git push origin HEAD:<branch>
 gh pr diff <number> | grep -A5 '^+## \[X.Y.Z\]'       # check it landed
 ```
@@ -106,6 +106,5 @@ anything in the changelog you could not verify.
 
 ## 8. After the release
 
-The release workflow adds the changelog section to the GitHub release as
-`## Release Notes` and attaches the `.deb` and `.rpm`. Check the release page;
-if the notes are missing, run `gh workflow run release-notes.yml -f tag=v<X.Y.Z>`.
+cargo-dist puts the `CHANGELOG.md` section on the GitHub release, and the
+release workflow attaches the `.deb` and `.rpm`. Check the release page.
