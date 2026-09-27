@@ -60,7 +60,7 @@ jobs:
       - name: Install on Ubuntu 24.04, Debian 12 and Fedora 41
         run: |
           export VERSION="$TAG"
-          check='command -v wg-quick openvpn && [ "$(command -v vortix)" = /usr/bin/vortix ] && vortix --version | grep -F "${VERSION#v}"'
+          check='command -v wg-quick && command -v openvpn && [ "$(command -v vortix)" = /usr/bin/vortix ] && vortix --version | grep -F "${VERSION#v}"'
           for image in ubuntu:24.04 debian:12; do
             docker run --rm -e VERSION -v "$PWD/packages:/p" "$image" sh -ec \
               "apt-get update -qq && apt-get install -y -qq /p/vortix_*_amd64.deb >/dev/null && $check"

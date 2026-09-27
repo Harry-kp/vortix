@@ -179,4 +179,4 @@ jobs:
       - name: Install on a clean image and check the protocol tools came along
         run: |
           docker run --rm -v "$PWD:/p" -w /p "${{ matrix.image }}" sh -ec \
-            '${{ matrix.install }} >/dev/null && command -v wg-quick openvpn && [ "$(command -v vortix)" = /usr/bin/vortix ] && vortix --version'
+            '${{ matrix.install }} >/dev/null && command -v wg-quick && command -v openvpn && [ "$(command -v vortix)" = /usr/bin/vortix ] && vortix --version'
