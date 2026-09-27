@@ -10,8 +10,8 @@
 #
 # Profiles are chosen by role, from `vortix list`. Set them in the environment
 # or answer the prompts once; answers (never secrets) are kept in
-# target/p0.env for the next run. A role left empty skips the scenarios that
-# need it.
+# target/p0.env for the next run (delete it to be asked again). A role left
+# empty, or set to empty, skips the scenarios that need it without asking.
 #   P0_FULL       full-tunnel profile (AllowedIPs 0/0 or redirect-gateway)
 #   P0_FULL2      a second full tunnel that declares 0/0 itself (conflict check)
 #   P0_SPLIT      a split-route profile
@@ -73,7 +73,7 @@ PROFILES=$(as_user "$VX" list 2>/dev/null | awk 'NR > 1 && NF >= 2 {print $1}')
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 ask() { # var description
     local var=$1 answer
-    [ -n "${!var:-}" ] && return
+    [ -n "${!var+set}" ] && return # set, even to empty: already answered
     [ -t 0 ] || return
     printf '%s — %s (empty to skip): ' "$var" "$2"
     read -r answer
@@ -85,7 +85,7 @@ ask() { # var description
 }
 if [ -t 0 ]; then
     missing=0
-    for v in P0_FULL P0_FULL2 P0_SPLIT P0_OVPN P0_OVPN_AUTH; do [ -n "${!v:-}" ] || missing=1; done
+    for v in P0_FULL P0_FULL2 P0_SPLIT P0_OVPN P0_OVPN_AUTH; do [ -n "${!v+set}" ] || missing=1; done
     [ "$missing" = 1 ] && { echo "Profiles:"; printf '  %s\n' $PROFILES; }
 fi
 ask P0_FULL "a full-tunnel profile"

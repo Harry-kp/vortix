@@ -166,7 +166,9 @@ Mac). Sync with `git fetch origin <branch> && git checkout -B lab FETCH_HEAD`
 `umask 022 && cargo test -p vortix` (the login umask 002 makes the file-safety tests refuse
 their temp dirs), and run as
 `sudo -n env SUDO_UID=1000 SUDO_GID=1000 SUDO_USER=harrykp ./target/debug/vortix …`.
-tmux session `vxlinux` has root windows 1 and 2 for the TUI. Check host state
+tmux session `vxlinux` has root windows 1 and 2 for the TUI. The lab also hosts
+`arch`, `cachyos` and `fedora44` VMs; `scripts/p0-vms.sh` runs the smoke set and a new
+user's journey in them (P0.md "Distro VMs"). Check host state
 with `ip -4 route`, `resolvectl dns`, `nft list table inet vortix_killswitch`.
 Anything verified live on macOS should be verified here too.
 

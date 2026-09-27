@@ -32,7 +32,9 @@ skill has the exact `lab()` function and `git apply` sync). Stop on red.
 ## 2–4. Smoke, risk, explore
 
 Run `sudo scripts/p0.sh` on both machines (the smoke set; on the Mac, in the
-root pane), then walk the risk-mapped workflows,
+root pane), and `scripts/p0-vms.sh` on the lab (P0.md "Distro VMs": the smoke set and a
+new user's install-to-uninstall journey on Arch, CachyOS and Fedora). Then walk the
+risk-mapped workflows,
 then about 15 minutes per machine trying to break what changed. Run the whole
 file when the engine, a firewall or DNS backend, or a protocol layer changed
 broadly.
@@ -75,6 +77,10 @@ Anything you decide not to fix (by design, or needing a product call) goes in
 the report as open, with its user-visible effect. It is never silently dropped.
 
 ## Finish
+
+0. After the release is published, run `P0_TAG=vX.Y.Z P0_SMOKE=0 scripts/p0-vms.sh` on the lab: the
+   journey installs the new release through every channel on each distro. A failure there
+   is a user-facing bug in the release; fix it in a patch release.
 
 1. Restore both machines to the state noted in step 0 and prove it: no
    tunnels, the kill-switch mode, empty pf anchor / nft table, the theme.

@@ -8,7 +8,6 @@ privileged container, plus one macOS release check.
 | `wg_happy_path.sh` | WireGuard connect, status, ping and disconnect between two network namespaces |
 | `killswitch.sh` | The nftables kill switch blocks traffic, leaves host rules alone and releases cleanly; runs `nft_killswitch.sh` for multi-tunnel dual-stack rules and a failed atomic replace |
 | `release_smoke.sh` | The release build links, runs and holds its CLI contracts and size budget (macOS, no root) |
-| `distro_ux_audit.sh <label> <binary>` | Manual: a fresh install as an ordinary user (umask, file ownership after sudo, missing tools, error wording), across distro images |
 
 `setup-netns.sh` makes two namespaces joined by a veth pair (server `10.99.0.1`, client
 `10.99.0.2`); `teardown-netns.sh` removes them, and both are safe to rerun. The images are
@@ -34,3 +33,6 @@ docker run --privileged --rm -v "$PWD:/workspace" -w /workspace vortix-integrati
              bash tests/integration/killswitch.sh && \
              bash tests/integration/teardown-netns.sh'
 ```
+
+A new user's install-to-uninstall journey on real Arch, CachyOS and Fedora machines is
+`scripts/p0-vms.sh` (see [P0.md](../../docs/manual-testing/P0.md#distro-vms)).
