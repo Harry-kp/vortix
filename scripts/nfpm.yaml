@@ -1,4 +1,4 @@
-# .deb and .rpm for vortix; filled in by scripts/linux-packages.sh.
+# .deb and .rpm for vortix; built by .github/workflows/linux-packages.yml.
 name: vortix
 version: ${VERSION}
 arch: ${ARCH}

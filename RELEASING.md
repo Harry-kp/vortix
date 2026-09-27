@@ -16,7 +16,7 @@ step by step; this page is the pipeline it drives.
    (x86_64, aarch64) archives, the GitHub release, the shell installer, the Homebrew tap and
    npm. The release notes are that version's `CHANGELOG.md` section, which cargo-dist reads
    only from the repo root. Its `custom-linux-packages` job runs `linux-packages.yml`, which builds `.deb` and
-   `.rpm` from the musl binaries (`scripts/linux-packages.sh`), installs them on Ubuntu, Debian
+   `.rpm` from the musl binaries with nfpm (`scripts/nfpm.yaml`), installs them on Ubuntu, Debian
    and Fedora images, and attaches them to the release. To add them to an older release:
    `gh workflow run linux-packages.yml -f tag=vX.Y.Z`.
 5. Extra release steps run as jobs of the release workflow: a release created with

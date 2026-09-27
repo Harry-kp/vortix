@@ -2,8 +2,8 @@ name: Installation Sanity
 
 on:
   schedule:
-    # Weekly on Monday at 06:00 UTC: install paths drift slowly. The release
-    # workflow checks the .deb and .rpm itself before attaching them.
+    # Weekly on Monday at 06:00 UTC: install paths drift slowly. The .deb and
+    # .rpm are checked by linux-packages.yml.
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
@@ -157,26 +157,3 @@ jobs:
           LOCATION=$(command -v vortix)
           echo "Installed at: $LOCATION"
           echo "$LOCATION" | grep -qE "^/usr/(s?bin)/vortix$"
-
-  linux-package:
-    name: install (${{ matrix.image }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: ubuntu:24.04
-            pattern: "vortix_*_amd64.deb"
-            install: apt-get update -qq && apt-get install -y -qq ./vortix_*_amd64.deb
-          - image: fedora:41
-            pattern: "vortix-*.x86_64.rpm"
-            install: dnf install -y -q ./vortix-*.x86_64.rpm
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Download the latest package
-        run: gh release download --repo Harry-kp/vortix --pattern "${{ matrix.pattern }}"
-      - name: Install on a clean image and check the protocol tools came along
-        run: |
-          docker run --rm -v "$PWD:/p" -w /p "${{ matrix.image }}" sh -ec \
-            '${{ matrix.install }} >/dev/null && command -v wg-quick && command -v openvpn && [ "$(command -v vortix)" = /usr/bin/vortix ] && vortix --version'

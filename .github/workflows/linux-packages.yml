@@ -3,6 +3,7 @@ name: Linux packages
 # Builds .deb and .rpm from a release's musl binaries, installs them on clean
 # distro images, and attaches them to the release. The release workflow calls
 # it after publishing; run it by hand to add packages to an existing release.
+# Weekly and on packaging PRs it checks the latest release without uploading.
 on:
   workflow_call:
     inputs:
@@ -14,10 +15,11 @@ on:
       tag:
         description: "Release tag, e.g. v0.5.1"
         required: true
+  schedule:
+    - cron: "0 6 * * 1"
   pull_request:
     paths:
       - "scripts/nfpm.yaml"
-      - "scripts/linux-packages.sh"
       - ".github/workflows/linux-packages.yml"
 
 permissions:
@@ -55,7 +57,17 @@ jobs:
           echo "${NFPM_SHA256}  nfpm.tar.gz" | sha256sum -c
           tar -xzf nfpm.tar.gz nfpm
           sudo mv nfpm /usr/local/bin/
-      - run: scripts/linux-packages.sh "$TAG" packages
+      - name: Build .deb and .rpm from the musl binaries
+        run: |
+          mkdir -p packages target/linux-package
+          for pair in x86_64:amd64 aarch64:arm64; do
+            triple="${pair%%:*}-unknown-linux-musl"
+            gh release download "$TAG" --repo Harry-kp/vortix --pattern "vortix-$triple.tar.xz" --output - |
+              tar -xJ -C target/linux-package --strip-components=1 "vortix-$triple/vortix"
+            for packager in deb rpm; do
+              VERSION="${TAG#v}" ARCH="${pair##*:}" nfpm package --config scripts/nfpm.yaml --packager "$packager" --target packages
+            done
+          done
       # Recommends pulls in wireguard-tools and openvpn, as a user's install would.
       - name: Install on Ubuntu 24.04, Debian 12 and Fedora 41
         run: |
@@ -68,5 +80,6 @@ jobs:
           docker run --rm -e VERSION -v "$PWD/packages:/p" fedora:41 sh -ec \
             "dnf install -y -q /p/vortix-*.x86_64.rpm && $check"
       - name: Attach to the release
-        if: github.event_name != 'pull_request'
+        # A called workflow sees the caller's event (the tag push), never `workflow_call`.
+        if: github.event_name != 'pull_request' && github.event_name != 'schedule'
         run: gh release upload "$TAG" packages/*.deb packages/*.rpm --repo Harry-kp/vortix --clobber
