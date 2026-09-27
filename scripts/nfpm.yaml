@@ -1,0 +1,24 @@
+# .deb and .rpm for vortix; filled in by scripts/linux-packages.sh.
+name: vortix
+version: ${VERSION}
+arch: ${ARCH}
+platform: linux
+section: net
+maintainer: Harry KP <harrykp@users.noreply.github.com>
+description: Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding
+homepage: https://github.com/Harry-kp/vortix
+license: MIT
+recommends:
+  - wireguard-tools
+  - openvpn
+contents:
+  - src: target/linux-package/vortix
+    dst: /usr/bin/vortix
+    file_info:
+      mode: 0755
+  - src: LICENSE
+    dst: /usr/share/doc/vortix/copyright
+    packager: deb
+  - src: LICENSE
+    dst: /usr/share/licenses/vortix/LICENSE
+    packager: rpm

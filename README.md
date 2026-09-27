@@ -71,7 +71,7 @@ sudo pacman -S wireguard-tools openvpn
 sudo dnf install wireguard-tools openvpn
 ```
 
-Installing Vortix does not pull these in, whichever channel you use — Vortix drives
+Only the `.deb` and `.rpm` packages pull these in; with any other channel, install them first. Vortix drives
 `wg-quick` and `openvpn` as subprocesses, so without them a profile imports but cannot
 connect. `vortix up` names the missing package and the install command for your distro.
 
@@ -80,6 +80,8 @@ Then install Vortix using your preferred channel:
 | Channel | Install |
 |---|---|
 | Homebrew | `brew install Harry-kp/tap/vortix` |
+| Debian / Ubuntu | Download the `.deb` from [Releases](https://github.com/Harry-kp/vortix/releases), then `sudo apt install ./vortix_*_amd64.deb` (or `arm64`) |
+| Fedora / RHEL | Download the `.rpm` from [Releases](https://github.com/Harry-kp/vortix/releases), then `sudo dnf install ./vortix-*.x86_64.rpm` (or `aarch64`) |
 | Arch Linux | `sudo pacman -S vortix` |
 | Cargo | `cargo binstall vortix` (prebuilt binary) or `cargo install vortix` (builds from source, needs about 4 GB of memory) |
 | npm | `npm install -g @harry-kp/vortix` |

@@ -1,0 +1,72 @@
+name: Linux packages
+
+# Builds .deb and .rpm from a release's musl binaries, installs them on clean
+# distro images, and attaches them to the release. The release workflow calls
+# it after publishing; run it by hand to add packages to an existing release.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.5.1"
+        required: true
+  pull_request:
+    paths:
+      - "scripts/nfpm.yaml"
+      - "scripts/linux-packages.sh"
+      - ".github/workflows/linux-packages.yml"
+
+permissions:
+  contents: write
+
+env:
+  NFPM_VERSION: "2.47.0"
+  NFPM_SHA256: "0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783"
+
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Pick the release
+        env:
+          PLAN: ${{ inputs.plan }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$PLAN" ]; then
+            tag=$(echo "$PLAN" | jq -r '.announcement_tag')
+          elif [ -n "$DISPATCH_TAG" ]; then
+            tag="$DISPATCH_TAG"
+          else
+            tag=$(gh release view --repo Harry-kp/vortix --json tagName -q .tagName)
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+      - name: Install nfpm
+        run: |
+          curl -fsSLo nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  nfpm.tar.gz" | sha256sum -c
+          tar -xzf nfpm.tar.gz nfpm
+          sudo mv nfpm /usr/local/bin/
+      - run: scripts/linux-packages.sh "$TAG" packages
+      # Recommends pulls in wireguard-tools and openvpn, as a user's install would.
+      - name: Install on Ubuntu 24.04, Debian 12 and Fedora 41
+        run: |
+          export VERSION="$TAG"
+          check='command -v wg-quick openvpn && [ "$(command -v vortix)" = /usr/bin/vortix ] && vortix --version | grep -F "${VERSION#v}"'
+          for image in ubuntu:24.04 debian:12; do
+            docker run --rm -e VERSION -v "$PWD/packages:/p" "$image" sh -ec \
+              "apt-get update -qq && apt-get install -y -qq /p/vortix_*_amd64.deb >/dev/null && $check"
+          done
+          docker run --rm -e VERSION -v "$PWD/packages:/p" fedora:41 sh -ec \
+            "dnf install -y -q /p/vortix-*.x86_64.rpm && $check"
+      - name: Attach to the release
+        if: github.event_name != 'pull_request'
+        run: gh release upload "$TAG" packages/*.deb packages/*.rpm --repo Harry-kp/vortix --clobber

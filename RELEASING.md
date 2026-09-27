@@ -14,7 +14,10 @@ step by step; this page is the pipeline it drives.
 3. Merging the release PR publishes to crates.io and pushes the tag `vX.Y.Z`.
 4. The tag runs **cargo-dist** (`release.yml`): macOS (x86_64, arm64) and Linux gnu and musl
    (x86_64, aarch64) archives, the GitHub release, the shell installer, the Homebrew tap and
-   npm.
+   npm. Its `custom-linux-packages` job runs `linux-packages.yml`, which builds `.deb` and
+   `.rpm` from the musl binaries (`scripts/linux-packages.sh`), installs them on Ubuntu, Debian
+   and Fedora images, and attaches them to the release. To add them to an older release:
+   `gh workflow run linux-packages.yml -f tag=vX.Y.Z`.
 5. After publishing, check the GitHub release page. A release created with `GITHUB_TOKEN`
    triggers no other workflow, so `release-notes.yml` and the release trigger of
    `install-sanity.yml` never run: prepend the changelog section as `## Release Notes` with
