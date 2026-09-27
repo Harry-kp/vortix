@@ -1,0 +1,98 @@
+{
+  "$schema": "https://fundingjson.org/schema/v1.1.0.json",
+  "version": "v1.1.0",
+  "entity": {
+    "type": "individual",
+    "role": "maintainer",
+    "name": "Harshit Chaudhary",
+    "email": "chaudharyharshit9@gmail.com",
+    "description": "Developer in India. I build and maintain Vortix alone, alongside a full-time job, and test every release by hand on a real Mac and a Linux machine against real VPN servers.",
+    "webpageUrl": {
+      "url": "https://github.com/Harry-kp/vortix",
+      "wellKnown": "https://github.com/Harry-kp/vortix/blob/main/.well-known/funding-manifest-urls"
+    }
+  },
+  "projects": [
+    {
+      "guid": "vortix",
+      "name": "Vortix",
+      "description": "A terminal app, written in Rust, for running WireGuard and OpenVPN on Linux and macOS. It runs several tunnels at once, and has a kill switch that blocks traffic if a VPN drops, so the user's real IP never leaks. It's packaged in Arch Linux extra, Homebrew, crates.io and npm, ships .deb/.rpm packages, and is listed in awesome-rust and awesome-tuis.",
+      "webpageUrl": {
+        "url": "https://github.com/Harry-kp/vortix",
+        "wellKnown": "https://github.com/Harry-kp/vortix/blob/main/.well-known/funding-manifest-urls"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/Harry-kp/vortix",
+        "wellKnown": "https://github.com/Harry-kp/vortix/blob/main/.well-known/funding-manifest-urls"
+      },
+      "licenses": [
+        "spdx:MIT"
+      ],
+      "tags": [
+        "vpn",
+        "networking",
+        "security",
+        "privacy",
+        "wireguard",
+        "openvpn",
+        "cli",
+        "tui",
+        "rust",
+        "linux"
+      ]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "bank-transfer",
+        "type": "bank",
+        "description": "Bank transfer to an Indian bank account; details on request by email."
+      },
+      {
+        "guid": "ko-fi",
+        "type": "payment-provider",
+        "address": "https://ko-fi.com/harrykp",
+        "description": "One-off or monthly support through Ko-fi."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "six-month-grant",
+        "status": "active",
+        "name": "Six months of development",
+        "description": "1. Months 1-2: start at boot, with the kill switch on before the network comes up (issues #16, #250). 2. Months 3-4: automated OpenVPN and DNS-leak tests in CI. 3. Months 5-6: exclude the LAN or chosen networks from a tunnel from the dashboard (issue #15). Budget: maintainer time, about 10-12 hours a week for 26 weeks (INR 2,55,000); two VPN test servers for a year (INR 24,000); an ARM64 Linux test device (INR 12,000); an Apple Developer account to sign the macOS builds (INR 9,000). A short report after each milestone; all work stays MIT-licensed and public.",
+        "amount": 300000,
+        "currency": "INR",
+        "frequency": "one-time",
+        "channels": [
+          "bank-transfer"
+        ]
+      },
+      {
+        "guid": "supporter",
+        "status": "active",
+        "name": "Supporter",
+        "description": "Monthly support for testing on real machines.",
+        "amount": 3,
+        "currency": "USD",
+        "frequency": "monthly",
+        "channels": [
+          "ko-fi"
+        ]
+      },
+      {
+        "guid": "any-amount",
+        "status": "active",
+        "name": "One-off support",
+        "description": "Any amount, once.",
+        "amount": 0,
+        "currency": "USD",
+        "frequency": "one-time",
+        "channels": [
+          "ko-fi"
+        ]
+      }
+    ]
+  }
+}
