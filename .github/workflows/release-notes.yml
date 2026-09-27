@@ -1,16 +1,21 @@
 name: Release Notes
 
-# cargo-dist creates the GitHub release with an install/download body only —
-# its changelog auto-detection doesn't reliably extract our keep-a-changelog
-# sections, so release pages shipped without notes (v0.4.2, v0.4.3 fixed by
-# hand). This workflow prepends the matching CHANGELOG.md section as
-# "## Release Notes" once the release is published, preserving dist's install
-# block below a separator. It lives in its own file so `dist generate` never
-# clobbers it (unlike release.yml).
+# cargo-dist writes an install/download body only, so this prepends the
+# matching CHANGELOG.md section as "## Release Notes". The release workflow
+# calls it after publishing (a release made with GITHUB_TOKEN fires no
+# `release` event); run it by hand to fix an existing release.
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.5.1"
+        required: true
 
 permissions:
   contents: write
@@ -26,10 +31,16 @@ jobs:
       - name: Prepend changelog section to release body
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
-          EXISTING_BODY: ${{ github.event.release.body }}
+          PLAN: ${{ inputs.plan }}
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          if [ -n "$PLAN" ]; then
+            TAG=$(echo "$PLAN" | jq -r '.announcement_tag')
+          else
+            TAG="$DISPATCH_TAG"
+          fi
+          EXISTING_BODY=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body)
 
           # Idempotency: if notes are already present (manual fix, or a
           # re-run), do nothing.

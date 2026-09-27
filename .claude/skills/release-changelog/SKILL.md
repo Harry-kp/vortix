@@ -106,7 +106,6 @@ anything in the changelog you could not verify.
 
 ## 8. After the release
 
-`release-notes.yml` does not run: a release created with `GITHUB_TOKEN`
-triggers no other workflow. Check the GitHub release page, and if it shows
-only the install instructions, prepend the changelog section as
-`## Release Notes` with `gh release edit v<X.Y.Z> --notes-file <file>`.
+The release workflow adds the changelog section to the GitHub release as
+`## Release Notes` and attaches the `.deb` and `.rpm`. Check the release page;
+if the notes are missing, run `gh workflow run release-notes.yml -f tag=v<X.Y.Z>`.

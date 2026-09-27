@@ -18,10 +18,11 @@ step by step; this page is the pipeline it drives.
    `.rpm` from the musl binaries (`scripts/linux-packages.sh`), installs them on Ubuntu, Debian
    and Fedora images, and attaches them to the release. To add them to an older release:
    `gh workflow run linux-packages.yml -f tag=vX.Y.Z`.
-5. After publishing, check the GitHub release page. A release created with `GITHUB_TOKEN`
-   triggers no other workflow, so `release-notes.yml` and the release trigger of
-   `install-sanity.yml` never run: prepend the changelog section as `## Release Notes` with
-   `gh release edit vX.Y.Z --notes-file <file>`.
+5. Its `custom-release-notes` job runs `release-notes.yml`, which prepends the version's
+   `crates/vortix/CHANGELOG.md` section to the release as `## Release Notes`. (These run as
+   jobs of the release workflow because a release created with `GITHUB_TOKEN` triggers no
+   other workflow.) Check the release page; to redo the notes:
+   `gh workflow run release-notes.yml -f tag=vX.Y.Z`.
 
 ## Versions
 
