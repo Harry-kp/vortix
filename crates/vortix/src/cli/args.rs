@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueHint};
 
-/// Terminal UI for `WireGuard` and `OpenVPN` — real-time telemetry, leak guarding, and kill switch.
+/// Terminal UI for `WireGuard` and `OpenVPN` with multi-tunnel control, real-time telemetry, and leak guarding.
 ///
 /// Run without arguments to launch the interactive dashboard.
 /// Use subcommands for headless CLI operations (ideal for scripts, cron, and AI agents).

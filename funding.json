@@ -15,7 +15,7 @@
     {
       "guid": "vortix",
       "name": "Vortix",
-      "description": "A terminal app, written in Rust, for running WireGuard and OpenVPN on Linux and macOS. It runs several tunnels at once, and has a kill switch that blocks traffic if a VPN drops, so the user's real IP never leaks. It's packaged in Arch Linux extra, Homebrew, crates.io and npm, ships .deb/.rpm packages, and is listed in awesome-rust and awesome-tuis.",
+      "description": "Terminal UI for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and leak guarding. It runs several tunnels at once, and has a kill switch that blocks traffic if a VPN drops, so the user's real IP never leaks. It's packaged in Arch Linux extra, Homebrew, crates.io and npm, ships .deb/.rpm packages, and is listed in awesome-rust and awesome-tuis.",
       "webpageUrl": {
         "url": "https://github.com/Harry-kp/vortix"
       },

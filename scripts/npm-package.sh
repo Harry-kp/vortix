@@ -22,7 +22,7 @@ const fs = require("node:fs");
 fs.writeFileSync(process.argv[1], JSON.stringify({
   name: "@harry-kp/vortix",
   version: process.env.VERSION,
-  description: "Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding",
+  description: "Terminal UI for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and leak guarding",
   license: "MIT",
   repository: "https://github.com/Harry-kp/vortix",
   homepage: "https://github.com/Harry-kp/vortix",

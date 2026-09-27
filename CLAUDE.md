@@ -193,6 +193,12 @@ in-app help (`HELP_TEXT` in `ui/overlays.rs`) and `docs/usage.md`. `cargo xtask 
 on an undocumented subcommand, flag or config key; CI runs both even on docs-only PRs. Everything else is caught by the
 `docs-review` skill, which is mandatory before every commit alongside ponytail.
 
+**The tagline is the one description of Vortix:** the line under the README title. Use it
+verbatim wherever Vortix is described: `Cargo.toml`, `vortix --help` (`cli/args.rs`), the crate
+docs, the npm and `.deb`/`.rpm` packages, `flake.nix`, `funding.json`, the GitHub repo
+description, and external listings. Shorten it only where a field has a hard limit
+(homebrew-core's `desc` is at most 80 characters). To change it, change every copy at once.
+
 ## Secrets
 
 Profiles contain private keys and passwords, on both machines: never print,

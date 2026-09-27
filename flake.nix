@@ -26,7 +26,7 @@
           doCheck = false;
 
           meta = with pkgs.lib; {
-            description = "Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding";
+            description = "Terminal UI for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and leak guarding";
             homepage = "https://github.com/Harry-kp/vortix";
             license = licenses.mit;
             mainProgram = "vortix";
