@@ -12,58 +12,45 @@ use ratatui::{
     Frame,
 };
 
-/// Render the Network Throughput chart, scoped to the primary tunnel.
-///
-/// Stage B: session-transfer totals come from
-/// the primary tunnel's snapshot. Rate history (`down/up_history`) stays
-/// on `app.runtime` because it's measured from the host's network stats
-/// rather than per-tunnel — secondary tunnels add to the same byte
-/// counters per H7.
-/// Current up/down rates and the session's cumulative transfer.
-fn stats_line<'a>(app: &App, session_rx: &'a str, session_tx: &'a str) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(" ▲ UP: ", Style::default().fg(theme::current().success)),
-        Span::styled(
-            format!(
-                "{:<10}",
-                crate::ui::helpers::format_bytes_speed(app.runtime.current_up)
+/// Current up/down rates and the session's cumulative transfer. When the
+/// padded, labelled form is wider than `width`, the rate words and padding go
+/// so the session totals stay on screen.
+fn stats_line(app: &App, session_rx: &str, session_tx: &str, width: usize) -> Line<'static> {
+    let up = helpers::format_bytes_speed(app.runtime.current_up);
+    let down = helpers::format_bytes_speed(app.runtime.current_down);
+    let line = |[up_label, down_label, session_label]: [&str; 3], up: String, down: String| {
+        let t = theme::current();
+        let rule = Style::default().fg(t.nord_polar_night_4);
+        Line::from(vec![
+            Span::styled(up_label.to_string(), Style::default().fg(t.success)),
+            Span::styled(up, Style::default().fg(t.text_primary)),
+            Span::styled(" │ ", rule),
+            Span::styled(
+                down_label.to_string(),
+                Style::default().fg(t.accent_primary),
             ),
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(
-            " │ ",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        ),
-        Span::styled(
-            " ▼ DOWN: ",
-            Style::default().fg(theme::current().accent_primary),
-        ),
-        Span::styled(
-            format!(
-                "{:<10}",
-                crate::ui::helpers::format_bytes_speed(app.runtime.current_down)
+            Span::styled(down, Style::default().fg(t.text_primary)),
+            Span::styled(" │ ", rule),
+            Span::styled(
+                session_label.to_string(),
+                Style::default().fg(t.text_secondary),
             ),
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(
-            " │ ",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        ),
-        Span::styled(
-            " Session: ",
-            Style::default().fg(theme::current().text_secondary),
-        ),
-        Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
-        Span::styled(
-            session_rx,
-            Style::default().fg(theme::current().text_primary),
-        ),
-        Span::styled(" ↑", Style::default().fg(theme::current().success)),
-        Span::styled(
-            session_tx,
-            Style::default().fg(theme::current().text_primary),
-        ),
-    ])
+            Span::styled("↓", Style::default().fg(t.nord_frost_3)),
+            Span::styled(session_rx.to_string(), Style::default().fg(t.text_primary)),
+            Span::styled(" ↑", Style::default().fg(t.success)),
+            Span::styled(session_tx.to_string(), Style::default().fg(t.text_primary)),
+        ])
+    };
+    let full = line(
+        [" ▲ UP: ", " ▼ DOWN: ", " Session: "],
+        format!("{up:<10}"),
+        format!("{down:<10}"),
+    );
+    if full.width() <= width {
+        full
+    } else {
+        line(["▲", "▼", "Session "], up, down)
+    }
 }
 
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
@@ -121,7 +108,13 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     frame.render_widget(
-        Paragraph::new(stats_line(app, &session_rx, &session_tx)).alignment(Alignment::Center),
+        Paragraph::new(stats_line(
+            app,
+            &session_rx,
+            &session_tx,
+            chunks[0].width as usize,
+        ))
+        .alignment(Alignment::Center),
         chunks[0],
     );
 
@@ -217,4 +210,28 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     ];
 
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chart is 52 cells wide inside its border in an 80-column terminal.
+    #[test]
+    fn session_totals_stay_visible_at_80_columns() {
+        let mut app = App::new_test();
+        app.runtime.current_up = 12_300_000;
+        app.runtime.current_down = 45_600_000;
+        let line = stats_line(&app, "1.21GiB", "300.5MiB", 52);
+        let text = line.to_string();
+        assert!(line.width() <= 52, "{text}");
+        assert!(text.contains("↓1.21GiB ↑300.5MiB"), "{text}");
+    }
+
+    #[test]
+    fn a_wide_chart_keeps_the_rate_labels() {
+        let app = App::new_test();
+        let text = stats_line(&app, "0B", "0B", 120).to_string();
+        assert!(text.contains("UP:") && text.contains("DOWN:"), "{text}");
+    }
 }
