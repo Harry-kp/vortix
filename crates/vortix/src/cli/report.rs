@@ -175,7 +175,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
         shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string()),
         is_root: crate::platform::is_root(),
         tools: collect_tool_statuses(),
-        config_dir: redact_home_prefix(&config_dir.display().to_string()),
+        config_dir: crate::config::home_relative(config_dir),
         config_source: config_source.to_string(),
         config_toml_status,
         profile_counts,
@@ -484,11 +484,7 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
         let _ = writeln!(body, "## Diagnostic Journal\n");
         let _ = writeln!(body, "```");
         if let Some(path) = &journal.session_path {
-            let _ = writeln!(
-                body,
-                "Session file: {}",
-                redact_home_prefix(&path.display().to_string())
-            );
+            let _ = writeln!(body, "Session file: {}", crate::config::home_relative(path));
         } else {
             let _ = writeln!(body, "Session file: (disk persistence disabled)");
         }
@@ -597,17 +593,6 @@ fn print_fallback(body: &str) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Replace the user's home directory prefix with `~` for privacy.
-fn redact_home_prefix(path: &str) -> String {
-    if let Some(home) = crate::config::user_home() {
-        let home_str = home.to_string_lossy();
-        if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
-            return format!("~{rest}");
-        }
-    }
-    path.to_string()
-}
 
 #[cfg(test)]
 mod tests {

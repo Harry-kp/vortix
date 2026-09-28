@@ -469,11 +469,15 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
         Line::from(""),
     ];
 
+    let value_width = inner.width.saturating_sub(10) as usize;
     if let Some(idx) = app.profile_list_state.selected() {
         if let Some(profile) = app.runtime.profiles.get(idx) {
             text.push(Line::from(vec![
                 Span::styled("Profile : ", Style::default().fg(palette.text_secondary)),
-                Span::styled(&profile.name, Style::default().fg(palette.accent_primary)),
+                Span::styled(
+                    crate::ui::helpers::truncate_to_width(&profile.name, value_width),
+                    Style::default().fg(palette.accent_primary),
+                ),
             ]));
             text.push(Line::from(vec![
                 Span::styled("Protocol: ", Style::default().fg(palette.text_secondary)),
@@ -485,9 +489,9 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
             text.push(Line::from(vec![
                 Span::styled("Config  : ", Style::default().fg(palette.text_secondary)),
                 Span::styled(
-                    crate::ui::helpers::truncate_to_width(
-                        &profile.config_path.display().to_string(),
-                        inner.width.saturating_sub(10) as usize,
+                    crate::ui::helpers::truncate_start_to_width(
+                        &crate::config::home_relative(&profile.config_path),
+                        value_width,
                     ),
                     Style::default().fg(palette.text_secondary),
                 ),
@@ -868,6 +872,20 @@ mod tests {
             assert!(out.contains(expected), "{out}");
             assert!(!out.contains(forbidden), "{out}");
         }
+    }
+
+    /// Connection Details is 26 columns wide in an 80-column terminal.
+    #[test]
+    fn a_long_config_path_keeps_its_file_name_at_80_columns() {
+        let mut app = App::new_test();
+        app.runtime.profiles.push(make_profile(
+            "01-openvpn-udp-full-inline",
+            PathBuf::from("/srv/vortix/profiles/01-openvpn-udp-full-inline.ovpn"),
+        ));
+        app.profile_list_state.select(Some(0));
+        let out = render_to_string(&mut app, 26, 10);
+        assert!(out.contains("…inline.ovpn"), "{out}");
+        assert!(out.contains("01-openvp..."), "{out}");
     }
 
     // ───────────── role_line: pure-function variants ─────────────

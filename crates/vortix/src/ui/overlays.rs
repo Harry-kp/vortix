@@ -1507,26 +1507,6 @@ pub mod import {
         }
     }
 
-    fn suffix_window(characters: &[char], budget: usize) -> String {
-        let mut width = 0;
-        let mut start = characters.len();
-        for (index, character) in characters.iter().enumerate().rev() {
-            let character_width = display_character(*character).width().unwrap_or(1);
-            let ellipsis = usize::from(index > 0);
-            if width + character_width + ellipsis > budget {
-                break;
-            }
-            width += character_width;
-            start = index;
-        }
-        let mut output = String::new();
-        if start > 0 && budget > 0 {
-            output.push('…');
-        }
-        output.extend(characters[start..].iter().copied().map(display_character));
-        output
-    }
-
     fn prefix_window(characters: &[char], budget: usize) -> String {
         let mut width = 0;
         let mut end = 0;
@@ -1570,7 +1550,10 @@ pub mod import {
         };
         let after_start = cursor + usize::from(cursor < characters.len());
         (
-            suffix_window(&characters[..cursor], left_budget),
+            crate::ui::helpers::truncate_start_to_width(
+                &characters[..cursor].iter().collect::<String>(),
+                left_budget,
+            ),
             cursor_text,
             prefix_window(&characters[after_start..], right_budget),
         )

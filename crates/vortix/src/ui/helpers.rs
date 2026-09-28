@@ -135,6 +135,31 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
     truncated
 }
 
+/// Keep the end of `text` within `budget` columns, marking a cut start with `…`.
+pub(crate) fn truncate_start_to_width(text: &str, budget: usize) -> String {
+    let characters: Vec<char> = text
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect();
+    let mut width = 0;
+    let mut start = characters.len();
+    for (index, character) in characters.iter().enumerate().rev() {
+        let character_width = character.width().unwrap_or(1);
+        let ellipsis = usize::from(index > 0);
+        if width + character_width + ellipsis > budget {
+            break;
+        }
+        width += character_width;
+        start = index;
+    }
+    let mut output = String::new();
+    if start > 0 && budget > 0 {
+        output.push('…');
+    }
+    output.extend(&characters[start..]);
+    output
+}
+
 /// Word-wrap `text` into lines of at most `width` columns; a word longer
 /// than a line is split.
 pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
@@ -324,6 +349,12 @@ mod tests {
         let r = centered_rect(50, 50, area);
         assert_eq!(r.width, 50);
         assert_eq!(r.height, 50);
+    }
+
+    #[test]
+    fn truncate_start_keeps_the_end() {
+        assert_eq!(truncate_start_to_width("/a/b/wg.conf", 9), "…/wg.conf");
+        assert_eq!(truncate_start_to_width("wg.conf", 8), "wg.conf");
     }
 
     #[test]

@@ -321,6 +321,15 @@ pub(crate) fn user_home() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
 
+/// `path` with the invoking user's home directory shown as `~`.
+pub(crate) fn home_relative(path: &Path) -> String {
+    match user_home().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// Loads `AppConfig` from `config.toml` in the given directory.
 ///
 /// Returns defaults if the file doesn't exist. Returns an error if the file
@@ -847,6 +856,15 @@ pub(crate) fn set_temp_config_dir() -> (tempfile::TempDir, std::sync::MutexGuard
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_relative_replaces_only_a_whole_home_directory() {
+        let home = user_home().expect("home");
+        assert_eq!(home_relative(&home.join("a/b.conf")), "~/a/b.conf");
+        assert_eq!(home_relative(&home), "~");
+        let sibling = PathBuf::from(format!("{}x/b.conf", home.display()));
+        assert_eq!(home_relative(&sibling), sibling.display().to_string());
+    }
 
     // ---- AppConfig defaults ----
 
