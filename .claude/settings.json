@@ -27,7 +27,15 @@
       "Bash(gh run view:*)",
       "Bash(gh run list:*)",
       "Bash(tmux capture-pane:*)",
-      "Bash(tmux send-keys:*)"
+      "Bash(tmux send-keys:*)",
+      "Bash(git push:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh label:*)",
+      "Bash(gh run rerun:*)",
+      "Bash(gh release view:*)",
+      "Bash(ssh -i ~/.ssh/vortix_lab_ed25519:*)",
+      "Bash(scp -i ~/.ssh/vortix_lab_ed25519:*)"
     ],
     "deny": [
       "Bash(sudo:*)",
@@ -36,13 +44,20 @@
       "Bash(git push origin main:*)",
       "Bash(git reset --hard:*)",
       "Read(~/.config/vortix/profiles/**)"
-    ],
-    "ask": [
-      "Bash(git push:*)",
-      "Bash(gh pr merge:*)"
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-merge.sh"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
