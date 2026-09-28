@@ -10,10 +10,17 @@ supervision: create a branch, commit, push it, open a PR, and squash-merge once
 the gate in step 11 passes. Never `sudo` on the Mac, force-push, push to `main`,
 or touch other branches or PRs. Read `CLAUDE.md` first; it is the rulebook.
 
-`git push` and `gh pr merge` still ask for approval (`.claude/settings.json`).
-Keep it to one push and one merge: finish both reviews (step 8) and
+Keep it to one push and one merge: finish the reviews (step 8) and
 `scripts/ci-local.sh` before the first push. If a prompt is denied or nobody
 answers, stop and report the branch name and the exact command left to run.
+
+**An approved feature** (an issue labelled `approved`, usually handed over by
+`autopilot`) takes the same path with three differences. Its issue body is the spec,
+and its **Acceptance criteria** replace the bug report. Step 3 shows live that the
+behaviour is missing. Step 4 writes one test per criterion, and step 5 is the design:
+which owner in CLAUDE.md's "Where things live" gets the change. Subjects use `feat:`.
+Anything the spec leaves open that would change user-visible behaviour is a question on
+the issue (label `blocked`), not a guess.
 
 **Several issues at once:** one branch and one PR for all of them, with one
 commit per issue (each ending `Fixes #<n>`). Run steps 1–8 per issue and
@@ -156,10 +163,9 @@ Three passes over `git diff origin/main` (staged and unstaged), all required:
    here; keep the one that covers every path.
 2. **Docs (mandatory):** run the `docs-review` skill. A changed flag, key,
    message, setting or default updates its doc in this commit.
-3. **Correctness:** run `/code-review` if available, otherwise read the diff
-   and check correctness, missed sibling callers, test strength, and CLAUDE.md
-   rules (boundaries, kill switch vocabulary, no plan IDs in comments, no stray
-   `#[allow]`).
+3. **Correctness:** spawn the `reviewer` agent (`.claude/agents/reviewer.md`)
+   on the branch. It runs in a fresh context, so it doesn't share the
+   author's assumptions. Act on every finding it verified.
 
 Fix real findings, then re-run `scripts/ci-local.sh`. Commit only after all three
 passes; if a later change lands on the branch, review that change the same way.
@@ -200,7 +206,8 @@ all of these hold:
 
 - every `gh pr checks` row is `pass` or `skipping` — none `fail`, `pending` or
   `cancel` (release and dependabot jobs always show `skipping`);
-- the review in step 8 has no unresolved findings;
+- the review in step 8 has no unresolved findings, and the `reviewer` said
+  `APPROVE`;
 - the new test failed before the fix and passes after.
 
 ```bash

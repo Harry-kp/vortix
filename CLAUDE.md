@@ -10,6 +10,13 @@ run `/fix-bug <issue number, URL or description>`. Before a release, run
 `/release-changelog` (user-facing notes, version and upgrade steps); the pipeline itself is in
 [`RELEASING.md`](RELEASING.md).
 
+The project runs itself with `/loop /autopilot` (`.claude/skills/autopilot/`): triage, builds,
+PR upkeep, release prep and post-release checks, one unit per tick. The maintainer makes only
+two decisions: what gets built (`/ideate`, or labelling an issue `approved`) and what ships
+(merging the release PR, which `.claude/hooks/guard-merge.sh` keeps Claude from doing).
+Before merging, the `reviewer` agent (`.claude/agents/reviewer.md`) reviews every change in a
+fresh context.
+
 ## How we work here
 
 - **Less code, fewer files, fewer bugs.** Deleting is the best change. Before

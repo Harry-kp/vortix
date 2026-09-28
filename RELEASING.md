@@ -8,8 +8,9 @@ step by step; this page is the pipeline it drives.
 1. Every push to `main` makes **release-plz** open or update a release PR (`chore: release
    vX.Y.Z`, label `release`): it bumps the version in `Cargo.toml` and writes
    `CHANGELOG.md` (repo root) from the commit subjects.
-2. That generated changelog is replaced by hand with the user-facing one, as the last step
-   before merging, because release-plz rewrites it on every push to `main`. Nothing else merges
+2. That generated changelog is replaced with the user-facing one (autopilot runs `release-qa`
+   and `release-changelog`, then comments **What ships** on the PR for the maintainer), as
+   the last step before merging, because release-plz rewrites it on every push to `main`. Nothing else merges
    to `main` in between.
 3. Merging the release PR publishes to crates.io and pushes the tag `vX.Y.Z`.
 4. The tag runs **cargo-dist** (`release.yml`): macOS (x86_64, arm64) and Linux gnu and musl
