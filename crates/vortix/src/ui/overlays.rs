@@ -1489,6 +1489,7 @@ pub mod help {
     }
 }
 pub mod import {
+    use crate::ui::helpers::display_character;
     use crate::{constants, ui::theme};
     use ratatui::{
         layout::Alignment,
@@ -1498,14 +1499,6 @@ pub mod import {
         Frame,
     };
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-    fn display_character(character: char) -> char {
-        if character.is_control() {
-            '\u{fffd}'
-        } else {
-            character
-        }
-    }
 
     fn prefix_window(characters: &[char], budget: usize) -> String {
         let mut width = 0;

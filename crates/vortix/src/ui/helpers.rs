@@ -92,18 +92,18 @@ pub(crate) fn centered_rect_fixed(width: u16, height: u16, area: Rect) -> Rect {
     area
 }
 
+/// `character`, or `�` for a control character that would corrupt the terminal.
+pub(crate) fn display_character(character: char) -> char {
+    if character.is_control() {
+        '\u{FFFD}'
+    } else {
+        character
+    }
+}
+
 /// Truncate text to a terminal-column budget, including the ellipsis.
 pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
-    let sanitized: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '\u{FFFD}'
-            } else {
-                character
-            }
-        })
-        .collect();
+    let sanitized: String = text.chars().map(display_character).collect();
     let sanitized_width = sanitized
         .chars()
         .map(|character| character.width().unwrap_or(1))
@@ -137,10 +137,7 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
 
 /// Keep the end of `text` within `budget` columns, marking a cut start with `…`.
 pub(crate) fn truncate_start_to_width(text: &str, budget: usize) -> String {
-    let characters: Vec<char> = text
-        .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect();
+    let characters: Vec<char> = text.chars().map(display_character).collect();
     let mut width = 0;
     let mut start = characters.len();
     for (index, character) in characters.iter().enumerate().rev() {
@@ -169,11 +166,10 @@ pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     let mut line_width = 0;
     for word in text.split_whitespace() {
         let word_width: usize = word.chars().map(|c| c.width().unwrap_or(1)).sum();
-        let gap = usize::from(line_width > 0);
-        if line_width > 0 && line_width + gap + word_width > width {
+        if line_width > 0 && line_width + 1 + word_width > width {
             lines.push(std::mem::take(&mut line));
             line_width = 0;
-        } else if gap == 1 {
+        } else if line_width > 0 {
             line.push(' ');
             line_width += 1;
         }
