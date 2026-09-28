@@ -163,14 +163,18 @@ fn signal_for(
     }
 }
 
+/// Narrowest name cell worth keeping the last-used column for.
+const MIN_NAME_WITH_TIME: usize = 12;
+
 /// One profile row: status badge, name (with the primary `*`), protocol
-/// tag and last-used time. Selection owns the foreground of every cell.
+/// tag and, when `show_time`, last-used time. Selection owns the foreground of every cell.
 fn profile_row(
     profile: &crate::config::profiles::VpnProfile,
     idx: usize,
     is_selected: bool,
     signal: &RowSignal,
     name_cell_width: usize,
+    show_time: bool,
 ) -> Row<'static> {
     // Status cell: badge taxonomy + optional `!` risk annotation.
     // Numeric prefix (1..=9) remains the affordance for keyboard
@@ -244,6 +248,16 @@ fn profile_row(
         theme::current().text_secondary
     };
 
+    let row_style = if is_selected {
+        Style::default().bg(theme::current().row_selected_bg)
+    } else {
+        Style::default()
+    };
+    let proto_cell = Cell::from(Span::styled(proto_icon, Style::default().fg(proto_color)));
+    if !show_time {
+        return Row::new(vec![status_cell, name_cell, proto_cell]).style(row_style);
+    }
+
     let time_str = if let Some(last_used) = profile.last_used {
         let relative = crate::ui::helpers::format_relative_time(last_used);
         if !relative.ends_with("ago") && !relative.is_empty() {
@@ -254,14 +268,6 @@ fn profile_row(
     } else {
         "never".to_string()
     };
-
-    let row_style = if is_selected {
-        Style::default().bg(theme::current().row_selected_bg)
-    } else {
-        Style::default()
-    };
-
-    let proto_cell = Cell::from(Span::styled(proto_icon, Style::default().fg(proto_color)));
     let time_cell = Cell::from(Span::styled(
         time_str,
         Style::default().fg(row_fg(is_selected, theme::current().text_secondary)),
@@ -335,9 +341,14 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Column arithmetic: status(2) + proto(4) + time(7) + 3 inter-column gaps.
-    let fixed_cols: u16 = 2 + 4 + 7 + 3;
-    // Width budget available to the name cell before primary `*` reserve.
-    let name_cell_width = inner.width.saturating_sub(fixed_cols) as usize;
+    // A narrow sidebar drops the time (Connection Details shows it) so names stay readable.
+    let with_time = inner.width.saturating_sub(2 + 4 + 7 + 3) as usize;
+    let show_time = with_time >= MIN_NAME_WITH_TIME;
+    let name_cell_width = if show_time {
+        with_time
+    } else {
+        inner.width.saturating_sub(2 + 4 + 2) as usize
+    };
     let items: Vec<Row> = app
         .runtime
         .profiles
@@ -351,19 +362,20 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.profile_list_state.selected() == Some(idx),
                 &signal,
                 name_cell_width,
+                show_time,
             )
         })
         .collect();
 
-    let table = Table::new(
-        items,
-        [
-            Constraint::Length(2), // Status: badge glyph (+ optional `!`)
-            Constraint::Min(3),    // Profile name (flex, with optional ` *`)
-            Constraint::Length(4), // Protocol (WG/OV)
-            Constraint::Length(7), // Last used time: "59m ago", "never"
-        ],
-    );
+    let mut widths = vec![
+        Constraint::Length(2), // Status: badge glyph (+ optional `!`)
+        Constraint::Min(3),    // Profile name (flex, with optional ` *`)
+        Constraint::Length(4), // Protocol (WG/OV)
+    ];
+    if show_time {
+        widths.push(Constraint::Length(7)); // Last used time: "59m ago", "never"
+    }
+    let table = Table::new(items, widths);
     frame.render_stateful_widget(table, inner, &mut app.profile_list_state);
 
     // Scrollbar Logic
@@ -474,6 +486,22 @@ mod tests {
         app.runtime.profiles = vec![make_profile("wg08")];
         let out = render_to_string(&mut app, 26, 6);
         assert!(out.contains("wg08"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_long_name_keeps_its_distinguishing_part_at_80_columns() {
+        let mut app = App::new_test();
+        app.runtime.profiles = vec![make_profile("01-openvpn-udp-full")];
+        let out = render_to_string(&mut app, 26, 6);
+        assert!(out.contains("01-openvpn-..."), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_wide_sidebar_keeps_the_last_used_column() {
+        let mut app = App::new_test();
+        app.runtime.profiles = vec![make_profile("01-openvpn-udp-full")];
+        let out = render_to_string(&mut app, 40, 6);
+        assert!(out.contains("never"), "got:\n{out}");
     }
 
     #[test]
