@@ -33,7 +33,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `i` | Import a file, directory or URL |
 | `K` | Cycle the kill-switch mode |
 | `j` `k` / `↓` `↑`, `g` `G`, `PgUp` `PgDn` | Move through the list |
-| `Tab` / `Shift-Tab`, `F1`–`F5` | Move between panels (Profiles, Details, Chart, Security, Logs) |
+| `Tab` / `Shift-Tab`, `l` / `h`, `F1`–`F5` | Move between panels (Profiles, Details, Chart, Security, Logs) |
 | `z` | Zoom the focused panel |
 | `f` | Flip the Chart, Details or Security panel to its other side; in the Logs panel, cycle the source |
 | `x` / `b` | Action menu / bulk actions |
