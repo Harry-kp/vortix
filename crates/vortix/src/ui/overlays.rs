@@ -1112,14 +1112,17 @@ pub mod help {
         // here, max_scroll would underestimate and the bottom 3 lines of
         // each tab would be unreachable.
         let content_height = chunks[2].height;
+        let content_width = usize::from(chunks[2].width);
         let max_scroll = total_lines(tab).saturating_sub(content_height);
         let clamped_scroll = scroll.min(max_scroll);
 
         let lines = match HelpTab::ALL[active_tab] {
             HelpTab::Keys => build_keys_lines(),
-            HelpTab::Roles => build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER)),
+            HelpTab::Roles => {
+                build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER), content_width)
+            }
             HelpTab::Sigils => build_sigils_lines(),
-            HelpTab::Guard => build_guard_glossary_lines(),
+            HelpTab::Guard => build_guard_glossary_lines(content_width),
         };
         let paragraph = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1192,17 +1195,21 @@ pub mod help {
     /// Card-style glossary renderer for the Roles tab. Each entry:
     ///   blank
     ///   ●  <label>
-    ///   <description, indented, wrapped naturally>
+    ///   <description, wrapped to `width` and indented on every line>
     fn build_glossary_lines(
         entries: &'static [(&'static str, &'static str)],
         footer: Option<&'static str>,
+        width: usize,
     ) -> Vec<Line<'static>> {
-        build_glossary_lines_with(entries, footer, |_, description| description.to_string())
+        build_glossary_lines_with(entries, footer, width, |_, description| {
+            description.to_string()
+        })
     }
 
     fn build_glossary_lines_with(
         entries: &'static [(&'static str, &'static str)],
         footer: Option<&'static str>,
+        width: usize,
         description_for: impl Fn(&str, &str) -> String,
     ) -> Vec<Line<'static>> {
         let mut lines: Vec<Line> = Vec::with_capacity(entries.len() * 6 + 2);
@@ -1222,10 +1229,13 @@ pub mod help {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
-            lines.push(Line::from(Span::styled(
-                format!("     {}", description_for(label, desc)),
-                Style::default().fg(theme::current().text_secondary),
-            )));
+            let description = description_for(label, desc);
+            for line in crate::ui::helpers::wrap_to_width(&description, width.saturating_sub(5)) {
+                lines.push(Line::from(Span::styled(
+                    format!("     {line}"),
+                    Style::default().fg(theme::current().text_secondary),
+                )));
+            }
             lines.push(Line::from(""));
         }
         if let Some(footer) = footer {
@@ -1239,10 +1249,11 @@ pub mod help {
         lines
     }
 
-    fn build_guard_glossary_lines() -> Vec<Line<'static>> {
+    fn build_guard_glossary_lines(width: usize) -> Vec<Line<'static>> {
         build_glossary_lines_with(
             GUARD_GLOSSARY,
             Some(GUARD_GLOSSARY_FOOTER),
+            width,
             |label, template| {
                 if label != "Defense → Killswitch" {
                     return template.to_string();
@@ -1386,6 +1397,26 @@ pub mod help {
         }
 
         #[test]
+        fn glossary_descriptions_stay_indented_when_they_wrap() {
+            let lines = build_glossary_lines(ROLE_GLOSSARY, None, 40);
+            let body: Vec<String> = lines
+                .iter()
+                .map(ToString::to_string)
+                .filter(|text| !text.trim().is_empty() && !text.contains('\u{25cf}'))
+                .collect();
+            assert!(
+                body.len() > ROLE_GLOSSARY.len(),
+                "nothing wrapped: {body:?}"
+            );
+            for text in &body {
+                assert!(
+                    text.starts_with("     ") && text.chars().count() <= 40,
+                    "{text:?}"
+                );
+            }
+        }
+
+        #[test]
         fn keys_total_lines_invariant_holds() {
             let expected = u16::try_from(build_keys_lines().len()).expect("fits in u16");
             assert_eq!(total_lines(HelpTab::Keys), expected);
@@ -1441,7 +1472,7 @@ pub mod help {
 
         #[test]
         fn guard_glossary_uses_the_canonical_long_form_killswitch_label() {
-            let rendered = build_guard_glossary_lines()
+            let rendered = build_guard_glossary_lines(usize::MAX)
                 .into_iter()
                 .map(|line| line.to_string())
                 .collect::<Vec<_>>()
