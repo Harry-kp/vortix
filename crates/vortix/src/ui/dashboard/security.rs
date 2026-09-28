@@ -38,6 +38,33 @@ const SECTION_HEADER_MIN_INNER_WIDTH: u16 = 24;
 /// the v4-only fallbacks `Real IP` / `Exit IP` (≤8).
 const LABEL_COLUMN_WIDTH: usize = 12;
 
+/// Below this inner width a full label leaves no room for an IPv4 address
+/// (12 + 15 + sigil), so rows switch to [`short_label`] in a 6-cell column.
+const FULL_LABELS_MIN_INNER_WIDTH: usize = 29;
+const SHORT_LABEL_COLUMN_WIDTH: usize = 6;
+
+fn label_width(inner_width: usize) -> usize {
+    if inner_width < FULL_LABELS_MIN_INNER_WIDTH {
+        SHORT_LABEL_COLUMN_WIDTH
+    } else {
+        LABEL_COLUMN_WIDTH
+    }
+}
+
+/// A row label that fits [`SHORT_LABEL_COLUMN_WIDTH`].
+fn short_label(label: &str) -> &str {
+    match label {
+        "Real IP" | "Real IPv4" => "Real",
+        "Real IPv6" => "Real6",
+        "Exit IP" | "Exit IPv4" => "Exit",
+        "Exit IPv6" => "Exit6",
+        "Location" => "Loc",
+        "Killswitch" => "KS",
+        "Encryption" => "Enc",
+        other => other,
+    }
+}
+
 /// Total width of the right-pinned sigil column: 1-char sigil + 1-space pad.
 const SIGIL_COLUMN_WIDTH: usize = 2;
 
@@ -257,7 +284,7 @@ impl RealAddress {
 /// How much room a row has for its value at this panel width.
 fn value_budget(inner_width: usize) -> usize {
     inner_width
-        .saturating_sub(LABEL_COLUMN_WIDTH)
+        .saturating_sub(label_width(inner_width))
         .saturating_sub(SIGIL_COLUMN_WIDTH)
 }
 
@@ -275,12 +302,12 @@ fn tagged_if_it_fits(value: &str, tag: &str, inner_width: usize) -> String {
 
 /// Value color is derived from the sigil so each row reads as one unit.
 fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line<'static> {
-    let label_col = format!("{label:<10}: ");
-    debug_assert_eq!(label_col.chars().count(), LABEL_COLUMN_WIDTH);
-
-    let value_budget = inner_width
-        .saturating_sub(LABEL_COLUMN_WIDTH)
-        .saturating_sub(SIGIL_COLUMN_WIDTH);
+    let label_col = if label_width(inner_width) == LABEL_COLUMN_WIDTH {
+        format!("{label:<10}: ")
+    } else {
+        format!("{:<5} ", short_label(label))
+    };
+    let value_budget = value_budget(inner_width);
     let value_truncated = crate::ui::helpers::truncate_to_width(value, value_budget);
     let value_chars = value_truncated.chars().count();
     let padding = " ".repeat(value_budget.saturating_sub(value_chars));
@@ -310,7 +337,7 @@ fn push_dns_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
         ));
         return;
     }
-    let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
+    let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider, w);
     let dns_value = match s.dns_status {
         DnsSecurityStatus::Unverified => format!("Unverified · {dns_value}"),
         DnsSecurityStatus::NotRequested => format!("Not provided · {dns_value}"),
@@ -372,7 +399,7 @@ fn push_exit_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
         };
         lines.push(audit_row(v4_label, &s.public_ip, v4_sigil, w));
         if s.ip_status == IpStatus::Leaking {
-            lines.push(alarm_subline("real IPv4 exposed", w));
+            lines.extend(alarm_subline("real IPv4 exposed", w));
         }
     }
     if v6 {
@@ -410,7 +437,7 @@ fn push_exit_ipv6_row(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) 
     };
     lines.push(audit_row("Exit IPv6", &v6_value, v6_sigil, w));
     if leak_subline {
-        lines.push(alarm_subline("v6 exposed — matches real IPv6", w));
+        lines.extend(alarm_subline("v6 exposed — matches real IPv6", w));
     }
 }
 
@@ -426,19 +453,22 @@ fn location_row(s: &PanelState, w: usize) -> Line<'static> {
     }
 }
 
-/// One-line human-readable explainer rendered under an alarming row.
-/// Aligned to the value column for visual continuity with its parent row.
-fn alarm_subline(text: &str, inner_width: usize) -> Line<'static> {
-    let indent = " ".repeat(LABEL_COLUMN_WIDTH);
-    let budget = inner_width.saturating_sub(LABEL_COLUMN_WIDTH);
-    let truncated = crate::ui::helpers::truncate_to_width(text, budget);
-    Line::from(vec![
-        Span::raw(indent),
-        Span::styled(
-            truncated,
-            Style::default().fg(theme::current().text_secondary),
-        ),
-    ])
+/// Human-readable explainer under an alarming row, wrapped in the value
+/// column so it lines up with its parent row.
+fn alarm_subline(text: &str, inner_width: usize) -> Vec<Line<'static>> {
+    wrapped_text(text, inner_width, label_width(inner_width))
+}
+
+fn wrapped_text(text: &str, inner_width: usize, indent: usize) -> Vec<Line<'static>> {
+    crate::ui::helpers::wrap_to_width(text, inner_width.saturating_sub(indent))
+        .into_iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(line, Style::default().fg(theme::current().text_secondary)),
+            ])
+        })
+        .collect()
 }
 
 /// Footer line: `Updated Ns ago` / `Updated Nm ago` / pending placeholder.
@@ -735,6 +765,20 @@ fn row_label(line: &Line<'static>) -> String {
         .unwrap_or_default()
 }
 
+/// The exposed panel's closing advice; the banner already says the same, so
+/// it goes first, and whole, when the panel is short.
+const CONNECT_HINT: &str = "Connect to a profile to protect this traffic.";
+
+fn is_hint_line(line: &Line<'static>) -> bool {
+    // Hint lines carry no indent, unlike the sublines built the same way.
+    let text = line.to_string();
+    line.spans
+        .first()
+        .is_some_and(|span| span.content.is_empty())
+        && !text.trim().is_empty()
+        && CONNECT_HINT.contains(text.trim())
+}
+
 fn is_blank_line(line: &Line<'static>) -> bool {
     line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty())
 }
@@ -748,11 +792,18 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
     // Shed spacing first, then decoration, then the rows a reader can do
     // without — never a verdict row, while anything cheaper remains.
     let mut excess = lines.len().saturating_sub(available_height);
+    if excess > lines.iter().filter(|line| is_blank_line(line)).count() {
+        lines.retain(|line| !is_hint_line(line));
+        excess = lines.len().saturating_sub(available_height);
+    }
     while excess > 0 {
         let victim = lines.iter().position(is_blank_line).or_else(|| {
-            SHEDDABLE_ROWS
-                .iter()
-                .find_map(|label| lines.iter().position(|line| row_label(line) == *label))
+            SHEDDABLE_ROWS.iter().find_map(|label| {
+                lines.iter().position(|line| {
+                    let shown = row_label(line);
+                    shown == *label || shown == short_label(label)
+                })
+            })
         });
         match victim {
             Some(index) => {
@@ -967,7 +1018,7 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
     let ks_value = killswitch_value(s.killswitch_mode, s.killswitch_state);
     lines.push(audit_row("Killswitch", &ks_value, ks_sigil, w));
     if let Some(why) = ks_subline {
-        lines.push(alarm_subline(why, w));
+        lines.extend(alarm_subline(why, w));
     }
 
     let cipher_strength = classify_cipher(&s.encryption);
@@ -979,7 +1030,7 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
         w,
     ));
     if let Some(why) = cipher_strength.alarm_subline() {
-        lines.push(alarm_subline(why, w));
+        lines.extend(alarm_subline(why, w));
     }
 
     lines.push(Line::from(""));
@@ -1032,7 +1083,7 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
     let ks_value = killswitch_value(s.killswitch_mode, s.killswitch_state);
     lines.push(audit_row("Killswitch", &ks_value, ks_sigil, w));
     if let Some(why) = ks_subline {
-        lines.push(alarm_subline(why, w));
+        lines.extend(alarm_subline(why, w));
     }
 
     if s.encryption != "N/A" {
@@ -1045,7 +1096,7 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
             w,
         ));
         if let Some(why) = cipher_strength.alarm_subline() {
-            lines.push(alarm_subline(why, w));
+            lines.extend(alarm_subline(why, w));
         }
     }
 
@@ -1108,7 +1159,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     } else {
         "no VPN — your real IPv4 is visible"
     };
-    lines.push(alarm_subline(alarm, w));
+    lines.extend(alarm_subline(alarm, w));
 
     let location = if constants::is_pending(&app.runtime.location) {
         "detecting…".to_string()
@@ -1125,6 +1176,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     let dns_value = format_value_with_tag(
         &app.runtime.dns_server,
         dns_provider_label(&app.runtime.dns_server),
+        w,
     );
     lines.push(audit_row("DNS", &dns_value, Sigil::OkMuted, w));
 
@@ -1140,10 +1192,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         w,
     ));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Connect to a profile to protect this traffic.",
-        Style::default().fg(theme::current().text_secondary),
-    )));
+    lines.extend(wrapped_text(CONNECT_HINT, w, 0));
 
     lines
 }
@@ -1202,9 +1251,9 @@ mod killswitch_degraded_tests {
 
 /// `value · tag` when `tag` is present, otherwise just `value`. Used for
 /// inlining a provider name with a DNS server, or a country/city with an IP.
-fn format_value_with_tag(value: &str, tag: Option<&str>) -> String {
+fn format_value_with_tag(value: &str, tag: Option<&str>, inner_width: usize) -> String {
     match tag {
-        Some(t) if !t.is_empty() => format!("{value} · {t}"),
+        Some(t) if !t.is_empty() => tagged_if_it_fits(value, t, inner_width),
         _ => value.to_string(),
     }
 }
@@ -1460,17 +1509,62 @@ mod tests {
     /// it; the sigil still carries the signal.
     #[test]
     fn a_narrow_panel_drops_the_tag_but_keeps_the_signal() {
-        let mut s = baseline_protected_state(28);
+        let mut s = baseline_protected_state(22);
         s.real_ip = RealAddress::Remembered("203.0.113.5".to_string());
 
         let lines = build_protected_audit(&s);
-        let real = row_named(&lines, "Real IP");
+        let real = row_named(&lines, "Real");
 
         assert!(
             !real.contains('·'),
             "a tag that cannot fit must be dropped whole, not truncated: {real:?}"
         );
-        assert_ne!(sigil_of(&lines, "Real IP"), "✓");
+        assert_ne!(sigil_of(&lines, "Real"), "✓");
+    }
+
+    /// 23 cells is the Guard's inner width in an 80-column terminal.
+    #[test]
+    fn a_full_ipv4_address_fits_at_80_columns() {
+        let mut s = baseline_protected_state(23);
+        s.public_ip = "203.113.200.100".to_string();
+        let lines = build_protected_audit(&s);
+        assert!(
+            row_named(&lines, "Exit").contains("203.113.200.100"),
+            "{:?}",
+            lines.iter().map(line_text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_exposed_hints_wrap_instead_of_being_cut() {
+        let app = App::new_test();
+        let lines = build_exposed_audit(&app, 23);
+        let text = lines
+            .iter()
+            .map(|line| line_text(line).trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(lines.iter().all(|line| line.width() <= 23), "{text}");
+        assert!(
+            text.contains("Connect to a profile to protect this traffic."),
+            "{text}"
+        );
+        assert!(text.contains("your real IPv4 is visible"), "{text}");
+    }
+
+    /// The Guard has 8 rows inside its border at 80x24.
+    #[test]
+    fn a_short_panel_drops_the_connect_hint_whole() {
+        let app = App::new_test();
+        let lines = compact_to_fit(build_exposed_audit(&app, 23), 8);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(lines.len(), 8, "{text}");
+        assert!(!text.contains("Connect"), "{text}");
+        assert!(text.contains("visible"), "{text}");
     }
 
     /// One healthy probe must not be able to stamp "just now" over readings
@@ -2109,14 +2203,7 @@ mod tests {
             !all_text.contains("Defense"),
             "section words must drop at narrow widths: {all_text}"
         );
-        for label in [
-            "Real IP",
-            "Exit IP",
-            "Location",
-            "DNS",
-            "Killswitch",
-            "Encryption",
-        ] {
+        for label in ["Real", "Exit", "Loc", "DNS", "KS", "Enc"] {
             assert!(
                 all_text.contains(label),
                 "row `{label}` missing at narrow width:\n{all_text}"

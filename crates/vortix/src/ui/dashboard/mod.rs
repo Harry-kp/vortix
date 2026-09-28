@@ -86,8 +86,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         },
     );
 
-    // Bottom Dash: Left (Security Guard) | Right (Event Log)
-    let dash_chunks = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+    // Bottom Dash: Left (Security Guard) | Right (Event Log).
+    // 27 columns keeps an IPv4 address whole in the Guard at 80 columns.
+    let dash_chunks = Layout::horizontal([Constraint::Min(27), Constraint::Percentage(60)])
         .split(workspace_chunks[1]);
 
     render_animated_panel(

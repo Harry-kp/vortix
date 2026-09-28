@@ -135,6 +135,39 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
     truncated
 }
 
+/// Word-wrap `text` into lines of at most `width` columns; a word longer
+/// than a line is split.
+pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0;
+    for word in text.split_whitespace() {
+        let word_width: usize = word.chars().map(|c| c.width().unwrap_or(1)).sum();
+        let gap = usize::from(line_width > 0);
+        if line_width > 0 && line_width + gap + word_width > width {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        } else if gap == 1 {
+            line.push(' ');
+            line_width += 1;
+        }
+        for character in word.chars() {
+            let character_width = character.width().unwrap_or(1);
+            if line_width > 0 && line_width + character_width > width {
+                lines.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+            line.push(character);
+            line_width += character_width;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 /// Typed text, a blinking cursor, then the remainder.
 ///
 /// Every text-entry overlay draws this. Keeping the cursor's treatment here
@@ -291,6 +324,15 @@ mod tests {
         let r = centered_rect(50, 50, area);
         assert_eq!(r.width, 50);
         assert_eq!(r.height, 50);
+    }
+
+    #[test]
+    fn wraps_on_words_and_splits_only_overlong_ones() {
+        assert_eq!(
+            wrap_to_width("Connect to a profile to protect", 12),
+            ["Connect to a", "profile to", "protect"]
+        );
+        assert_eq!(wrap_to_width("abcdefgh ij", 4), ["abcd", "efgh", "ij"]);
     }
 
     #[test]
