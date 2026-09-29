@@ -7,6 +7,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod autoconnect;
 pub mod dns;
 pub mod firewall;
 pub mod interface;

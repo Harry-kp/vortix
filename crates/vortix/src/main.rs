@@ -243,7 +243,11 @@ fn main() -> Result<()> {
             cli::args::Commands::Status { .. }
                 | cli::args::Commands::ReleaseKillSwitch
                 | cli::args::Commands::Down { profile: None, .. }
+                | cli::args::Commands::Autoconnect { profile: None }
         )
+    ) || matches!(
+        &args.command,
+        Some(cli::args::Commands::Autoconnect { profile: Some(target) }) if target == "off"
     );
     if std::env::var_os("VORTIX_SKIP_MIGRATION").is_some() {
         eprintln!("VORTIX_SKIP_MIGRATION set — skipping startup sidecar backfill.");

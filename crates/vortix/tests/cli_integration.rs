@@ -309,6 +309,31 @@ fn cli_release_killswitch_accepts_canonical_command_and_compatibility_alias() {
 
 #[cfg(unix)]
 #[test]
+fn autoconnect_changes_need_root_and_write_nothing_without_it() {
+    if vortix::platform::is_root() {
+        return;
+    }
+    let before = vortix::platform::autoconnect::installed_profile();
+    let config = tempfile::tempdir().unwrap();
+    for target in ["work", "off"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box root gate
+            .arg("--config-dir")
+            .arg(config.path())
+            .args(["autoconnect", target])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(ExitCode::PermissionDenied.code())
+        );
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("sudo vortix autoconnect {target}")));
+    }
+    assert_eq!(vortix::platform::autoconnect::installed_profile(), before);
+}
+
+#[cfg(unix)]
+#[test]
 fn emergency_release_reaches_root_gate_before_normal_startup() {
     if vortix::platform::is_root() {
         // Non-root CI exercises the proof that emergency dispatch precedes
@@ -658,6 +683,7 @@ fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
             Some(Commands::Rename { .. }) => "rename",
             Some(Commands::KillSwitch { .. }) => "killswitch",
             Some(Commands::ReleaseKillSwitch) => "release-killswitch",
+            Some(Commands::Autoconnect { .. }) => "autoconnect",
             Some(Commands::Info) => "info",
             Some(Commands::Update) => "update",
             Some(Commands::Report) => "report",

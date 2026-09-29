@@ -13,7 +13,8 @@ use super::status::handle_status;
 use super::tunnel::{handle_down, handle_reconnect, handle_up, prompt_masked_otp};
 use crate::cli::args::Commands;
 use crate::cli::output::{
-    err_permission_denied, print_error_and_exit, print_success, CliError, ExitCode, OutputMode,
+    err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError, ExitCode,
+    OutputMode,
 };
 use crate::config::AppConfig;
 use crate::constants;
@@ -66,6 +67,9 @@ pub fn handle_command(
             handle_killswitch(ks_mode.as_deref(), config, config_dir, mode)
         }
         Commands::ReleaseKillSwitch => handle_release_killswitch(config_dir, mode),
+        Commands::Autoconnect { profile } => {
+            handle_autoconnect(profile.as_deref(), config_dir, mode)
+        }
         Commands::Info => {
             handle_info(config_dir, config_source, mode);
             0
@@ -338,6 +342,116 @@ fn print_killswitch_status(
             other.one_liner()
         );
     }
+}
+
+#[derive(Serialize)]
+struct AutoconnectData {
+    profile: Option<String>,
+}
+
+fn handle_autoconnect(target: Option<&str>, config_dir: &Path, mode: OutputMode) -> i32 {
+    use crate::platform::autoconnect;
+    if let Some(target) = target {
+        if !crate::platform::is_root() {
+            print_error_and_exit(
+                mode,
+                "autoconnect",
+                err_permission_denied(&format!("vortix autoconnect {target}")),
+                ExitCode::PermissionDenied,
+            );
+        }
+        let result = if target == "off" {
+            autoconnect::remove()
+        } else {
+            if !crate::config::profiles::load_profiles()
+                .iter()
+                .any(|profile| profile.name == target)
+            {
+                print_error_and_exit(
+                    mode,
+                    "autoconnect",
+                    err_not_found(target),
+                    ExitCode::NotFound,
+                );
+            }
+            let env: Vec<(String, String)> = ["PATH", "SUDO_USER", "SUDO_UID", "SUDO_GID"]
+                .into_iter()
+                .filter_map(|key| Some((key.to_string(), std::env::var(key).ok()?)))
+                .collect();
+            boot_command(config_dir, target, &env)
+                .and_then(|command| autoconnect::install(&command, &env))
+        };
+        if let Err(message) = result {
+            print_error_and_exit(
+                mode,
+                "autoconnect",
+                CliError {
+                    code: "autoconnect_failed",
+                    message,
+                    hint: None,
+                },
+                ExitCode::GeneralError,
+            );
+        }
+    }
+
+    let data = AutoconnectData {
+        profile: autoconnect::installed_profile(),
+    };
+    match mode {
+        OutputMode::Human => match &data.profile {
+            Some(profile) => println!(
+                "Autoconnect: {profile} at boot (log: {})",
+                autoconnect::log_hint()
+            ),
+            None => println!("Autoconnect: off"),
+        },
+        OutputMode::Json => print_success(mode, "autoconnect", &data, vec![]),
+        OutputMode::Quiet => {}
+    }
+    0
+}
+
+/// What the boot unit runs. It and `env` (the invoking user's identity, so the boot run uses
+/// their config as `sudo` does, and `PATH`, because a boot unit's default one finds no
+/// Homebrew `wg-quick` or `openvpn`) go into a systemd unit and a plist unescaped, so the
+/// characters those formats treat specially are refused.
+fn boot_command(
+    config_dir: &Path,
+    profile: &str,
+    env: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let command = vec![
+        installed_program()?,
+        "-C".to_string(),
+        config_dir.display().to_string(),
+        "up".to_string(),
+        profile.to_string(),
+    ];
+    let unsafe_char =
+        |c: char| matches!(c, '"' | '\\' | '$' | '%' | '&' | '<' | '>') || c.is_control();
+    match command
+        .iter()
+        .chain(env.iter().map(|(_, value)| value))
+        .find(|word| word.chars().any(unsafe_char))
+    {
+        Some(word) => Err(format!(
+            "'{word}' can't go in a boot unit; remove quotes, backslashes, $, %, &, < and > from it"
+        )),
+        None => Ok(command),
+    }
+}
+
+/// This binary as it is reached on PATH: a Homebrew, npm or cargo symlink keeps pointing at the
+/// current version after an upgrade, where the resolved path would not.
+fn installed_program() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("Could not find the vortix binary: {error}"))?;
+    let resolved = exe.canonicalize().unwrap_or_else(|_| exe.clone());
+    let on_path = crate::platform::find_binary_path("vortix").filter(|candidate| {
+        candidate.is_absolute() && candidate.canonicalize().is_ok_and(|real| real == resolved)
+    });
+    Ok(on_path.unwrap_or(exe).display().to_string())
 }
 
 fn handle_killswitch(
@@ -663,6 +777,24 @@ fn handle_completions(shell: clap_complete::Shell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_boot_unit_refuses_what_its_format_would_reinterpret() {
+        let dir = std::path::Path::new("/home/u/.config/vortix");
+        let path = |value: &str| vec![("PATH".to_string(), value.to_string())];
+        let ok = boot_command(dir, "Bob's Work VPN", &path("/usr/bin:/bin")).unwrap();
+        assert_eq!(ok.last().map(String::as_str), Some("Bob's Work VPN"));
+        for bad in ["a%n", "a$b", "a\"b", "a\\b", "a&b", "a<b", "a>b", "a\nb"] {
+            assert!(
+                boot_command(dir, bad, &path("/usr/bin")).is_err(),
+                "{bad:?} as a profile"
+            );
+            assert!(
+                boot_command(dir, "work", &path(bad)).is_err(),
+                "{bad:?} in PATH"
+            );
+        }
+    }
 
     #[test]
     fn unreadable_control_history_does_not_block_emergency_release_persistence() {

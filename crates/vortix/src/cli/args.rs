@@ -322,6 +322,24 @@ pub enum Commands {
     #[command(name = "release-killswitch", alias = "release-kill-switch")]
     ReleaseKillSwitch,
 
+    /// Connect a profile when the computer starts
+    ///
+    /// Installs a boot unit (systemd on Linux, launchd on macOS) that runs
+    /// `vortix up <PROFILE>` at every boot, from the next one on, retrying a
+    /// failed attempt every 30 seconds. It applies the saved kill switch mode
+    /// like any connect. `off` removes the unit. Without an argument, shows
+    /// the current setting.
+    ///
+    /// EXAMPLES:
+    ///     vortix autoconnect                   Show the current setting
+    ///     sudo vortix autoconnect work-vpn     Connect 'work-vpn' at boot
+    ///     sudo vortix autoconnect off          Stop connecting at boot
+    Autoconnect {
+        /// Profile to connect at boot, or `off` (omit to show the current setting)
+        #[arg(value_hint = ValueHint::Other)]
+        profile: Option<String>,
+    },
+
     /// Show config directory, profile count, and runtime info
     ///
     /// EXAMPLES:

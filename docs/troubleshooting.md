@@ -114,6 +114,17 @@ curl -4 --max-time 15 --resolve cloudflare.com:443:104.16.132.229 https://cloudf
 Device-management software or another VPN client that owns DNS can stop Vortix from applying
 its resolvers.
 
+## Connecting at boot
+
+**The profile doesn't connect after a reboot.** Check the unit's log: `journalctl -u
+vortix-autoconnect` on Linux, `/var/log/vortix-autoconnect.log` on macOS. A renamed or deleted
+profile fails every attempt: set it again with `sudo vortix autoconnect <profile>`. With SELinux
+enforcing (Fedora, RHEL), a boot unit can't run a binary from a home directory, such as
+`~/.cargo/bin/vortix`: `autoconnect` refuses it and says how to install Vortix system-wide.
+On Linux without systemd (a container, another init system) it refuses to install: "Connecting
+at boot needs systemd, which isn't running here". An OpenVPN
+profile that needs a password must have saved credentials, because nobody can type them at boot.
+
 ## Kill switch
 
 **No internet after a crash or with `vpn-only` and no tunnel.** Connect a profile, or remove

@@ -10,7 +10,7 @@ Every command takes `-j`/`--json` (see [JSON and exit codes](#json-and-exit-code
 ## Root and the one-instance rule
 
 Tunnel, route, DNS and firewall changes need root, so the dashboard and every command that
-changes state need `sudo`. `list`, `show`, `status`, `info` and `killswitch` (without a mode)
+changes state need `sudo`. `list`, `show`, `status`, `info`, and `killswitch` and `autoconnect` without an argument,
 work unprivileged; `status` without root says the state is unknown when it cannot see
 WireGuard, rather than reporting Disconnected.
 
@@ -143,6 +143,29 @@ asked for on the terminal.
   share split routes stop the old one first.
 - Disconnecting one tunnel leaves the others alone.
 
+### Connecting at boot
+
+```bash
+vortix autoconnect                 # show the profile connected at boot, or off
+sudo vortix autoconnect work       # connect 'work' at every boot
+sudo vortix autoconnect off        # stop
+```
+
+This installs a boot unit that runs `vortix up work` at every boot and retries a failed
+attempt every 30 s:
+
+- **Linux:** the systemd unit `vortix-autoconnect.service` starts once the network is online
+  and gives up after 10 failed attempts in 10 minutes (`journalctl -u vortix-autoconnect` for
+  its log). It needs systemd.
+- **macOS:** the launchd daemon `/Library/LaunchDaemons/com.vortix.autoconnect.plist` starts at
+  boot and retries until it connects, which also covers a network that comes up late. It logs
+  to `/var/log/vortix-autoconnect.log`.
+
+It takes effect from the next boot and applies the saved
+kill switch mode like any connect. Renaming or deleting the profile makes the boot attempt
+fail, so run `sudo vortix autoconnect <new-name>` after a rename. Run
+`sudo vortix autoconnect off` before uninstalling Vortix.
+
 ## Status
 
 ```bash
@@ -164,7 +187,8 @@ sudo vortix release-killswitch     # emergency: remove Vortix's rules and set th
 ```
 
 The mode is saved and re-applied whenever Vortix next runs as root. A reboot clears the rules,
-so between boot and that first run nothing is blocked. macOS uses a `pf` anchor of its own,
+so between boot and that first run nothing is blocked; [connecting at boot](#connecting-at-boot)
+shortens that gap to the time the network takes to come up. macOS uses a `pf` anchor of its own,
 Linux an `nftables` table.
 
 ## Diagnostics

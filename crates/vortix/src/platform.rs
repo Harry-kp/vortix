@@ -1,6 +1,8 @@
 //! The OS adapters for this build, and small per-OS helpers.
 
 #[cfg(target_os = "linux")]
+pub use crate::linux::autoconnect;
+#[cfg(target_os = "linux")]
 pub use crate::linux::{
     clipboard_commands,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
@@ -11,6 +13,8 @@ pub use crate::linux::{
     LinuxDns as Dns, LinuxInterface as Interface, LinuxNetworkStats as NetworkStats,
     LinuxRouteTable as Routes, NftFirewall as Firewall, ProcSocketAudit as SocketAudit,
 };
+#[cfg(target_os = "macos")]
+pub use crate::macos::autoconnect;
 #[cfg(target_os = "macos")]
 pub use crate::macos::{
     clipboard_commands,
@@ -946,6 +950,24 @@ pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
                 .metadata()
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
+}
+
+/// Write a root-owned file only root may change, whatever the umask or its old mode: it
+/// holds something that runs as root.
+pub(crate) fn write_root_file(path: &str, text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)
+        .and_then(|mut file| {
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            file.write_all(text.as_bytes())
+        })
+        .map_err(|error| format!("Could not write {path}: {error}"))
 }
 
 /// Whether an executable named `name` is on `$PATH`.

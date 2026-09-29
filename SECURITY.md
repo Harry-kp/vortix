@@ -21,6 +21,14 @@ Reporters are credited in the release notes unless they prefer not to be.
 - **Root.** The dashboard and every command that changes tunnels, routes, DNS or the firewall
   run as root, because the operating system requires it. Commands that only read (`list`,
   `show`, `status`, `info`) do not.
+- **Boot unit.** `sudo vortix autoconnect <profile>` installs one root-owned unit
+  (`/etc/systemd/system/vortix-autoconnect.service` or
+  `/Library/LaunchDaemons/com.vortix.autoconnect.plist`) that runs `vortix up <profile>` as
+  root at boot, with the invoking user's identity for their config. `autoconnect off` removes
+  it. On macOS its log is `/var/log/vortix-autoconnect.log`. The unit runs the `vortix` binary
+  at the path it was set up from, so whoever can replace that binary (for a Homebrew or
+  `cargo install` copy, the user who owns it) gets root at the next boot, the same trust as
+  running `sudo vortix`, without the prompt.
 - **Nothing runs from a profile.** Script directives (`PreUp`/`PostUp`/`PreDown`/`PostDown`,
   OpenVPN `up`, `down`, plugins and similar) are refused at import. [Hooks](docs/configuration.md#hooks)
   run as the invoking user, never root, from an absolute path without a shell.
