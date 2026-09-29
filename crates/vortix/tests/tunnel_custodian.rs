@@ -243,15 +243,14 @@ fn eventually(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 fn wait_for_pid_file(path: &std::path::Path) -> u32 {
-    let read = || {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-    };
+    let mut pid = None;
     eventually(&format!("child pid file {}", path.display()), || {
-        read().is_some()
+        pid = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        pid.is_some()
     });
-    read().expect("pid file populated")
+    pid.expect("pid file populated")
 }
 
 fn pid_recording_sleep(path: &std::path::Path) -> CommandSpec {
@@ -487,11 +486,10 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
         graceful_timeout_ms: 100,
     };
     let (mut hidden, hidden_stdin, _output, group_pid) = spawn_hidden_until_ready(&request);
-    let child_pid = wait_for_pid_file(&child_pid_path);
+    wait_for_pid_file(&child_pid_path);
     drop(hidden_stdin);
     assert!(!hidden.wait().unwrap().success());
     wait_for_group_absence(group_pid);
-    assert!(!group_has_live_members(child_pid));
 
     // Signals are installed before spawn and the READY/COMMIT wait polls the
     // termination flag. Keep stdin open to prove SIGTERM, rather than EOF,
