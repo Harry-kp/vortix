@@ -435,6 +435,25 @@ fn render_switch_confirm(
     );
 }
 
+/// A panel drawn into a `width`×`height` test terminal, one text line per row.
+#[cfg(test)]
+fn render_to_string(width: u16, height: u16, draw: impl FnOnce(&mut Frame, Rect)) -> String {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    terminal
+        .draw(|frame| draw(frame, Rect::new(0, 0, width, height)))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod overlay_tests {
     use super::*;

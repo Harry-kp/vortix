@@ -760,9 +760,6 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::profile::ProfileId;
-    use ratatui::backend::TestBackend;
-    use ratatui::layout::Rect;
-    use ratatui::Terminal;
 
     fn up_view(name: &str) -> crate::control::TunnelView {
         let mut view = crate::app::connection::test_view(name, crate::control::Phase::Up);
@@ -771,23 +768,9 @@ mod tests {
     }
 
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| {
-                let area = Rect::new(0, 0, width, height);
-                render(frame, app, area);
-            })
-            .expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
+        crate::ui::dashboard::render_to_string(width, height, |frame, area| {
+            render(frame, app, area);
+        })
     }
 
     fn app_handshaking(protocol: crate::profile::ProtocolKind) -> App {

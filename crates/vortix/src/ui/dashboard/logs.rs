@@ -267,7 +267,6 @@ mod tests {
     use crate::control::{Phase, Snapshot};
     use crate::message::Message;
     use crate::profile::{ProfileId, ProtocolKind};
-    use ratatui::{backend::TestBackend, Terminal};
     use std::time::{Duration, SystemTime};
 
     /// `OpenVPN` profiles `(name, active, last_used seconds)` in a scratch config dir.
@@ -314,19 +313,7 @@ mod tests {
     }
 
     fn panel(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
-        terminal
-            .draw(|frame| super::render(frame, app, frame.area()))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        crate::ui::dashboard::render_to_string(80, 8, |frame, area| super::render(frame, app, area))
     }
 
     fn press_f(app: &mut App, times: usize) {
