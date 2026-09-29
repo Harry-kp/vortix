@@ -85,7 +85,8 @@ not measured yet.
 | Encryption | The cipher and its grade: `modern AEAD`, `strong`, `deprecated` or `INSECURE` |
 
 In a narrow panel (an 80-column terminal) the rows use short labels, so an address fits:
-`Real`, `Exit` (`Real6`, `Exit6` for IPv6), `Loc`, `DNS`, `KS` and `Enc`.
+`Real`, `Exit` (`Real6`, `Exit6` for IPv6), `Loc`, `DNS`, `KS` and `Enc`. When rows still do
+not fit, the explanation under a `✗` goes first; the mark stays and `f` shows why.
 
 The footer gives the age of the readings (`Updated 12s ago`); a reading too old to trust shows
 `unavailable`. Addresses come from public IP lookup services (see [SECURITY.md](../SECURITY.md)).

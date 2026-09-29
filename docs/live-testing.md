@@ -47,6 +47,7 @@ their temp dirs), and run as
 `sudo -n env SUDO_UID=1000 SUDO_GID=1000 SUDO_USER=harrykp ./target/debug/vortix …`.
 tmux session `vxlinux` has root windows 1 and 2 for the TUI. The lab also hosts
 `arch`, `cachyos` and `fedora44` VMs; `scripts/p0-vms.sh` runs the smoke set and a new
-user's journey in them (P0.md "Distro VMs"). Check host state
+user's journey in them (P0.md "Distro VMs"); over a plain `ssh` command put `~/.cargo/bin`
+first on `PATH`, or the distro's `/usr/bin/cargo` (no musl target) builds and fails. Check host state
 with `ip -4 route`, `resolvectl dns`, `nft list table inet vortix_killswitch`.
 Anything verified live on macOS should be verified here too.
