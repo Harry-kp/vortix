@@ -727,6 +727,9 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelView>) -> Verdic
     }
 }
 
+/// The exposed panel's closing advice.
+const CONNECT_HINT: &str = "Connect to a profile to protect this traffic.";
+
 /// Drop blank lines first, then truncate. Same shape as the prior
 /// implementation — preserves headline + status rows on tight terminals.
 /// In the new layout the audit list is sized to fit at 80×24, so this is
@@ -735,9 +738,6 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelView>) -> Verdic
 /// bottom instead dropped whichever rows happened to be last — at 80x24
 /// that was `Killswitch`, the one row stating whether anything is being
 /// protected at all. Spacing and decoration go before any verdict does.
-/// The exposed panel's closing advice.
-const CONNECT_HINT: &str = "Connect to a profile to protect this traffic.";
-
 const SHEDDABLE_ROWS: [&str; 8] = [
     // The EXPOSED banner already says it.
     CONNECT_HINT,
@@ -1178,7 +1178,6 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         },
         w,
     ));
-    // The banner already says it; the advice shows only where it fits whole.
     // Shown only where it fits whole, so a short panel sheds it as one row.
     if CONNECT_HINT.chars().count() <= w {
         lines.push(Line::from(""));
