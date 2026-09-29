@@ -787,6 +787,7 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
     // Shed spacing first, then decoration, then the rows a reader can do
     // without, then the explainers under alarms (the ✗ stays, and the flip
     // side explains it) — never a verdict row, while anything cheaper remains.
+    let is_explainer = |line: &Line<'static>| !is_blank_line(line) && row_label(line).is_empty();
     let mut excess = lines.len().saturating_sub(available_height);
     while excess > 0 {
         let victim = lines
@@ -800,15 +801,20 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
                     })
                 })
             })
+            .map(|index| index..=index)
             .or_else(|| {
-                lines
+                // A whole explainer goes at once: half a sentence reads as a different one.
+                let end = lines.iter().rposition(is_explainer)?;
+                let start = lines[..end]
                     .iter()
-                    .rposition(|line| !is_blank_line(line) && row_label(line).is_empty())
+                    .rposition(|line| !is_explainer(line))
+                    .map_or(0, |index| index + 1);
+                Some(start..=end)
             });
         match victim {
-            Some(index) => {
-                lines.remove(index);
-                excess -= 1;
+            Some(range) => {
+                let removed = lines.drain(range).count();
+                excess = excess.saturating_sub(removed);
             }
             None => break,
         }
@@ -1643,9 +1649,24 @@ mod tests {
         app.runtime.last_egress_check = Some(Instant::now());
         app.runtime.real_ipv6 = Some("2401:4900:89ab::1".to_string());
         app.runtime.public_ipv6 = Some("2401:4900:89ab::1".to_string());
-        let out = render_to_string(&app, 27, 10);
-        assert!(out.contains("Updated"), "{out}");
-        assert!(!out.contains("off — not "), "{out}");
+        for height in 9..=14 {
+            let out = render_to_string(&app, 27, height);
+            let words = out
+                .lines()
+                .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for sentence in ["v6 exposed — matches real IPv6", "off — not protecting"] {
+                let head = &sentence[..sentence.find(" —").unwrap() + 4];
+                assert!(
+                    !words.contains(head) || words.contains(sentence),
+                    "height {height} cut `{sentence}`:\n{out}"
+                );
+            }
+            if height >= 10 {
+                assert!(out.contains("Updated"), "height {height}:\n{out}");
+            }
+        }
     }
 
     #[test]

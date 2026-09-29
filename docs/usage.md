@@ -86,7 +86,8 @@ not measured yet.
 
 In a narrow panel (an 80-column terminal) the rows use short labels, so an address fits:
 `Real`, `Exit` (`Real6`, `Exit6` for IPv6), `Loc`, `DNS`, `KS` and `Enc`. When rows still do
-not fit, the explanation under a `✗` goes first; the mark stays and `f` shows why.
+not fit, the explanations under alarm rows go last, after the other optional rows, and each one
+goes whole; the mark stays.
 
 The footer gives the age of the readings (`Updated 12s ago`); a reading too old to trust shows
 `unavailable`. Addresses come from public IP lookup services (see [SECURITY.md](../SECURITY.md)).
