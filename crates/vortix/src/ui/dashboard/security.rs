@@ -785,17 +785,26 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
     let mut lines = audit;
 
     // Shed spacing first, then decoration, then the rows a reader can do
-    // without — never a verdict row, while anything cheaper remains.
+    // without, then the explainers under alarms (the ✗ stays, and the flip
+    // side explains it) — never a verdict row, while anything cheaper remains.
     let mut excess = lines.len().saturating_sub(available_height);
     while excess > 0 {
-        let victim = lines.iter().position(is_blank_line).or_else(|| {
-            SHEDDABLE_ROWS.iter().find_map(|label| {
-                lines.iter().position(|line| {
-                    let shown = row_label(line);
-                    shown == *label || shown == short_label(label)
+        let victim = lines
+            .iter()
+            .position(is_blank_line)
+            .or_else(|| {
+                SHEDDABLE_ROWS.iter().find_map(|label| {
+                    lines.iter().position(|line| {
+                        let shown = row_label(line);
+                        shown == *label || shown == short_label(label)
+                    })
                 })
             })
-        });
+            .or_else(|| {
+                lines
+                    .iter()
+                    .rposition(|line| !is_blank_line(line) && row_label(line).is_empty())
+            });
         match victim {
             Some(index) => {
                 lines.remove(index);
@@ -1616,6 +1625,27 @@ mod tests {
             wide.contains("Connect to a profile to protect this traffic."),
             "{wide}"
         );
+    }
+
+    /// Two alarms at 80×24 (an IPv4-only tunnel on an IPv6 network, kill switch off) overflowed
+    /// the Guard: the footer went and the last sentence stopped at "off — not".
+    #[test]
+    fn two_alarms_at_80_columns_keep_the_footer_and_whole_sentences() {
+        let mut app = App::new_test();
+        let view = crate::app::connection::test_view("alpha", Phase::Up);
+        let id = view.profile_id.clone();
+        app.set_tunnels_for_test(vec![view], Some(id));
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .status = crate::control::DnsSecurityStatus::Protected;
+        app.runtime.real_ip = Some("198.51.100.1".into());
+        app.runtime.public_ip = "203.0.113.5".into();
+        app.runtime.last_egress_check = Some(Instant::now());
+        app.runtime.real_ipv6 = Some("2401:4900:89ab::1".to_string());
+        app.runtime.public_ipv6 = Some("2401:4900:89ab::1".to_string());
+        let out = render_to_string(&app, 27, 10);
+        assert!(out.contains("Updated"), "{out}");
+        assert!(!out.contains("off — not "), "{out}");
     }
 
     #[test]
