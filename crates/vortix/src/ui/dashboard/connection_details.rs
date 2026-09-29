@@ -791,8 +791,6 @@ mod tests {
     use crate::config::profiles::VpnProfile;
     use crate::profile::ProfileId;
     use crate::profile::ProtocolKind;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
@@ -1125,22 +1123,7 @@ mod tests {
         // Exercise render_profile_unavailable directly: easiest way to
         // confirm the hint copy without needing to model a delete-mid-
         // render race in engine snapshot state.
-        let backend = TestBackend::new(60, 8);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| {
-                let area = Rect::new(0, 0, 60, 8);
-                render_profile_unavailable(frame, area);
-            })
-            .expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
+        let out = crate::ui::dashboard::render_to_string(60, 8, render_profile_unavailable);
         assert!(
             out.contains("Profile no longer available"),
             "missing unavailable hint:\n{out}"
