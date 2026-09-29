@@ -16,8 +16,8 @@ if [ ! -d ".git" ]; then
 fi
 
 echo "⚙️  Installing pre-commit hook..."
-cp "$HOOK_SRC" "$HOOK_DEST"
-chmod +x "$HOOK_DEST"
+# A link, not a copy: an edit to the script takes effect without reinstalling.
 chmod +x "$HOOK_SRC"
+ln -sf "../../$HOOK_SRC" "$HOOK_DEST"
 
 echo "✅ Pre-commit hook installed successfully!"
