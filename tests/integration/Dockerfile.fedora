@@ -23,7 +23,7 @@ RUN dnf install -y \
         ca-certificates curl git \
         gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
         wireguard-tools openvpn iproute iptables-nft nftables \
-        iputils sudo \
+        iputils sudo tmux procps-ng \
     && iptables --version | grep -q 'nf_tables' \
     && ip6tables --version | grep -q 'nf_tables' \
     && dnf clean all

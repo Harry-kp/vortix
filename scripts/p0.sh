@@ -10,7 +10,8 @@
 #
 # Profiles are chosen by role, from `vortix list`. Set them in the environment
 # or answer the prompts once; answers (never secrets) are kept in
-# target/p0.env for the next run (delete it to be asked again). A role left
+# target/p0.env, or P0_ENV_FILE, for the next run (delete it to be asked again).
+# A role set in the environment wins over the saved one. A role left
 # empty, or set to empty, skips the scenarios that need it without asking.
 #   P0_FULL       full-tunnel profile (AllowedIPs 0/0 or redirect-gateway)
 #   P0_FULL2      a second full tunnel that declares 0/0 itself (conflict check)
@@ -33,7 +34,7 @@ PATH=$PATH:/opt/homebrew/bin:/usr/local/bin
 VX=${VX:-$PWD/target/debug/vortix}
 OS=$(uname -s)
 OUT=target/p0-results.json
-ENV_FILE=target/p0.env
+ENV_FILE=${P0_ENV_FILE:-target/p0.env}
 TM="tmux -L vortix-p0"
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo scripts/p0.sh"; exit 2; }
@@ -94,7 +95,10 @@ ask P0_SPLIT "a split-route profile"
 ask P0_OVPN "a full-tunnel OpenVPN profile"
 ask P0_OVPN_AUTH "an OpenVPN profile that needs a username and password"
 mkdir -p target
-for v in P0_FULL P0_FULL2 P0_SPLIT P0_OVPN P0_OVPN_AUTH; do printf '%s=%q\n' "$v" "${!v:-}"; done >"$ENV_FILE"
+# Each saved answer fills its role only when the environment leaves it unset.
+for v in P0_FULL P0_FULL2 P0_SPLIT P0_OVPN P0_OVPN_AUTH; do
+    printf '[ -n "${%s+set}" ] || %s=%q\n' "$v" "$v" "${!v:-}"
+done >"$ENV_FILE"
 chown "$SUDO_UID:$SUDO_GID" "$ENV_FILE"
 if [ -n "${P0_OVPN_AUTH:-}" ] && [ -z "${P0_OVPN_PASS:-}" ] && [ -t 0 ]; then
     echo "Credentials for $P0_OVPN_AUTH, used only if none are saved (never stored; empty to skip):"
@@ -109,7 +113,8 @@ FULL=${P0_FULL:-} FULL2=${P0_FULL2:-} SPLIT=${P0_SPLIT:-} OVPN=${P0_OVPN:-} OVPN
 
 # ── host probes ─────────────────────────────────────────────────────────
 tunnels() {
-    if [ "$OS" = Darwin ]; then /sbin/ifconfig | grep -c '^utun'; else ip -brief link | grep -cE '^(wg|tun)'; fi
+    # Linux names a WireGuard link after its profile, so count every link.
+    if [ "$OS" = Darwin ]; then /sbin/ifconfig | grep -c '^utun'; else ip -brief link | wc -l | tr -d ' '; fi
 }
 fw_rules() {
     if [ "$OS" = Darwin ]; then pfctl -a com.apple/vortix.killswitch -sr 2>/dev/null | wc -l | tr -d ' '

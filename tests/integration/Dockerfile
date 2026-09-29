@@ -27,7 +27,7 @@ ENV CARGO_TERM_COLOR=always
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git build-essential pkg-config libssl-dev \
         wireguard-tools openvpn iproute2 iptables nftables \
-        iputils-ping sudo \
+        iputils-ping sudo tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 2: Rust toolchain. Pin matches the workspace MSRV badge.
