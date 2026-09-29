@@ -456,19 +456,12 @@ fn location_row(s: &PanelState, w: usize) -> Line<'static> {
 /// Human-readable explainer under an alarming row, wrapped in the value
 /// column so it lines up with its parent row.
 fn alarm_subline(text: &str, inner_width: usize) -> Vec<Line<'static>> {
-    wrapped_text(text, inner_width, label_width(inner_width))
-}
-
-fn wrapped_text(text: &str, inner_width: usize, indent: usize) -> Vec<Line<'static>> {
-    crate::ui::helpers::wrap_to_width(text, inner_width.saturating_sub(indent))
-        .into_iter()
-        .map(|line| {
-            Line::from(vec![
-                Span::raw(" ".repeat(indent)),
-                Span::styled(line, Style::default().fg(theme::current().text_secondary)),
-            ])
-        })
-        .collect()
+    crate::ui::helpers::wrapped_lines(
+        text,
+        inner_width,
+        label_width(inner_width),
+        Style::default().fg(theme::current().text_secondary),
+    )
 }
 
 /// Footer line: `Updated Ns ago` / `Updated Nm ago` / pending placeholder.
@@ -1272,64 +1265,28 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
 
     let is_connected = app.primary_id().is_some();
 
-    let text = if is_connected {
-        vec![
-            Line::from(Span::styled(
-                "Active Connections Audit",
-                Style::default()
-                    .fg(theme::current().accent_primary)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Per-socket VPN routing verification",
-                Style::default().fg(theme::current().text_secondary),
-            )),
-            Line::from(Span::styled(
-                "  will be available in a future release.",
-                Style::default().fg(theme::current().text_secondary),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  This view will show which connections",
-                Style::default().fg(theme::current().text_secondary),
-            )),
-            Line::from(Span::styled(
-                "  are routed through the VPN tunnel vs",
-                Style::default().fg(theme::current().text_secondary),
-            )),
-            Line::from(Span::styled(
-                "  bypassing it (split-tunnel detection).",
-                Style::default().fg(theme::current().text_secondary),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  See: github.com/Harry-kp/vortix/issues/168",
-                Style::default().fg(theme::current().nord_polar_night_4),
-            )),
-        ]
+    let width = inner.width as usize;
+    let dim = Style::default().fg(theme::current().text_secondary);
+    let body = if is_connected {
+        "Per-socket VPN routing verification will be available in a future release. This \
+             view will show which connections are routed through the VPN tunnel vs bypassing it \
+             (split-tunnel detection)."
     } else {
-        vec![
-            Line::from(Span::styled(
-                "Active Connections Audit",
-                Style::default()
-                    .fg(theme::current().inactive)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Connect to a VPN to see",
-                Style::default().fg(theme::current().text_secondary),
-            )),
-            Line::from(Span::styled(
-                "  connection routing details.",
-                Style::default().fg(theme::current().text_secondary),
-            )),
-        ]
+        "Connect to a VPN to see connection routing details."
     };
+    // The block title already names this face.
+    let mut text = crate::ui::helpers::wrapped_lines(body, width, 0, dim);
+    if is_connected {
+        text.push(Line::from(""));
+        text.extend(crate::ui::helpers::wrapped_lines(
+            "See: github.com/Harry-kp/vortix/issues/168",
+            width,
+            2,
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ));
+    }
 
     let max_lines = inner.height as usize;
-    let mut text = text;
     text.truncate(max_lines);
     frame.render_widget(Paragraph::new(text), inner);
 }
@@ -1530,6 +1487,23 @@ mod tests {
         assert!(
             wide.contains("Connect to a profile to protect this traffic."),
             "{wide}"
+        );
+    }
+
+    #[test]
+    fn the_flipped_guard_wraps_its_sentences_at_80_columns() {
+        let mut app = App::new_test();
+        app.flip_state_mut(crate::app::FocusedPanel::Security)
+            .set_showing_back(true);
+        let out = render_to_string(&app, 27, 10);
+        let words = out
+            .lines()
+            .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            words.contains("Connect to a VPN to see connection routing details."),
+            "{out}"
         );
     }
 

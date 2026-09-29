@@ -39,6 +39,56 @@ pub(crate) fn detail_row<'a>(
     ])
 }
 
+/// `text` word-wrapped to `width` columns, each line indented by `indent` spaces.
+pub(crate) fn wrapped_lines(
+    text: &str,
+    width: usize,
+    indent: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
+    wrap_to_width(text, width.saturating_sub(indent))
+        .into_iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(line, style),
+            ])
+        })
+        .collect()
+}
+
+/// `line` cut to `width` columns: the span that crosses the edge ends in an ellipsis and the
+/// spans after it go, so a row never stops mid-word at a panel edge.
+pub(crate) fn fit_line(line: Line<'_>, width: usize) -> Line<'_> {
+    if line.width() <= width {
+        return line;
+    }
+    let Line {
+        spans,
+        style,
+        alignment,
+    } = line;
+    let mut used = 0;
+    let mut kept = Vec::new();
+    for mut span in spans {
+        let span_width = span.width();
+        if used + span_width < width {
+            used += span_width;
+            kept.push(span);
+            continue;
+        }
+        // The trailing space makes a span that ends exactly at the edge still get its ellipsis.
+        span.content = truncate_to_width(&format!("{} ", span.content), width - used).into();
+        kept.push(span);
+        break;
+    }
+    Line {
+        spans: kept,
+        style,
+        alignment,
+    }
+}
+
 /// `value`, or `fallback` when the backend reported the field blank.
 pub(crate) fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     if value.is_empty() {
@@ -345,6 +395,20 @@ mod tests {
         let r = centered_rect(50, 50, area);
         assert_eq!(r.width, 50);
         assert_eq!(r.height, 50);
+    }
+
+    #[test]
+    fn fit_line_cuts_the_span_at_the_edge_and_drops_the_rest() {
+        let line = Line::from(vec![
+            Span::raw("Stats   : "),
+            Span::raw("PID 12345 | Drops "),
+            Span::raw("0"),
+        ]);
+        let fitted = fit_line(line, 22);
+        assert_eq!(fitted.width(), 22);
+        assert_eq!(fitted.to_string(), "Stats   : PID 12345...");
+        let exact = fit_line(Line::from(vec![Span::raw("abcd"), Span::raw("ef")]), 4);
+        assert_eq!(exact.to_string(), "a...");
     }
 
     #[test]

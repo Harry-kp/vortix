@@ -186,17 +186,17 @@ fn quality_rows(app: &App, is_focused_primary: bool) -> Vec<Line<'static>> {
         };
         rows.extend([
             helpers::detail_row(
-                "  ├─ Ping (Latency)   : ",
+                "  ├─ Latency : ",
                 format!("{}ms", app.runtime.latency_ms),
                 helpers::latency_color(app.runtime.latency_ms),
             ),
             helpers::detail_row(
-                "  ├─ Stability (Jitter): ",
+                "  ├─ Jitter  : ",
                 format!("±{}ms", app.runtime.jitter_ms),
                 jitter_color,
             ),
             helpers::detail_row(
-                "  └─ Reliability (Loss): ",
+                "  └─ Loss    : ",
                 format!("{:.1}%", app.runtime.packet_loss),
                 loss_color,
             ),
@@ -360,7 +360,7 @@ fn render_connected(
         text.push(warn);
     }
 
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(Paragraph::new(fitted(text, inner)), inner);
 }
 
 /// Compact summary for a tunnel that is not up yet (or any more): headline,
@@ -436,7 +436,14 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelV
 
     let max_lines = inner.height as usize;
     text.truncate(max_lines);
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(Paragraph::new(fitted(text, inner)), inner);
+}
+
+/// Every row cut to the panel with an ellipsis instead of stopping at its edge.
+fn fitted(text: Vec<Line<'_>>, inner: Rect) -> Vec<Line<'_>> {
+    text.into_iter()
+        .map(|line| helpers::fit_line(line, inner.width as usize))
+        .collect()
 }
 
 fn render_profile_unavailable(frame: &mut Frame, inner: Rect) {
@@ -453,7 +460,7 @@ fn render_profile_unavailable(frame: &mut Frame, inner: Rect) {
             Style::default().fg(theme::current().text_secondary),
         )),
     ];
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(Paragraph::new(fitted(text, inner)), inner);
 }
 
 fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
@@ -474,10 +481,7 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
         if let Some(profile) = app.runtime.profiles.get(idx) {
             text.push(Line::from(vec![
                 Span::styled("Profile : ", Style::default().fg(palette.text_secondary)),
-                Span::styled(
-                    crate::ui::helpers::truncate_to_width(&profile.name, value_width),
-                    Style::default().fg(palette.accent_primary),
-                ),
+                Span::styled(&profile.name, Style::default().fg(palette.accent_primary)),
             ]));
             text.push(Line::from(vec![
                 Span::styled("Protocol: ", Style::default().fg(palette.text_secondary)),
@@ -512,12 +516,14 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
             let egress_stale = app.observation_is_stale(app.runtime.last_egress_check);
             let dns_stale = app.observation_is_stale(app.runtime.last_dns_check);
 
-            if !app.runtime.public_ip.is_empty() {
-                let (value, colour) = if egress_stale {
-                    (constants::MSG_UNAVAILABLE, palette.text_secondary)
-                } else {
-                    (app.runtime.public_ip.as_str(), palette.warning)
-                };
+            // An address shows whole or not at all; the header and Security Guard carry it too.
+            let whole = |value: &str| "Your IP : ".len() + value.len() <= inner.width as usize;
+            let (value, colour) = if egress_stale {
+                (constants::MSG_UNAVAILABLE, palette.text_secondary)
+            } else {
+                (app.runtime.public_ip.as_str(), palette.warning)
+            };
+            if !app.runtime.public_ip.is_empty() && whole(value) {
                 text.push(Line::from(vec![
                     Span::styled("Your IP : ", Style::default().fg(palette.text_secondary)),
                     Span::styled(value.to_string(), Style::default().fg(colour)),
@@ -529,14 +535,15 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
                     Span::styled(&app.runtime.isp, Style::default().fg(palette.text_primary)),
                 ]));
             }
+            let (value, colour) = if dns_stale {
+                (constants::MSG_UNAVAILABLE, palette.text_secondary)
+            } else {
+                (app.runtime.dns_server.as_str(), palette.text_primary)
+            };
             if !app.runtime.dns_server.is_empty()
                 && app.runtime.dns_server != constants::MSG_DETECTING
+                && whole(value)
             {
-                let (value, colour) = if dns_stale {
-                    (constants::MSG_UNAVAILABLE, palette.text_secondary)
-                } else {
-                    (app.runtime.dns_server.as_str(), palette.text_primary)
-                };
                 text.push(Line::from(vec![
                     Span::styled("DNS     : ", Style::default().fg(palette.text_secondary)),
                     Span::styled(value.to_string(), Style::default().fg(colour)),
@@ -551,7 +558,7 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
     }
 
     text.truncate(max_lines);
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(Paragraph::new(fitted(text, inner)), inner);
 }
 
 /// Format a [`Role`] as a single `Role: ...` line.
@@ -735,14 +742,9 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
 
     let latency_color = helpers::latency_color(app.runtime.latency_ms);
 
-    let text = vec![
-        Line::from(Span::styled(
-            "Session Quality History",
-            Style::default()
-                .fg(theme::current().accent_primary)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
+    // The block title already names this face, so its rows start straight away.
+    let width = inner.width as usize;
+    let mut text = vec![
         helpers::detail_row(
             "  Latency : ",
             format!("{}ms", app.runtime.latency_ms),
@@ -759,23 +761,22 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
             theme::current().text_primary,
         ),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Sparkline history & session stats",
-            Style::default().fg(theme::current().text_secondary),
-        )),
-        Line::from(Span::styled(
-            "  will be available in a future release.",
-            Style::default().fg(theme::current().text_secondary),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  See: github.com/Harry-kp/vortix/issues/167",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        )),
     ];
+    text.extend(helpers::wrapped_lines(
+        "Sparkline history & session stats will be available in a future release.",
+        width,
+        2,
+        Style::default().fg(theme::current().text_secondary),
+    ));
+    text.push(Line::from(""));
+    text.extend(helpers::wrapped_lines(
+        "See: github.com/Harry-kp/vortix/issues/167",
+        width,
+        2,
+        Style::default().fg(theme::current().nord_polar_night_4),
+    ));
 
     let max_lines = inner.height as usize;
-    let mut text = text;
     text.truncate(max_lines);
     frame.render_widget(Paragraph::new(text), inner);
 }
@@ -870,6 +871,60 @@ mod tests {
         let out = render_to_string(&mut app, 26, 10);
         assert!(out.contains("…inline.ovpn"), "{out}");
         assert!(out.contains("01-openvp..."), "{out}");
+    }
+
+    /// Connection Details is 26 columns wide in an 80-column terminal.
+    #[test]
+    fn a_long_value_ends_in_an_ellipsis_not_at_the_panel_edge() {
+        let mut app = App::new_test();
+        app.runtime
+            .profiles
+            .push(make_profile("wg07", PathBuf::from("/tmp/wg07.conf")));
+        app.profile_list_state.select(Some(0));
+        app.runtime.public_ip = "203.0.113.5".into();
+        app.runtime.isp = "Bharti Airtel Limited".into();
+        let out = render_to_string(&mut app, 26, 12);
+        let isp = out
+            .lines()
+            .find(|line| line.contains("ISP"))
+            .expect("ISP row");
+        assert!(isp.contains("..."), "{out}");
+    }
+
+    #[test]
+    fn an_address_that_does_not_fit_is_left_out_not_cut() {
+        let mut app = App::new_test();
+        app.runtime
+            .profiles
+            .push(make_profile("wg07", PathBuf::from("/tmp/wg07.conf")));
+        app.profile_list_state.select(Some(0));
+        app.runtime.public_ip = "203.113.200.100".into();
+        let narrow = render_to_string(&mut app, 26, 12);
+        assert!(!narrow.contains("Your IP"), "{narrow}");
+        let wide = render_to_string(&mut app, 40, 12);
+        assert!(wide.contains("Your IP : 203.113.200.100"), "{wide}");
+        // A stale reading shows `unavailable`, which fits where the address does not.
+        let long_ago = std::time::Instant::now()
+            .checked_sub(app.telemetry_stale_after() + std::time::Duration::from_secs(30))
+            .expect("instant in range");
+        app.runtime.last_egress_check = Some(long_ago);
+        let stale = render_to_string(&mut app, 26, 12);
+        assert!(stale.contains("Your IP : unavailable"), "{stale}");
+    }
+
+    #[test]
+    fn the_flipped_panel_wraps_its_sentences_at_80_columns() {
+        let mut app = App::new_test();
+        app.flip_state_mut(crate::app::FocusedPanel::ConnectionDetails)
+            .set_showing_back(true);
+        let out = render_to_string(&mut app, 26, 16);
+        let words = out
+            .lines()
+            .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(words.contains("Latency"), "{out}");
+        assert!(words.contains("available in a future release."), "{out}");
     }
 
     // ───────────── role_line: pure-function variants ─────────────
