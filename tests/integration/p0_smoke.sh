@@ -33,12 +33,12 @@ chown -R "$P0_USER" "$WORK"
 chmod 700 "$WORK"
 chmod 600 "$WORK"/*.conf
 for profile in p0full p0split; do
-  sudo -u "$P0_USER" -H "$VX" import "$WORK/$profile.conf" >/dev/null
+  runuser -u "$P0_USER" -- "$VX" import "$WORK/$profile.conf" >/dev/null
 done
-sudo -u "$P0_USER" tee "$CONFIG_DIR/config.toml" >/dev/null <<'TOML'
+runuser -u "$P0_USER" -- tee "$CONFIG_DIR/config.toml" >/dev/null <<'TOML'
 ping_targets = ["10.99.99.1"]
 TOML
-sudo -u "$P0_USER" tee "$CONFIG_DIR/settings.toml" >/dev/null <<'TOML'
+runuser -u "$P0_USER" -- tee "$CONFIG_DIR/settings.toml" >/dev/null <<'TOML'
 [engine]
 wireguard_health_targets = ["10.99.99.1"]
 TOML

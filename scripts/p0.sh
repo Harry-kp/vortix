@@ -65,7 +65,8 @@ need() { # id var... — skip the scenario unless every role is set
 need_tmux() { [ -n "$HAVE_TMUX" ] || { record SKIP "$1" "tmux is not installed"; return 1; }; }
 
 vx() { "$VX" "$@"; }
-as_user() { sudo -u "$SUDO_USER" -H "$@"; }
+# runuser (Linux) runs no PAM account check, which a minimal container's sudo can fail.
+as_user() { if command -v runuser >/dev/null; then runuser -u "$SUDO_USER" -- "$@"; else sudo -u "$SUDO_USER" -H "$@"; fi; }
 rc() { "$@" >/dev/null 2>&1; echo $?; }
 contains() { printf '%s' "$1" | grep -qiE -- "$2"; }
 
