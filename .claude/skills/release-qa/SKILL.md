@@ -14,7 +14,7 @@ machine.
 ## 0. Before anything
 
 - Bring up the test VPN servers and their profiles: the `scripts/vpn-lab.sh ensure` command in
-  CLAUDE.md "Test VPN servers". Every live pass below needs them.
+  docs/live-testing.md "Test VPN servers". Every live pass below needs them.
 
 - Note the state you must restore on both machines: the kill-switch mode
   (`vortix killswitch`), the theme (`grep theme ~/.config/vortix/config.toml`),

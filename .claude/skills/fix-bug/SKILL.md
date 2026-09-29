@@ -60,7 +60,7 @@ missed.
 - Use a scratch config directory (`vortix -C <tmp>`) so real profiles and
   state are untouched.
 - Anything that connects needs the test VPN servers: run the `scripts/vpn-lab.sh ensure`
-  command in CLAUDE.md "Test VPN servers" first.
+  command in docs/live-testing.md "Test VPN servers" first.
 - Prefer the Linux lab for anything that connects. When the bug needs a
   profile shape nobody has, derive it from a lab profile with a script that
   never prints the file, keep it on that machine with mode 600, and delete it
@@ -118,7 +118,7 @@ It must end with `All checks passed.` Paste the tail as evidence; "passes
 locally" without output doesn't count. Fix every failure, including ones that
 look unrelated to your change.
 
-**Linux lab** (CLAUDE.md, "Live testing (Linux)"): apply the branch there and
+**Linux lab** (docs/live-testing.md, "Linux lab"): apply the branch there and
 run the tests, which also runs Linux-only code for real:
 
 ```bash
@@ -130,7 +130,7 @@ git diff --cached origin/main -- crates scripts tests | lab 'cd ~/vortix && git 
 lab 'cd ~/vortix && umask 022 && cargo build -p vortix && cargo test -p vortix'
 ```
 
-`umask 022` matters; see CLAUDE.md "Live testing (Linux)".
+`umask 022` matters; see docs/live-testing.md "Linux lab".
 
 **Live check** when the change affects runtime behaviour (connect, routes, DNS,
 kill switch, TUI frames), on both machines:
