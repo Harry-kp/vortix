@@ -862,7 +862,7 @@ pub mod help {
             &[
                 ("1-9", "Quick connect to profile N"),
                 ("d", "Disconnect focused tunnel / Cancel"),
-                ("D", "Disconnect ALL active tunnels (when N>1)"),
+                ("D", "Sidebar: disconnect all (asks if 2+); else: focused"),
                 ("r", "Reconnect"),
                 ("i", "Import profile (file, dir, URL)"),
                 ("K", "Cycle kill switch mode"),
@@ -1344,7 +1344,7 @@ pub mod help {
                     let _ = writeln!(acc, "{k} {d}");
                     acc
                 });
-            assert!(blob.contains("Disconnect ALL"));
+            assert!(blob.contains("disconnect all"));
             assert!(blob.contains("Switch — stop the conflicting tunnel"));
             assert!(!blob.contains("Connect both"));
         }

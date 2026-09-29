@@ -765,8 +765,8 @@ impl crate::app::App {
                 }
                 self.handle_message(Message::Disconnect);
             }
-            // Uppercase `D` is the global Disconnect All action. The message
-            // layer skips confirmation when zero or one tunnel is active.
+            // Uppercase `D` disconnects every tunnel from the sidebar and the
+            // focused one elsewhere; the message layer asks only when 2+ are up.
             KeyCode::Char('D') => {
                 if self.focused_panel == FocusedPanel::Sidebar {
                     self.handle_message(Message::RequestDisconnectAll);
