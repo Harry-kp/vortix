@@ -402,7 +402,7 @@ fn handle_autoconnect(target: Option<&str>, config_dir: &Path, mode: OutputMode)
         OutputMode::Human => match &data.profile {
             Some(profile) => println!(
                 "Autoconnect: {profile} at boot (log: {})",
-                autoconnect::log_hint()
+                autoconnect::LOG_HINT
             ),
             None => println!("Autoconnect: off"),
         },

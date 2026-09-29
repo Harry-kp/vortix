@@ -47,10 +47,7 @@ pub fn installed_profile() -> Option<String> {
 }
 
 /// Where the boot attempts log.
-#[must_use]
-pub fn log_hint() -> String {
-    format!("journalctl -u {UNIT}")
-}
+pub const LOG_HINT: &str = "journalctl -u vortix-autoconnect.service";
 
 fn unit_text(command: &[String], env: &[(String, String)]) -> String {
     let profile = command.last().map_or("", String::as_str);
@@ -121,6 +118,11 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_hint_names_the_unit() {
+        assert!(LOG_HINT.ends_with(UNIT));
+    }
 
     #[test]
     fn the_unit_runs_vortix_up_after_the_network_and_names_its_profile() {

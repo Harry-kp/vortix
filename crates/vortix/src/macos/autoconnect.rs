@@ -42,10 +42,7 @@ pub fn installed_profile() -> Option<String> {
 }
 
 /// Where the boot attempts log.
-#[must_use]
-pub fn log_hint() -> String {
-    LOG_PATH.to_string()
-}
+pub const LOG_HINT: &str = LOG_PATH;
 
 fn plist_text(command: &[String], env: &[(String, String)]) -> String {
     let mut args = String::new();

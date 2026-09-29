@@ -735,7 +735,12 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelView>) -> Verdic
 /// bottom instead dropped whichever rows happened to be last — at 80x24
 /// that was `Killswitch`, the one row stating whether anything is being
 /// protected at all. Spacing and decoration go before any verdict does.
-const SHEDDABLE_ROWS: [&str; 7] = [
+/// The exposed panel's closing advice.
+const CONNECT_HINT: &str = "Connect to a profile to protect this traffic.";
+
+const SHEDDABLE_ROWS: [&str; 8] = [
+    // The EXPOSED banner already says it.
+    CONNECT_HINT,
     "Identity",
     "Defense",
     "Location",
@@ -765,20 +770,6 @@ fn row_label(line: &Line<'static>) -> String {
         .unwrap_or_default()
 }
 
-/// The exposed panel's closing advice; the banner already says the same, so
-/// it goes first, and whole, when the panel is short.
-const CONNECT_HINT: &str = "Connect to a profile to protect this traffic.";
-
-fn is_hint_line(line: &Line<'static>) -> bool {
-    // Hint lines carry no indent, unlike the sublines built the same way.
-    let text = line.to_string();
-    line.spans
-        .first()
-        .is_some_and(|span| span.content.is_empty())
-        && !text.trim().is_empty()
-        && CONNECT_HINT.contains(text.trim())
-}
-
 fn is_blank_line(line: &Line<'static>) -> bool {
     line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty())
 }
@@ -792,10 +783,6 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
     // Shed spacing first, then decoration, then the rows a reader can do
     // without — never a verdict row, while anything cheaper remains.
     let mut excess = lines.len().saturating_sub(available_height);
-    if excess > lines.iter().filter(|line| is_blank_line(line)).count() {
-        lines.retain(|line| !is_hint_line(line));
-        excess = lines.len().saturating_sub(available_height);
-    }
     while excess > 0 {
         let victim = lines.iter().position(is_blank_line).or_else(|| {
             SHEDDABLE_ROWS.iter().find_map(|label| {
@@ -1191,8 +1178,15 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         },
         w,
     ));
-    lines.push(Line::from(""));
-    lines.extend(wrapped_text(CONNECT_HINT, w, 0));
+    // The banner already says it; the advice shows only where it fits whole.
+    // Shown only where it fits whole, so a short panel sheds it as one row.
+    if CONNECT_HINT.chars().count() <= w {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            CONNECT_HINT,
+            Style::default().fg(theme::current().text_secondary),
+        )));
+    }
 
     lines
 }
@@ -1536,35 +1530,36 @@ mod tests {
     }
 
     #[test]
-    fn the_exposed_hints_wrap_instead_of_being_cut() {
-        let app = App::new_test();
-        let lines = build_exposed_audit(&app, 23);
-        let text = lines
-            .iter()
-            .map(|line| line_text(line).trim().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(lines.iter().all(|line| line.width() <= 23), "{text}");
+    fn the_exposed_explanations_wrap_and_the_advice_shows_only_whole() {
+        let text = |width: u16| {
+            let lines = build_exposed_audit(&App::new_test(), width);
+            assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
+            lines
+                .iter()
+                .map(|line| line_text(line).trim().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let narrow = text(23);
+        assert!(narrow.contains("your real IPv4 is visible"), "{narrow}");
+        assert!(!narrow.contains("Connect"), "{narrow}");
+        let wide = text(60);
         assert!(
-            text.contains("Connect to a profile to protect this traffic."),
-            "{text}"
+            wide.contains("Connect to a profile to protect this traffic."),
+            "{wide}"
         );
-        assert!(text.contains("your real IPv4 is visible"), "{text}");
     }
 
-    /// The Guard has 8 rows inside its border at 80x24.
+    /// A wide Guard in a 24-row terminal has 8 rows: the advice goes before any real row.
     #[test]
-    fn a_short_panel_drops_the_connect_hint_whole() {
-        let app = App::new_test();
-        let lines = compact_to_fit(build_exposed_audit(&app, 23), 8);
-        let text = lines
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(lines.len(), 8, "{text}");
+    fn a_short_wide_panel_gives_up_the_advice_before_a_row() {
+        let mut app = App::new_test();
+        app.runtime.public_ipv6 = Some("2001:db8::1".to_string());
+        let lines = compact_to_fit(build_exposed_audit(&app, 60), 8);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(!text.contains("Connect"), "{text}");
-        assert!(text.contains("visible"), "{text}");
+        assert!(text.contains("Exit IPv6"), "{text}");
+        assert!(text.contains("Killswitch"), "{text}");
     }
 
     /// One healthy probe must not be able to stamp "just now" over readings
