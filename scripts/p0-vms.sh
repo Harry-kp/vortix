@@ -15,8 +15,8 @@
 #
 # Run it on the lab host, from this checkout. By default it tests this checkout,
 # built as a static musl binary so one build runs on every distro. For each VM it
-# boots it if needed, copies in the binary, p0.sh and any missing P0-role profile
-# (roles come from target/p0.env of the lab's own p0 run), runs p0.sh there with
+# boots it if needed, copies in the binary, p0.sh and the current P0-role profiles, replacing
+# the VM's copies (roles come from target/p0.env of the lab's own p0 run), runs p0.sh there with
 # the blocking scenarios allowed (only the VM loses its network), collects
 # target/p0-vms/<vm>.json, and shuts down a VM it started. Exits 1 on any FAIL.
 set -euo pipefail
@@ -69,12 +69,17 @@ for vm in "${VMS[@]}"; do
     vm_put "$BIN" vx-p0/target/debug/vortix
     vm_put scripts/p0.sh vx-p0/scripts/p0.sh
     for profile in ${P0_FULL:-} ${P0_FULL2:-} ${P0_SPLIT:-} ${P0_OVPN:-}; do
-        vm_ssh "~/vx-p0/target/debug/vortix list --names-only 2>/dev/null | grep -qxF '$profile'" && continue
         file=$(profile_file "$profile")
         [ -n "$file" ] || { echo "  $profile: not on the lab, its scenarios will skip"; continue; }
+        # Replaced every run: a recreated lab droplet makes the VM's old copy dead.
         vm_put "$file" "/tmp/${file##*/}"
-        vm_ssh "chmod 600 '/tmp/${file##*/}' && cd /tmp && ~/vx-p0/target/debug/vortix import '/tmp/${file##*/}' >/dev/null; rm -f '/tmp/${file##*/}'"
-        echo "  imported $profile"
+        # delete exits 3 for a profile that isn't there; any other failure would leave the old copy.
+        if vm_ssh "chmod 600 '/tmp/${file##*/}' && cd /tmp && { ~/vx-p0/target/debug/vortix delete '$profile' --yes >/dev/null 2>&1; rc=\$?; [ \$rc = 0 ] || [ \$rc = 3 ]; } && ~/vx-p0/target/debug/vortix import '/tmp/${file##*/}' >/dev/null; rc=\$?; rm -f '/tmp/${file##*/}'; exit \$rc"; then
+            echo "  imported $profile"
+        else
+            echo "  $profile: could not replace the VM's copy (a tunnel still using it?)"
+            failed=1
+        fi
     done
 
     # Phase 1: the journey, with the role profiles under the names it expects.

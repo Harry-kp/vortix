@@ -13,6 +13,9 @@ machine.
 
 ## 0. Before anything
 
+- Bring up the test VPN servers and their profiles: the `scripts/vpn-lab.sh ensure` command in
+  CLAUDE.md "Test VPN servers". Every live pass below needs them.
+
 - Note the state you must restore on both machines: the kill-switch mode
   (`vortix killswitch`), the theme (`grep theme ~/.config/vortix/config.toml`),
   and whatever tunnels are up (normally none).
@@ -83,7 +86,9 @@ the report as open, with its user-visible effect. It is never silently dropped.
    is a user-facing bug in the release; fix it in a patch release.
 
 1. Restore both machines to the state noted in step 0 and prove it: no
-   tunnels, the kill-switch mode, empty pf anchor / nft table, the theme.
+   tunnels, the kill-switch mode, empty pf anchor / nft table, the theme. Then stop the
+   droplet's billing with `scripts/vpn-lab.sh down --yes`; the post-release check makes a new
+   one.
 2. Update P0.md's results log with this run: one row per area, the fixed
    findings, and the open ones. Fix any workflow whose expectation turned out
    stale. Add a workflow only for something no automated test can catch.

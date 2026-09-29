@@ -50,6 +50,7 @@ cargo build -p vortix                 # debug build → target/debug/vortix (use
 cargo test -p vortix <filter>         # focused tests while iterating
 scripts/ci-local.sh --quick           # what CI runs (fmt, clippy, test, doc, xtask, Linux cross-clippy)
 scripts/ci-local.sh                   # same + release build; run before every push
+scripts/vpn-lab.sh ensure             # the VPN servers every real tunnel uses (see "Test VPN servers")
 sudo scripts/p0.sh                    # live smoke set against real tunnels (release QA)
 ```
 
@@ -148,6 +149,23 @@ output), and no trait added only to make something mockable.
 - Things only a real kernel, terminal or VPN server can show go in
   [`docs/manual-testing/P0.md`](docs/manual-testing/P0.md), with a pass signal
   visible in a captured frame — only if no automated test can answer it.
+
+## Test VPN servers
+
+Every lab profile (`wg07`–`wg15`, `01-`–`06-openvpn-*`) points at one DigitalOcean droplet made by
+`scripts/vpn-lab.sh`; it is often destroyed to save cost, and a new one has new addresses and keys.
+Before anything connects a real tunnel, on either machine or in the distro VMs, run from the
+Mac:
+
+```bash
+VPN_LAB_SYNC=harrykp@192.168.1.97 VPN_LAB_SYNC_KEY=~/.ssh/vortix_lab_ed25519 VPN_LAB_SYNC_VORTIX=vortix/target/debug/vortix scripts/vpn-lab.sh ensure
+```
+
+It keeps a live droplet or creates one, and replaces the lab profiles here and on the Linux
+lab wherever they don't point at it (deleting the old names first); `scripts/p0-vms.sh` then copies them
+into the VMs. Quit both dashboards first: an open one holds the lock and the import stops.
+`scripts/vpn-lab.sh down --yes` destroys it when testing is done; OpenVPN credentials must be
+saved again for each droplet (its `credentials.txt`).
 
 ## Live testing (macOS)
 

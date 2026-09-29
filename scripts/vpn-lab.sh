@@ -2,6 +2,7 @@
 # One-droplet, ephemeral VPN compatibility lab for Vortix.
 #
 # Usage:
+#   ./scripts/vpn-lab.sh ensure             # a live lab with its profiles imported: run before any real-VPN test
 #   ./scripts/vpn-lab.sh up                 # create, provision, download profiles
 #   ./scripts/vpn-lab.sh status             # show the active droplet and elapsed time
 #   ./scripts/vpn-lab.sh ssh                # open a root shell on the lab
@@ -17,6 +18,15 @@
 #   DO_SSH_KEY_FILE=~/.ssh/id_ed25519       local private key override
 #   VPN_LAB_PROFILE_DIR=/secure/path        download destination override
 #   VPN_LAB_KEEP_ON_FAILURE=1               retain a failed droplet for debugging
+#   VPN_LAB_SYNC=user@host                  also replace the profiles on this Linux machine
+#   VPN_LAB_SYNC_KEY=~/.ssh/key             its SSH key
+#   VPN_LAB_SYNC_VORTIX=vortix              the Vortix binary there
+#
+# Every droplet has new addresses and keys, so `ensure` replaces the lab's profiles on this
+# machine and on VPN_LAB_SYNC wherever they point anywhere else (deleting the old names first;
+# importing over them would add wg08_1 beside a dead wg08). The distro VMs take theirs from VPN_LAB_SYNC on
+# each scripts/p0-vms.sh run. Saved OpenVPN credentials go with the old profiles; the new
+# droplet's are in its credentials.txt.
 
 set -euo pipefail
 
@@ -754,8 +764,85 @@ command_up() {
 
   ok "Lab ready: ${name} (${ipv4})"
   ok "${#EXPECTED_PROFILES[@]} profiles downloaded to ${output}"
-  printf '\nRead %s/README.txt, then import the directory into Vortix.\n' "$output"
+  [[ -n "${ENSURING:-}" ]] || printf '\nRead %s/README.txt, then run %s ensure to import them.\n' "$output" "$0"
   printf 'When testing is finished, stop billing with:\n  %s down\n' "$0"
+}
+
+# The recorded lab: none (no state), gone (DigitalOcean has no such droplet), alive (active
+# and answering SSH), or unreachable (it exists, or the API could not say, but does not answer).
+lab_state() {
+  local id ipv4 status
+  id=$(state_value id || true)
+  ipv4=$(state_value ipv4 || true)
+  [[ "$id" =~ ^[0-9]+$ ]] || { echo none; return; }
+  if ! status=$(doctl compute droplet get "$id" --format Status --no-header 2>&1); then
+    [[ "$status" == *" 404 "* ]] && echo gone || echo unreachable
+    return
+  fi
+  [[ "$status" == active ]] && lab_ssh "root@${ipv4}" true 2>/dev/null && echo alive || echo unreachable
+}
+
+# Replace the lab profiles in a Vortix unless its copies are the new files byte for byte
+# (import keeps a file unchanged; a new droplet can reuse an address, never its keys):
+# $1 vortix, $2 its profiles dir, $3 the new profiles, the rest the names. Old names are
+# deleted first; `delete` exits 3 for one that isn't there, and any other failure (a tunnel
+# or dashboard still using it) stops before the import could add duplicates.
+readonly REPLACE_PROFILES='vx=$1 have=$2 dir=$3; shift 3
+current=1
+for name in "$@"; do
+  new=$(ls "$dir/$name".conf "$dir/$name".ovpn 2>/dev/null | head -1)
+  old="$have/${new##*/}"
+  cmp -s "$old" "$new" || current=
+done
+[ -n "$current" ] && { echo current; exit 0; }
+for name in "$@"; do
+  out=$("$vx" delete "$name" --yes 2>&1); rc=$?
+  [ "$rc" = 0 ] || [ "$rc" = 3 ] || { printf "%s\n" "$out" >&2; exit "$rc"; }
+done
+out=$("$vx" import "$dir" 2>&1) || { printf "%s\n" "$out" >&2; exit 1; }
+echo replaced'
+
+sync_profiles() {
+  local dir names=() vortix remote_dir remote_rm result
+  dir=$(state_value profiles)
+  [[ -d "$dir" ]] || die "The downloaded profiles are gone (${dir}); run '$0 down --yes', then '$0 ensure'"
+  verify_profile_matrix "$dir"
+  for profile in "${EXPECTED_PROFILES[@]}"; do names+=("${profile%.*}"); done
+  vortix="$(cd "$(dirname "$0")/.." && pwd)/target/debug/vortix"
+  [[ -x "$vortix" ]] || vortix=vortix
+  result=$(bash -c "$REPLACE_PROFILES" _ "$vortix" "${VORTIX_CONFIG_DIR:-$HOME/.config/vortix}/profiles" \
+    "$dir" "${names[@]}") || die "Replacing the profiles here failed (above); fix that and run '$0 ensure' again"
+  ok "Profiles here: ${result}"
+  [[ -n "${VPN_LAB_SYNC:-}" ]] || return 0
+  local opts=(-o BatchMode=yes -o ConnectTimeout=8 ${VPN_LAB_SYNC_KEY:+-i "$VPN_LAB_SYNC_KEY"})
+  remote_dir=$(ssh "${opts[@]}" "$VPN_LAB_SYNC" 'umask 077; mktemp -d')
+  remote_rm="rm -rf $(printf %q "$remote_dir")"
+  if ! scp -q "${opts[@]}" "$dir"/* "${VPN_LAB_SYNC}:${remote_dir}/"; then
+    ssh "${opts[@]}" "$VPN_LAB_SYNC" "$remote_rm" || true
+    die "Copying the profiles to ${VPN_LAB_SYNC} failed"
+  fi
+  # The copy holds keys: it goes on every exit, including a dropped session.
+  result=$(ssh "${opts[@]}" "$VPN_LAB_SYNC" "trap $(printf %q "$remote_rm") EXIT HUP; bash -c \
+    $(printf %q "$REPLACE_PROFILES") _ $(printf '%q ' "${VPN_LAB_SYNC_VORTIX:-vortix}" \
+    .config/vortix/profiles "$remote_dir" "${names[@]}")") ||
+    die "Replacing the profiles on ${VPN_LAB_SYNC} failed (above); fix that and run '$0 ensure' again"
+  ok "Profiles on ${VPN_LAB_SYNC}: ${result}"
+}
+
+command_ensure() {
+  (($# == 0)) || die "Usage: $0 ensure"
+  require_cmd doctl
+  case $(lab_state) in
+    alive) ok "Lab up: $(state_value name) ($(state_value ipv4))" ;;
+    none) ENSURING=1 command_up ;;
+    gone)
+      warn "The recorded lab no longer exists; making a new one"
+      clear_state
+      ENSURING=1 command_up
+      ;;
+    *) die "The recorded lab $(state_value name) exists but does not answer; check '$0 status', or '$0 down --yes' and run ensure again" ;;
+  esac
+  sync_profiles
 }
 
 command_status() {
@@ -857,17 +944,19 @@ usage() {
 Usage: $0 <command>
 
 Commands:
+  ensure          Keep or create the lab and import its profiles here (and on VPN_LAB_SYNC)
   up              Create one droplet, provision all profiles, and download them
   status          Show the active droplet, elapsed lifetime, and profile path
   ssh             Open an SSH shell on the active lab
   down [--yes]    Destroy the active droplet; downloaded profiles are retained
   self-test       Validate the embedded provisioner without using DigitalOcean
 
-The script never imports profiles automatically and never deletes downloaded keys.
+Only ensure imports profiles; nothing deletes downloaded keys.
 EOF
 }
 
 case "${1:-}" in
+  ensure) shift; command_ensure "$@" ;;
   up) shift; command_up "$@" ;;
   status) shift; command_status "$@" ;;
   ssh) shift; command_ssh "$@" ;;

@@ -7,8 +7,9 @@
 # Records ~25 s; output lands at assets/leak-detection.gif.
 #
 # Prerequisites:
-#   ./scripts/vpn-lab.sh up
-#   Copy wg14.conf to wg-dns-leak.conf in the clean demo profile directory and
+#   ./scripts/vpn-lab.sh ensure
+#   From the profile directory `./scripts/vpn-lab.sh status` prints (again after
+#   every new droplet: the copies go stale with it), copy wg14.conf to wg-dns-leak.conf in the clean demo profile directory and
 #   import it into vortix. This profile intentionally redirects DNS upstream.
 #   sudo NOPASSWD configured for vortix (see README).
 #   vhs tapes/leak-detection.tape

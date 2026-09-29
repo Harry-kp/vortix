@@ -7,8 +7,9 @@
 # Records ~20 s; output lands at assets/split-tunnel.gif.
 #
 # Prerequisites:
-#   ./scripts/vpn-lab.sh up
-#   Copy wg07.conf to wg-split.conf in the clean demo profile directory and
+#   ./scripts/vpn-lab.sh ensure
+#   From the profile directory `./scripts/vpn-lab.sh status` prints (again after
+#   every new droplet: the copies go stale with it), copy wg07.conf to wg-split.conf in the clean demo profile directory and
 #   import it into vortix.
 #   sudo NOPASSWD configured for vortix (see README).
 #   vhs tapes/split-tunnel.tape

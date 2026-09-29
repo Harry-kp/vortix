@@ -8,8 +8,9 @@
 # Records ~70 s; output lands at assets/demo.gif.
 #
 # Prerequisites (one-time setup before recording):
-#   1. Create the one-droplet lab:            ./scripts/vpn-lab.sh up
-#   2. From its printed profile directory, copy wg08.conf to wg-full.conf,
+#   1. The lab and its profiles:              ./scripts/vpn-lab.sh ensure
+#   2. From the profile directory `./scripts/vpn-lab.sh status` prints (again after
+#      every new droplet: the copies below go stale with it), copy wg08.conf to wg-full.conf,
 #      wg07.conf to wg-split.conf, wg14.conf to wg-dns-leak.conf, and
 #      04-openvpn-tcp-static-challenge.ovpn to ovpn-totp.ovpn in the clean
 #      demo profile directory, then import that directory into vortix.

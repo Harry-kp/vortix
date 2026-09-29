@@ -59,6 +59,8 @@ missed.
 
 - Use a scratch config directory (`vortix -C <tmp>`) so real profiles and
   state are untouched.
+- Anything that connects needs the test VPN servers: run the `scripts/vpn-lab.sh ensure`
+  command in CLAUDE.md "Test VPN servers" first.
 - Prefer the Linux lab for anything that connects. When the bug needs a
   profile shape nobody has, derive it from a lab profile with a script that
   never prints the file, keep it on that machine with mode 600, and delete it

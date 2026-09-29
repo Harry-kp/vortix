@@ -34,7 +34,8 @@ Do the first step below that has work, finish that one unit, report, and stop. O
 tick keeps the work serial: one branch, one PR, nothing racing.
 
 **0. Preflight.** On `main` with a clean tree (`git status`); `gh auth status` shows
-`Harry-kp` active; the lab answers (`ssh … true`); tmux `vxrun` exists. A missing machine
+`Harry-kp` active; the lab answers (`ssh … true`); tmux `vxrun` exists. Only when this tick
+will connect a real tunnel: `scripts/vpn-lab.sh ensure` (CLAUDE.md "Test VPN servers"). A missing machine
 does not stop the tick, but a step that needs it does: the live checks in `fix-bug`, and
 `release-qa`. Skip those steps and name the missing machine in the report.
 
@@ -104,9 +105,11 @@ carries a `docs: user-facing changelog` commit.
 
 **After it ships** (a new tag, and the release PR merged):
 - Check the release page for all assets.
-- Check the install channels: `P0_TAG=vX.Y.Z P0_SMOKE=0 scripts/p0-vms.sh` on the lab.
+- Bring up the test VPN servers (`scripts/vpn-lab.sh ensure`, CLAUDE.md "Test VPN servers"),
+  then check the install channels: `P0_TAG=vX.Y.Z P0_SMOKE=0 scripts/p0-vms.sh` on the lab.
 - A failure is a `priority` bug. Open it and fix it through `fix-bug`.
 - Comment the result on the release PR. Issues fixed in the release are closed by their PRs.
+- Stop the droplet's billing: `scripts/vpn-lab.sh down --yes`.
 
 ## Rules
 

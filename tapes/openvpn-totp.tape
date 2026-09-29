@@ -7,8 +7,9 @@
 # Records ~30 s; output lands at assets/openvpn-totp.gif.
 #
 # Prerequisites:
-#   ./scripts/vpn-lab.sh up
-#   Copy 04-openvpn-tcp-static-challenge.ovpn to ovpn-totp.ovpn in the clean
+#   ./scripts/vpn-lab.sh ensure
+#   From the profile directory `./scripts/vpn-lab.sh status` prints (again after
+#   every new droplet: the copies go stale with it), copy 04-openvpn-tcp-static-challenge.ovpn to ovpn-totp.ovpn in the clean
 #   demo profile directory and import it into vortix.
 #   sudo NOPASSWD configured for vortix (see README).
 #   The generated credentials.txt supplies the fixed isolated-lab values:
