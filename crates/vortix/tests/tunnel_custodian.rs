@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead as _, Write as _};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use vortix::process::{
@@ -227,31 +227,31 @@ fn spawn_hidden_until_ready(
 }
 
 fn wait_for_group_absence(pid: u32) {
-    for _ in 0..200 {
-        if !group_has_live_members(pid) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
+    eventually(&format!("process group {pid} gone"), || {
+        !group_has_live_members(pid)
+    });
+}
+
+/// Poll `done` until it holds. The deadline is generous because a loaded CI
+/// runner can take seconds to spawn or reap; a passing run returns at once.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what} within 10 s");
+        thread::sleep(Duration::from_millis(25));
     }
-    assert!(
-        !group_has_live_members(pid),
-        "process group {pid} retained a live member"
-    );
 }
 
 fn wait_for_pid_file(path: &std::path::Path) -> u32 {
-    for _ in 0..40 {
-        if let Ok(pid) = std::fs::read_to_string(path)
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .parse::<u32>()
-        {
-            return pid;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("child pid file was not populated: {}", path.display());
+    let read = || {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    eventually(&format!("child pid file {}", path.display()), || {
+        read().is_some()
+    });
+    read().expect("pid file populated")
 }
 
 fn pid_recording_sleep(path: &std::path::Path) -> CommandSpec {
@@ -318,19 +318,15 @@ fn zombie_only_process_group_is_not_a_live_leak() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let mut state = String::new();
-    for _ in 0..200 {
+    eventually("the exited child shows as a zombie", || {
         let status = Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
             .unwrap();
-        state = String::from_utf8(status.stdout).unwrap();
-        if state.trim_start().starts_with('Z') {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(state.trim_start().starts_with('Z'), "state was {state:?}");
+        String::from_utf8_lossy(&status.stdout)
+            .trim_start()
+            .starts_with('Z')
+    });
     let reported_alive = group_has_live_members(pid);
     child.wait().unwrap();
 
@@ -454,20 +450,11 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
         None,
     )
     .unwrap();
-    for _ in 0..100 {
-        if vortix::process::custodian::load_identity(&natural.profile_id)
-            .unwrap()
-            .is_none()
-        {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    assert!(
+    eventually("the natural exit releases its receipt", || {
         vortix::process::custodian::load_identity(&natural.profile_id)
             .unwrap()
             .is_none()
-    );
+    });
     vortix::process::custodian::remote_stop_after_startup(&natural_handshake)
         .expect("the startup owner can prove an already-clean natural exit");
 
