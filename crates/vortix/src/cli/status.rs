@@ -274,7 +274,7 @@ pub(super) fn handle_status(
                     snap.killswitch_state.display_status()
                 );
                 if let Some(health) = &session.health {
-                    println!("  Health       {}", connection_health_human(health));
+                    println!("  Health       {}", health.describe());
                 }
             } else {
                 println!("{}", snapshot_headline(&snap));
@@ -461,7 +461,7 @@ pub(super) fn human_status_headline(session: Option<&SessionStatus>) -> String {
             |health| match health {
                 crate::tunnel::ConnectionHealth::Degraded { .. } => format!(
                     "⚠ Connected to {profile} ({protocol}) — {}",
-                    connection_health_human(health)
+                    health.describe()
                 ),
                 _ => format!("● Connected to {profile} ({protocol})"),
             },
@@ -490,55 +490,9 @@ pub(super) fn connection_health_entry(
         },
         ConnectionHealth::Degraded { reason } => ConnectionHealthEntry {
             status: "degraded".into(),
-            reason: Some(degraded_reason_human(reason)),
+            reason: Some(reason.describe()),
         },
     }
-}
-
-pub(super) fn connection_health_human(health: &crate::tunnel::ConnectionHealth) -> String {
-    use crate::tunnel::ConnectionHealth;
-    match health {
-        ConnectionHealth::Unknown => "Unknown (measuring)".into(),
-        ConnectionHealth::Healthy => "Healthy".into(),
-        ConnectionHealth::Degraded { reason } => {
-            format!("Degraded: {}", degraded_reason_human(reason))
-        }
-    }
-}
-
-fn degraded_reason_human(reason: &crate::tunnel::DegradedReason) -> String {
-    use crate::tunnel::DegradedReason;
-    match reason {
-        DegradedReason::HandshakeStale {
-            seconds_since_last_handshake,
-        } => format!("handshake stale for {seconds_since_last_handshake}s"),
-        DegradedReason::WireGuardPeerStale {
-            peer_public_key,
-            allowed_routes,
-            seconds_since_last_handshake,
-        } => format!(
-            "peer {} stale for {}s on {}",
-            short_peer(peer_public_key),
-            seconds_since_last_handshake,
-            allowed_routes.join(",")
-        ),
-        DegradedReason::WireGuardPeerNeverObserved {
-            peer_public_key,
-            allowed_routes,
-        } => format!(
-            "peer {} has no handshake on {}",
-            short_peer(peer_public_key),
-            allowed_routes.join(",")
-        ),
-        DegradedReason::HighPacketLoss { loss_percent } => {
-            format!("{loss_percent:.1}% packet loss")
-        }
-        DegradedReason::HighLatency { latency_ms } => format!("{latency_ms}ms latency"),
-    }
-}
-
-fn short_peer(peer: &str) -> &str {
-    peer.get(..peer.len().min(8)).unwrap_or(peer)
 }
 
 #[allow(clippy::cast_possible_wrap)]

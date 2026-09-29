@@ -90,6 +90,8 @@ fn set_connected(app: &mut App, name: &str) {
             ..Default::default()
         },
         health: vortix::tunnel::ConnectionHealth::default(),
+        drops: 0,
+        last_drop: None,
     });
     app.apply_control_snapshot(std::sync::Arc::new(snapshot));
 }

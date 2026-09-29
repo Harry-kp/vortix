@@ -870,7 +870,7 @@ pub mod help {
                 ("Tab/S-Tab,l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),
-                ("f", "Flip Chart / Details / Security panel"),
+                ("f", "Flip Details / Security: why the front says that"),
                 ("x", "Action menu"),
                 ("b", "Bulk action menu"),
                 ("p", "Switch color theme"),
@@ -1357,6 +1357,16 @@ pub mod help {
                 .map(|(_, bindings)| *bindings)
                 .expect("Global help section must exist");
             assert!(global.contains(&("p", "Switch color theme")));
+        }
+
+        #[test]
+        fn help_offers_flip_only_where_it_explains() {
+            let flip = HELP_TEXT
+                .iter()
+                .flat_map(|(_, bindings)| bindings.iter())
+                .find(|(key, _)| *key == "f")
+                .expect("f is in the help");
+            assert_eq!(flip.1, "Flip Details / Security: why the front says that");
         }
 
         #[test]

@@ -279,13 +279,10 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
     }
 
     // 2. Universal Contextual Utility
-    if matches!(
-        focused_panel,
-        FocusedPanel::Chart | FocusedPanel::ConnectionDetails | FocusedPanel::Security
-    ) {
+    if focused_panel.flips() {
         actions.push(ActionMenuItem {
             key: "f",
-            label: "Flip Panel (Front/Back)",
+            label: "Flip: why the front says that",
             message: Message::ToggleFlip,
         });
     }
@@ -349,10 +346,9 @@ mod tests {
     }
 
     #[test]
-    fn test_chart_actions_flip_and_zoom() {
+    fn test_chart_actions_zoom_only() {
         let actions = get_single_actions(&FocusedPanel::Chart);
-        assert_eq!(actions.len(), 2);
-        assert!(actions.iter().any(|a| a.key == "f")); // flip
+        assert_eq!(actions.len(), 1);
         assert!(actions.iter().any(|a| a.key == "z")); // zoom
     }
 

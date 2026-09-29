@@ -161,10 +161,7 @@ impl App {
             }
             Message::ToggleFlip => {
                 let panel = self.focused_panel.clone();
-                if matches!(
-                    panel,
-                    FocusedPanel::Chart | FocusedPanel::ConnectionDetails | FocusedPanel::Security
-                ) {
+                if panel.flips() {
                     self.flip_state_mut(panel).flip();
                 }
             }

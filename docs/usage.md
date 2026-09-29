@@ -35,7 +35,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `j` `k` / `↓` `↑`, `g` `G`, `PgUp` `PgDn` | Move through the list |
 | `Tab` / `Shift-Tab`, `l` / `h`, `F1`–`F5` | Move between panels (Profiles, Details, Chart, Security, Logs) |
 | `z` | Zoom the focused panel |
-| `f` | Flip the Chart, Details or Security panel to its other side; in the Logs panel, cycle the source |
+| `f` | Flip Details or Security to the side that explains it ([Flip side](#flip-side)); in the Logs panel, cycle the source |
 | `x` / `b` | Action menu / bulk actions |
 | `R` / `v` / `Del` | Rename / view config / delete the focused profile |
 | `a` / `A` | Save / clear OpenVPN credentials |
@@ -89,6 +89,22 @@ In a narrow panel (an 80-column terminal) the rows use short labels, so an addre
 
 The footer gives the age of the readings (`Updated 12s ago`); a reading too old to trust shows
 `unavailable`. Addresses come from public IP lookup services (see [SECURITY.md](../SECURITY.md)).
+
+### Flip side
+
+`f` turns Details or Security over to show why its front says what it does. A panel with
+something to explain has `[f] why` in its bottom border: Security when the verdict is `PARTIAL`
+or `EXPOSED`, Details when the tunnel is degraded or its last connect failed.
+
+- **Evidence** (Security): each reading behind the verdict with its age: exit and real
+  addresses, the resolvers the tunnel asked for against the ones in use, the kill switch
+  with what it does, and the cipher. The failing checks come first; when they do not all fit, the last line says
+  `… z shows all`.
+- **Health** (Details): the focused profile's state and uptime, drops since you connected (a
+  disconnect resets the count) and when the last one was, the health reason (for example
+  `handshake stale for 90s`), and the routes and DNS it carries. Why the last connect or
+  reconnect failed stays on it until the profile comes up; a profile that never tried shows
+  `No connection yet this session.`
 
 ### Logs
 

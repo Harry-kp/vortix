@@ -3,7 +3,7 @@ use crate::app::App;
 use crate::app::Role;
 use crate::cidr::Cidr;
 use crate::control::{Phase, TunnelView};
-use crate::profile::ProtocolKind;
+use crate::profile::{ProfileId, ProtocolKind};
 use crate::tunnel::DetailedConnectionInfo;
 use crate::ui::helpers;
 use crate::{constants, ui::theme};
@@ -32,20 +32,6 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(theme::current().border_default)
     };
 
-    if app.effective_flipped(&crate::app::FocusedPanel::ConnectionDetails) {
-        render_back(frame, app, area, border_style);
-        return;
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .padding(Padding::horizontal(1))
-        .title(" Connection Details ");
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     // Focused profile = sidebar selection, falling back to the primary if
     // nothing is selected (so the panel still has useful content when the
     // user is browsing other panels).
@@ -56,7 +42,34 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .map(|p| p.id.clone())
         .or_else(|| app.primary_id().cloned());
 
+    if app.effective_flipped(&crate::app::FocusedPanel::ConnectionDetails) {
+        render_back(frame, app, focused_profile_id.as_ref(), area, border_style);
+        return;
+    }
+
     let focused_snap = focused_profile_id.as_ref().and_then(|id| app.tunnel(id));
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .padding(Padding::horizontal(1))
+        .title(" Connection Details ");
+    // The flip side explains a degraded tunnel or a failed connect.
+    let degraded = focused_snap.is_some_and(|tunnel| {
+        matches!(
+            tunnel.health,
+            crate::tunnel::ConnectionHealth::Degraded { .. }
+        )
+    });
+    let failed = focused_profile_id
+        .as_ref()
+        .is_some_and(|id| app.control_snapshot.failures.contains_key(id));
+    if degraded || failed {
+        block = block.title_bottom(helpers::border_hint(constants::FLIP_WHY_HINT));
+    }
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let primary_id = app.primary_id();
     let is_focused_primary = matches!(
         (&focused_profile_id, primary_id),
@@ -723,62 +736,87 @@ fn config_has_fwmark(raw: &str) -> bool {
     false
 }
 
-fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
+fn render_back(
+    frame: &mut Frame,
+    app: &App,
+    profile_id: Option<&ProfileId>,
+    area: Rect,
+    border_style: Style,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .padding(Padding::horizontal(1))
-        .title(constants::TITLE_FLIP_QUALITY_TIMELINE)
-        .title_bottom(
-            Line::from(Span::styled(
-                constants::FLIP_BACK_HINT,
-                Style::default().fg(theme::current().key_hint_desc),
-            ))
-            .right_aligned(),
-        );
+        .title(constants::TITLE_FLIP_HEALTH)
+        .title_bottom(helpers::border_hint(constants::FLIP_BACK_HINT));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let latency_color = helpers::latency_color(app.runtime.latency_ms);
-
-    // The block title already names this face, so its rows start straight away.
-    let width = inner.width as usize;
-    let mut text = vec![
-        helpers::detail_row(
-            "  Latency : ",
-            format!("{}ms", app.runtime.latency_ms),
-            latency_color,
-        ),
-        helpers::detail_row(
-            "  Jitter  : ",
-            format!("±{}ms", app.runtime.jitter_ms),
-            theme::current().text_primary,
-        ),
-        helpers::detail_row(
-            "  Loss    : ",
-            format!("{:.1}%", app.runtime.packet_loss),
-            theme::current().text_primary,
-        ),
-        Line::from(""),
-    ];
-    text.extend(helpers::wrapped_lines(
-        "Sparkline history & session stats will be available in a future release.",
-        width,
-        2,
-        Style::default().fg(theme::current().text_secondary),
-    ));
-    text.push(Line::from(""));
-    text.extend(helpers::wrapped_lines(
-        "See: github.com/Harry-kp/vortix/issues/167",
-        width,
-        2,
-        Style::default().fg(theme::current().nord_polar_night_4),
-    ));
-
+    let mut text = build_health(app, profile_id, inner.width as usize);
     let max_lines = inner.height as usize;
     text.truncate(max_lines);
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+/// The flip side for the selected profile: how its tunnel is doing and why, or why its last
+/// connect failed.
+fn build_health(app: &App, profile_id: Option<&ProfileId>, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme::current().text_secondary);
+    let row = |label: &str, value: &str| helpers::reading_rows(label, 7, value, None, width);
+    let Some(profile_id) = profile_id else {
+        return helpers::wrapped_lines("Select a profile to see its health.", width, 0, dim);
+    };
+    let name = app
+        .runtime
+        .profiles
+        .iter()
+        .find(|profile| &profile.id == profile_id)
+        .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone());
+    let mut lines = row("Profile", &name);
+    let failure = app.control_snapshot.failures.get(profile_id);
+    if let Some(error) = failure {
+        lines.push(Line::from(Span::styled("Last attempt failed:", dim)));
+        lines.extend(helpers::wrapped_lines(
+            error,
+            width,
+            2,
+            Style::default().fg(theme::current().error),
+        ));
+    }
+    let Some(tunnel) = app.tunnel(profile_id) else {
+        if failure.is_none() {
+            lines.extend(helpers::wrapped_lines(
+                "No connection yet this session.",
+                width,
+                0,
+                dim,
+            ));
+        }
+        return lines;
+    };
+    let for_how_long = helpers::format_relative_time(tunnel.since);
+    let state = match tunnel.phase {
+        Phase::Up => format!("up for {for_how_long}"),
+        Phase::Starting => format!("connecting for {for_how_long}"),
+        Phase::AwaitingCredentials => "waiting for credentials".to_string(),
+        Phase::Waiting { .. } => format!("reconnecting for {for_how_long}"),
+        Phase::Stopping => "disconnecting".to_string(),
+    };
+    lines.extend(row("State", &state));
+    let drops = match tunnel.last_drop {
+        Some(at) if tunnel.drops > 0 => format!(
+            "{} · last {}",
+            tunnel.drops,
+            helpers::format_system_time_local(at)
+        ),
+        _ => "none".to_string(),
+    };
+    lines.extend(row("Drops", &drops));
+    lines.extend(row("Health", &tunnel.health.describe()));
+    lines.extend(row("Routes", &helpers::list_or_none(&tunnel.routes)));
+    lines.extend(row("DNS", &helpers::list_or_none(&tunnel.dns)));
+    lines
 }
 
 #[cfg(test)]
@@ -912,19 +950,89 @@ mod tests {
         assert!(stale.contains("Your IP : unavailable"), "{stale}");
     }
 
-    #[test]
-    fn the_flipped_panel_wraps_its_sentences_at_80_columns() {
-        let mut app = App::new_test();
+    fn health_face(app: &mut App) -> String {
         app.flip_state_mut(crate::app::FocusedPanel::ConnectionDetails)
             .set_showing_back(true);
-        let out = render_to_string(&mut app, 26, 16);
-        let words = out
-            .lines()
-            .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(words.contains("Latency"), "{out}");
-        assert!(words.contains("available in a future release."), "{out}");
+        render_to_string(app, 40, 16)
+    }
+
+    fn one_profile(name: &str) -> App {
+        let mut app = App::new_test();
+        app.runtime
+            .profiles
+            .push(make_profile(name, PathBuf::from("/tmp/p.conf")));
+        app.profile_list_state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn health_says_when_a_profile_has_not_connected_yet() {
+        let mut app = one_profile("wg07");
+        let front = render_to_string(&mut app, 40, 16);
+        assert!(!front.contains("[f] why"), "{front}");
+        let out = health_face(&mut app);
+        assert!(out.contains("No connection yet this session."), "{out}");
+    }
+
+    #[test]
+    fn health_shows_why_the_last_attempt_failed() {
+        let mut app = one_profile("wg07");
+        let id = app.runtime.profiles[0].id.clone();
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .failures
+            .insert(id, "Could not connect 'wg07': handshake timed out".into());
+        let front = render_to_string(&mut app, 40, 16);
+        assert!(front.contains("[f] why"), "{front}");
+        let out = health_face(&mut app);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("Last attempt failed:"), "{out}");
+        assert!(words.contains("handshake timed out"), "{out}");
+    }
+
+    /// A reconnect that gave up keeps its tunnel in `Waiting`; its failure is the answer.
+    #[test]
+    fn health_of_a_tunnel_that_gave_up_reconnecting_says_why() {
+        let mut app = one_profile("wg07");
+        let mut view = crate::app::connection::test_view("wg07", Phase::Waiting { retry_at: None });
+        view.profile_id = app.runtime.profiles[0].id.clone();
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .failures
+            .insert(
+                view.profile_id.clone(),
+                "Could not connect 'wg07': timed out".into(),
+            );
+        app.set_tunnels_for_test(vec![view], None);
+        let front = render_to_string(&mut app, 40, 16);
+        assert!(front.contains("[f] why"), "{front}");
+        let out = health_face(&mut app);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("Last attempt failed:"), "{out}");
+        assert!(words.contains("reconnecting for"), "{out}");
+    }
+
+    #[test]
+    fn health_of_a_degraded_tunnel_names_the_reason_drops_routes_and_dns() {
+        let mut app = one_profile("wg07");
+        let mut view = crate::app::connection::test_view("wg07", Phase::Up);
+        view.profile_id = app.runtime.profiles[0].id.clone();
+        view.since = std::time::SystemTime::now();
+        view.drops = 2;
+        view.last_drop = Some(std::time::SystemTime::now());
+        view.health = crate::tunnel::ConnectionHealth::Degraded {
+            reason: crate::tunnel::DegradedReason::HandshakeStale {
+                seconds_since_last_handshake: 90,
+            },
+        };
+        view.routes = vec![v4("0.0.0.0/0")];
+        view.dns = vec!["10.2.0.1".parse().unwrap()];
+        app.set_tunnels_for_test(vec![view], None);
+        let front = render_to_string(&mut app, 40, 16);
+        assert!(front.contains("[f] why"), "{front}");
+        let out = health_face(&mut app);
+        assert!(out.contains("Drops  : 2 · last "), "{out}");
+        assert!(out.contains("handshake stale for 90s"), "{out}");
+        assert!(out.contains("Routes : 0.0.0.0/0"), "{out}");
+        assert!(out.contains("DNS    : 10.2.0.1"), "{out}");
     }
 
     // ───────────── role_line: pure-function variants ─────────────

@@ -458,6 +458,8 @@ pub(crate) fn test_view(name: &str, phase: Phase) -> TunnelView {
         dns: Vec::new(),
         details: crate::tunnel::DetailedConnectionInfo::default(),
         health: crate::tunnel::ConnectionHealth::default(),
+        drops: 0,
+        last_drop: None,
     }
 }
 

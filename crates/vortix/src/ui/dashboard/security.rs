@@ -468,17 +468,21 @@ fn alarm_subline(text: &str, inner_width: usize) -> Vec<Line<'static>> {
 ///
 /// The figure is the age of the **oldest** reading on display, so it cannot
 /// be read as a promise about a field that has quietly stopped refreshing.
-fn footer_line(secs: Option<u64>) -> Line<'static> {
-    let text = match secs {
-        Some(s) if s < 5 => "Updated just now".to_string(),
-        Some(s) if s < 60 => format!("Updated {s}s ago"),
-        Some(s) => format!("Updated {}m ago", s / 60),
-        None => "Updated pending…".to_string(),
-    };
+fn footer_line(age: Option<Duration>) -> Line<'static> {
     Line::from(Span::styled(
-        text,
+        format!("Updated {}", ago(age)),
         Style::default().fg(theme::current().key_hint_desc),
     ))
+}
+
+/// How old a reading is: `just now`, `12s ago`, `3m ago`, or `pending…` before the first one.
+fn ago(age: Option<Duration>) -> String {
+    match age.map(|age| age.as_secs()) {
+        Some(s) if s < 5 => "just now".to_string(),
+        Some(s) if s < 60 => format!("{s}s ago"),
+        Some(s) => format!("{}m ago", s / 60),
+        None => "pending…".to_string(),
+    }
 }
 
 // ── PanelState: the polished panel's read-only input ────────────────────────
@@ -651,11 +655,14 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Verdict::Exposed
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .padding(Padding::horizontal(1))
         .title(" Security Guard ");
+    if verdict != Verdict::Protected {
+        block = block.title_bottom(crate::ui::helpers::border_hint(constants::FLIP_WHY_HINT));
+    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -689,17 +696,7 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelView>) -> Verdic
     let ip_leaking = matches!(&app.runtime.real_ip, Some(real) if &app.runtime.public_ip == real);
     let dns_unverified =
         app.control_snapshot.dns.status != crate::control::DnsSecurityStatus::Protected;
-    let ks_alarm = matches!(
-        (
-            app.control_snapshot.kill_switch,
-            app.control_snapshot.kill_switch_state
-        ),
-        (
-            crate::control::killswitch::KillSwitchMode::Auto,
-            crate::control::killswitch::KillSwitchState::Blocking
-        ) | (_, crate::control::killswitch::KillSwitchState::Degraded)
-            | (crate::control::killswitch::KillSwitchMode::Off, _)
-    );
+    let ks_alarm = kill_switch_alarm(app);
     // Insecure cipher = effective wire plaintext. Demote to Partial so
     // the title doesn't claim full protection while crypto is broken.
     let cipher_insecure = matches!(
@@ -718,6 +715,20 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelView>) -> Verdic
     } else {
         Verdict::Protected
     }
+}
+
+/// The kill switch is off, blocking after a drop, or its rules could not be verified.
+fn kill_switch_alarm(app: &App) -> bool {
+    use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
+    matches!(
+        (
+            app.control_snapshot.kill_switch,
+            app.control_snapshot.kill_switch_state
+        ),
+        (KillSwitchMode::Auto, KillSwitchState::Blocking)
+            | (_, KillSwitchState::Degraded)
+            | (KillSwitchMode::Off, _)
+    )
 }
 
 /// The exposed panel's closing advice.
@@ -1014,7 +1025,7 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
-    lines.push(footer_line(s.oldest_shown_age().map(|age| age.as_secs())));
+    lines.push(footer_line(s.oldest_shown_age()));
 
     lines
 }
@@ -1081,7 +1092,7 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
-    lines.push(footer_line(s.oldest_shown_age().map(|age| age.as_secs())));
+    lines.push(footer_line(s.oldest_shown_age()));
 
     lines
 }
@@ -1251,44 +1262,161 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
         .borders(Borders::ALL)
         .border_style(border_style)
         .padding(Padding::horizontal(1))
-        .title(constants::TITLE_FLIP_CONNECTIONS_AUDIT)
-        .title_bottom(
-            Line::from(Span::styled(
-                constants::FLIP_BACK_HINT,
-                Style::default().fg(theme::current().key_hint_desc),
-            ))
-            .right_aligned(),
-        );
+        .title(constants::TITLE_FLIP_EVIDENCE)
+        .title_bottom(crate::ui::helpers::border_hint(constants::FLIP_BACK_HINT));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let is_connected = app.primary_id().is_some();
+    let state = collect_state(
+        app,
+        app.primary_id().and_then(|id| app.tunnel(id)),
+        inner.width,
+    );
+    let text = fit_evidence(build_evidence(app, &state), inner.height as usize);
+    frame.render_widget(Paragraph::new(text), inner);
+}
 
-    let width = inner.width as usize;
-    let dim = Style::default().fg(theme::current().text_secondary);
-    let body = if is_connected {
-        "Per-socket VPN routing verification will be available in a future release. This \
-             view will show which connections are routed through the VPN tunnel vs bypassing it \
-             (split-tunnel detection)."
-    } else {
-        "Connect to a VPN to see connection routing details."
-    };
-    // The block title already names this face.
-    let mut text = crate::ui::helpers::wrapped_lines(body, width, 0, dim);
-    if is_connected {
-        text.push(Line::from(""));
-        text.extend(crate::ui::helpers::wrapped_lines(
-            "See: github.com/Harry-kp/vortix/issues/168",
-            width,
-            2,
-            Style::default().fg(theme::current().nord_polar_night_4),
+/// Spacing goes first; if the readings still overflow, the last row says there is more.
+fn fit_evidence(mut lines: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+    if lines.len() > height {
+        lines.retain(|line| line.width() > 0);
+    }
+    if lines.len() > height && height > 0 {
+        lines.truncate(height - 1);
+        lines.push(Line::from(Span::styled(
+            "… z shows all",
+            Style::default().fg(theme::current().key_hint_desc),
+        )));
+    }
+    lines
+}
+
+/// The flip side: what each verdict on the front was drawn from, and how old it is. The
+/// checks that failed come first, so a small panel still shows why.
+fn build_evidence(app: &App, s: &PanelState) -> Vec<Line<'static>> {
+    let w = s.inner_width as usize;
+    let mode = s.killswitch_mode;
+    let value = format!(
+        "{} · {}",
+        mode.display_name(),
+        s.killswitch_state.display_status()
+    );
+    let mut kill_switch = reading("Kill switch", &value, None, w);
+    kill_switch.extend(explain(mode.one_liner(), w));
+    let mut sections = vec![
+        (
+            derive_ip_status(app) != IpStatus::Masked || s.ipv6_status == Ipv6RowStatus::Leaking,
+            address_evidence(app, s, w),
+        ),
+        (
+            s.dns_status != crate::control::DnsSecurityStatus::Protected,
+            dns_evidence(app, s, w),
+        ),
+        (kill_switch_alarm(app), kill_switch),
+    ];
+    if s.encryption != "N/A" {
+        let strength = classify_cipher(&s.encryption);
+        let value = format!("{} · {}", s.encryption, strength.label());
+        sections.push((
+            strength == CipherStrength::Insecure,
+            reading("Encryption", &value, None, w),
         ));
     }
+    sections.sort_by_key(|(failed, _)| !failed);
+    let mut lines = Vec::new();
+    for (_, section) in sections {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.extend(section);
+    }
+    lines
+}
 
-    let max_lines = inner.height as usize;
-    text.truncate(max_lines);
-    frame.render_widget(Paragraph::new(text), inner);
+fn reading(label: &str, value: &str, age: Option<String>, w: usize) -> Vec<Line<'static>> {
+    crate::ui::helpers::reading_rows(label, 11, value, age, w)
+}
+
+fn explain(text: &str, w: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme::current().text_secondary);
+    crate::ui::helpers::wrapped_lines(text, w, 2, dim)
+}
+
+/// A reading older than the staleness window stands for nothing now; its age says why.
+fn fresh(stale: bool, value: &str) -> String {
+    if stale {
+        constants::MSG_UNAVAILABLE.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn address_evidence(app: &App, s: &PanelState, w: usize) -> Vec<Line<'static>> {
+    let real = |address: &RealAddress| match address {
+        RealAddress::Observed(ip) => ip.clone(),
+        RealAddress::Remembered(ip) => format!("{ip} (last session)"),
+        RealAddress::Unknown => "not known yet".to_string(),
+    };
+    // The front leaves the exit blank with no tunnel up; the evidence is the same either way.
+    let exit4 = fresh(s.egress_is_stale(), &app.runtime.public_ip);
+    let mut lines = reading("Exit IPv4", &exit4, Some(ago(s.egress_age)), w);
+    lines.extend(reading("Real IPv4", &real(&s.real_ip), None, w));
+    lines.extend(explain(
+        match derive_ip_status(app) {
+            IpStatus::Masked => "They differ: sites see the VPN's address.",
+            IpStatus::Leaking => "They match: sites see your real address.",
+            IpStatus::Pending => "Not compared yet.",
+        },
+        w,
+    ));
+    if has_v6_signal(s) {
+        let exit6 = fresh(
+            s.ipv6_is_stale(),
+            s.public_ipv6.as_deref().unwrap_or("none seen"),
+        );
+        lines.extend(reading("Exit IPv6", &exit6, Some(ago(s.ipv6_age)), w));
+        lines.extend(reading("Real IPv6", &real(&s.real_ipv6), None, w));
+        lines.extend(explain(
+            match s.ipv6_status {
+                Ipv6RowStatus::Masked => "They differ: IPv6 sites see the VPN's address.",
+                Ipv6RowStatus::Leaking => "They match: IPv6 sites see your real address.",
+                Ipv6RowStatus::Unavailable => {
+                    "No IPv6 exit was found: IPv6 traffic has no way out."
+                }
+                Ipv6RowStatus::Pending | Ipv6RowStatus::Absent => "Not compared yet.",
+            },
+            w,
+        ));
+    }
+    lines
+}
+
+fn dns_evidence(app: &App, s: &PanelState, w: usize) -> Vec<Line<'static>> {
+    use crate::control::DnsSecurityStatus;
+    let asked = crate::ui::helpers::list_or_none(&app.control_snapshot.dns.intended_servers);
+    let in_use = fresh(s.dns_is_stale(), &app.runtime.dns_server);
+    let mut lines = reading(
+        "DNS in use",
+        &in_use,
+        s.dns_observed.then(|| ago(s.dns_age)),
+        w,
+    );
+    lines.extend(reading("DNS asked", &asked, None, w));
+    lines.extend(explain(
+        match s.dns_status {
+            DnsSecurityStatus::Protected => "Queries go to the tunnel's resolvers.",
+            DnsSecurityStatus::Unverified => {
+                "The tunnel's resolvers could not be applied: queries may use your normal ones."
+            }
+            DnsSecurityStatus::NotRequested => {
+                "The profile sets no DNS, so queries use your normal resolver."
+            }
+            DnsSecurityStatus::NotActive => "No tunnel: queries use your normal resolver.",
+        },
+        w,
+    ));
+    lines
 }
 
 #[cfg(test)]
@@ -1491,20 +1619,109 @@ mod tests {
     }
 
     #[test]
-    fn the_flipped_guard_wraps_its_sentences_at_80_columns() {
+    fn only_a_guard_short_of_protected_points_to_its_evidence() {
         let mut app = App::new_test();
-        app.flip_state_mut(crate::app::FocusedPanel::Security)
-            .set_showing_back(true);
-        let out = render_to_string(&app, 27, 10);
-        let words = out
-            .lines()
-            .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let view = crate::app::connection::test_view("alpha", Phase::Up);
+        let id = view.profile_id.clone();
+        app.set_tunnels_for_test(vec![view], Some(id));
+        let snapshot = std::sync::Arc::make_mut(&mut app.control_snapshot);
+        snapshot.kill_switch = KillSwitchMode::AlwaysOn;
+        snapshot.kill_switch_state = KillSwitchState::Blocking;
+        snapshot.dns.status = crate::control::DnsSecurityStatus::Protected;
+        app.runtime.real_ip = Some("198.51.100.1".into());
+        app.runtime.public_ip = "203.0.113.5".into();
+        let out = render_to_string(&app, 60, 20);
         assert!(
-            words.contains("Connect to a VPN to see connection routing details."),
+            out.contains("PROTECTED") && !out.contains("[f] why"),
             "{out}"
         );
+
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .status = crate::control::DnsSecurityStatus::Unverified;
+        let out = render_to_string(&app, 60, 20);
+        assert!(out.contains("PARTIAL") && out.contains("[f] why"), "{out}");
+    }
+
+    #[test]
+    fn an_exposed_guard_points_to_its_evidence() {
+        let app = App::new_test();
+        let out = render_to_string(&app, 40, 16);
+        assert!(out.contains("[f] why"), "{out}");
+    }
+
+    fn flipped(app: &mut App) {
+        app.flip_state_mut(crate::app::FocusedPanel::Security)
+            .set_showing_back(true);
+    }
+
+    #[test]
+    fn the_evidence_face_shows_each_reading_and_its_age() {
+        let mut app = App::new_test();
+        app.runtime.public_ip = "203.0.113.5".into();
+        app.runtime.real_ip = Some("203.0.113.5".into());
+        app.runtime.last_egress_check = Some(Instant::now());
+        app.runtime.dns_server = "192.168.1.1".into();
+        flipped(&mut app);
+        let out = render_to_string(&app, 60, 24);
+        assert!(out.contains("Exit IPv4  : 203.0.113.5 · just now"), "{out}");
+        assert!(out.contains("Real IPv4  : 203.0.113.5"), "{out}");
+        assert!(out.contains("DNS in use : 192.168.1.1"), "{out}");
+        assert!(out.contains("DNS asked  : none"), "{out}");
+        assert!(out.contains("Kill switch: "), "{out}");
+    }
+
+    #[test]
+    fn a_stale_reading_says_unavailable_with_its_age() {
+        let mut app = App::new_test();
+        app.runtime.public_ip = "203.0.113.5".into();
+        let long_ago = Instant::now()
+            .checked_sub(app.telemetry_stale_after() + Duration::from_secs(120))
+            .expect("instant in range");
+        app.runtime.last_egress_check = Some(long_ago);
+        flipped(&mut app);
+        let out = render_to_string(&app, 60, 24);
+        let exit = out
+            .lines()
+            .find(|line| line.contains("Exit IPv4"))
+            .expect("exit row");
+        assert!(
+            exit.contains("unavailable") && exit.contains("m ago"),
+            "{out}"
+        );
+        assert!(!exit.contains("203.0.113.5"), "{out}");
+    }
+
+    /// 27×10 is the Guard at 80×24; an address goes on its own line rather than being cut.
+    #[test]
+    fn the_evidence_face_never_cuts_an_address_at_80_columns() {
+        let mut app = App::new_test();
+        app.runtime.public_ip = "203.113.200.100".into();
+        app.runtime.last_egress_check = Some(Instant::now());
+        flipped(&mut app);
+        let out = render_to_string(&app, 27, 10);
+        assert!(out.contains("Exit IPv4 · just now"), "{out}");
+        assert!(out.contains("  203.113.200.100"), "{out}");
+        assert!(out.contains("… z shows all"), "{out}");
+    }
+
+    /// With the kill switch the only failing check, it leads, so 80×24 still says why.
+    #[test]
+    fn the_failing_check_leads_the_evidence_at_80_columns() {
+        let mut app = App::new_test();
+        let view = crate::app::connection::test_view("alpha", Phase::Up);
+        let id = view.profile_id.clone();
+        app.set_tunnels_for_test(vec![view], Some(id));
+        std::sync::Arc::make_mut(&mut app.control_snapshot)
+            .dns
+            .status = crate::control::DnsSecurityStatus::Protected;
+        app.runtime.real_ip = Some("198.51.100.1".into());
+        app.runtime.public_ip = "203.0.113.5".into();
+        app.runtime.last_egress_check = Some(Instant::now());
+        flipped(&mut app);
+        let out = render_to_string(&app, 27, 10);
+        let first = out.lines().nth(1).unwrap_or_default();
+        assert!(first.contains("Kill switch"), "{out}");
     }
 
     /// A wide Guard in a 24-row terminal has 8 rows: the advice goes before any real row.

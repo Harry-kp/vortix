@@ -89,6 +89,54 @@ pub(crate) fn fit_line(line: Line<'_>, width: usize) -> Line<'_> {
     }
 }
 
+/// One labelled reading: on one line (`label: value · suffix`) when the panel is wide enough,
+/// otherwise the label and suffix above the value, so an address or reason is never cut.
+pub(crate) fn reading_rows(
+    label: &str,
+    label_width: usize,
+    value: &str,
+    suffix: Option<String>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme::current().text_secondary);
+    let bright = Style::default().fg(theme::current().text_primary);
+    let suffix = suffix
+        .map(|suffix| format!(" · {suffix}"))
+        .unwrap_or_default();
+    let label_col = format!("{label:<label_width$}: ");
+    if label_col.chars().count() + value.chars().count() + suffix.chars().count() <= width {
+        return vec![Line::from(vec![
+            Span::styled(label_col, dim),
+            Span::styled(value.to_string(), bright),
+            Span::styled(suffix, dim),
+        ])];
+    }
+    let mut lines = vec![Line::from(Span::styled(format!("{label}{suffix}"), dim))];
+    lines.extend(wrapped_lines(value, width, 2, bright));
+    lines
+}
+
+/// A key hint in a panel's bottom border.
+pub(crate) fn border_hint(text: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(theme::current().key_hint_desc),
+    ))
+    .right_aligned()
+}
+
+/// `items` joined with commas, or `none`.
+pub(crate) fn list_or_none<T: ToString>(items: &[T]) -> String {
+    if items.is_empty() {
+        return "none".to_string();
+    }
+    items
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `value`, or `fallback` when the backend reported the field blank.
 pub(crate) fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     if value.is_empty() {

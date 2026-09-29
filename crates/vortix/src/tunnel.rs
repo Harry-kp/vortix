@@ -330,6 +330,51 @@ pub enum ConnectionHealth {
     },
 }
 
+impl ConnectionHealth {
+    /// The health in plain words, as the CLI and the dashboard show it.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Unknown => "Unknown (measuring)".into(),
+            Self::Healthy => "Healthy".into(),
+            Self::Degraded { reason } => format!("Degraded: {}", reason.describe()),
+        }
+    }
+}
+
+impl DegradedReason {
+    /// Why the tunnel is degraded, in plain words.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let short = |peer: &str| peer.get(..peer.len().min(8)).unwrap_or(peer).to_string();
+        match self {
+            Self::HandshakeStale {
+                seconds_since_last_handshake,
+            } => format!("handshake stale for {seconds_since_last_handshake}s"),
+            Self::WireGuardPeerStale {
+                peer_public_key,
+                allowed_routes,
+                seconds_since_last_handshake,
+            } => format!(
+                "peer {} stale for {}s on {}",
+                short(peer_public_key),
+                seconds_since_last_handshake,
+                allowed_routes.join(",")
+            ),
+            Self::WireGuardPeerNeverObserved {
+                peer_public_key,
+                allowed_routes,
+            } => format!(
+                "peer {} has no handshake on {}",
+                short(peer_public_key),
+                allowed_routes.join(",")
+            ),
+            Self::HighPacketLoss { loss_percent } => format!("{loss_percent:.1}% packet loss"),
+            Self::HighLatency { latency_ms } => format!("{latency_ms}ms latency"),
+        }
+    }
+}
+
 /// Technical details parsed from the VPN interface.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DetailedConnectionInfo {

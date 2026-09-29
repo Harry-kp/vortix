@@ -246,14 +246,14 @@ pub const PROMPT_IMPORT_PATH: &str = "Enter path to file, directory, or URL:";
 
 // === Flip Panel (Back-View) Titles ===
 
-/// Back-view title for the Network Throughput chart panel.
-pub const TITLE_FLIP_NETWORK_ACTIVITY: &str = " ◀ Network Activity ";
 /// Back-view title for the Connection Details panel.
-pub const TITLE_FLIP_QUALITY_TIMELINE: &str = " ◀ Quality Timeline ";
+pub const TITLE_FLIP_HEALTH: &str = " ◀ Health ";
 /// Back-view title for the Security Guard panel.
-pub const TITLE_FLIP_CONNECTIONS_AUDIT: &str = " ◀ Connections Audit ";
+pub const TITLE_FLIP_EVIDENCE: &str = " ◀ Evidence ";
 /// Footer hint shown on every flipped panel.
 pub const FLIP_BACK_HINT: &str = " [f] flip back ";
+/// Footer hint on a front face whose verdict its back face explains.
+pub const FLIP_WHY_HINT: &str = " [f] why ";
 /// Minimum panel width (columns) to render content during flip animation.
 pub const FLIP_ANIMATION_MIN_WIDTH: u16 = 3;
 pub const LABEL_SUPPORTED_FORMATS: &str = "Supported formats:";

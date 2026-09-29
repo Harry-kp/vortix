@@ -58,6 +58,8 @@ fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
             ..Default::default()
         },
         health: crate::tunnel::ConnectionHealth::default(),
+        drops: 0,
+        last_drop: None,
     });
     snapshot
         .tunnels
@@ -1375,23 +1377,23 @@ fn complete_flip(app: &mut App, panel: FocusedPanel) {
 #[test]
 fn flip_starts_animation() {
     let mut app = test_app();
-    app.focused_panel = FocusedPanel::Chart;
+    app.focused_panel = FocusedPanel::Security;
     app.handle_message(Message::ToggleFlip);
     assert!(app.has_active_animation());
-    assert!(!app.is_flipped(&FocusedPanel::Chart));
+    assert!(!app.is_flipped(&FocusedPanel::Security));
 }
 
 #[test]
-fn flip_toggles_chart_panel_after_animation() {
+fn flip_toggles_security_panel_after_animation() {
     let mut app = test_app();
-    app.focused_panel = FocusedPanel::Chart;
-    assert!(!app.is_flipped(&FocusedPanel::Chart));
+    app.focused_panel = FocusedPanel::Security;
+    assert!(!app.is_flipped(&FocusedPanel::Security));
     app.handle_message(Message::ToggleFlip);
-    complete_flip(&mut app, FocusedPanel::Chart);
-    assert!(app.is_flipped(&FocusedPanel::Chart));
+    complete_flip(&mut app, FocusedPanel::Security);
+    assert!(app.is_flipped(&FocusedPanel::Security));
     app.handle_message(Message::ToggleFlip);
-    complete_flip(&mut app, FocusedPanel::Chart);
-    assert!(!app.is_flipped(&FocusedPanel::Chart));
+    complete_flip(&mut app, FocusedPanel::Security);
+    assert!(!app.is_flipped(&FocusedPanel::Security));
 }
 
 #[test]
@@ -1401,7 +1403,7 @@ fn flip_toggles_security_panel() {
     app.handle_message(Message::ToggleFlip);
     complete_flip(&mut app, FocusedPanel::Security);
     assert!(app.is_flipped(&FocusedPanel::Security));
-    assert!(!app.is_flipped(&FocusedPanel::Chart));
+    assert!(!app.is_flipped(&FocusedPanel::ConnectionDetails));
 }
 
 #[test]
@@ -1434,49 +1436,49 @@ fn flip_ignores_logs() {
 #[test]
 fn flip_blocked_during_active_animation() {
     let mut app = test_app();
-    app.focused_panel = FocusedPanel::Chart;
+    app.focused_panel = FocusedPanel::Security;
     app.handle_message(Message::ToggleFlip);
     assert!(app.has_active_animation());
     // Second toggle while animating should be a no-op; the in-flight
     // flip from the first toggle proceeds unchanged.
     app.handle_message(Message::ToggleFlip);
     assert!(app.has_active_animation());
-    assert!(!app.is_flipped(&FocusedPanel::Chart));
+    assert!(!app.is_flipped(&FocusedPanel::Security));
 }
 
 #[test]
 fn flip_state_persists_across_focus_changes() {
     let mut app = test_app();
-    app.focused_panel = FocusedPanel::Chart;
-    app.handle_message(Message::ToggleFlip);
-    complete_flip(&mut app, FocusedPanel::Chart);
-    assert!(app.is_flipped(&FocusedPanel::Chart));
     app.focused_panel = FocusedPanel::Security;
-    assert!(app.is_flipped(&FocusedPanel::Chart));
+    app.handle_message(Message::ToggleFlip);
+    complete_flip(&mut app, FocusedPanel::Security);
+    assert!(app.is_flipped(&FocusedPanel::Security));
+    app.focused_panel = FocusedPanel::Security;
+    assert!(app.is_flipped(&FocusedPanel::Security));
 }
 
 #[test]
 fn flip_multiple_panels_independently() {
     let mut app = test_app();
-    app.focused_panel = FocusedPanel::Chart;
+    app.focused_panel = FocusedPanel::ConnectionDetails;
     app.handle_message(Message::ToggleFlip);
-    complete_flip(&mut app, FocusedPanel::Chart);
+    complete_flip(&mut app, FocusedPanel::ConnectionDetails);
     app.focused_panel = FocusedPanel::Security;
     app.handle_message(Message::ToggleFlip);
     complete_flip(&mut app, FocusedPanel::Security);
-    assert!(app.is_flipped(&FocusedPanel::Chart));
+    assert!(app.is_flipped(&FocusedPanel::ConnectionDetails));
     assert!(app.is_flipped(&FocusedPanel::Security));
-    assert!(!app.is_flipped(&FocusedPanel::ConnectionDetails));
+    assert!(!app.is_flipped(&FocusedPanel::Chart));
 }
 
 #[test]
 fn flip_effective_state_at_midpoint() {
     let mut app = test_app();
-    app.focused_panel = FocusedPanel::Chart;
-    assert!(!app.effective_flipped(&FocusedPanel::Chart));
+    app.focused_panel = FocusedPanel::Security;
+    assert!(!app.effective_flipped(&FocusedPanel::Security));
     app.handle_message(Message::ToggleFlip);
     // Just-started animation hasn't passed the midpoint yet.
-    assert!(!app.effective_flipped(&FocusedPanel::Chart));
+    assert!(!app.effective_flipped(&FocusedPanel::Security));
 }
 
 #[test]
@@ -1485,11 +1487,11 @@ fn advance_animation_completes_to_back() {
     let mut app = test_app();
     let mut state = crate::app::state::FlipState::new(Duration::from_millis(20));
     state.flip();
-    app.flip_states.insert(FocusedPanel::Chart, state);
+    app.flip_states.insert(FocusedPanel::Security, state);
     std::thread::sleep(Duration::from_millis(80));
     app.advance_animation();
     assert!(!app.has_active_animation());
-    assert!(app.is_flipped(&FocusedPanel::Chart));
+    assert!(app.is_flipped(&FocusedPanel::Security));
 }
 
 #[test]
@@ -1509,7 +1511,7 @@ fn advance_animation_completes_to_front() {
 #[test]
 fn advance_animation_noop_when_still_running() {
     let mut app = test_app();
-    app.focused_panel = FocusedPanel::Chart;
+    app.focused_panel = FocusedPanel::Security;
     app.handle_message(Message::ToggleFlip);
     assert!(app.has_active_animation());
     app.advance_animation();
@@ -1522,9 +1524,9 @@ fn effective_flipped_shows_target_after_midpoint() {
     let mut app = test_app();
     let mut state = crate::app::state::FlipState::new(Duration::from_millis(100));
     state.flip();
-    app.flip_states.insert(FocusedPanel::Chart, state);
+    app.flip_states.insert(FocusedPanel::Security, state);
     std::thread::sleep(Duration::from_millis(75));
-    assert!(app.effective_flipped(&FocusedPanel::Chart));
+    assert!(app.effective_flipped(&FocusedPanel::Security));
 }
 
 // ====================================================================
@@ -2424,6 +2426,8 @@ fn an_unexpected_drop_counts_once() {
         dns: Vec::new(),
         details: crate::tunnel::DetailedConnectionInfo::default(),
         health: crate::tunnel::ConnectionHealth::default(),
+        drops: 0,
+        last_drop: None,
     };
     // Up -> Waiting -> Starting all happened between two polls: the app
     // never saw Waiting, so only the engine's count can report the drop.
@@ -2634,4 +2638,14 @@ fn declining_a_late_takeover_disconnects_the_new_tunnel() {
     open(&mut app);
     assert!(matches!(app.input_mode, InputMode::Normal));
     assert!(declined());
+}
+
+/// The Chart has no second face: `f` there changes nothing.
+#[test]
+fn f_leaves_the_chart_unflipped() {
+    let mut app = test_app();
+    app.focused_panel = FocusedPanel::Chart;
+    app.handle_message(Message::ToggleFlip);
+    assert!(!app.has_active_animation());
+    assert!(!app.is_flipped(&FocusedPanel::Chart));
 }

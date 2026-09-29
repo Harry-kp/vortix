@@ -62,10 +62,12 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
                 ("L", "Clear"),
             ]);
         }
-        crate::app::FocusedPanel::Chart
+        panel @ (crate::app::FocusedPanel::Chart
         | crate::app::FocusedPanel::Security
-        | crate::app::FocusedPanel::ConnectionDetails => {
-            context_hints.push(("f", "Flip"));
+        | crate::app::FocusedPanel::ConnectionDetails) => {
+            if panel.flips() {
+                context_hints.push(("f", "Why"));
+            }
             context_hints.push(("z", "Zoom"));
         }
     }

@@ -61,11 +61,6 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(theme::current().border_default)
     };
 
-    if app.effective_flipped(&crate::app::FocusedPanel::Chart) {
-        render_back(frame, app, area, border_style);
-        return;
-    }
-
     let max_down = app.runtime.down_history.iter().copied().fold(0.0, f64::max);
     let max_up = app.runtime.up_history.iter().copied().fold(0.0, f64::max);
     let peak = (max_down.max(max_up) * 1.2).max(500_000.0);
@@ -148,68 +143,6 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             }
         });
     frame.render_widget(canvas, chunks[1]);
-}
-
-fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(constants::TITLE_FLIP_NETWORK_ACTIVITY)
-        .title_bottom(
-            Line::from(Span::styled(
-                constants::FLIP_BACK_HINT,
-                Style::default().fg(theme::current().key_hint_desc),
-            ))
-            .right_aligned(),
-        );
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let current_down_str = crate::ui::helpers::format_bytes_speed(app.runtime.current_down);
-    let current_up_str = crate::ui::helpers::format_bytes_speed(app.runtime.current_up);
-
-    let text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Per-Process Network Usage",
-            Style::default()
-                .fg(theme::current().accent_primary)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  Total ▼ ",
-                Style::default().fg(theme::current().accent_primary),
-            ),
-            Span::styled(
-                &current_down_str,
-                Style::default().fg(theme::current().text_primary),
-            ),
-            Span::styled("  ▲ ", Style::default().fg(theme::current().success)),
-            Span::styled(
-                &current_up_str,
-                Style::default().fg(theme::current().text_primary),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Process table with sorting & filtering",
-            Style::default().fg(theme::current().text_secondary),
-        )),
-        Line::from(Span::styled(
-            "  will be available in a future release.",
-            Style::default().fg(theme::current().text_secondary),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  See: github.com/Harry-kp/vortix/issues/166",
-            Style::default().fg(theme::current().nord_polar_night_4),
-        )),
-    ];
-
-    frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
 }
 
 #[cfg(test)]

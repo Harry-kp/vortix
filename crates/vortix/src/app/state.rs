@@ -29,6 +29,14 @@ pub enum FocusedPanel {
     Logs,
 }
 
+impl FocusedPanel {
+    /// Whether `f` flips this panel to the face explaining its front.
+    #[must_use]
+    pub fn flips(&self) -> bool {
+        matches!(self, Self::ConnectionDetails | Self::Security)
+    }
+}
+
 /// Active tab in the Help overlay. `?` opens the overlay on
 /// [`HelpTab::Keys`] by default; `Tab` / `Shift+Tab` cycle through
 /// the tabs. Each tab renders its own content with an appropriate
