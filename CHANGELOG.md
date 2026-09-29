@@ -4,48 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.5.3] - 2026-09-29
+## [0.5.3] - 2026-09-30
 
-### Bug Fixes
+### Highlights
 
-- Session-lock hint names the config directory in use
-- Disconnecting and Reconnecting count from when they began
-- Local-time formatting builds without warnings on musl
-- Profile names stay readable in a narrow sidebar
-- Security Guard shows whole addresses and sentences at 80 columns
-- Help cards keep their indent when a description wraps
-- Connection Details shows the end of a long config path
-- Throughput keeps the session totals at 80 columns
-- Panels at 80 columns end a value in an ellipsis, never at their edge
-- Help describes D the way it works
-- The Security Guard keeps its footer when two alarms stack at 80 columns
-- The Guard sheds a whole alarm explainer, never half a sentence
+- **Connect a profile at boot.** `sudo vortix autoconnect <profile>` installs a boot unit (systemd on Linux, launchd on macOS) that runs `vortix up <profile>` at every boot and retries a failed attempt every 30 s. `vortix autoconnect` shows what is set, and `sudo vortix autoconnect off` removes it. ([#363](https://github.com/Harry-kp/vortix/pull/363))
+- **Flip a panel to see why it says what it does.** `f` on Security Guard shows the evidence behind the verdict, each reading with its age: exit and real addresses, the DNS the tunnel asked for against the one in use, the kill switch and the cipher, failing checks first. `f` on Connection Details shows the tunnel's health: uptime, drops since you connected, the health reason (such as a stale handshake), routes and DNS, or why its last connect failed. A panel with something to explain shows `[f] why` in its border; the Chart no longer flips. ([#370](https://github.com/Harry-kp/vortix/pull/370))
 
-### Documentation
+### Fixed
 
-- One tagline everywhere Vortix is described ([#359](https://github.com/Harry-kp/vortix/pull/359))
+- **The npm package installs with npm 11, pnpm and Bun.** It now carries its binaries instead of downloading them in an install script those tools skip, which left `vortix` failing with `EACCES`. ([#358](https://github.com/Harry-kp/vortix/pull/358))
+- **The dashboard reads cleanly at 80×24.** Profile names in a narrow sidebar, whole addresses and sentences in Security Guard (also with two warnings on an IPv6 network), the end of a long config path in Connection Details and the session totals in Throughput all stay readable, and a value too long for its panel ends in an ellipsis. ([#360](https://github.com/Harry-kp/vortix/pull/360), [#369](https://github.com/Harry-kp/vortix/pull/369), [#372](https://github.com/Harry-kp/vortix/pull/372))
+- **Disconnecting and Reconnecting count from when they began,** not from when the tunnel first connected. ([#357](https://github.com/Harry-kp/vortix/pull/357))
+- **The session-lock hint names the config directory in use,** so its `chown` command works with `-C` or a custom config directory. ([#357](https://github.com/Harry-kp/vortix/pull/357))
+- **The help matches the keys.** It lists `h`/`l` for moving between panels and describes `D` as it works. ([#361](https://github.com/Harry-kp/vortix/pull/361), [#369](https://github.com/Harry-kp/vortix/pull/369))
 
-### Features
+### Changed
 
-- Connect a profile at boot with `vortix autoconnect` ([#363](https://github.com/Harry-kp/vortix/pull/363))
-- The flip side of Details and Security explains the front ([#370](https://github.com/Harry-kp/vortix/pull/370))
-
-### Miscellaneous
-
-- Install from homebrew-core, stop publishing to the tap ([#352](https://github.com/Harry-kp/vortix/pull/352))
-
-### Refactor
-
-- One control-character sanitiser for terminal text
-- Autoconnect's log hint is a constant; the exposed advice shows only whole ([#365](https://github.com/Harry-kp/vortix/pull/365))
-- One test helper renders a dashboard panel to text
-- The last hand-rolled panel render uses the shared helper
-
-### Testing
-
-- Custodian waits use a deadline, not a fixed poll count ([#367](https://github.com/Harry-kp/vortix/pull/367))
-
-
+- **Homebrew installs from homebrew-core.** `brew install vortix` now comes from homebrew-core; users of the old `Harry-kp/tap` formula move over on their next `brew upgrade`. ([#352](https://github.com/Harry-kp/vortix/pull/352))
 
 ## [0.5.2] - 2026-09-27
 
