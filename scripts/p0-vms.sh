@@ -71,9 +71,8 @@ for vm in "${VMS[@]}"; do
     for profile in ${P0_FULL:-} ${P0_FULL2:-} ${P0_SPLIT:-} ${P0_OVPN:-}; do
         file=$(profile_file "$profile")
         [ -n "$file" ] || { echo "  $profile: not on the lab, its scenarios will skip"; continue; }
-        # Replaced every run: a recreated lab droplet makes the VM's old copy dead.
         vm_put "$file" "/tmp/${file##*/}"
-        # delete exits 3 for a profile that isn't there; any other failure would leave the old copy.
+        # Replaced every run (a new droplet kills the old copy); delete exits 3 for a missing one.
         if vm_ssh "chmod 600 '/tmp/${file##*/}' && cd /tmp && { ~/vx-p0/target/debug/vortix delete '$profile' --yes >/dev/null 2>&1; rc=\$?; [ \$rc = 0 ] || [ \$rc = 3 ]; } && ~/vx-p0/target/debug/vortix import '/tmp/${file##*/}' >/dev/null; rc=\$?; rm -f '/tmp/${file##*/}'; exit \$rc"; then
             echo "  imported $profile"
         else

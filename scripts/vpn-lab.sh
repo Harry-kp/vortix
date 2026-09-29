@@ -764,7 +764,7 @@ command_up() {
 
   ok "Lab ready: ${name} (${ipv4})"
   ok "${#EXPECTED_PROFILES[@]} profiles downloaded to ${output}"
-  [[ -n "${ENSURING:-}" ]] || printf '\nRead %s/README.txt, then run %s ensure to import them.\n' "$output" "$0"
+  printf '\nRead %s/README.txt; %s ensure imports them.\n' "$output" "$0"
   printf 'When testing is finished, stop billing with:\n  %s down\n' "$0"
 }
 
@@ -810,7 +810,7 @@ sync_profiles() {
   for profile in "${EXPECTED_PROFILES[@]}"; do names+=("${profile%.*}"); done
   vortix="$(cd "$(dirname "$0")/.." && pwd)/target/debug/vortix"
   [[ -x "$vortix" ]] || vortix=vortix
-  result=$(bash -c "$REPLACE_PROFILES" _ "$vortix" "${VORTIX_CONFIG_DIR:-$HOME/.config/vortix}/profiles" \
+  result=$(bash -c "$REPLACE_PROFILES" _ "$vortix" "${VORTIX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/vortix}/profiles" \
     "$dir" "${names[@]}") || die "Replacing the profiles here failed (above); fix that and run '$0 ensure' again"
   ok "Profiles here: ${result}"
   [[ -n "${VPN_LAB_SYNC:-}" ]] || return 0
@@ -823,8 +823,9 @@ sync_profiles() {
   fi
   # The copy holds keys: it goes on every exit, including a dropped session.
   result=$(ssh "${opts[@]}" "$VPN_LAB_SYNC" "trap $(printf %q "$remote_rm") EXIT HUP; bash -c \
-    $(printf %q "$REPLACE_PROFILES") _ $(printf '%q ' "${VPN_LAB_SYNC_VORTIX:-vortix}" \
-    .config/vortix/profiles "$remote_dir" "${names[@]}")") ||
+    $(printf %q "$REPLACE_PROFILES") _ $(printf %q "${VPN_LAB_SYNC_VORTIX:-vortix}") \
+    \"\${VORTIX_CONFIG_DIR:-\${XDG_CONFIG_HOME:-\$HOME/.config}/vortix}/profiles\" \
+    $(printf '%q ' "$remote_dir" "${names[@]}")") ||
     die "Replacing the profiles on ${VPN_LAB_SYNC} failed (above); fix that and run '$0 ensure' again"
   ok "Profiles on ${VPN_LAB_SYNC}: ${result}"
 }
@@ -834,11 +835,9 @@ command_ensure() {
   require_cmd doctl
   case $(lab_state) in
     alive) ok "Lab up: $(state_value name) ($(state_value ipv4))" ;;
-    none) ENSURING=1 command_up ;;
-    gone)
-      warn "The recorded lab no longer exists; making a new one"
-      clear_state
-      ENSURING=1 command_up
+    none | gone)
+      [[ -z "$(state_value id || true)" ]] || { warn "The recorded lab no longer exists; making a new one"; clear_state; }
+      command_up
       ;;
     *) die "The recorded lab $(state_value name) exists but does not answer; check '$0 status', or '$0 down --yes' and run ensure again" ;;
   esac
