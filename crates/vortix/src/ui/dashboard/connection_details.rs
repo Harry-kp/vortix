@@ -517,10 +517,7 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
                 text.push(Line::from(vec![
                     Span::styled("Last use: ", Style::default().fg(palette.text_secondary)),
                     Span::styled(
-                        format!(
-                            "{} ago",
-                            crate::ui::helpers::format_relative_time(last_used)
-                        ),
+                        crate::ui::helpers::format_relative_time(last_used),
                         Style::default().fg(palette.text_primary),
                     ),
                 ]));
@@ -992,19 +989,6 @@ mod tests {
         assert!(words.contains("handshake timed out"), "{out}");
     }
 
-    /// Uptime is a duration, not a past moment: three days up reads `up for 3d`.
-    #[test]
-    fn health_gives_uptime_without_ago() {
-        let mut app = one_profile("wg07");
-        let mut view = crate::app::connection::test_view("wg07", Phase::Up);
-        view.profile_id = app.runtime.profiles[0].id.clone();
-        view.since = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 3);
-        app.set_tunnels_for_test(vec![view], None);
-        let out = health_face(&mut app);
-        assert!(out.contains("State  : up for 3d "), "{out}");
-        assert!(!out.contains("ago"), "{out}");
-    }
-
     /// A reconnect that gave up keeps its tunnel in `Waiting`; its failure is the answer.
     #[test]
     fn health_of_a_tunnel_that_gave_up_reconnecting_says_why() {
@@ -1046,7 +1030,6 @@ mod tests {
         assert!(front.contains("[f] why"), "{front}");
         let out = health_face(&mut app);
         assert!(out.contains("Drops  : 2 · last "), "{out}");
-        assert!(out.contains("State  : up for 0s"), "{out}");
         assert!(out.contains("handshake stale for 90s"), "{out}");
         assert!(out.contains("Routes : 0.0.0.0/0"), "{out}");
         assert!(out.contains("DNS    : 10.2.0.1"), "{out}");

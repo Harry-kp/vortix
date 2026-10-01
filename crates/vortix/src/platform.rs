@@ -195,16 +195,17 @@ pub fn wireguard_staging_dir() -> Option<&'static std::path::Path> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn process_group_has_live_members(group_id: u32) -> Option<bool> {
-    // An unreadable /proc answers nothing; the caller then assumes the group is alive.
+pub(crate) fn process_group_has_live_members(group_id: u32) -> std::io::Result<Option<bool>> {
     crate::linux::process_identity::process_group_has_live_members(group_id)
-        .ok()
-        .flatten()
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn process_group_has_live_members(_group_id: u32) -> Option<bool> {
-    None
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the Linux platform probe so the process layer stays OS-agnostic"
+)]
+pub(crate) fn process_group_has_live_members(_group_id: u32) -> std::io::Result<Option<bool>> {
+    Ok(None)
 }
 
 fn syscall_result(result: libc::c_int) -> std::io::Result<()> {

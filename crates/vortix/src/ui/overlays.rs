@@ -16,6 +16,7 @@ pub mod action_menu {
     };
 
     /// Render the action menu overlay
+    #[allow(clippy::cast_possible_truncation)]
     pub fn render(
         frame: &mut Frame,
         items: &[ActionMenuItem],
@@ -25,9 +26,8 @@ pub mod action_menu {
         // Calculate menu dimensions based on content
         let max_label_len = items.iter().map(|i| i.label.len()).max().unwrap_or(20);
         let max_key_len = items.iter().map(|i| i.key.len()).max().unwrap_or(1);
-        // key + padding + label, and items + borders; both capped well inside u16
-        let menu_width = u16::try_from((max_key_len + max_label_len + 8).min(60)).unwrap_or(60);
-        let menu_height = u16::try_from((items.len().max(1) + 2).min(18)).unwrap_or(18);
+        let menu_width = (max_key_len + max_label_len + 8).min(60) as u16; // key + padding + label
+        let menu_height = (items.len().max(1) + 2).min(18) as u16; // items + borders
 
         let area = centered_rect_fixed(menu_width, menu_height, frame.area());
 
@@ -1028,30 +1028,30 @@ pub mod help {
 
     #[must_use]
     pub fn total_lines(tab: HelpTab) -> u16 {
-        let lines = match tab {
+        #[allow(clippy::cast_possible_truncation)]
+        match tab {
             HelpTab::Keys => HELP_TEXT
                 .iter()
                 .enumerate()
                 .map(|(section_idx, (_, bindings))| {
                     bindings.len() + 2 + usize::from(section_idx > 0)
                 })
-                .sum::<usize>(),
+                .sum::<usize>() as u16,
             HelpTab::Roles => {
                 // ~6 lines per entry (header + ~4 wrapped + blank) + leading blank + footer
-                1 + ROLE_GLOSSARY.len() * 6 + 2
+                (1 + ROLE_GLOSSARY.len() * 6 + 2) as u16
             }
             HelpTab::Sigils => {
                 // 1 header per category + ~2 lines per entry. Conservative upper bound.
                 let entries = CATALOG.len();
-                2 + entries * 2 + 4
+                (2 + entries * 2 + 4) as u16
             }
             HelpTab::Guard => {
                 // Same shape as Roles — ~6 lines per entry (header + wrapped
                 // body + blank) + leading blank + footer.
-                1 + GUARD_GLOSSARY.len() * 6 + 2
+                (1 + GUARD_GLOSSARY.len() * 6 + 2) as u16
             }
-        };
-        u16::try_from(lines).unwrap_or(u16::MAX)
+        }
     }
 
     pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {

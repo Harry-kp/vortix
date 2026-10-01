@@ -371,7 +371,11 @@ pub(super) fn process_group_has_live_members(group_id: u32) -> Result<bool, Proc
         ProcessGroupProbe::Signalable => {}
     }
 
-    Ok(crate::platform::process_group_has_live_members(group_id).unwrap_or(true))
+    if let Ok(Some(has_live_members)) = crate::platform::process_group_has_live_members(group_id) {
+        return Ok(has_live_members);
+    }
+
+    Ok(true)
 }
 
 pub(super) fn process_is_nonleader_group_member(

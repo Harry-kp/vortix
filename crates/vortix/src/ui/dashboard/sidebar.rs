@@ -259,10 +259,12 @@ fn profile_row(
     }
 
     let time_str = if let Some(last_used) = profile.last_used {
-        format!(
-            "{} ago",
-            crate::ui::helpers::format_relative_time(last_used)
-        )
+        let relative = crate::ui::helpers::format_relative_time(last_used);
+        if !relative.ends_with("ago") && !relative.is_empty() {
+            format!("{relative} ago")
+        } else {
+            relative
+        }
     } else {
         "never".to_string()
     };

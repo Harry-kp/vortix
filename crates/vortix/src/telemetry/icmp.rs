@@ -28,8 +28,9 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 /// One ICMP echo identifier per process (lower 16 bits of the PID).
 fn echo_identifier() -> u16 {
-    let [.., high, low] = std::process::id().to_be_bytes();
-    u16::from_be_bytes([high, low])
+    #[allow(clippy::cast_possible_truncation)]
+    let pid = std::process::id() as u16;
+    pid
 }
 
 /// Stats from a single probe target — same shape the prior
@@ -133,7 +134,9 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    !u16::try_from(sum).unwrap_or(u16::MAX)
+    #[allow(clippy::cast_possible_truncation)]
+    let folded = sum as u16;
+    !folded
 }
 
 /// Read replies until we see an Echo Reply (type 0) whose identifier +
@@ -230,18 +233,20 @@ fn aggregate_rtts(
     }
 
     let total_ms: u128 = rtts.iter().map(Duration::as_millis).sum();
-    let avg_ms = u64::try_from(total_ms / rtts.len() as u128).unwrap_or(u64::MAX);
+    #[allow(clippy::cast_possible_truncation)]
+    let avg_ms = (total_ms / rtts.len() as u128) as u64;
 
     let min_ms = rtts.iter().map(Duration::as_millis).min().unwrap_or(0);
     let max_ms = rtts.iter().map(Duration::as_millis).max().unwrap_or(0);
-    let jitter_ms = u64::try_from(max_ms.saturating_sub(min_ms) / 2).unwrap_or(u64::MAX);
+    #[allow(clippy::cast_possible_truncation)]
+    let jitter_ms = ((max_ms.saturating_sub(min_ms)) / 2) as u64;
 
-    let count = |n: usize| f32::from(u16::try_from(n).unwrap_or(u16::MAX));
+    #[allow(clippy::cast_precision_loss)]
     let packet_loss = if attempts == 0 {
         0.0
     } else {
-        let sent = usize::try_from(attempts).unwrap_or(usize::MAX);
-        count(sent.saturating_sub(rtts.len())) * 100.0 / count(sent)
+        let received = u32::try_from(rtts.len()).unwrap_or(u32::MAX);
+        (attempts.saturating_sub(received) as f32) * 100.0 / attempts as f32
     };
 
     Some(ProbeStats {

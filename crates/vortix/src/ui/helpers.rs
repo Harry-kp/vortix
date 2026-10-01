@@ -385,8 +385,7 @@ fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
     ))
 }
 
-/// How long ago `time` was, as a bare compact age (`5s`, `2m`, `3h`, `4d`, `2M`, `3Y`); a
-/// future time is `0s`. Callers say whether it is "ago" or "for".
+/// Formats a `SystemTime` into a compact relative time string (e.g., 1s, 2m, 3h, 4d).
 #[must_use]
 pub fn format_relative_time(time: std::time::SystemTime) -> String {
     let now = std::time::SystemTime::now();
@@ -401,15 +400,15 @@ pub fn format_relative_time(time: std::time::SystemTime) -> String {
                 format!("{}h", secs / 3600)
             } else if secs < 2_592_000 {
                 // 30 days
-                format!("{}d", secs / 86400)
+                format!("{}d ago", secs / 86400)
             } else if secs < 31_536_000 {
                 // 365 days
-                format!("{}M", secs / 2_592_000)
+                format!("{}M ago", secs / 2_592_000)
             } else {
-                format!("{}Y", secs / 31_536_000)
+                format!("{}Y ago", secs / 31_536_000)
             }
         }
-        Err(_) => "0s".to_string(),
+        Err(_) => "now".to_string(),
     }
 }
 
@@ -567,18 +566,18 @@ mod tests {
 
         // Days
         let three_days = now - Duration::from_secs(86400 * 3);
-        assert_eq!(format_relative_time(three_days), "3d");
+        assert_eq!(format_relative_time(three_days), "3d ago");
 
         // Months
         let two_months = now - Duration::from_secs(2_592_000 * 2);
-        assert_eq!(format_relative_time(two_months), "2M");
+        assert_eq!(format_relative_time(two_months), "2M ago");
 
         // Years
         let three_years = now - Duration::from_secs(31_536_000 * 3);
-        assert_eq!(format_relative_time(three_years), "3Y");
+        assert_eq!(format_relative_time(three_years), "3Y ago");
 
         // Future or now
         let future = now + Duration::from_secs(10);
-        assert_eq!(format_relative_time(future), "0s");
+        assert_eq!(format_relative_time(future), "now");
     }
 }
