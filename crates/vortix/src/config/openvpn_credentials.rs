@@ -526,11 +526,10 @@ enum EntryAction {
     AdoptRoot,
 }
 
-#[allow(clippy::similar_names)]
 fn classify_entry(
     facts: EntryFacts,
     expected_uid: u32,
-    expected_gid: u32,
+    expected_group: u32,
     canonical_stable_id: bool,
     adoption: RootOwnedCredentialAdoption,
     effective_owner: (u32, u32),
@@ -562,7 +561,7 @@ fn classify_entry(
         return Ok(EntryAction::ReadOwned);
     }
     if facts.uid == 0
-        && (facts.gid == expected_gid || facts.gid == effective_owner.1)
+        && (facts.gid == expected_group || facts.gid == effective_owner.1)
         && expected_uid != 0
         && canonical_stable_id
         && adoption == RootOwnedCredentialAdoption::Enabled
