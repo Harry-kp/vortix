@@ -229,11 +229,12 @@ vortix completions bash > ~/.local/share/bash-completion/completions/vortix
 # zsh: any directory on your fpath; add `fpath=(~/.zfunc $fpath)` before `compinit` in ~/.zshrc
 mkdir -p ~/.zfunc && vortix completions zsh > ~/.zfunc/_vortix
 # fish
+mkdir -p ~/.config/fish/completions
 vortix completions fish > ~/.config/fish/completions/vortix.fish
 ```
 
-Homebrew and the `.deb`/`.rpm` packages do not install completions yet, so run these once after
-installing.
+No install channel installs completions yet, so run these after installing, and again after an
+upgrade that adds commands or flags.
 
 `update` works only for a copy in `~/.cargo/bin` (Cargo or the shell installer). For any other
 install it exits 1 and names the right way, such as `brew upgrade vortix`.
