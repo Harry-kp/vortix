@@ -219,6 +219,22 @@ vortix completions zsh             # bash, zsh, fish, elvish, powershell
 vortix update                      # runs `cargo install vortix --force`
 ```
 
+`vortix completions <shell>` prints the script to stdout. Save it where your shell looks for
+completions, then start a new shell:
+
+```bash
+# bash
+mkdir -p ~/.local/share/bash-completion/completions
+vortix completions bash > ~/.local/share/bash-completion/completions/vortix
+# zsh: any directory on your fpath; add `fpath=(~/.zfunc $fpath)` before `compinit` in ~/.zshrc
+mkdir -p ~/.zfunc && vortix completions zsh > ~/.zfunc/_vortix
+# fish
+vortix completions fish > ~/.config/fish/completions/vortix.fish
+```
+
+Homebrew and the `.deb`/`.rpm` packages do not install completions yet, so run these once after
+installing.
+
 `update` works only for a copy in `~/.cargo/bin` (Cargo or the shell installer). For any other
 install it exits 1 and names the right way, such as `brew upgrade vortix`.
 
