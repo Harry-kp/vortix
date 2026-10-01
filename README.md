@@ -6,6 +6,7 @@
 [![Homebrew](https://img.shields.io/homebrew/v/vortix?logo=homebrew)](https://formulae.brew.sh/formula/vortix)
 [![Arch Linux](https://img.shields.io/badge/Arch_Linux-extra-1793D1?logo=archlinux&logoColor=white)](https://archlinux.org/packages/extra/x86_64/vortix/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
+[![Support on Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/harrykp)
 
 Terminal UI for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and leak guarding.
 
@@ -162,6 +163,11 @@ See [CONTRIBUTING.md](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.
 ## Featured in
 
 [awesome-rust](https://github.com/rust-unofficial/awesome-rust) · [awesome-ratatui](https://github.com/ratatui/awesome-ratatui) · [awesome-tuis](https://github.com/rothgar/awesome-tuis) · [Arch Linux extra](https://archlinux.org/packages/extra/x86_64/vortix/) · [Terminal Trove](https://terminaltrove.com/vortix/) · [LinuxLinks](https://www.linuxlinks.com/vortix-terminal-ui-wireguard-openvpn/) · [Orhun Parmaksız's spotlight](https://bsky.app/profile/orhun.dev/post/3medp5icbf22y) · [RustNation UK talk deck](https://github.com/orhun/rat-tools/blob/main/ratdeck/intro.md#L213-L219) · [JustTUI](https://github.com/musichen/justtuit/blob/main/README.md#L610)
+
+## Support
+
+Vortix is free and MIT-licensed, built and tested on real macOS and Linux machines in spare time.
+If it saves you or your team time, you can [support its development on Ko-fi](https://ko-fi.com/harrykp).
 
 ## Also by the author
 
