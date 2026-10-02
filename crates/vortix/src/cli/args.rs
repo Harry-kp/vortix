@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand, ValueHint};
 ///     sudo vortix up work-vpn           Connect to 'work-vpn'
 ///     vortix status --json              Machine-readable connection status
 ///     vortix list --names-only          Profile names for scripting
-///     vortix completions bash >> ~/.bashrc
+///     vortix completions bash > ~/.local/share/bash-completion/completions/vortix
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, after_long_help = GLOBAL_EXAMPLES)]
 pub struct Args {
@@ -384,7 +384,7 @@ pub enum Commands {
     /// Generate shell completions for vortix
     ///
     /// EXAMPLES:
-    ///     vortix completions bash >> ~/.bashrc
+    ///     vortix completions bash > ~/.local/share/bash-completion/completions/vortix
     ///     vortix completions zsh > ~/.zfunc/_vortix
     ///     vortix completions fish > ~/.config/fish/completions/vortix.fish
     Completions {
