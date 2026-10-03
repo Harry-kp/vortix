@@ -25,6 +25,19 @@ use vortix::message::{Message, ScrollMove, SelectionMove};
 
 static INIT: Once = Once::new();
 
+/// Every test in this binary shares one config dir: `init_test_env` sets it
+/// through a `Once`, and `set_config_dir` is first-write-wins. Every import,
+/// direct or through `Message::Import`, takes the one profile-storage lock, and
+/// on a loaded CI runner a waiter times out with "profile storage is busy".
+/// Each test that writes the store holds this guard.
+static STORE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+    STORE_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn init_test_env() {
     INIT.call_once(|| {
         let dir = tempfile::Builder::new()
@@ -103,19 +116,10 @@ fn set_connected(app: &mut App, name: &str) {
 mod profile_import {
     use super::*;
 
-    /// Every test in this binary shares one config dir: `init_test_env` sets it
-    /// through a `Once`, and `set_config_dir` is first-write-wins, so there is no
-    /// per-test directory to fall back on. Imports therefore contend for a single
-    /// profile-storage lock, and on a loaded CI runner the losers time out with
-    /// "profile storage is busy". Serialising them removes the contention.
-    static IMPORT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn import_serialised(
         path: &std::path::Path,
     ) -> Result<vortix::config::profiles::VpnProfile, String> {
-        let _guard = IMPORT_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = store_guard();
         vortix::config::profiles::import_profile(path)
     }
 
@@ -267,7 +271,9 @@ mod profile_import {
             cursor: 0,
         };
         let initial = app.runtime.profiles.len();
+        let guard = store_guard();
         app.handle_message(Message::Import(dir.to_string_lossy().to_string()));
+        drop(guard);
 
         assert!(
             app.runtime.profiles.len() > initial,
@@ -294,7 +300,9 @@ mod profile_import {
             path: dir.to_string_lossy().to_string(),
             cursor: 0,
         };
+        let guard = store_guard();
         app.handle_message(Message::Import(dir.to_string_lossy().to_string()));
+        drop(guard);
 
         assert!(
             matches!(app.input_mode, InputMode::Import { .. }),
