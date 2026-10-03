@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-03
+
+### Bug Fixes
+
+- Session-lock hint names the config directory in use
+- Disconnecting and Reconnecting count from when they began
+- Local-time formatting builds without warnings on musl
+- Profile names stay readable in a narrow sidebar
+- Security Guard shows whole addresses and sentences at 80 columns
+- Help cards keep their indent when a description wraps
+- Connection Details shows the end of a long config path
+- Throughput keeps the session totals at 80 columns
+- Panels at 80 columns end a value in an ellipsis, never at their edge
+- Help describes D the way it works
+- The Security Guard keeps its footer when two alarms stack at 80 columns
+- The Guard sheds a whole alarm explainer, never half a sentence
+- Uptime reads 'up for 3d', and every last-used age says ago
+- **cli:** Point bash completion examples at documented location ([#383](https://github.com/Harry-kp/vortix/pull/383))
+
+### Documentation
+
+- One tagline everywhere Vortix is described ([#359](https://github.com/Harry-kp/vortix/pull/359))
+
+### Features
+
+- Connect a profile at boot with `vortix autoconnect` ([#363](https://github.com/Harry-kp/vortix/pull/363))
+- The flip side of Details and Security explains the front ([#370](https://github.com/Harry-kp/vortix/pull/370))
+
+### Miscellaneous
+
+- Install from homebrew-core, stop publishing to the tap ([#352](https://github.com/Harry-kp/vortix/pull/352))
+
+### Refactor
+
+- One control-character sanitiser for terminal text
+- Autoconnect's log hint is a constant; the exposed advice shows only whole ([#365](https://github.com/Harry-kp/vortix/pull/365))
+- One test helper renders a dashboard panel to text
+- The last hand-rolled panel render uses the shared helper
+- The process-group probe answers Option<bool>, so macOS needs no allow
+- Casts in the ICMP probe and overlays convert losslessly instead of being allowed
+
+### Testing
+
+- Custodian waits use a deadline, not a fixed poll count ([#367](https://github.com/Harry-kp/vortix/pull/367))
+
+### Revert
+
+- Hold #373 until after the 0.5.3 release ([#375](https://github.com/Harry-kp/vortix/pull/375))
+
+
+
 ## [0.5.2] - 2026-09-27
 
 ### Highlights
