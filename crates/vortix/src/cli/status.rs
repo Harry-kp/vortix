@@ -215,7 +215,6 @@ struct StatusSecurity {
     killswitch_state: String,
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn handle_status(
     watch: bool,
     interval: u64,
@@ -495,7 +494,6 @@ pub(super) fn connection_health_entry(
     }
 }
 
-#[allow(clippy::cast_possible_wrap)]
 /// Current UTC time as `YYYY-MM-DDTHH:MM:SSZ`.
 pub(super) fn chrono_now() -> String {
     time::OffsetDateTime::now_utc()

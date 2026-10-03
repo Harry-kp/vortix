@@ -23,7 +23,6 @@ use ratatui::{
 /// H7 — when the focused profile is a split-tunnel row the panel renders
 /// "Latency: n/a" + the explanatory follow-up line "only measured on
 /// the active exit" instead of primary-scoped metrics.
-#[allow(clippy::similar_names)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::ConnectionDetails);
     let border_style = if is_focused {

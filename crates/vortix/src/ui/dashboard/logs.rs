@@ -8,7 +8,6 @@ use ratatui::{
     Frame,
 };
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Logs);
     let border_style = if is_focused {

@@ -383,7 +383,6 @@ pub struct Toast {
     /// Message to display.
     pub message: String,
     /// Type of toast for styling.
-    #[allow(clippy::struct_field_names)]
     pub toast_type: ToastType,
     /// When the toast should disappear.
     pub expires: Instant,

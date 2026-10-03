@@ -30,7 +30,6 @@ struct ProfileEntry {
     group: Option<String>,
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn handle_list(
     sort: Option<&str>,
     reverse: bool,
