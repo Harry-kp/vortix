@@ -32,6 +32,13 @@ machine.
 `umask 022 && cargo build -p vortix && cargo test -p vortix` (the `fix-bug`
 skill has the exact `lab()` function and `git apply` sync). Stop on red.
 
+Release QA tests the binaries; the release workflow also *publishes* them, and a job that runs
+only on a tag fails only on release day (0.5.3 never reached npm that way). For every publish
+job whose code changed since the last tag (`git diff --stat <tag>..HEAD -- .github/ scripts/`),
+its newest run on `main` must be green: `npm-publish.yml` and `linux-packages.yml` dry-run
+weekly and on their PRs (`gh workflow run` either one to get a fresh run). A change to the
+cargo-dist builds (`dist-workspace.toml`, `release.yml`) has no dry-run: say so in the report.
+
 ## 2–4. Smoke, risk, explore
 
 Run `sudo scripts/p0.sh` on both machines (the smoke set; on the Mac, in the
