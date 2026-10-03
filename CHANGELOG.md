@@ -6,16 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ## [0.5.4] - 2026-10-03
 
-### Bug Fixes
+### Fixed
 
-- Uptime reads 'up for 3d', and every last-used age says ago
-
-### Refactor
-
-- The process-group probe answers Option<bool>, so macOS needs no allow
-- Casts in the ICMP probe and overlays convert losslessly instead of being allowed
-
-
+- **The npm package is published again.** 0.5.3 never reached npm because of a publishing bug. `npm install -g @harry-kp/vortix` now installs 0.5.4, which works with npm 11, pnpm and Bun. ([#386](https://github.com/Harry-kp/vortix/pull/386))
+- **Uptime reads correctly.** The flip side of Connection Details says `up for 3d`, not `up for 3d ago`, and every last-used time ends in `ago`, including `Last use: 5m ago` in Connection Details. ([#376](https://github.com/Harry-kp/vortix/pull/376))
 
 ## [0.5.3] - 2026-10-03
 
