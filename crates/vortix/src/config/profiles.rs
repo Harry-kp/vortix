@@ -47,7 +47,6 @@ pub(crate) struct PreparedProfileImport {
     raw_body: Zeroizing<Box<[u8]>>,
 }
 
-#[allow(clippy::too_many_lines)] // validation and identity preparation are one bounded read
 pub(crate) fn prepare_profile_import(
     path: &Path,
     profiles_dir: &Path,

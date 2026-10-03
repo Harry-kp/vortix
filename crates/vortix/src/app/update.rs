@@ -625,7 +625,6 @@ impl App {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // TEA-style dispatch — every arm is one telemetry variant; splitting would obscure the handler shape without simplifying it
     fn handle_telemetry(&mut self, update: TelemetryUpdate) {
         match update {
             TelemetryUpdate::EgressIdentity(identity) => {

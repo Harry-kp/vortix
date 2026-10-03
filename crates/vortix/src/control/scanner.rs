@@ -366,7 +366,6 @@ fn check_wireguard_by_name(
 /// - Internal IP from the tun/tap interface
 /// - MTU from the interface
 /// - Remote endpoint from process args or config file
-#[allow(clippy::too_many_lines)]
 fn check_openvpn_by_pid(
     pid: u32,
     config_path: &Path,
