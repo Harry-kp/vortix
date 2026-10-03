@@ -162,9 +162,17 @@ fn format_elapsed(secs: u64) -> String {
         return format!("{} min ago", secs / 60);
     }
     if secs < 86_400 {
-        return format!("{} hours ago", secs / 3600);
+        return pluralised_ago(secs / 3600, "hour");
     }
-    format!("{} days ago", secs / 86_400)
+    pluralised_ago(secs / 86_400, "day")
+}
+
+fn pluralised_ago(count: u64, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{count} {unit}s ago")
+    }
 }
 
 /// Build a single `ProfileEntry` for `handle_list`. Pulled out as a
@@ -952,7 +960,11 @@ mod tests {
     fn test_format_elapsed() {
         assert_eq!(format_elapsed(30), "just now");
         assert_eq!(format_elapsed(120), "2 min ago");
+        assert_eq!(format_elapsed(3600), "1 hour ago");
+        assert_eq!(format_elapsed(7199), "1 hour ago");
         assert_eq!(format_elapsed(7200), "2 hours ago");
+        assert_eq!(format_elapsed(86_400), "1 day ago");
+        assert_eq!(format_elapsed(172_799), "1 day ago");
         assert_eq!(format_elapsed(172_800), "2 days ago");
     }
 }
