@@ -249,6 +249,8 @@ are in [`docs/performance.md`](docs/performance.md).
 - Async results that arrive after the state they describe must be dropped: the
   telemetry worker tags results with an epoch so a pre-disconnect lookup cannot
   overwrite the real IP.
+- `npm publish dir/file.tgz` treats the path as a GitHub `owner/repo` and fails with a git
+  error; write `./dir/file.tgz`. It cost the 0.5.3 npm publish.
 - `process::run` returns `Ok` for a command that exits non-zero; check
   `CommandOutcome::success()`. Treating `Ok` as success shipped a DNS flush
   that silently ignored failures.

@@ -39,4 +39,5 @@ jobs:
         env:
           # Shows the trusted-publishing token exchange, which npm logs only at verbose.
           NPM_CONFIG_LOGLEVEL: verbose
-        run: npm publish --access public npm-out/*.tgz
+        # The ./ makes npm read a local tarball; a bare dir/file is taken as a GitHub repo.
+        run: npm publish --access public ./npm-out/*.tgz
