@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-10-03
+
+### Bug Fixes
+
+- Uptime reads 'up for 3d', and every last-used age says ago
+
+### Refactor
+
+- The process-group probe answers Option<bool>, so macOS needs no allow
+- Casts in the ICMP probe and overlays convert losslessly instead of being allowed
+
+
+
 ## [0.5.3] - 2026-10-03
 
 ### Highlights
