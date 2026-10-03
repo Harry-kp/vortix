@@ -163,7 +163,8 @@ type_secret() { # paste a value through a tmux buffer: stdin, never a process ar
 }
 tui_connect() { # profile — select its sidebar row and connect it; 1 if not on screen
     local row
-    row=$(frame | sed -n '/Profiles/,/└/p' | sed '1d' | grep -anE "^│ .{2} +$1 " | head -1 | cut -d: -f1)
+    # End at the sidebar's own corner: a popup's border can share the first rows.
+    row=$(frame | sed -n '/Profiles/,/^└/p' | sed '1d' | grep -anE "^│ .{2} +$1 " | head -1 | cut -d: -f1)
     [ -n "$row" ] || return 1
     # A fresh TUI selects row 1, and the list wraps, so step down from there;
     # Connection Details names the selected profile, which proves the row.
