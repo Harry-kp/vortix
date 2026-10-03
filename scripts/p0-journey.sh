@@ -30,7 +30,8 @@ as_new() { su -l "$NEW" -c "$*"; }
 out_new() { su -l "$NEW" -c "$*" 2>&1; }
 
 case $ID in
-    arch | cachyos) pkg_install="pacman -Sy --noconfirm --needed"; pkg_remove="pacman -Rns --noconfirm"; native="pacman -S vortix" ;;
+    # Arch does not support a partial upgrade: -Sy alone pulled a nodejs newer than its libraries.
+    arch | cachyos) pkg_install="pacman -Syu --noconfirm --needed"; pkg_remove="pacman -Rns --noconfirm"; native="pacman -S vortix" ;;
     fedora) pkg_install="dnf install -y -q"; pkg_remove="dnf remove -y -q"; native="dnf install ./vortix-$VERSION-1.x86_64.rpm" ;;
     *) echo "unsupported distro: $ID"; exit 2 ;;
 esac
