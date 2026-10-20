@@ -49,6 +49,9 @@ Reporters are credited in the release notes unless they prefer not to be.
   profile connects, every server address it names is reachable, so a profile with many
   attacker-chosen `remote` lines opens traffic to those addresses for that time. Import profiles
   only from providers you trust.
+- **The kill switch starts with Vortix, not with the OS.** A reboot clears its rules, so until
+  Vortix next runs as root nothing is blocked, even in `vpn-only`
+  ([Kill switch](docs/usage.md#kill-switch)). `vortix autoconnect` narrows that gap.
 - **A second WireGuard tunnel without `FwMark`** can have its own encrypted traffic to its
   server routed through the primary tunnel, so the primary's operator sees that you connect to
   the second server. Vortix warns about this (see
