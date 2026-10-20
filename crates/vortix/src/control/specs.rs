@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::net::{IpAddr, ToSocketAddrs as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,9 @@ use super::state::Spec;
 
 const MAX_PROFILE_BYTES: u64 = 4 * 1024 * 1024;
 const CACHE_FILE: &str = "endpoints.json";
+/// How long one hostname lookup may take before the cached address is used. A resolver behind a
+/// dead tunnel or a blocking kill switch otherwise holds every load for its full timeout.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One profile, parsed.
 #[derive(Debug, Clone)]
@@ -40,7 +44,13 @@ impl Entry {
 /// Hostname → address answers from earlier runs, used when live resolution
 /// fails (for example while `vpn-only` blocks DNS).
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct EndpointCache(BTreeMap<String, IpAddr>);
+#[serde(transparent)]
+struct EndpointCache {
+    addresses: BTreeMap<String, IpAddr>,
+    /// Set after one lookup times out, so the rest of this load uses cached addresses at once.
+    #[serde(skip)]
+    resolver_down: bool,
+}
 
 impl EndpointCache {
     fn load(config_dir: &Path) -> Self {
@@ -62,17 +72,42 @@ impl EndpointCache {
             return Some(address);
         }
         let key = format!("{}:{port}", host.to_ascii_lowercase());
-        let live = (host, port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addresses| addresses.next())
-            .map(|address| address.ip());
+        // With a cached address to fall back on, a resolver may not hold the load for longer
+        // than LOOKUP_TIMEOUT; without one, wait for the answer however slow.
+        let live = match self.addresses.get(&key) {
+            Some(_) if self.resolver_down => None,
+            Some(_) => lookup(host, port).unwrap_or_else(|_| {
+                self.resolver_down = true;
+                None
+            }),
+            None => resolve_now(host, port),
+        };
         if let Some(address) = live {
-            self.0.insert(key, address);
+            self.addresses.insert(key, address);
             return Some(address);
         }
-        self.0.get(&key).copied()
+        self.addresses.get(&key).copied()
     }
+}
+
+fn resolve_now(host: &str, port: u16) -> Option<IpAddr> {
+    (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.next())
+        .map(|address| address.ip())
+}
+
+/// [`resolve_now`], or an error if the resolver gave no answer within [`LOOKUP_TIMEOUT`].
+// ponytail: a lookup that times out keeps its thread until the OS resolver gives up; at most one
+// per load, since a timeout stops the rest of the load from asking.
+fn lookup(host: &str, port: u16) -> Result<Option<IpAddr>, std::sync::mpsc::RecvTimeoutError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host = host.to_owned();
+    std::thread::spawn(move || {
+        let _ = tx.send(resolve_now(&host, port));
+    });
+    rx.recv_timeout(LOOKUP_TIMEOUT)
 }
 
 /// Parse every profile. A profile that cannot be parsed stays listed with
@@ -172,4 +207,56 @@ fn parse(
         server_ips,
         dns,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_with(entry: &str) -> EndpointCache {
+        serde_json::from_str(entry).unwrap()
+    }
+
+    #[test]
+    fn the_cache_file_keeps_its_format() {
+        let cache = cache_with(r#"{"vpn.example.com:51820":"203.0.113.7"}"#);
+        assert_eq!(
+            cache.addresses.get("vpn.example.com:51820"),
+            Some(&"203.0.113.7".parse().unwrap())
+        );
+        assert_eq!(
+            serde_json::to_string(&cache).unwrap(),
+            r#"{"vpn.example.com:51820":"203.0.113.7"}"#
+        );
+    }
+
+    /// Without a cached address there is nothing to fall back to: wait for the answer, however slow.
+    #[test]
+    fn an_uncached_host_is_resolved_even_after_a_timeout() {
+        let mut cache = EndpointCache {
+            resolver_down: true,
+            ..EndpointCache::default()
+        };
+        let address = cache.resolve("localhost", 51820).unwrap();
+        assert!(address.is_loopback(), "{address}");
+    }
+
+    #[test]
+    fn a_working_resolver_wins_over_the_cache() {
+        let mut cache = cache_with(r#"{"localhost:51820":"10.9.9.9"}"#);
+        let address = cache.resolve("localhost", 51820).unwrap();
+        assert!(address.is_loopback(), "{address}");
+    }
+
+    /// With the resolver behind a dead tunnel, every lookup waited out its timeout and the
+    /// dashboard took 20 s to start. After one timeout the load stops asking.
+    #[test]
+    fn a_resolver_that_timed_out_is_not_asked_again() {
+        let mut cache = cache_with(r#"{"localhost:51820":"10.9.9.9"}"#);
+        cache.resolver_down = true;
+        assert_eq!(
+            cache.resolve("localhost", 51820),
+            Some("10.9.9.9".parse().unwrap())
+        );
+    }
 }

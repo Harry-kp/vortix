@@ -26,6 +26,7 @@ Every file Vortix writes there is owned by you and private, including under `sud
 ├── config.toml        optional: appearance, timing, retries, logs, probes
 ├── settings.toml      optional: engine settings, journal, hooks
 ├── state-version      the Vortix version that last ran here (for the upgrade notes)
+├── endpoints.json     each server hostname's last address, used when DNS gives no answer within 2 s
 ├── killswitch.state   the saved kill-switch mode
 ├── real-ip.cache      last seen address without a VPN
 └── real-ipv6.cache
