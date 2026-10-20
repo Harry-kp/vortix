@@ -46,14 +46,17 @@ jobs:
         run: |
           if [ -n "$PLAN" ]; then
             tag=$(echo "$PLAN" | jq -r '.announcement_tag')
+            version=${tag#v}
           else
             tag=$(gh release view --repo Harry-kp/vortix --json tagName -q .tagName)
+            # npm refuses even a dry run over a published version.
+            version=${tag#v}-dryrun.$GITHUB_RUN_ID
           fi
-          scripts/npm-package.sh "$tag" npm-out
+          scripts/npm-package.sh "$tag" npm-out "$version"
       - name: Publish
         env:
           # Shows the trusted-publishing token exchange, which npm logs only at verbose.
           NPM_CONFIG_LOGLEVEL: verbose
         # The ./ makes npm read a local tarball; a bare dir/file is taken as a GitHub repo.
         # Only the release passes a plan; every other run is a dry run.
-        run: npm publish --access public ${{ !inputs.plan && '--dry-run' || '' }} ./npm-out/*.tgz
+        run: npm publish --access public ${{ !inputs.plan && '--dry-run --tag dryrun' || '' }} ./npm-out/*.tgz

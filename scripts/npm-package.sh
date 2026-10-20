@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the @harry-kp/vortix npm package for a release: the release's macOS and
 # static Linux binaries plus scripts/npm-launcher.js, with no install script.
-#   scripts/npm-package.sh <tag> <out-dir>     needs gh, node and npm
+#   scripts/npm-package.sh <tag> <out-dir> [version]   needs gh, node and npm (version: the tag's)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,7 +17,7 @@ for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl
 done
 cp scripts/npm-launcher.js "$pkg/vortix.js"
 cp README.md LICENSE "$pkg/"
-VERSION=${tag#v} node -e '
+VERSION=${3:-${tag#v}} node -e '
 const fs = require("node:fs");
 fs.writeFileSync(process.argv[1], JSON.stringify({
   name: "@harry-kp/vortix",
