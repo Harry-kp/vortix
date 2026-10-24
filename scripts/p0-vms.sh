@@ -64,6 +64,23 @@ for vm in "${VMS[@]}"; do
     vm_ssh() { ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "harrykp@$ip" "$@"; }
     vm_put() { scp -q -i "$KEY" "$1" "harrykp@$ip:$2"; }
     for _ in $(seq 60); do vm_ssh true 2>/dev/null && break; sleep 3; done
+    # Arch does not support a partial upgrade, and a full one replaces the running kernel's
+    # modules, so WireGuard and nftables fail until a reboot: bring the VM current first.
+    case $vm in
+        arch | cachyos)
+            upgrade=$(vm_ssh 'sudo pacman -Syu --noconfirm >/dev/null 2>&1 || { echo failed; exit; }; [ -d "/lib/modules/$(uname -r)" ] || echo reboot')
+            case $upgrade in
+                failed)
+                    echo "  upgrade failed"
+                    failed=1
+                    [ -n "$started" ] && sudo -n virsh shutdown "$vm" >/dev/null
+                    continue ;;
+                reboot)
+                    vm_ssh 'sudo systemctl reboot' 2>/dev/null || true
+                    # Only the new boot has modules for its kernel; the old one cannot pass this.
+                    for _ in $(seq 60); do vm_ssh '[ -d "/lib/modules/$(uname -r)" ]' 2>/dev/null && break; sleep 3; done ;;
+            esac ;;
+    esac
 
     vm_ssh 'mkdir -p ~/vx-p0/scripts ~/vx-p0/target/debug && rm -f ~/vx-p0/target/p0-results.json ~/vx-p0/target/p0.log'
     vm_put "$BIN" vx-p0/target/debug/vortix
