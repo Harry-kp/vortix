@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-10-24
+
+### Security
+
+- **TLS fixes in the address lookups.** The library that checks certificates for Vortix's public-IP and ISP lookups had four advisories (RUSTSEC-2026-0346 to 0349), and its certificate checker and root store two more (RUSTSEC-2026-0381, 0382). All are updated; nothing changes in how tunnels work. ([#398](https://github.com/Harry-kp/vortix/pull/398), [#400](https://github.com/Harry-kp/vortix/pull/400))
+
+### Fixed
+
+- **The dashboard no longer waits 20 s to start when a tunnel's server is unreachable.** With a full tunnel whose server had gone away, DNS went into the dead tunnel and Vortix waited out its timeouts before showing anything; `vortix status` and `vortix down` waited too. A server's last known address is now used after 2 s. ([#399](https://github.com/Harry-kp/vortix/pull/399))
+- **`vortix list` says `1 hour ago` and `1 day ago`,** not `1 hours ago`. ([#389](https://github.com/Harry-kp/vortix/pull/389))
+
 ## [0.5.4] - 2026-10-03
 
 ### Fixed
