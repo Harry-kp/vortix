@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-10-24
+
+### Bug Fixes
+
+- **cli:** Use singular 1 hour ago and 1 day ago in vortix list ([#389](https://github.com/Harry-kp/vortix/pull/389))
+- A dead resolver no longer holds the dashboard's start for 20 s ([#399](https://github.com/Harry-kp/vortix/pull/399))
+
+### Refactor
+
+- Delete nine #[allow] attributes clippy no longer needs ([#390](https://github.com/Harry-kp/vortix/pull/390))
+
+### Testing
+
+- Every import in the integration binary takes one store guard ([#393](https://github.com/Harry-kp/vortix/pull/393))
+
+
+
 ## [0.5.4] - 2026-10-03
 
 ### Fixed
