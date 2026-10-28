@@ -23,6 +23,8 @@ pub struct LiveTunnel {
     pub dns: DnsRequest,
     /// Larger is newer. The newest full tunnel owns the default route.
     pub rank: u64,
+    /// The group its daemon runs under, which the firewall lets out.
+    pub group: Option<u32>,
 }
 
 impl LiveTunnel {
@@ -49,6 +51,8 @@ pub struct PlanInput {
     /// is pinned to the physical gateway before they come up, so a switch
     /// from one full tunnel to another never opens the new one inside the old.
     pub pending_full_endpoints: BTreeSet<IpAddr>,
+    /// Daemon groups of those tunnels, let out before they are up.
+    pub pending_groups: BTreeSet<u32>,
     /// A tunnel dropped without being asked to.
     pub dropped: bool,
     /// Interfaces of tunnels being torn down.
@@ -217,6 +221,7 @@ fn firewall(input: &PlanInput) -> (Firewall, KillSwitchState) {
             server_ips: tunnel.server_ips.iter().copied().collect(),
             declared_cidrs: tunnel.routes.iter().copied().collect(),
             is_primary: tunnel.is_full(),
+            group: tunnel.group,
         })
         .collect::<Vec<_>>();
     let covered = allow
@@ -228,8 +233,14 @@ fn firewall(input: &PlanInput) -> (Firewall, KillSwitchState) {
         .difference(&covered)
         .copied()
         .collect::<Vec<_>>();
-    if !pending.is_empty() {
-        allow.push(ActiveTunnelInfo::endpoint_allowlist(pending));
+    // Every daemon Vortix runs shares one group, so one entry covers them.
+    let pending_group = input
+        .pending_groups
+        .iter()
+        .copied()
+        .find(|group| allow.iter().all(|tunnel| tunnel.group != Some(*group)));
+    if !pending.is_empty() || pending_group.is_some() {
+        allow.push(ActiveTunnelInfo::endpoint_allowlist(pending, pending_group));
     }
     (Firewall::Block(allow), KillSwitchState::Blocking)
 }
@@ -243,6 +254,7 @@ pub(crate) mod tests {
 
     pub fn live(id: &str, iface: &str, route: &str, rank: u64) -> LiveTunnel {
         LiveTunnel {
+            group: None,
             profile_id: ProfileId::new(id),
             interface: iface.into(),
             routes: BTreeSet::from([route.parse().unwrap()]),
@@ -401,5 +413,34 @@ pub(crate) mod tests {
         let plan = plan(&input);
         assert_eq!(plan.kill_switch_state, KillSwitchState::Blocking);
         assert_invariants(&input, &plan);
+    }
+    /// A mesh daemon is let out by its group while it starts and once it is
+    /// up, beside a full tunnel, without taking routes or DNS.
+    #[test]
+    fn vpn_only_lets_a_mesh_daemon_out_by_its_group() {
+        let group = crate::control::killswitch::TRANSPORT_GROUP;
+        let mut input = input(vec![live("01", "utun4", FULL, 1)]);
+        input.kill_switch = KillSwitchMode::AlwaysOn;
+        input.pending_groups = BTreeSet::from([group]);
+        let groups = |plan: &NetworkPlan| match &plan.firewall {
+            Firewall::Block(allow) => allow
+                .iter()
+                .filter_map(|tunnel| tunnel.group.map(|group| (tunnel.interface.clone(), group)))
+                .collect::<Vec<_>>(),
+            Firewall::Open => panic!("vpn-only must block"),
+        };
+        let starting = plan(&input);
+        assert_eq!(groups(&starting), [(String::new(), group)]);
+
+        let mut mesh = live("02", "wt0", "10.0.0.0/8", 2);
+        mesh.routes.clear();
+        mesh.group = Some(group);
+        input.live.push(mesh);
+        input.pending_groups.clear();
+        let up = plan(&input);
+        assert_eq!(groups(&up), [("wt0".to_string(), group)]);
+        assert_eq!(up.primary.as_ref().map(ProfileId::as_str), Some("01"));
+        assert!(up.routes.values().all(|interface| interface == "utun4"));
+        assert_invariants(&input, &up);
     }
 }

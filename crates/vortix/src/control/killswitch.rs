@@ -418,8 +418,13 @@ pub(crate) fn policy_digest_bytes(active: &[ActiveTunnelInfo]) -> [u8; 32] {
                 .map(ToString::to_string)
                 .collect();
             cidrs.sort_unstable();
+            // Absent from older policies, so their digests stay the same.
+            let group = tunnel
+                .group
+                .map(|group| format!("|group={group}"))
+                .unwrap_or_default();
             format!(
-                "{}|{}|{}|{}",
+                "{}|{}|{}|{}{group}",
                 tunnel.interface,
                 tunnel.is_primary,
                 endpoints.join(","),
@@ -443,7 +448,7 @@ pub(crate) fn policy_digest_bytes(active: &[ActiveTunnelInfo]) -> [u8; 32] {
 pub fn validate_policy(active: &[ActiveTunnelInfo]) -> Result<()> {
     for tunnel in active {
         let endpoint_allowlist = tunnel.is_endpoint_allowlist()
-            && !tunnel.server_ips.is_empty()
+            && (!tunnel.server_ips.is_empty() || tunnel.group.is_some())
             && tunnel.declared_cidrs.is_empty()
             && !tunnel.is_primary;
         if !endpoint_allowlist && !crate::profile::is_safe_interface_name(&tunnel.interface) {
@@ -454,7 +459,7 @@ pub fn validate_policy(active: &[ActiveTunnelInfo]) -> Result<()> {
         }
         if tunnel.is_endpoint_allowlist() && !endpoint_allowlist {
             return Err(KillswitchError::InvalidPolicy(
-                "endpoint-only policy entries require at least one server IP and no route role"
+                "endpoint-only policy entries require a server IP or group and no route role"
                     .into(),
             ));
         }
@@ -532,6 +537,8 @@ pub struct PersistedTunnelInfo {
     /// `true` when this tunnel claims the default route.
     #[serde(default)]
     pub is_primary: bool,
+    #[serde(default)]
+    pub group: Option<u32>,
 }
 
 /// Persistent state for kill-switch recovery across process restarts.
@@ -657,6 +664,7 @@ fn coerce_v1_to_v2(state: &mut PersistedState) {
                 server_ips: state.vpn_server_ip.clone().into_iter().collect(),
                 declared_cidrs: Vec::new(),
                 is_primary: true,
+                group: None,
             });
         }
     }
@@ -865,6 +873,7 @@ fn active_from_persisted(active: &[PersistedTunnelInfo]) -> Option<Vec<ActiveTun
                     .map(|cidr| cidr.parse().ok())
                     .collect::<Option<Vec<_>>>()?,
                 is_primary: tunnel.is_primary,
+                group: tunnel.group,
             })
         })
         .collect()
@@ -882,6 +891,7 @@ pub fn persisted_from_active(active: &[ActiveTunnelInfo]) -> Vec<PersistedTunnel
             server_ips: a.server_ips.iter().map(ToString::to_string).collect(),
             declared_cidrs: a.declared_cidrs.iter().map(ToString::to_string).collect(),
             is_primary: a.is_primary,
+            group: a.group,
         })
         .collect()
 }
@@ -940,12 +950,14 @@ mod tests {
         use std::net::IpAddr;
 
         let first = ActiveTunnelInfo {
+            group: None,
             interface: "wg0".to_string(),
             server_ips: vec!["1.2.3.4".parse::<IpAddr>().unwrap()],
             declared_cidrs: vec!["0.0.0.0/0".parse::<Cidr>().unwrap()],
             is_primary: true,
         };
         let second = ActiveTunnelInfo {
+            group: None,
             interface: "wg1".to_string(),
             server_ips: vec!["2001:db8::1".parse::<IpAddr>().unwrap()],
             declared_cidrs: vec!["10.0.0.0/8".parse::<Cidr>().unwrap()],
@@ -968,6 +980,7 @@ mod tests {
     #[test]
     fn policy_validation_rejects_firewall_script_injection() {
         let malicious = ActiveTunnelInfo {
+            group: None,
             interface: "wg0\nblock all".to_string(),
             server_ips: Vec::new(),
             declared_cidrs: Vec::new(),
@@ -978,6 +991,7 @@ mod tests {
             Err(KillswitchError::InvalidPolicy(_))
         ));
         let safe = ActiveTunnelInfo {
+            group: None,
             interface: "wg-corp.1".to_string(),
             server_ips: Vec::new(),
             declared_cidrs: Vec::new(),
@@ -988,9 +1002,9 @@ mod tests {
 
     #[test]
     fn endpoint_allowlist_is_valid_only_with_resolved_servers() {
-        let valid = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()]);
+        let valid = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()], None);
         assert!(validate_policy(&[valid]).is_ok());
-        let empty = ActiveTunnelInfo::endpoint_allowlist(Vec::new());
+        let empty = ActiveTunnelInfo::endpoint_allowlist(Vec::new(), None);
         assert!(matches!(
             validate_policy(&[empty]),
             Err(KillswitchError::InvalidPolicy(_))
@@ -1030,6 +1044,7 @@ mod tests {
             vpn_interface: None,
             vpn_server_ip: None,
             active_tunnels: vec![PersistedTunnelInfo {
+                group: None,
                 interface: "utun3".to_string(),
                 server_ips: vec!["1.2.3.4".to_string()],
                 declared_cidrs: vec!["10.0.0.0/8".to_string()],
@@ -1131,18 +1146,21 @@ mod tests {
             vpn_server_ip: None,
             active_tunnels: vec![
                 PersistedTunnelInfo {
+                    group: None,
                     interface: "eth0".to_string(),
                     server_ips: Vec::new(),
                     declared_cidrs: Vec::new(),
                     is_primary: true,
                 },
                 PersistedTunnelInfo {
+                    group: None,
                     interface: "utun99".to_string(),
                     server_ips: Vec::new(),
                     declared_cidrs: Vec::new(),
                     is_primary: false,
                 },
                 PersistedTunnelInfo {
+                    group: None,
                     interface: String::new(),
                     server_ips: vec!["203.0.113.19".into()],
                     declared_cidrs: Vec::new(),
@@ -1169,6 +1187,7 @@ mod tests {
             vpn_interface: None,
             vpn_server_ip: None,
             active_tunnels: vec![PersistedTunnelInfo {
+                group: None,
                 interface: "utun99".to_string(),
                 server_ips: Vec::new(),
                 declared_cidrs: Vec::new(),
@@ -1226,6 +1245,7 @@ mod tests {
         use crate::cidr::Cidr;
         use std::net::IpAddr;
         let active = vec![ActiveTunnelInfo {
+            group: None,
             interface: "utun3".to_string(),
             server_ips: vec!["1.2.3.4".parse::<IpAddr>().unwrap()],
             declared_cidrs: vec!["10.0.0.0/8".parse::<Cidr>().unwrap()],
@@ -1346,7 +1366,14 @@ pub struct ActiveTunnelInfo {
     /// `true` when this tunnel claims the default route (primary).
     /// Primaries are excluded from RFC1918 subtraction.
     pub is_primary: bool,
+    /// The group its daemon runs under ([`TRANSPORT_GROUP`]): a mesh daemon
+    /// talks to peers and relays at addresses nobody knows in advance.
+    pub group: Option<u32>,
 }
+
+/// The group every tunnel daemon Vortix runs uses, so the kill switch can let
+/// that daemon, and nothing else, reach any address.
+pub const TRANSPORT_GROUP: u32 = 51820;
 
 pub(crate) const FIREWALL_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const FIREWALL_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -1374,6 +1401,7 @@ pub(crate) fn test_tunnel(
         server_ips: server_ips.iter().map(|s| s.parse().unwrap()).collect(),
         declared_cidrs: declared.iter().map(|s| s.parse().unwrap()).collect(),
         is_primary,
+        group: None,
     }
 }
 
@@ -1382,12 +1410,13 @@ impl ActiveTunnelInfo {
     /// exist yet. Platform adapters emit only the destination exceptions and
     /// never an interface allow rule for this value.
     #[must_use]
-    pub fn endpoint_allowlist(server_ips: Vec<IpAddr>) -> Self {
+    pub fn endpoint_allowlist(server_ips: Vec<IpAddr>, group: Option<u32>) -> Self {
         Self {
             interface: String::new(),
             server_ips,
             declared_cidrs: Vec::new(),
             is_primary: false,
+            group,
         }
     }
 

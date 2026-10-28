@@ -225,6 +225,10 @@ so between boot and that first run nothing is blocked; [connecting at boot](#con
 shortens that gap to the time the network takes to come up. macOS uses a `pf` anchor of its own,
 Linux an `nftables` table.
 
+A NetBird network reaches its peers and relays at addresses nobody knows in advance, so Vortix
+runs its daemon under group 51820 and the blocking modes let that group's traffic out to any
+address, while it connects and while it is up. Every other process stays blocked.
+
 ## Diagnostics
 
 ```bash

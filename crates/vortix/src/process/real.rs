@@ -289,6 +289,20 @@ pub(crate) fn run_guardian_entrypoint() -> Result<(), ProcessError> {
     if let Some(cwd) = &spec.cwd {
         command.current_dir(cwd);
     }
+    if let Some(gid) = spec.firewall_group {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: only async-signal-safe syscalls run between fork and exec.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(move || {
+                crate::platform::set_process_supplementary_groups(&[])?;
+                if libc::setgid(gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     command
         .stdin(if spec.stdin_bytes.is_some() {
             Stdio::piped()
@@ -504,6 +518,14 @@ impl RealRunner {
             return Err(ProcessError::PrivilegeDenied {
                 program: spec.program.clone(),
             });
+        }
+        if let Some(gid) = spec.firewall_group {
+            if gid == 0 || spec.requires_privilege != PrivilegeReq::Root || spec.run_as.is_some() {
+                return Err(ProcessError::InvalidCredentials {
+                    program: spec.program.clone(),
+                    reason: "a firewall group needs a root subprocess and a non-zero gid".into(),
+                });
+            }
         }
         if let Some(credentials) = &spec.run_as {
             if credentials.uid == 0 || credentials.gid == 0 {

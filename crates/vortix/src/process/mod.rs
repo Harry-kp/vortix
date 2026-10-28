@@ -171,6 +171,10 @@ pub struct CommandSpec {
     /// timeout/cancellation. Required for lifecycle hooks.
     #[serde(default)]
     pub terminate_process_group: bool,
+    /// Keep root, but run under this primary group with no supplementary
+    /// groups, so the firewall can tell this child's traffic apart.
+    #[serde(default)]
+    pub firewall_group: Option<u32>,
 }
 
 impl CommandSpec {
@@ -189,6 +193,7 @@ impl CommandSpec {
             redact_in_audit: Vec::new(),
             run_as: None,
             terminate_process_group: false,
+            firewall_group: None,
         }
     }
 

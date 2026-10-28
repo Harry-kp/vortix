@@ -24,6 +24,9 @@ pub struct Spec {
     pub routes: BTreeSet<Cidr>,
     pub server_ips: BTreeSet<IpAddr>,
     pub dns: DnsRequest,
+    /// The group its daemon runs under, for a transport that needs the firewall
+    /// to let it reach any address.
+    pub group: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +351,7 @@ impl State {
                     server_ips: tunnel.spec.server_ips.clone(),
                     dns: tunnel.spec.dns.clone(),
                     rank: tunnel.rank,
+                    group: tunnel.spec.group,
                 })
             })
             .collect();
@@ -373,6 +377,17 @@ impl State {
             })
             .flat_map(|tunnel| tunnel.spec.server_ips.iter().copied())
             .collect();
+        let pending_groups = self
+            .tunnels
+            .values()
+            .filter(|tunnel| {
+                matches!(
+                    tunnel.phase,
+                    Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
+                )
+            })
+            .filter_map(|tunnel| tunnel.spec.group)
+            .collect();
         let dropped = self
             .tunnels
             .values()
@@ -387,6 +402,7 @@ impl State {
             live,
             pending_endpoints,
             pending_full_endpoints,
+            pending_groups,
             dropped,
             releasing,
             kill_switch: self.kill_switch,
@@ -470,6 +486,7 @@ mod tests {
 
     fn spec(id: &str, route: &str) -> Spec {
         Spec {
+            group: None,
             profile_id: ProfileId::new(id),
             name: id.into(),
             protocol: ProtocolKind::OpenVpn,

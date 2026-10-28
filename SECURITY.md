@@ -39,9 +39,11 @@ Reporters are credited in the release notes unless they prefer not to be.
   file per profile. Keys and passwords are masked in `show`, never passed on a command line, and
   kept out of logs and JSON output.
 - **NetBird.** A `.netbird` profile's setup key is a credential like a WireGuard private key:
-  the file is owner-only, only `show --raw` prints it, and it reaches `netbird` through a root-only file that is
-  deleted after each connect. Each network's identity lives in `/var/lib/vortix/netbird/` (root
-  only), and the `netbird` daemon Vortix starts for it runs as root, as NetBird's own service does.
+  the file is owner-only, only `show --raw` prints it, and it reaches `netbird` through a
+  root-only file that is deleted after each connect. Each network's identity lives in `/var/lib/vortix/netbird/` (root
+  only), and the `netbird` daemon Vortix starts for it runs as root, as NetBird's own service does,
+  under group 51820 with no other groups. The kill switch lets that group reach any address, so
+  under `vpn-only` anything running as group 51820 is let out too.
 - **Network calls.** Vortix has no server and sends no analytics. It looks up your public
   address and its location with third-party services (by default ipinfo.io, ipwho.is,
   api.ipify.org, icanhazip.com, ifconfig.me and ident.me; see

@@ -178,6 +178,10 @@ impl PfFirewall {
                 )
                 .unwrap();
             }
+            if let Some(group) = tunnel.group {
+                writeln!(rules, "pass out quick proto tcp group {group} flags any").unwrap();
+                writeln!(rules, "pass out quick proto udp group {group}").unwrap();
+            }
             for ip in &tunnel.server_ips {
                 writeln!(rules, "pass out quick to {} flags any", fmt_ip(ip)).unwrap();
             }
@@ -328,6 +332,19 @@ fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
         return Some(
             "pass in quick proto udp from any port = 67 to any port = 68 keep state".into(),
         );
+    }
+    if let Some(group) = rule
+        .strip_prefix("pass out quick proto tcp group ")
+        .and_then(|rest| rest.strip_suffix(" flags any"))
+    {
+        return Some(format!(
+            "pass out quick proto tcp all group = {group} flags any keep state"
+        ));
+    }
+    if let Some(group) = rule.strip_prefix("pass out quick proto udp group ") {
+        return Some(format!(
+            "pass out quick proto udp all group = {group} keep state"
+        ));
     }
     if rule == "pass out quick on lo0 all" {
         return Some("pass out quick on lo0 all flags S/SA keep state".into());
@@ -644,9 +661,10 @@ mod tests {
 
     #[test]
     fn effective_state_requires_traversal_enabled_pf_and_exact_anchor_policy() {
-        let active = vec![ActiveTunnelInfo::endpoint_allowlist(vec!["198.51.100.7"
-            .parse()
-            .unwrap()])];
+        let active = vec![ActiveTunnelInfo::endpoint_allowlist(
+            vec!["198.51.100.7".parse().unwrap()],
+            None,
+        )];
         let anchor = PfFirewall::generate_pf_rules(&active);
         let root = "anchor \"com.apple/*\" all\n";
         let enabled = "Status: Enabled for 0 days\n";
@@ -676,6 +694,7 @@ mod tests {
     #[test]
     fn pfctl_normalization_is_exact_and_rejects_semantic_suffixes() {
         let active = vec![ActiveTunnelInfo {
+            group: None,
             interface: "utun4".into(),
             server_ips: vec!["198.51.100.7".parse().unwrap()],
             declared_cidrs: Vec::new(),
@@ -814,10 +833,35 @@ mod tests {
 
     #[test]
     fn endpoint_allowlist_emits_no_interface_rule() {
-        let policy = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()]);
+        let policy = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()], None);
         let rules = PfFirewall::generate_pf_rules(&[policy]);
         assert!(rules.contains("pass out quick to 1.2.3.4"));
         assert!(!rules.contains("pass out quick on  all"));
+    }
+
+    /// A mesh daemon reaches peers anywhere: only its group is let out, and
+    /// pfctl's read-back of those rules still verifies.
+    #[test]
+    fn a_daemon_group_is_let_out_and_reads_back() {
+        let mut mesh = tunnel("utun100", &["203.0.113.9"], &[], false);
+        mesh.group = Some(crate::control::killswitch::TRANSPORT_GROUP);
+        let active = [mesh];
+        let generated = PfFirewall::generate_pf_rules(&active);
+        assert!(generated.contains("pass out quick proto tcp group 51820 flags any\n"));
+        assert!(generated.contains("pass out quick proto udp group 51820\n"));
+        let observed = PfFirewall::canonical_pf_rules(&generated)
+            .into_iter()
+            .map(|rule| pfctl_normalized_generated_rule(rule).unwrap())
+            .collect::<Vec<_>>();
+        assert!(observed
+            .contains(&"pass out quick proto tcp all group = 51820 flags any keep state".into()));
+        assert!(observed.contains(&"pass out quick proto udp all group = 51820 keep state".into()));
+        let observed = observed.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(PfFirewall::canonical_snapshot_matches(&active, &observed));
+        assert!(!PfFirewall::canonical_snapshot_matches(
+            &[tunnel("utun100", &["203.0.113.9"], &[], false)],
+            &observed
+        ));
     }
 
     #[test]
@@ -825,6 +869,7 @@ mod tests {
         // pf accepts raw v6 syntax. Confirm the IpAddr Display impl
         // produces the v6 form.
         let t = ActiveTunnelInfo {
+            group: None,
             interface: "utun13".to_string(),
             server_ips: vec!["2001:db8::1".parse().unwrap()],
             declared_cidrs: vec![],
@@ -921,6 +966,7 @@ block drop out quick all
     #[test]
     fn snapshot_single_primary() {
         let t = ActiveTunnelInfo {
+            group: None,
             interface: "utun3".to_string(),
             server_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
             declared_cidrs: vec![cidr("0.0.0.0/0")],
@@ -957,12 +1003,14 @@ block drop out quick all
     #[test]
     fn snapshot_primary_plus_secondary() {
         let prim = ActiveTunnelInfo {
+            group: None,
             interface: "utun3".to_string(),
             server_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
             declared_cidrs: vec![cidr("0.0.0.0/0")],
             is_primary: true,
         };
         let sec = ActiveTunnelInfo {
+            group: None,
             interface: "utun4".to_string(),
             server_ips: vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))],
             declared_cidrs: vec![cidr("10.0.0.0/8")],

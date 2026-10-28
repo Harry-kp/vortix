@@ -227,6 +227,7 @@ impl NbTunnel {
         daemon
             .env
             .insert("NB_STATE_DIR".into(), state_dir.to_string_lossy().into());
+        daemon.firewall_group = Some(crate::control::killswitch::TRANSPORT_GROUP);
         let custody = crate::process::custodian::spawn_custodian(
             identity.clone(),
             daemon,
@@ -235,50 +236,7 @@ impl NbTunnel {
         )
         .map_err(|error| TunnelError::Subprocess(format!("netbird custody: {error}")))?;
 
-        let started = (|| {
-            wait_for(&socket, self.remaining()?)?;
-            let before = status(&binary, &socket)?;
-            // A fresh daemon reports Idle, not NeedsLogin, so the key goes with
-            // every connect; NetBird logs a registered peer in by its own key.
-            let key_file = match &settings.setup_key {
-                Some(key) => Some(write_key_file(&state_dir, key)?),
-                None if before.needs_login() => {
-                    return Err(TunnelError::AuthFailed(format!(
-                        "'{}' has no NetBird identity yet: add `setup_key` to its profile",
-                        profile.display_name
-                    )));
-                }
-                None => None,
-            };
-            let mut args = vec![
-                "up".to_string(),
-                "--management-url".into(),
-                settings.management_url.clone(),
-                "--interface-name".into(),
-                crate::platform::NETBIRD_INTERFACE.into(),
-                "--wireguard-port".into(),
-                WIREGUARD_PORT.to_string(),
-            ];
-            if let Some(key_file) = &key_file {
-                args.push("--setup-key-file".into());
-                args.push(key_file.to_string_lossy().into());
-            }
-            let mut up = command(&binary, &socket, args);
-            up.timeout = Some(self.remaining()?);
-            let outcome = crate::process::run(up);
-            if let Some(key_file) = &key_file {
-                let _ = std::fs::remove_file(key_file);
-            }
-            let outcome = outcome.map_err(|error| TunnelError::Subprocess(error.to_string()))?;
-            let after = status(&binary, &socket)?;
-            if !outcome.success() || !after.connected() {
-                return Err(up_failure(
-                    &after,
-                    &String::from_utf8_lossy(&outcome.stderr),
-                ));
-            }
-            Ok(())
-        })();
+        let started = self.connect(profile, &settings, &binary, &socket, &state_dir);
         if let Err(error) = started {
             return Err(
                 match crate::process::custodian::remote_stop_after_startup(&custody) {
@@ -304,6 +262,59 @@ impl NbTunnel {
             dns_request: crate::control::dns::DnsRequest::default(),
             openvpn_routes: None,
         })
+    }
+
+    /// Bring the network up through a running daemon.
+    fn connect(
+        &self,
+        profile: &Profile,
+        settings: &NetBirdProfile,
+        binary: &Path,
+        socket: &Path,
+        state_dir: &Path,
+    ) -> Result<(), TunnelError> {
+        wait_for(socket, self.remaining()?)?;
+        let before = status(binary, socket)?;
+        // A fresh daemon reports Idle, not NeedsLogin, so the key goes with
+        // every connect; NetBird logs a registered peer in by its own key.
+        let key_file = match &settings.setup_key {
+            Some(key) => Some(write_key_file(state_dir, key)?),
+            None if before.needs_login() => {
+                return Err(TunnelError::AuthFailed(format!(
+                    "'{}' has no NetBird identity yet: add `setup_key` to its profile",
+                    profile.display_name
+                )));
+            }
+            None => None,
+        };
+        let mut args = vec![
+            "up".to_string(),
+            "--management-url".into(),
+            settings.management_url.clone(),
+            "--interface-name".into(),
+            crate::platform::NETBIRD_INTERFACE.into(),
+            "--wireguard-port".into(),
+            WIREGUARD_PORT.to_string(),
+        ];
+        if let Some(key_file) = &key_file {
+            args.push("--setup-key-file".into());
+            args.push(key_file.to_string_lossy().into());
+        }
+        let mut up = command(binary, socket, args);
+        up.timeout = Some(self.remaining()?);
+        let outcome = crate::process::run(up);
+        if let Some(key_file) = &key_file {
+            let _ = std::fs::remove_file(key_file);
+        }
+        let outcome = outcome.map_err(|error| TunnelError::Subprocess(error.to_string()))?;
+        let after = status(binary, socket)?;
+        if !outcome.success() || !after.connected() {
+            return Err(up_failure(
+                &after,
+                &String::from_utf8_lossy(&outcome.stderr),
+            ));
+        }
+        Ok(())
     }
 
     pub fn down(&mut self, handle: &TunnelHandle) -> Result<(), TunnelError> {

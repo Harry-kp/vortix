@@ -156,6 +156,7 @@ fn parse(
 ) -> Result<Spec, String> {
     let mut routes = BTreeSet::new();
     let mut server_ips = BTreeSet::new();
+    let mut group = None;
     let mut resolve = |host: &str, port: u16, servers: &mut BTreeSet<IpAddr>| {
         if let Some(address) = cache.resolve(host, port) {
             servers.insert(address);
@@ -201,6 +202,7 @@ fn parse(
         ProtocolKind::NetBird => {
             let (host, port) = crate::netbird::NetBirdProfile::parse(body)?.management_host()?;
             resolve(&host, port, &mut server_ips);
+            group = Some(crate::control::killswitch::TRANSPORT_GROUP);
             (ProtocolKind::NetBird, DnsRequest::default())
         }
     };
@@ -213,6 +215,7 @@ fn parse(
         routes: routes.into_iter().map(Cidr::canonical_network).collect(),
         server_ips,
         dns,
+        group,
     })
 }
 
@@ -245,6 +248,10 @@ mod tests {
         .unwrap();
         assert!(spec.routes.is_empty());
         assert!(spec.dns.is_empty());
+        assert_eq!(
+            spec.group,
+            Some(crate::control::killswitch::TRANSPORT_GROUP)
+        );
         assert_eq!(
             spec.server_ips.into_iter().collect::<Vec<_>>(),
             ["127.0.0.1".parse::<IpAddr>().unwrap()]
