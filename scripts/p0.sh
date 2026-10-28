@@ -18,6 +18,8 @@
 #   P0_SPLIT      a split-route profile
 #   P0_OVPN       a full-tunnel OpenVPN profile
 #   P0_OVPN_AUTH  an OpenVPN profile that needs a username and password
+#   P0_NETBIRD    a NetBird profile with a setup key (S11; skipped while the
+#                 NetBird app's own service runs, as on a machine that uses it)
 # Credentials for P0_OVPN_AUTH, when none are saved: P0_OVPN_USER, P0_OVPN_PASS,
 # and P0_OVPN_OTP for a static challenge. Taken from the environment or asked
 # for with echo off; typed into the TUI through a tmux buffer, never saved.
@@ -87,7 +89,7 @@ ask() { # var description
 }
 if [ -t 0 ]; then
     missing=0
-    for v in P0_FULL P0_FULL2 P0_SPLIT P0_OVPN P0_OVPN_AUTH; do [ -n "${!v+set}" ] || missing=1; done
+    for v in P0_FULL P0_FULL2 P0_SPLIT P0_OVPN P0_OVPN_AUTH P0_NETBIRD; do [ -n "${!v+set}" ] || missing=1; done
     [ "$missing" = 1 ] && { echo "Profiles:"; printf '  %s\n' $PROFILES; }
 fi
 ask P0_FULL "a full-tunnel profile"
@@ -95,9 +97,10 @@ ask P0_FULL2 "a second full tunnel that declares 0.0.0.0/0 itself"
 ask P0_SPLIT "a split-route profile"
 ask P0_OVPN "a full-tunnel OpenVPN profile"
 ask P0_OVPN_AUTH "an OpenVPN profile that needs a username and password"
+ask P0_NETBIRD "a NetBird profile with a setup key"
 mkdir -p target
 # Each saved answer fills its role only when the environment leaves it unset.
-for v in P0_FULL P0_FULL2 P0_SPLIT P0_OVPN P0_OVPN_AUTH; do
+for v in P0_FULL P0_FULL2 P0_SPLIT P0_OVPN P0_OVPN_AUTH P0_NETBIRD; do
     printf '[ -n "${%s+set}" ] || %s=%q\n' "$v" "$v" "${!v:-}"
 done >"$ENV_FILE"
 chown "$SUDO_UID:$SUDO_GID" "$ENV_FILE"
@@ -111,6 +114,7 @@ if [ -z "${P0_ALLOW_BLOCKING:-}" ] && [ -t 0 ]; then
     case $P0_ALLOW_BLOCKING in [yY]*) P0_ALLOW_BLOCKING=1 ;; *) P0_ALLOW_BLOCKING= ;; esac
 fi
 FULL=${P0_FULL:-} FULL2=${P0_FULL2:-} SPLIT=${P0_SPLIT:-} OVPN=${P0_OVPN:-} OVPN_AUTH=${P0_OVPN_AUTH:-}
+NETBIRD=${P0_NETBIRD:-}
 
 # ── host probes ─────────────────────────────────────────────────────────
 tunnels() {
@@ -361,13 +365,40 @@ S10() { # credentials and secrets: P0-14, P0-37
     check S10 "auth files are private" test -z "$(find "$CONFIG/auth" -type f ! -perm 600 2>/dev/null)"
 }
 
+S11() { # NetBird run by Vortix: P0-44
+    need S11 NETBIRD || return
+    command -v netbird >/dev/null || { record SKIP S11 "netbird is not installed"; return; }
+    [ -S /var/run/netbird.sock ] && { record SKIP S11 "the NetBird app's own service is running here"; return; }
+    local iface=wt0; [ "$OS" = Darwin ] && iface=utun100
+    local has_iface out
+    has_iface() { if [ "$OS" = Darwin ]; then /sbin/ifconfig "$iface" >/dev/null 2>&1; else ip link show "$iface" >/dev/null 2>&1; fi; }
+    check S11 "up $NETBIRD exits 0" test "$(rc vx up "$NETBIRD" --timeout 60)" = 0
+    check S11 "its interface $iface is up" has_iface
+    out=$(vx status --json | tr -d ' \n')
+    check S11 "status names it NetBird on $iface" contains "$out" "\"protocol\":\"NetBird\".*\"interface\":\"$iface\""
+    check S11 "the daemon runs under the kill switch's group 51820" test "$(ps -o gid= -p "$(pgrep -x netbird | head -1)" | tr -d ' ')" = 51820
+    check S11 "down $NETBIRD exits 0" test "$(rc vx down "$NETBIRD")" = 0
+    check S11 "no netbird process is left" test -z "$(pgrep -x netbird)"
+    check S11 "its interface is gone" test ! "$(has_iface && echo up)"
+    [ "$OS" = Darwin ] || check S11 "no netbird nft table is left" test -z "$(nft list tables 2>/dev/null | grep netbird)"
+    # Connecting with vpn-only already on: the daemon must reach its servers
+    # before its interface exists.
+    may_block S11 || return
+    vx killswitch vpn-only >/dev/null 2>&1
+    check S11 "vpn-only: up $NETBIRD exits 0" test "$(rc vx up "$NETBIRD" --timeout 60)" = 0
+    check S11 "vpn-only: other traffic is blocked" test "$(egress)" != 200
+    vx down "$NETBIRD" >/dev/null 2>&1
+    vx killswitch off >/dev/null 2>&1
+    command -v wg >/dev/null && check S11 "wg still lists interfaces afterwards" wg show all dump
+}
+
 # ── run ─────────────────────────────────────────────────────────────────
 reset_host
 BASE_TUNNELS=$(tunnels)
 echo "== P0 on $OS, $(date -u +%FT%TZ), $("$VX" --version 2>/dev/null) =="
 [ -n "$PROBE_IP" ] || echo "note: example.com did not resolve; egress checks will be skipped"
 [ -n "$HAVE_TMUX" ] || echo "note: tmux is not installed; TUI checks will be skipped"
-for s in ${*:-S1 S2 S3 S4 S5 S6 S7 S8 S9 S10}; do
+for s in ${*:-S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11}; do
     reset_host
     "$s"
 done
