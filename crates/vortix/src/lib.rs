@@ -20,9 +20,9 @@ pub mod logger;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub mod macos;
-pub mod message;
 #[doc(hidden)]
-pub mod netbird;
+pub mod mesh;
+pub mod message;
 #[doc(hidden)]
 pub mod openvpn;
 pub mod platform;

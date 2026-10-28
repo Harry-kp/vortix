@@ -239,7 +239,7 @@ fn profile_row(
     let proto_icon = match profile.protocol {
         crate::profile::ProtocolKind::WireGuard => "WG",
         crate::profile::ProtocolKind::OpenVpn => "OV",
-        crate::profile::ProtocolKind::NetBird => "NB",
+        crate::profile::ProtocolKind::Mesh(driver) => driver.short(),
     };
     let proto_color = if is_selected {
         theme::current().row_selected_fg

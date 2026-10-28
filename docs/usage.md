@@ -139,8 +139,8 @@ A NetBird network is a `.netbird` file that names its management server, and opt
 setup key from the NetBird dashboard (Setup Keys):
 
 ```toml
-management_url = "https://api.netbird.io"   # or your own server
-setup_key = "…"                             # optional
+server_url = "https://api.netbird.io"   # its management server, or your own
+auth_key = "…"                         # optional: a setup key
 ```
 
 Without a setup key, a device that must log in (the first time, or when its login expires)

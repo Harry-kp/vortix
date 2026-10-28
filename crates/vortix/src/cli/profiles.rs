@@ -501,7 +501,10 @@ fn import_from_directory(
             "import",
             CliError {
                 code: "no_files",
-                message: "No .conf, .ovpn or .netbird files found in directory".into(),
+                message: format!(
+                    "No .conf, .ovpn or {} files found in directory",
+                    crate::mesh::MeshDriver::extensions()
+                ),
                 hint: None,
             },
             ExitCode::NotFound,

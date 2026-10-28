@@ -50,7 +50,7 @@ pub struct TunnelExecutionContext {
 pub enum TunnelKindTag {
     WireGuard,
     OpenVpn,
-    NetBird,
+    Mesh,
     Mock,
 }
 

@@ -97,16 +97,19 @@ pub(crate) fn prepare_profile_import(
     let protocol = match extension.as_str() {
         "ovpn" => ProtocolKind::OpenVpn,
         "conf" => crate::profile::detect_conf_protocol(&content)?,
-        "netbird" => ProtocolKind::NetBird,
-        _ => {
-            logger::log(
-                LogLevel::Error,
-                "IMPORT",
-                format!("Unsupported file type: .{extension}"),
-            );
-            return Err(format!(
-                "Unsupported file type: .{extension} (expected .conf, .ovpn or .netbird)"
-            ));
+        other => {
+            let Some(driver) = crate::mesh::MeshDriver::from_extension(other) else {
+                logger::log(
+                    LogLevel::Error,
+                    "IMPORT",
+                    format!("Unsupported file type: .{extension}"),
+                );
+                return Err(format!(
+                    "Unsupported file type: .{extension} (expected .conf, .ovpn or {})",
+                    crate::mesh::MeshDriver::extensions()
+                ));
+            };
+            ProtocolKind::Mesh(driver)
         }
     };
 
@@ -124,7 +127,7 @@ pub(crate) fn prepare_profile_import(
     let (name, location) = match protocol {
         ProtocolKind::WireGuard => parse_wireguard_config(&content, path)?,
         ProtocolKind::OpenVpn => parse_openvpn_config(&content, path)?,
-        ProtocolKind::NetBird => parse_netbird_config(&content, path)?,
+        ProtocolKind::Mesh(_) => parse_mesh_config(&content, path)?,
     };
 
     let dest_filename = format!("{name}.{extension}");
@@ -219,13 +222,13 @@ fn parse_wireguard_config(content: &str, path: &Path) -> Result<(String, String)
     Ok((name, location))
 }
 
-fn parse_netbird_config(content: &str, path: &Path) -> Result<(String, String), String> {
+fn parse_mesh_config(content: &str, path: &Path) -> Result<(String, String), String> {
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let (host, _) = crate::netbird::NetBirdProfile::parse(content)?.management_host()?;
+    let (host, _) = crate::mesh::MeshProfile::parse(content)?.server()?;
     Ok((name, host))
 }
 
@@ -453,7 +456,7 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
             let result = match protocol {
                 ProtocolKind::WireGuard => parse_wireguard_config(&content, &path),
                 ProtocolKind::OpenVpn => parse_openvpn_config(&content, &path),
-                ProtocolKind::NetBird => parse_netbird_config(&content, &path),
+                ProtocolKind::Mesh(_) => parse_mesh_config(&content, &path),
             };
             match result {
                 Ok((name, location)) => {

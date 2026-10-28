@@ -150,7 +150,8 @@ impl std::fmt::Display for ProfileId {
 pub enum ProtocolKind {
     WireGuard,
     OpenVpn,
-    NetBird,
+    /// A mesh network, run by its vendor's client.
+    Mesh(crate::mesh::MeshDriver),
 }
 
 /// One DNS endpoint resolution bound to an exact profile body by the caller.
@@ -179,7 +180,7 @@ impl std::fmt::Display for ProtocolKind {
         match self {
             Self::WireGuard => f.write_str("WireGuard"),
             Self::OpenVpn => f.write_str("OpenVPN"),
-            Self::NetBird => f.write_str("NetBird"),
+            Self::Mesh(driver) => f.write_str(driver.name()),
         }
     }
 }
@@ -266,13 +267,14 @@ pub fn hex(bytes: &[u8]) -> String {
         })
 }
 
-/// A `.conf`, `.ovpn` or `.netbird` file: the only extensions a profile can have.
+/// A `.conf` or `.ovpn` file, or a mesh driver's: the only extensions a profile can have.
 #[must_use]
 pub fn has_profile_extension(path: &std::path::Path) -> bool {
-    matches!(
-        path.extension().and_then(std::ffi::OsStr::to_str),
-        Some("conf" | "ovpn" | "netbird")
-    )
+    match path.extension().and_then(std::ffi::OsStr::to_str) {
+        Some("conf" | "ovpn") => true,
+        Some(extension) => crate::mesh::MeshDriver::from_extension(extension).is_some(),
+        None => false,
+    }
 }
 
 /// What a `.conf` file's syntax says it is: `WireGuard` sections, `OpenVPN`

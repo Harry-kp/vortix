@@ -92,7 +92,7 @@ release itself.
 | DNS | `control/dns.rs` (policy and its persisted receipt), `macos/dns.rs`, `linux/dns.rs` |
 | Reading and writing kernel routes | `macos/route_table.rs`, `linux/route_table.rs` (`route_interfaces_for` answers many checks from one read) |
 | Detecting running tunnels | `control/scanner.rs` |
-| Starting protocol processes | `control/tunnels.rs` → `wireguard/tunnel.rs`, `openvpn/tunnel.rs`, `netbird/mod.rs` (daemon, `status --json`, `.netbird` profile); supervision in `process/custodian.rs` |
+| Starting protocol processes | `control/tunnels.rs` → `wireguard/tunnel.rs`, `openvpn/tunnel.rs`, `mesh/mod.rs` (mesh networks: daemon, login, peers; one driver file per vendor, `mesh/netbird.rs`); supervision in `process/custodian.rs` |
 | Config parsing | `wireguard/parser.rs`, `openvpn/parser.rs` (the only readers of profile files); a profile becomes a tunnel spec (routes, DNS, servers) in `control/specs.rs` |
 | Profiles on disk, import, rename, delete | `config/profiles.rs`, `config/profile_store.rs`, `config/import.rs` |
 | Settings, config dir, file ownership under sudo | `config/settings.rs`, `config/mod.rs`, `config/owned_file.rs`, `config/secret.rs`; old profile storage upgraded by `config/migration.rs` |
@@ -146,7 +146,7 @@ for the 80-column budget.
 
 - `cfg(target_os)` only in `macos/`, `linux/`, `platform.rs` (`check-platform-leak`).
 - `Command::new` only in `process/` (`check-subprocess`).
-- `wg`/`wg-quick` only in `wireguard/`, `openvpn` only in `openvpn/`, `netbird` only in `netbird/`
+- `wg`/`wg-quick` only in `wireguard/`, `openvpn` only in `openvpn/`, mesh vendors' binaries only in `mesh/`
   (`check-protocol-leak`).
 
 Exceptions take `// xtask:allow-*: <reason>`. If you reach for one, move the

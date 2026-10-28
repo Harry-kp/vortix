@@ -270,7 +270,7 @@ impl FsProfileStore {
         match protocol {
             ProtocolKind::OpenVpn => "ovpn",
             ProtocolKind::WireGuard => "conf",
-            ProtocolKind::NetBird => "netbird",
+            ProtocolKind::Mesh(driver) => driver.slug(),
         }
     }
 

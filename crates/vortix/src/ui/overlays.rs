@@ -868,7 +868,7 @@ pub mod config_viewer {
             "presharedkey",
             "password",
             "secret",
-            "setup_key",
+            "auth_key",
         ];
 
         let key_lower = key.to_lowercase();
@@ -890,11 +890,9 @@ pub mod config_viewer {
     #[cfg(test)]
     mod tests {
         #[test]
-        fn a_netbird_setup_key_is_masked() {
-            let shown = super::mask_sensitive_value(
-                "setup_key",
-                "\"A1B2C3D4-E5F6-7788-99AA-BBCCDDEEFF00\"",
-            );
+        fn a_mesh_auth_key_is_masked() {
+            let shown =
+                super::mask_sensitive_value("auth_key", "\"A1B2C3D4-E5F6-7788-99AA-BBCCDDEEFF00\"");
             assert!(
                 shown.ends_with("(masked)") && !shown.contains("E5F6"),
                 "{shown}"

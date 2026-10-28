@@ -199,11 +199,11 @@ fn parse(
             (ProtocolKind::OpenVpn, parsed.dns_request())
         }
         // The daemon installs its own routes and DNS.
-        ProtocolKind::NetBird => {
-            let (host, port) = crate::netbird::NetBirdProfile::parse(body)?.management_host()?;
+        ProtocolKind::Mesh(driver) => {
+            let (host, port) = crate::mesh::MeshProfile::parse(body)?.server()?;
             resolve(&host, port, &mut server_ips);
             group = Some(crate::control::killswitch::TRANSPORT_GROUP);
-            (ProtocolKind::NetBird, DnsRequest::default())
+            (ProtocolKind::Mesh(driver), DnsRequest::default())
         }
     };
     endpoints.sort();
@@ -229,11 +229,11 @@ mod tests {
 
     /// The daemon owns its routes and DNS; Vortix only needs the management server.
     #[test]
-    fn a_netbird_profile_plans_no_routes_or_dns() {
+    fn a_mesh_profile_plans_no_routes_or_dns() {
         let profile = VpnProfile {
             id: ProfileId::new("a".repeat(64)),
             name: "mesh".into(),
-            protocol: ProtocolKind::NetBird,
+            protocol: ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird),
             location: String::new(),
             config_path: PathBuf::new(),
             last_used: None,
@@ -241,7 +241,7 @@ mod tests {
         };
         let spec = parse(
             &profile,
-            "management_url = \"https://127.0.0.1:33073\"\nsetup_key = \"K\"",
+            "server_url = \"https://127.0.0.1:33073\"\nauth_key = \"K\"",
             &mut EndpointCache::default(),
             &mut Vec::new(),
         )

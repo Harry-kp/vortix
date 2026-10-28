@@ -51,7 +51,7 @@ behaviour in the engine and one UI, written once:
 |---|---|---|
 | Config file | WireGuard `.conf`, OpenVPN `.ovpn` | Profile; import, rename, delete |
 | Provider account | Mullvad, Proton, IVPN | Account, `Server` catalog (location, load, latency), keys; one server picker, favourites, recents, connect fastest |
-| Mesh network | NetBird, Tailscale, Headscale, Netmaker | Network, `MeshPeer` (address, connected, direct or relayed, latency), `RoutedNetwork` (range or domains, in use, exit node), login (a link or a key); one overlay (`P`) for networks and peers, one login step; the daemon runs under the kill switch's transport group |
+| Mesh network (`mesh/`, a `MeshDriver` per vendor) | NetBird, Tailscale, Headscale, Netmaker | Network, `MeshPeer` (address, connected, direct or relayed, latency), `RoutedNetwork` (range or domains, in use, exit node), login (a link or a key); one overlay (`P`) for networks and peers, one login step; the daemon runs under the kill switch's transport group |
 
 A company is a **driver**: the code that turns its CLI output or API into that model and
 issues its commands, plus its name and wording in the UI. Nothing outside the driver names the
@@ -63,7 +63,7 @@ optional field on the model, not a branch on the company.
 
 1. **Demand first.** An adapter is a maintenance contract with someone else's API or binary;
    it needs an `approved` issue with users who asked for it.
-2. **Its own module** (`wireguard/`, `openvpn/`, `netbird/`, …), the only place its binary is
+2. **Its own module** (`wireguard/`, `openvpn/`, or a driver file under `mesh/`), the only place its binary is
    named; add the binary to `check_protocol_leak` in `crates/xtask/src/main.rs`. Sources and
    transports are plain enums matched in one place, not traits.
 3. **Tests** with `process::MockRunner` canned output for every state the UI shows, and a

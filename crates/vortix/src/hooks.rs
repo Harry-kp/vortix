@@ -518,7 +518,7 @@ mod runner {
             match job.fact.protocol {
                 crate::profile::ProtocolKind::WireGuard => "wireguard",
                 crate::profile::ProtocolKind::OpenVpn => "openvpn",
-                crate::profile::ProtocolKind::NetBird => "netbird",
+                crate::profile::ProtocolKind::Mesh(driver) => driver.slug(),
             }
             .into(),
         );

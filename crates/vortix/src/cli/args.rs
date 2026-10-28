@@ -223,7 +223,7 @@ pub enum Commands {
 
     /// Import VPN profile(s) from a file, directory, or URL
     ///
-    /// Supports `.conf` (`WireGuard`), `.ovpn` (`OpenVPN`), `.netbird` (`NetBird`), directories for bulk import,
+    /// Supports `.conf` (`WireGuard`), `.ovpn` (`OpenVPN`), `.netbird` (a `NetBird` mesh network), directories for bulk import,
     /// and http/https URLs for remote config download.
     ///
     /// EXAMPLES:

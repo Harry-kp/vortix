@@ -19,7 +19,7 @@ use crate::tunnel::{AuthorityEpoch, OperationId};
 use crate::tunnel::{TunnelExecutionContext, TunnelHandle, TunnelKindTag};
 use crate::wireguard::ownership::TunnelOwnershipStore;
 
-use crate::netbird::NbTunnel;
+use crate::mesh::MeshTunnel;
 use crate::openvpn::OvpnTunnel;
 use crate::tunnel::TunnelError;
 use crate::wireguard::WgTunnel;
@@ -224,8 +224,8 @@ pub fn adopt(
             };
             Ok(Some(Live { kind, handle }))
         }
-        ProtocolKind::NetBird => {
-            let Some(custody) = crate::netbird::running_owner(&profile.id) else {
+        ProtocolKind::Mesh(_) => {
+            let Some(custody) = crate::mesh::running_owner(&profile.id) else {
                 return Ok(None);
             };
             let handle = TunnelHandle {
@@ -236,7 +236,7 @@ pub fn adopt(
                 started_at: session
                     .started_at
                     .unwrap_or_else(std::time::SystemTime::now),
-                kind: TunnelKindTag::NetBird,
+                kind: TunnelKindTag::Mesh,
                 generation: custody.identity.generation,
                 handshake: None,
                 probe_receipts: Vec::new(),
@@ -246,7 +246,7 @@ pub fn adopt(
                 openvpn_routes: None,
             };
             Ok(Some(Live {
-                kind: TunnelKind::new(ProtocolKind::NetBird, settings),
+                kind: TunnelKind::new(profile.protocol, settings),
                 handle,
             }))
         }
@@ -327,7 +327,7 @@ fn route_claims(evidence: &OpenVpnRouteEvidence) -> BTreeSet<Cidr> {
 pub enum TunnelKind {
     WireGuard(WgTunnel),
     OpenVpn(OvpnTunnel),
-    NetBird(NbTunnel),
+    Mesh(MeshTunnel),
 }
 
 impl TunnelKind {
@@ -350,7 +350,9 @@ impl TunnelKind {
                 &settings.openvpn_verbosity,
                 settings.connect_timeout_secs,
             )),
-            ProtocolKind::NetBird => Self::NetBird(NbTunnel::new(settings.connect_timeout_secs)),
+            ProtocolKind::Mesh(driver) => {
+                Self::Mesh(MeshTunnel::new(driver, settings.connect_timeout_secs))
+            }
         }
     }
 
@@ -377,7 +379,7 @@ impl TunnelKind {
                     None => tunnel,
                 })
             }
-            Self::NetBird(tunnel) => Self::NetBird(
+            Self::Mesh(tunnel) => Self::Mesh(
                 tunnel
                     .for_generation(generation)
                     .with_execution_context(context),
@@ -389,7 +391,7 @@ impl TunnelKind {
         match self {
             Self::WireGuard(t) => t.up(profile),
             Self::OpenVpn(t) => t.up(profile),
-            Self::NetBird(t) => t.up(profile),
+            Self::Mesh(t) => t.up(profile),
         }
     }
 
@@ -397,7 +399,7 @@ impl TunnelKind {
         match self {
             Self::WireGuard(t) => t.down(handle),
             Self::OpenVpn(t) => t.down(handle),
-            Self::NetBird(t) => t.down(handle),
+            Self::Mesh(t) => t.down(handle),
         }
     }
 
@@ -407,7 +409,7 @@ impl TunnelKind {
             Self::WireGuard(tunnel) => tunnel
                 .compensate_inflight()
                 .map_err(|error| error.to_string()),
-            Self::OpenVpn(_) | Self::NetBird(_) => {
+            Self::OpenVpn(_) | Self::Mesh(_) => {
                 Err("protocol did not retain an exact in-flight capability".into())
             }
         }

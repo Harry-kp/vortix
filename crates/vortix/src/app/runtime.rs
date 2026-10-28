@@ -234,7 +234,7 @@ impl crate::app::state::ProfileSortOrder {
                     match p {
                         ProtocolKind::WireGuard => 0,
                         ProtocolKind::OpenVpn => 1,
-                        ProtocolKind::NetBird => 2,
+                        ProtocolKind::Mesh(_) => 2,
                     }
                 }
                 profiles.sort_by(|a, b| {

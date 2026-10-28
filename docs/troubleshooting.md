@@ -97,12 +97,12 @@ Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root on
 
 - `timed out` after a login link: the login was not finished in time. Connect again with
   `--timeout 300` (in the dashboard, raise `connect_timeout_secs` in `settings.toml`), or add a
-  `setup_key` to the `.netbird` file.
+  `auth_key` (a setup key) to the `.netbird` file.
 - `another NetBird network is connected`: only one NetBird runs on a computer; disconnect the
   other network first.
 - `NetBird refused this device`: the setup key is expired, used up or revoked, or the
   device was removed from the NetBird dashboard. Make a new key.
-- `NetBird management server: …`: `management_url` is wrong or the server is unreachable.
+- `NetBird server: …`: `server_url` is wrong or the server is unreachable.
 - `the NetBird app's service is running`: only one NetBird can run on a computer. Stop the
   app's service as the message says ([moving from the NetBird app](usage.md#netbird-networks)).
 

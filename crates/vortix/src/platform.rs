@@ -469,9 +469,9 @@ pub fn check_dependencies(
             #[cfg(not(target_os = "linux"))]
             let _ = config_path; // suppress unused warning on non-Linux
         }
-        crate::profile::ProtocolKind::NetBird => {
-            if !crate::platform::binary_exists("netbird") {
-                missing.push("netbird".to_string());
+        crate::profile::ProtocolKind::Mesh(driver) => {
+            if !crate::platform::binary_exists(driver.slug()) {
+                missing.push(driver.slug().to_string());
             }
         }
         crate::profile::ProtocolKind::OpenVpn => {
