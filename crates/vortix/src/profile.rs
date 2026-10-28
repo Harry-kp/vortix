@@ -150,6 +150,7 @@ impl std::fmt::Display for ProfileId {
 pub enum ProtocolKind {
     WireGuard,
     OpenVpn,
+    NetBird,
 }
 
 /// One DNS endpoint resolution bound to an exact profile body by the caller.
@@ -178,6 +179,7 @@ impl std::fmt::Display for ProtocolKind {
         match self {
             Self::WireGuard => f.write_str("WireGuard"),
             Self::OpenVpn => f.write_str("OpenVPN"),
+            Self::NetBird => f.write_str("NetBird"),
         }
     }
 }
@@ -264,12 +266,12 @@ pub fn hex(bytes: &[u8]) -> String {
         })
 }
 
-/// A `.conf` or `.ovpn` file: the only extensions a profile can have.
+/// A `.conf`, `.ovpn` or `.netbird` file: the only extensions a profile can have.
 #[must_use]
 pub fn has_profile_extension(path: &std::path::Path) -> bool {
     matches!(
         path.extension().and_then(std::ffi::OsStr::to_str),
-        Some("conf" | "ovpn")
+        Some("conf" | "ovpn" | "netbird")
     )
 }
 

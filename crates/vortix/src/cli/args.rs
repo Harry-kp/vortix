@@ -223,7 +223,7 @@ pub enum Commands {
 
     /// Import VPN profile(s) from a file, directory, or URL
     ///
-    /// Supports `.conf` (`WireGuard`), `.ovpn` (`OpenVPN`), directories for bulk import,
+    /// Supports `.conf` (`WireGuard`), `.ovpn` (`OpenVPN`), `.netbird` (`NetBird`), directories for bulk import,
     /// and http/https URLs for remote config download.
     ///
     /// EXAMPLES:
@@ -231,7 +231,7 @@ pub enum Commands {
     ///     vortix import ./configs/              Bulk import from directory
     ///     vortix import <https://example.com/vpn.conf>
     Import {
-        /// Path to `.conf`/`.ovpn` file, directory, or URL
+        /// Path to `.conf`/`.ovpn`/`.netbird` file, directory, or URL
         #[arg(value_hint = ValueHint::AnyPath)]
         file: String,
     },

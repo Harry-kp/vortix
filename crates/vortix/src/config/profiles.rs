@@ -97,6 +97,7 @@ pub(crate) fn prepare_profile_import(
     let protocol = match extension.as_str() {
         "ovpn" => ProtocolKind::OpenVpn,
         "conf" => crate::profile::detect_conf_protocol(&content)?,
+        "netbird" => ProtocolKind::NetBird,
         _ => {
             logger::log(
                 LogLevel::Error,
@@ -104,7 +105,7 @@ pub(crate) fn prepare_profile_import(
                 format!("Unsupported file type: .{extension}"),
             );
             return Err(format!(
-                "Unsupported file type: .{extension} (expected .conf or .ovpn)"
+                "Unsupported file type: .{extension} (expected .conf, .ovpn or .netbird)"
             ));
         }
     };
@@ -123,6 +124,7 @@ pub(crate) fn prepare_profile_import(
     let (name, location) = match protocol {
         ProtocolKind::WireGuard => parse_wireguard_config(&content, path)?,
         ProtocolKind::OpenVpn => parse_openvpn_config(&content, path)?,
+        ProtocolKind::NetBird => parse_netbird_config(&content, path)?,
     };
 
     let dest_filename = format!("{name}.{extension}");
@@ -222,6 +224,16 @@ fn parse_wireguard_config(content: &str, path: &Path) -> Result<(String, String)
 /// Required: `remote` directive. Must also contain at least one `OpenVPN`-specific
 /// directive (`client`, `dev`, `proto`, `ca`, `cert`, `key`, `tls-auth`, `tls-crypt`)
 /// to distinguish from random text files.
+fn parse_netbird_config(content: &str, path: &Path) -> Result<(String, String), String> {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let (host, _) = crate::netbird::NetBirdProfile::parse(content)?.management_host()?;
+    Ok((name, host))
+}
+
 fn parse_openvpn_config(content: &str, path: &Path) -> Result<(String, String), String> {
     let name = path
         .file_stem()
@@ -441,6 +453,7 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
             let result = match protocol {
                 ProtocolKind::WireGuard => parse_wireguard_config(&content, &path),
                 ProtocolKind::OpenVpn => parse_openvpn_config(&content, &path),
+                ProtocolKind::NetBird => parse_netbird_config(&content, &path),
             };
             match result {
                 Ok((name, location)) => {

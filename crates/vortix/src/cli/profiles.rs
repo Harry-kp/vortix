@@ -499,7 +499,7 @@ fn import_from_directory(
             "import",
             CliError {
                 code: "no_files",
-                message: "No .conf or .ovpn files found in directory".into(),
+                message: "No .conf, .ovpn or .netbird files found in directory".into(),
                 hint: None,
             },
             ExitCode::NotFound,

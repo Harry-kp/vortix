@@ -3,8 +3,8 @@
 Vortix is one interface for the VPNs people actually use, whatever they call them: WireGuard,
 OpenVPN, NetBird, Mullvad, and others as users ask for them. Users never pick a protocol; they
 add a connection and use it. Behind each connection sits an adapter. This page is the contract
-every adapter follows. It describes the target design; today WireGuard and OpenVPN are the only
-adapters, both reading profile files.
+every adapter follows. It describes the target design; today the adapters are WireGuard and
+OpenVPN, which read profile files, and NetBird, whose `.netbird` profile names a network.
 
 ## The fixed experience
 
@@ -28,7 +28,8 @@ It never adds a panel per connection, a second vocabulary or its own settings sc
   management), a network (NetBird: a management URL with SSO or a setup key). A source
   produces connections; it does not run them.
 - **Transport**: how a connection runs as a process Vortix starts, supervises and stops:
-  `wg-quick`, `openvpn`, the `netbird` client in foreground mode, later `openconnect`. A
+  `wg-quick`, `openvpn`, the `netbird` daemon (`netbird service run`, one per network with its
+  own state directory), later `openconnect`. A
   transport reports what it can (peers, handshakes, pushed routes) and says whether it
   installs its own routes and DNS; the planner coordinates with one that does instead of
   overriding it.

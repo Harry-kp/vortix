@@ -117,7 +117,7 @@ the last one, `… · last session, ended HH:MM:SS`. `L` clears the view.
 ## Profiles
 
 ```bash
-vortix import ./work.conf          # WireGuard .conf, OpenVPN .ovpn or .conf
+vortix import ./work.conf          # WireGuard .conf, OpenVPN .ovpn or .conf, NetBird .netbird
 vortix import ./profiles/          # every supported file in a directory
 vortix import https://example.com/work.ovpn
 vortix list                        # --sort, --reverse, --protocol, --names-only
@@ -131,6 +131,22 @@ apply until you import it again. A WireGuard profile name becomes the interface 
 letters, numbers, `_`, `.` or `-`. Profiles may hold up to 1024 routes. Profiles that run
 commands (`PreUp`/`PostUp`/`PreDown`/`PostDown`, OpenVPN `up`/`down` and similar) are refused;
 use [hooks](configuration.md#hooks) instead.
+
+### NetBird networks
+
+A NetBird network is a `.netbird` file that names its management server and, the first time,
+a setup key from the NetBird dashboard (Setup Keys):
+
+```toml
+management_url = "https://api.netbird.io"   # or your own server
+setup_key = "…"
+```
+
+`vortix import work.netbird` adds it like any other profile, and `up`, `down`, `status`, the
+dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`) work the same. Vortix runs NetBird's
+own client (`netbird`, which must be installed) with this network's identity in
+`/var/lib/vortix/netbird/`, separate from the NetBird app's. NetBird sets up its own routes and DNS on
+`wt0` (macOS: `utun100`). One NetBird network can be up at a time.
 
 ## Connecting
 

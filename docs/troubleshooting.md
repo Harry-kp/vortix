@@ -91,6 +91,15 @@ dashboard's Logs panel (`f` until the title names the profile).
 - TLS timeout: the server is unreachable, or the certificates or protocol do not match.
 - Connected but no traffic: the server's pushed routes, forwarding or NAT.
 
+## NetBird
+
+Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root only).
+
+- `has no NetBird identity yet`: add a `setup_key` to the `.netbird` file and import it again.
+- `NetBird refused this device`: the setup key is expired, used up or revoked, or the
+  device was removed from the NetBird dashboard. Make a new key.
+- `NetBird management server: …`: `management_url` is wrong or the server is unreachable.
+
 ## DNS
 
 **Names do not resolve, or DNS shows `Unverified`.** The tunnel's resolvers could not be

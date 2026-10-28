@@ -278,6 +278,7 @@ fn connected_line(
         .map_or("", |p| match p.protocol {
             crate::profile::ProtocolKind::WireGuard => "WG",
             crate::profile::ProtocolKind::OpenVpn => "OVPN",
+            crate::profile::ProtocolKind::NetBird => "NB",
         });
 
     let proto_suffix = if proto_tag.is_empty() {

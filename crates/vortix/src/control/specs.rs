@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cidr::Cidr;
 use crate::config::profiles::VpnProfile;
+use crate::control::dns::DnsRequest;
 use crate::openvpn::routes::OpenVpnRedirectGateway;
 use crate::profile::{Profile, ProfileId, ProtocolKind, ResolvedEndpoint};
 
@@ -196,6 +197,12 @@ fn parse(
             }
             (ProtocolKind::OpenVpn, parsed.dns_request())
         }
+        // The daemon installs its own routes and DNS.
+        ProtocolKind::NetBird => {
+            let (host, port) = crate::netbird::NetBirdProfile::parse(body)?.management_host()?;
+            resolve(&host, port, &mut server_ips);
+            (ProtocolKind::NetBird, DnsRequest::default())
+        }
     };
     endpoints.sort();
     endpoints.dedup();
@@ -215,6 +222,33 @@ mod tests {
 
     fn cache_with(entry: &str) -> EndpointCache {
         serde_json::from_str(entry).unwrap()
+    }
+
+    /// The daemon owns its routes and DNS; Vortix only needs the management server.
+    #[test]
+    fn a_netbird_profile_plans_no_routes_or_dns() {
+        let profile = VpnProfile {
+            id: ProfileId::new("a".repeat(64)),
+            name: "mesh".into(),
+            protocol: ProtocolKind::NetBird,
+            location: String::new(),
+            config_path: PathBuf::new(),
+            last_used: None,
+            group: None,
+        };
+        let spec = parse(
+            &profile,
+            "management_url = \"https://127.0.0.1:33073\"\nsetup_key = \"K\"",
+            &mut EndpointCache::default(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(spec.routes.is_empty());
+        assert!(spec.dns.is_empty());
+        assert_eq!(
+            spec.server_ips.into_iter().collect::<Vec<_>>(),
+            ["127.0.0.1".parse::<IpAddr>().unwrap()]
+        );
     }
 
     #[test]

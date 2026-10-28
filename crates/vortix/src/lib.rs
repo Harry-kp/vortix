@@ -22,6 +22,7 @@ pub mod logger;
 pub mod macos;
 pub mod message;
 #[doc(hidden)]
+pub mod netbird;
 pub mod openvpn;
 pub mod platform;
 #[doc(hidden)]

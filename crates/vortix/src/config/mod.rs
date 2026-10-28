@@ -186,7 +186,9 @@ impl AppConfig {
     ) -> u64 {
         let protocol_gate = match protocol {
             crate::profile::ProtocolKind::WireGuard => self.wireguard_handshake_timeout_secs,
-            crate::profile::ProtocolKind::OpenVpn => self.connect_timeout,
+            crate::profile::ProtocolKind::OpenVpn | crate::profile::ProtocolKind::NetBird => {
+                self.connect_timeout
+            }
         };
         protocol_gate.saturating_add(crate::constants::CONTROL_COMPLETION_GRACE_SECS)
     }
@@ -201,7 +203,9 @@ impl AppConfig {
                 config.wireguard_handshake_timeout_secs =
                     gate.clamp(1, crate::wireguard::tunnel::MAX_HANDSHAKE_TIMEOUT.as_secs());
             }
-            crate::profile::ProtocolKind::OpenVpn => config.connect_timeout = gate.max(1),
+            crate::profile::ProtocolKind::OpenVpn | crate::profile::ProtocolKind::NetBird => {
+                config.connect_timeout = gate.max(1);
+            }
         }
         config
     }

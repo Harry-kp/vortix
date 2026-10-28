@@ -463,6 +463,11 @@ pub fn check_dependencies(
             #[cfg(not(target_os = "linux"))]
             let _ = config_path; // suppress unused warning on non-Linux
         }
+        crate::profile::ProtocolKind::NetBird => {
+            if !crate::platform::binary_exists("netbird") {
+                missing.push("netbird".to_string());
+            }
+        }
         crate::profile::ProtocolKind::OpenVpn => {
             if crate::platform::binary_exists("openvpn") {
                 // Assert OpenVPN ≥ 2.4 so `--pull-filter` (multi-tunnel
@@ -702,6 +707,12 @@ mod ipv6_gate_tests {
 }
 
 /// The address whose route stands for "the internet" when probing the default route.
+/// The interface each `NetBird` daemon Vortix runs is told to create.
+#[cfg(target_os = "macos")]
+pub const NETBIRD_INTERFACE: &str = "utun100";
+#[cfg(target_os = "linux")]
+pub const NETBIRD_INTERFACE: &str = "wt0";
+
 pub(crate) const INTERNET_ROUTE_PROBE: std::net::IpAddr =
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
 

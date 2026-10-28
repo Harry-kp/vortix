@@ -296,13 +296,15 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let allowed_names: &[&str] = if rel_str.starts_with("crates/vortix/src/wireguard/") {
-            &["openvpn"]
+            &["openvpn", "netbird"]
         } else if rel_str.starts_with("crates/vortix/src/openvpn/") {
-            &["wg", "wg-quick"]
+            &["wg", "wg-quick", "netbird"]
+        } else if rel_str.starts_with("crates/vortix/src/netbird/") {
+            &["wg", "wg-quick", "openvpn"]
         } else if rel_str.starts_with("crates/xtask/") {
             continue;
         } else {
-            &["wg", "wg-quick", "openvpn"]
+            &["wg", "wg-quick", "openvpn", "netbird"]
         };
 
         let Ok(content) = std::fs::read_to_string(path) else {
@@ -347,7 +349,7 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         eprintln!(
-            "xtask check-protocol-leak: {} violation(s) — protocol-specific binaries (`wg`, `wg-quick`, `openvpn`) must only be invoked from their protocol crate. Route via the `wireguard` or `openvpn` module; for legitimate exceptions, annotate with `// xtask:allow-protocol-leak: <reason>`.",
+            "xtask check-protocol-leak: {} violation(s) — protocol-specific binaries (`wg`, `wg-quick`, `openvpn`, `netbird`) must only be invoked from their protocol module. Route via the `wireguard`, `openvpn` or `netbird` module; for legitimate exceptions, annotate with `// xtask:allow-protocol-leak: <reason>`.",
             violations.len()
         );
         for v in &violations {

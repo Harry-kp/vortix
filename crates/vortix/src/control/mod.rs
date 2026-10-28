@@ -224,7 +224,9 @@ impl Config {
     #[must_use]
     pub const fn connect_timeout(&self, protocol: crate::profile::ProtocolKind) -> Duration {
         match protocol {
-            crate::profile::ProtocolKind::OpenVpn => self.openvpn_timeout,
+            crate::profile::ProtocolKind::OpenVpn | crate::profile::ProtocolKind::NetBird => {
+                self.openvpn_timeout
+            }
             crate::profile::ProtocolKind::WireGuard => self.wireguard_timeout,
         }
     }

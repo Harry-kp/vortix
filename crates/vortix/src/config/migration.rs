@@ -357,6 +357,7 @@ fn build_initial_inventory(
         let protocol = match path.extension().and_then(|extension| extension.to_str()) {
             Some("conf") => detect_conf_protocol(&path)?,
             Some("ovpn") => ProtocolKind::OpenVpn,
+            Some("netbird") => ProtocolKind::NetBird,
             _ => {
                 continue;
             }

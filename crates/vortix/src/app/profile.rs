@@ -282,7 +282,7 @@ impl App {
         }
     }
 
-    /// Import all `.conf` and `.ovpn` files from a directory.
+    /// Import all profile files from a directory.
     ///
     /// Returns the number imported synchronously in legacy mode or scheduled
     /// for bounded canonical admission.
