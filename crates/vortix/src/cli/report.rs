@@ -37,7 +37,7 @@ struct ReportInfo {
     config_dir: String,
     config_source: String,
     config_toml_status: String,
-    profile_counts: (u32, u32),
+    profile_counts: (u32, u32, u32),
     killswitch_state: String,
 }
 
@@ -321,8 +321,8 @@ fn parse_version_line(raw: &str) -> Option<String> {
 // ── Preview formatting ──────────────────────────────────────────────────────
 
 fn print_preview(info: &ReportInfo) {
-    let (wg, ovpn) = info.profile_counts;
-    let total = wg + ovpn;
+    let (wg, ovpn, mesh) = info.profile_counts;
+    let total = wg + ovpn + mesh;
 
     println!("Bug Report Preview");
     println!("==================\n");
@@ -352,7 +352,10 @@ fn print_preview(info: &ReportInfo) {
         info.config_dir, info.config_source
     );
     println!("    config.toml: {}", info.config_toml_status);
-    println!("    Profiles:    {total} ({wg} WireGuard, {ovpn} OpenVPN)");
+    println!(
+        "    Profiles:    {total} ({wg} WireGuard, {ovpn} OpenVPN, {mesh} {})",
+        crate::mesh::MeshDriver::names()
+    );
     println!("    Kill switch: {}", info.killswitch_state);
     println!();
 }
@@ -404,8 +407,8 @@ fn atty_is_terminal() -> bool {
 // ── Issue body formatting ───────────────────────────────────────────────────
 
 fn format_issue_body(info: &ReportInfo, description: &str) -> String {
-    let (wg, ovpn) = info.profile_counts;
-    let total = wg + ovpn;
+    let (wg, ovpn, mesh) = info.profile_counts;
+    let total = wg + ovpn + mesh;
 
     let mut body = String::with_capacity(2048);
 
@@ -473,7 +476,8 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     let _ = writeln!(body, "config.toml: {}", info.config_toml_status);
     let _ = writeln!(
         body,
-        "Profiles:    {total} ({wg} WireGuard, {ovpn} OpenVPN)"
+        "Profiles:    {total} ({wg} WireGuard, {ovpn} OpenVPN, {mesh} {})",
+        crate::mesh::MeshDriver::names()
     );
     let _ = writeln!(body, "Kill switch: {}", info.killswitch_state);
     let _ = writeln!(body, "```\n");
@@ -732,7 +736,7 @@ mod tests {
             config_dir: "~/.config/vortix".to_string(),
             config_source: "default".to_string(),
             config_toml_status: "found".to_string(),
-            profile_counts: (2, 1),
+            profile_counts: (2, 1, 0),
             killswitch_state: "off".to_string(),
         };
 
@@ -743,7 +747,7 @@ mod tests {
         assert!(body.contains("0.1.4 (cargo install)"));
         assert!(body.contains("## Dependencies"));
         assert!(body.contains("## Config"));
-        assert!(body.contains("3 (2 WireGuard, 1 OpenVPN)"));
+        assert!(body.contains("3 (2 WireGuard, 1 OpenVPN, 0 NetBird)"));
     }
 
     #[test]
@@ -761,7 +765,7 @@ mod tests {
             config_dir: "/root/.config/vortix".to_string(),
             config_source: "default".to_string(),
             config_toml_status: "not found (using defaults)".to_string(),
-            profile_counts: (0, 0),
+            profile_counts: (0, 0, 0),
             killswitch_state: "off".to_string(),
         };
 

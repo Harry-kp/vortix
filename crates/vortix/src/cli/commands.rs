@@ -645,6 +645,7 @@ struct InfoData {
     profile_count: u32,
     wireguard_count: u32,
     openvpn_count: u32,
+    mesh_count: u32,
     is_root: bool,
     /// Path of the current session's JSONL journal file, or `None`
     /// when disk persistence is disabled (`[journal] disk = false` in
@@ -655,8 +656,8 @@ struct InfoData {
 
 fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let (wg_count, ovpn_count) = super::profiles::count_profiles(&profiles_dir);
-    let total = wg_count + ovpn_count;
+    let (wg_count, ovpn_count, mesh_count) = super::profiles::count_profiles(&profiles_dir);
+    let total = wg_count + ovpn_count + mesh_count;
 
     let config_file = config_dir.join("config.toml");
     let config_status = if config_file.is_file() {
@@ -680,6 +681,7 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
         profile_count: total,
         wireguard_count: wg_count,
         openvpn_count: ovpn_count,
+        mesh_count,
         is_root: crate::platform::is_root(),
         journal_session: journal_session.clone(),
     };
@@ -690,7 +692,10 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
             println!();
             println!("  Config dir:  {} ({source})", config_dir.display());
             println!("  Config file: {} ({config_status})", config_file.display());
-            println!("  Profiles:    {total} ({wg_count} WireGuard, {ovpn_count} OpenVPN)");
+            println!(
+                "  Profiles:    {total} ({wg_count} WireGuard, {ovpn_count} OpenVPN, {mesh_count} {})",
+                crate::mesh::MeshDriver::names()
+            );
             println!("  Profiles at: {}", profiles_dir.display());
             println!(
                 "  Logs at:     {}",

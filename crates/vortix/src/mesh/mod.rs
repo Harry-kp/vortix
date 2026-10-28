@@ -76,6 +76,19 @@ impl MeshDriver {
             .find(|driver| driver.slug() == extension)
     }
 
+    /// Where its own app keeps its identity: importing this folder moves the
+    /// app's network to Vortix.
+    #[must_use]
+    pub const fn app_state_dir(self) -> &'static str {
+        self.app().state_dir
+    }
+
+    /// Every driver's name, for counts: `NetBird`.
+    #[must_use]
+    pub fn names() -> String {
+        Self::ALL.map(Self::name).join("/")
+    }
+
     /// The interface its daemon is told to create.
     #[must_use]
     pub const fn interface(self) -> &'static str {
@@ -207,7 +220,7 @@ impl MeshProfile {
             let line = error
                 .span()
                 .map_or(0, |span| content[..span.start].matches('\n').count() + 1);
-            format!("Invalid mesh profile (line {line}): {}", error.message())
+            format!("Invalid profile (line {line}): {}", error.message())
         })?;
         profile.server()?;
         Ok(profile)

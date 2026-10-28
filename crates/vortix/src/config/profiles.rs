@@ -172,7 +172,7 @@ pub(crate) fn commit_profile_import(
         LogLevel::Info,
         "IMPORT",
         format!(
-            "✓ Imported '{}' ({:?}) → {}",
+            "✓ Imported '{}' ({}) → {}",
             prepared.profile.name,
             prepared.profile.protocol,
             prepared.profile.config_path.display()

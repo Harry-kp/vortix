@@ -244,10 +244,20 @@ impl App {
                 scroll: 0,
             };
         } else {
-            self.show_toast(
-                "No peers: only a connected mesh network such as NetBird has them".into(),
-                ToastType::Info,
-            );
+            let mesh = self
+                .runtime
+                .profiles
+                .iter()
+                .find(|profile| profile.id == profile_id)
+                .filter(|profile| {
+                    matches!(profile.protocol, crate::profile::ProtocolKind::Mesh(_))
+                });
+            let text = match (mesh, self.tunnel(&profile_id)) {
+                (Some(profile), None) => format!("'{}' is not connected", profile.name),
+                (Some(profile), Some(_)) => format!("'{}' has no peers yet", profile.name),
+                (None, _) => "No peers: only a mesh network such as NetBird has them".into(),
+            };
+            self.show_toast(text, ToastType::Info);
         }
     }
 

@@ -1778,7 +1778,7 @@ pub mod import {
         let (before, cursor_char, after) =
             visible_path(path, cursor, usize::from(inner.width.saturating_sub(3)));
 
-        let text = vec![
+        let mut text = vec![
             Line::from(Span::styled(
                 constants::PROMPT_IMPORT_PATH,
                 Style::default().fg(theme::current().text_primary),
@@ -1826,6 +1826,18 @@ pub mod import {
                 ),
             ]),
         ];
+        for driver in crate::mesh::MeshDriver::ALL {
+            text.push(Line::from(vec![
+                Span::styled(
+                    format!("  .{}", driver.slug()),
+                    Style::default().fg(theme::current().success),
+                ),
+                Span::styled(
+                    format!(" → {driver}; {} moves its app", driver.app_state_dir()),
+                    Style::default().fg(theme::current().text_secondary),
+                ),
+            ]));
+        }
 
         frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
     }
@@ -1851,6 +1863,11 @@ pub mod import {
             assert!(output.contains("WireGuard"), "{output}");
             assert!(output.contains(".ovpn"), "{output}");
             assert!(output.contains("OpenVPN"), "{output}");
+            assert!(output.contains(".netbird → NetBird"), "{output}");
+            assert!(
+                output.contains("/var/lib/netbird moves its app"),
+                "{output}"
+            );
         }
 
         #[test]

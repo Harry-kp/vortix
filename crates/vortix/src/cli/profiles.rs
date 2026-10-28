@@ -878,12 +878,14 @@ fn sidecar_protocol(config: &Path) -> Option<String> {
         .map(|value| value.trim().trim_matches('"').to_owned())
 }
 
-pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
+/// `WireGuard`, `OpenVPN` and mesh-network profiles.
+pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32, u32) {
     if !profiles_dir.is_dir() {
-        return (0, 0);
+        return (0, 0, 0);
     }
     let mut wg = 0u32;
     let mut ovpn = 0u32;
+    let mut mesh = 0u32;
     if let Ok(entries) = std::fs::read_dir(profiles_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -912,11 +914,14 @@ pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
                     }
                 }
                 Some("ovpn") => ovpn += 1,
+                Some(other) if crate::mesh::MeshDriver::from_extension(other).is_some() => {
+                    mesh += 1;
+                }
                 _ => {}
             }
         }
     }
-    (wg, ovpn)
+    (wg, ovpn, mesh)
 }
 
 #[cfg(test)]
@@ -929,9 +934,8 @@ mod tests {
             .prefix("vortix_test_")
             .tempdir()
             .unwrap();
-        let (wg, ovpn) = count_profiles(dir.path());
-        assert_eq!(wg, 0);
-        assert_eq!(ovpn, 0);
+        let (wg, ovpn, mesh) = count_profiles(dir.path());
+        assert_eq!((wg, ovpn, mesh), (0, 0, 0));
     }
 
     #[test]
@@ -940,9 +944,8 @@ mod tests {
             .prefix("vortix_test_")
             .tempdir()
             .unwrap();
-        let (wg, ovpn) = count_profiles(&dir.path().join("no_such"));
-        assert_eq!(wg, 0);
-        assert_eq!(ovpn, 0);
+        let (wg, ovpn, mesh) = count_profiles(&dir.path().join("no_such"));
+        assert_eq!((wg, ovpn, mesh), (0, 0, 0));
     }
 
     #[test]
@@ -954,10 +957,13 @@ mod tests {
         std::fs::write(dir.path().join("wg0.conf"), "[Interface]").unwrap();
         std::fs::write(dir.path().join("wg1.conf"), "[Interface]").unwrap();
         std::fs::write(dir.path().join("us.ovpn"), "remote us.vpn").unwrap();
+        std::fs::write(
+            dir.path().join("office.netbird"),
+            "server_url = \"https://a\"",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
-        let (wg, ovpn) = count_profiles(dir.path());
-        assert_eq!(wg, 2);
-        assert_eq!(ovpn, 1);
+        assert_eq!(count_profiles(dir.path()), (2, 1, 1));
     }
 
     #[test]
