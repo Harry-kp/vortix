@@ -134,13 +134,17 @@ use [hooks](configuration.md#hooks) instead.
 
 ### NetBird networks
 
-A NetBird network is a `.netbird` file that names its management server and, the first time,
-a setup key from the NetBird dashboard (Setup Keys):
+A NetBird network is a `.netbird` file that names its management server, and optionally a
+setup key from the NetBird dashboard (Setup Keys):
 
 ```toml
 management_url = "https://api.netbird.io"   # or your own server
-setup_key = "…"
+setup_key = "…"                             # optional
 ```
+
+Without a setup key, a device that must log in (the first time, or when its login expires)
+gets a link: `vortix up` prints it and the dashboard shows it until the login completes. Log in
+within the connect timeout; `--timeout 300` gives more time.
 
 `vortix import work.netbird` adds it like any other profile, and `up`, `down`, `status`, the
 dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`) work the same. Vortix runs NetBird's

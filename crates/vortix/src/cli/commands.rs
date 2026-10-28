@@ -192,26 +192,31 @@ pub(super) fn run_on(
     let expires = crate::platform::boot_elapsed_millis()
         .unwrap_or_default()
         .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
-    control.wait(ticket, timeout, |prompt| {
-        let saved = control
-            .load_credentials(&prompt.profile_id, &prompt.name)
-            .ok()
-            .flatten()?;
-        let otp = match &prompt.otp_label {
-            Some(label) => Some(
-                prompt_masked_otp(label, expires)
-                    .ok()
-                    .filter(|otp| !otp.is_empty())?,
-            ),
-            None => None,
-        };
-        Some(crate::control::Credentials {
-            username: saved.username().to_owned(),
-            password: saved.password().to_owned(),
-            otp,
-            remember: false,
-        })
-    })?;
+    control.wait(
+        ticket,
+        timeout,
+        |prompt| {
+            let saved = control
+                .load_credentials(&prompt.profile_id, &prompt.name)
+                .ok()
+                .flatten()?;
+            let otp = match &prompt.otp_label {
+                Some(label) => Some(
+                    prompt_masked_otp(label, expires)
+                        .ok()
+                        .filter(|otp| !otp.is_empty())?,
+                ),
+                None => None,
+            };
+            Some(crate::control::Credentials {
+                username: saved.username().to_owned(),
+                password: saved.password().to_owned(),
+                otp,
+                remember: false,
+            })
+        },
+        |action| eprintln!("{action}"),
+    )?;
     Ok(control.snapshot())
 }
 

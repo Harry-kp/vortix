@@ -33,14 +33,26 @@ pub struct RealRunner {
 async fn drain_bounded(
     mut stream: impl AsyncRead + Unpin,
     limit: usize,
+    lines: Option<std::sync::mpsc::Sender<String>>,
 ) -> std::io::Result<(Vec<u8>, bool)> {
     let mut retained = Vec::with_capacity(limit.min(8192));
     let mut overflowed = false;
     let mut chunk = [0_u8; 8192];
+    let mut line = Vec::new();
     loop {
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
             return Ok((retained, overflowed));
+        }
+        if let Some(lines) = &lines {
+            for byte in &chunk[..read] {
+                if *byte == b'\n' {
+                    let _ = lines.send(String::from_utf8_lossy(&line).into_owned());
+                    line.clear();
+                } else if line.len() < 8192 {
+                    line.push(*byte);
+                }
+            }
         }
         let remaining = limit.saturating_sub(retained.len());
         let keep = remaining.min(read);
@@ -731,7 +743,8 @@ impl RealRunner {
             }
         }
 
-        let (status, stdout, stderr) = if let Some(limit) = spec.output_limit {
+        let streamed_limit = spec.stdout_lines.is_some().then_some(1024 * 1024);
+        let (status, stdout, stderr) = if let Some(limit) = spec.output_limit.or(streamed_limit) {
             let stdout = child.stdout.take().ok_or_else(|| ProcessError::IoError {
                 program: spec.program.clone(),
                 source: std::io::Error::other("child stdout pipe unavailable"),
@@ -740,8 +753,8 @@ impl RealRunner {
                 program: spec.program.clone(),
                 source: std::io::Error::other("child stderr pipe unavailable"),
             })?;
-            let stdout_task = tokio::spawn(drain_bounded(stdout, limit));
-            let stderr_task = tokio::spawn(drain_bounded(stderr, limit));
+            let stdout_task = tokio::spawn(drain_bounded(stdout, limit, spec.stdout_lines.clone()));
+            let stderr_task = tokio::spawn(drain_bounded(stderr, limit, None));
             let status = if let Some(timeout) = spec.timeout {
                 let Ok(result) = tokio::time::timeout(timeout, child.wait()).await else {
                     terminate_child(&mut child, spec.terminate_process_group).await;
@@ -892,6 +905,31 @@ mod tests {
         let outcome = RealRunner::new().run_blocking(spec).unwrap();
         assert_eq!(outcome.stdout_lossy().trim(), uid.to_string());
         assert_ne!(uid, 0);
+    }
+
+    /// Lines reach the channel as they are printed, and the output is still kept.
+    #[test]
+    fn stdout_lines_arrive_while_the_child_runs() {
+        let (lines, printed) = std::sync::mpsc::channel();
+        let mut spec = CommandSpec::oneshot(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "echo first; sleep 1; printf 'second\\npartial'".into(),
+            ],
+        );
+        spec.stdout_lines = Some(lines);
+        let started = std::time::Instant::now();
+        let reader = std::thread::spawn(move || {
+            let first = printed.recv().unwrap();
+            let early = started.elapsed() < std::time::Duration::from_millis(900);
+            (first, early, printed.iter().collect::<Vec<_>>())
+        });
+        let outcome = RealRunner::new().run_blocking(spec).unwrap();
+        let (first, early, rest) = reader.join().unwrap();
+        assert_eq!((first.as_str(), early), ("first", true));
+        assert_eq!(rest, ["second"]);
+        assert_eq!(outcome.stdout, b"first\nsecond\npartial");
     }
 
     #[test]

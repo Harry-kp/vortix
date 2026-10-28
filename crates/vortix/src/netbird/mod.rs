@@ -358,17 +358,10 @@ impl NbTunnel {
         state_dir: &Path,
     ) -> Result<(), TunnelError> {
         wait_for(socket, self.remaining()?)?;
-        let before = status(binary, socket)?;
         // A fresh daemon reports Idle, not NeedsLogin, so the key goes with
         // every connect; NetBird logs a registered peer in by its own key.
         let key_file = match &settings.setup_key {
             Some(key) => Some(write_key_file(state_dir, key)?),
-            None if before.needs_login() => {
-                return Err(TunnelError::AuthFailed(format!(
-                    "'{}' has no NetBird identity yet: add `setup_key` to its profile",
-                    profile.display_name
-                )));
-            }
             None => None,
         };
         let mut args = vec![
@@ -380,13 +373,36 @@ impl NbTunnel {
             "--wireguard-port".into(),
             WIREGUARD_PORT.to_string(),
         ];
-        if let Some(key_file) = &key_file {
-            args.push("--setup-key-file".into());
-            args.push(key_file.to_string_lossy().into());
+        match &key_file {
+            Some(key_file) => {
+                args.push("--setup-key-file".into());
+                args.push(key_file.to_string_lossy().into());
+            }
+            // Without a key, a device that must log in prints a link and waits.
+            None => args.push("--no-browser".into()),
         }
         let mut up = command(binary, socket, args);
-        up.timeout = Some(self.remaining()?);
-        let outcome = crate::process::run(up);
+        let timeout = self.remaining()?;
+        up.timeout = Some(timeout);
+        let (lines, printed) = std::sync::mpsc::channel();
+        up.stdout_lines = Some(lines);
+        let progress = self
+            .execution_context
+            .as_ref()
+            .and_then(|context| context.progress.as_ref());
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for line in printed {
+                    if let (Some(text), Some(progress)) = (
+                        login_notice(&line, &profile.display_name, timeout),
+                        progress,
+                    ) {
+                        let _ = progress.send(text);
+                    }
+                }
+            });
+            crate::process::run(up)
+        });
         if let Some(key_file) = &key_file {
             let _ = std::fs::remove_file(key_file);
         }
@@ -504,6 +520,17 @@ fn status(binary: &Path, socket: &Path) -> Result<Status, TunnelError> {
         )));
     }
     Status::parse(&outcome.stdout)
+}
+
+/// What to tell the user when `netbird up` prints its login link.
+fn login_notice(line: &str, name: &str, timeout: Duration) -> Option<String> {
+    let line = line.trim();
+    line.starts_with("https://").then(|| {
+        format!(
+            "Log in to '{name}' within {}s: open {line}",
+            timeout.as_secs()
+        )
+    })
 }
 
 fn up_failure(status: &Status, stderr: &str) -> TunnelError {
@@ -642,6 +669,22 @@ mod tests {
         assert!(idle.peers.details.is_empty());
         assert!(!idle.needs_login());
         assert!(Status::parse(b"not json").is_err());
+    }
+
+    #[test]
+    fn only_the_login_link_becomes_a_notice() {
+        let notice = |line| login_notice(line, "work", Duration::from_secs(60));
+        assert_eq!(
+            notice("https://idp.example/device?code=AB12 and enter the code AB12 to authenticate."),
+            Some(
+                "Log in to 'work' within 60s: open https://idp.example/device?code=AB12 \
+                 and enter the code AB12 to authenticate."
+                    .into()
+            )
+        );
+        for other in ["Use this URL to log in:", "", "Connected", "http://plain"] {
+            assert_eq!(notice(other), None, "{other}");
+        }
     }
 
     #[test]

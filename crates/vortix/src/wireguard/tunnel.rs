@@ -2513,6 +2513,7 @@ mod tests {
         let mut cancelled = WgTunnel::new().with_execution_context(TunnelExecutionContext {
             cancellation,
             deadline: Instant::now() + Duration::from_secs(1),
+            progress: None,
         });
         assert!(matches!(
             cancelled.up(&profile),

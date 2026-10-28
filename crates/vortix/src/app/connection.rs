@@ -147,6 +147,7 @@ impl App {
         }
 
         self.show_prompt(&snapshot);
+        self.show_action(&snapshot);
         self.show_notices(&snapshot);
 
         self.runtime.scanner_first_tick_done = true;
@@ -230,10 +231,31 @@ impl App {
         }
     }
 
+    /// Open what a connect waits for the user to do, and close it once the
+    /// connect no longer waits.
+    fn show_action(&mut self, snapshot: &Snapshot) {
+        if let InputMode::Action { profile_id, text } = &self.input_mode {
+            if snapshot.actions.get(profile_id) != Some(text) {
+                self.input_mode = InputMode::Normal;
+            }
+        }
+        let next = snapshot
+            .actions
+            .iter()
+            .find(|(_, text)| self.hidden_action.as_ref() != Some(*text));
+        if let (Some((profile_id, text)), InputMode::Normal) = (next, &self.input_mode) {
+            self.input_mode = InputMode::Action {
+                profile_id: profile_id.clone(),
+                text: text.clone(),
+            };
+        }
+    }
+
     /// Show a pending engine prompt once no other dialog owns the screen.
     pub(crate) fn show_pending_prompt(&mut self) {
         let snapshot = Arc::clone(&self.control_snapshot);
         self.show_prompt(&snapshot);
+        self.show_action(&snapshot);
     }
 
     fn show_prompt(&mut self, snapshot: &Snapshot) {

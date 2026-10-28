@@ -132,6 +132,8 @@ pub struct App {
     pub(crate) answered_prompt: u64,
     /// Highest engine notice already shown.
     pub(crate) notices_seen: u64,
+    /// The connect action the user hid; it stays hidden until it changes.
+    pub(crate) hidden_action: Option<String>,
     /// Kept when every tunnel is gone, so reconnect means "the last one".
     pub(crate) last_control_connected_profile: Option<crate::profile::ProfileId>,
     /// Kill switch mode sent but not yet in a snapshot.
@@ -208,6 +210,7 @@ impl App {
             control_prompt: None,
             answered_prompt: 0,
             notices_seen: 0,
+            hidden_action: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
 
@@ -360,6 +363,7 @@ impl App {
             control_prompt: None,
             answered_prompt: 0,
             notices_seen: 0,
+            hidden_action: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
 

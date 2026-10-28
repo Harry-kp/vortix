@@ -172,6 +172,8 @@ pub enum InputMode {
         /// Is "Yes" selected?
         confirm_selected: bool,
     },
+    /// What a connect in progress waits for the user to do, such as a login link.
+    Action { profile_id: ProfileId, text: String },
     /// What changed since the version that last ran here, shown once after
     /// an upgrade.
     WhatsNew {

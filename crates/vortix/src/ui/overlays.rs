@@ -470,6 +470,54 @@ mod whats_new_tests {
     }
 }
 
+pub mod action {
+    use crate::ui::theme;
+    use ratatui::{
+        layout::Rect,
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Paragraph, Wrap},
+        Frame,
+    };
+
+    /// What a connect waits for the user to do. No side borders, so a
+    /// wrapped link copies without border characters.
+    pub fn render(frame: &mut Frame, text: &str) {
+        let area = frame.area();
+        // The link gets lines of its own, so it wraps only where it must.
+        let text = text.replacen(" https://", "\nhttps://", 1);
+        let width = usize::from(area.width.max(1));
+        let lines: usize = text
+            .lines()
+            .map(|line| line.chars().count().div_ceil(width).max(1))
+            .sum();
+        let height = u16::try_from(lines + 3)
+            .unwrap_or(u16::MAX)
+            .min(area.height);
+        let overlay = Rect {
+            y: area.y + (area.height - height) / 2,
+            height,
+            ..area
+        };
+        crate::ui::helpers::clear_area(frame, overlay);
+        let accent = theme::current().warning;
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(accent))
+            .title(Span::styled(
+                " Waiting for you ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::from(" [Esc] Hide · the connect keeps waiting ").centered());
+        frame.render_widget(
+            Paragraph::new(format!("\n{text}"))
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            overlay,
+        );
+    }
+}
+
 pub mod config_viewer {
     //! Config file viewer overlay
 

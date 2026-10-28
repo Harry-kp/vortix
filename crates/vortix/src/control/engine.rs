@@ -14,7 +14,7 @@ use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
 use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 use crate::platform::DefaultRouteObservation;
 use crate::profile::{ProfileId, ProtocolKind};
-use crate::tunnel::TunnelCancellation;
+use crate::tunnel::{TunnelCancellation, TunnelExecutionContext};
 use crate::wireguard::ownership::TunnelOwnershipStore;
 
 use super::net::Net;
@@ -48,6 +48,8 @@ pub(super) enum Event {
     },
     /// A dropped tunnel's teardown finished.
     Drained { profile_id: ProfileId },
+    /// A connect in progress needs the user, e.g. to log in.
+    Progress { profile_id: ProfileId, text: String },
 }
 
 enum Wait {
@@ -75,6 +77,7 @@ pub(super) struct Engine {
     errors: BTreeMap<ProfileId, String>,
     /// The last connect failure per profile, kept until it comes up.
     failures: BTreeMap<ProfileId, String>,
+    actions: BTreeMap<ProfileId, String>,
     prompts: BTreeMap<u64, Prompt>,
     waits: BTreeMap<u64, Wait>,
     /// Switches waiting for the tunnels they share split routes with to stop.
@@ -156,6 +159,7 @@ impl Engine {
             cancel: BTreeMap::new(),
             errors: BTreeMap::new(),
             failures: BTreeMap::new(),
+            actions: BTreeMap::new(),
             prompts: BTreeMap::new(),
             waits: BTreeMap::new(),
             after_stop: BTreeMap::new(),
@@ -283,6 +287,9 @@ impl Engine {
                 Event::Stopped { profile_id, result } => self.stopped(&profile_id, result),
                 Event::Scanned { result, started } => self.scanned(result, started),
                 Event::Drained { profile_id } => self.drained(&profile_id),
+                Event::Progress { profile_id, text } => {
+                    self.actions.insert(profile_id, text);
+                }
             },
             Msg::Settle(_) | Msg::Shutdown => {}
         }
@@ -466,6 +473,7 @@ impl Engine {
         used_saved: bool,
     ) {
         self.cancel.remove(profile_id);
+        self.actions.remove(profile_id);
         let phase = self.state.get(profile_id).map(|tunnel| tunnel.phase);
         let name = self.name(profile_id);
         match result {
@@ -841,6 +849,18 @@ impl Engine {
         let ownership = Arc::clone(&self.ownership);
         let tx = self.tx.clone();
         let profile_id = profile_id.clone();
+        // `start` blocks, so what it reports on the way arrives through here.
+        let (progress, reports) = mpsc::channel::<String>();
+        let forward = self.tx.clone();
+        let reporting = profile_id.clone();
+        std::thread::spawn(move || {
+            for text in reports {
+                let _ = forward.send(Msg::Event(Box::new(Event::Progress {
+                    profile_id: reporting.clone(),
+                    text,
+                })));
+            }
+        });
         std::thread::spawn(move || {
             let result = tunnels::start(
                 &settings,
@@ -848,8 +868,11 @@ impl Engine {
                 &profile,
                 generation,
                 credentials,
-                cancel,
-                timeout,
+                TunnelExecutionContext {
+                    cancellation: cancel,
+                    deadline: Instant::now() + timeout,
+                    progress: Some(progress),
+                },
             );
             let _ = tx.send(Msg::Event(Box::new(Event::Started {
                 profile_id,
@@ -1101,6 +1124,7 @@ impl Engine {
             net_error: self.apply_error.clone(),
             drops: self.drops,
             failures: self.failures.clone(),
+            actions: self.actions.clone(),
         };
         if next == self.published {
             return;

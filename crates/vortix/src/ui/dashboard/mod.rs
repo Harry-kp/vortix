@@ -244,6 +244,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             count,
             confirm_selected,
         } => render_disconnect_all_confirm(frame, *count, *confirm_selected),
+        InputMode::Action { text, .. } => super::overlays::action::render(frame, text),
         InputMode::WhatsNew { from, scroll } => {
             super::overlays::whats_new::render(frame, from, *scroll);
         }
@@ -469,6 +470,33 @@ mod overlay_tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    /// The whole link fits on screen at 80 columns, with no side border in it.
+    #[test]
+    fn a_login_link_is_shown_whole() {
+        let mut app = App::new_test();
+        let link = format!(
+            "https://login.netbird.io/activate?user_code={}",
+            "X".repeat(90)
+        );
+        app.input_mode = InputMode::Action {
+            profile_id: crate::profile::ProfileId::new("work"),
+            text: format!("Log in to 'work' within 30s: open {link}"),
+        };
+        let screen = render(&mut app);
+        let cells: Vec<char> = screen.chars().collect();
+        let rows: Vec<String> = cells.chunks(80).map(|row| row.iter().collect()).collect();
+        assert!(screen.contains("Waiting for you"));
+        let first = rows
+            .iter()
+            .position(|row| row.starts_with("https://login.netbird.io/activate?user_code="))
+            .expect("the link starts a line of its own");
+        assert_eq!(screen.matches('X').count(), 90);
+        assert!(
+            rows[first + 2].starts_with('─'),
+            "the link ends inside the dialog"
+        );
     }
 
     fn switch(current: &str, to: &str, shared: Vec<crate::cidr::Cidr>) -> InputMode {

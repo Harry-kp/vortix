@@ -154,6 +154,8 @@ pub struct Snapshot {
     pub drops: u32,
     /// Why each profile's last connect failed, until it comes up.
     pub failures: BTreeMap<ProfileId, String>,
+    /// What a connect in progress waits for the user to do, such as logging in.
+    pub actions: BTreeMap<ProfileId, String>,
 }
 
 impl Snapshot {
@@ -342,17 +344,25 @@ impl Control {
         (snapshot.version != self.seen.replace(snapshot.version)).then_some(snapshot)
     }
 
-    /// Block until `ticket` settles, answering prompts with `prompt`.
+    /// Block until `ticket` settles, answering prompts with `prompt` and
+    /// passing each new thing the user must do to `act`.
     pub fn wait(
         &self,
         ticket: u64,
         timeout: Duration,
         mut prompt: impl FnMut(&Prompt) -> Option<Credentials>,
+        mut act: impl FnMut(&str),
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         let mut answered = std::collections::BTreeSet::new();
+        let mut shown = std::collections::BTreeSet::new();
         loop {
             let snapshot = self.snapshot();
+            for action in snapshot.actions.values() {
+                if shown.insert(action.clone()) {
+                    act(action);
+                }
+            }
             for pending in &snapshot.prompts {
                 if answered.insert(pending.id) {
                     self.answer(pending.id, prompt(pending));

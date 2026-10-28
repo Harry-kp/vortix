@@ -175,6 +175,9 @@ pub struct CommandSpec {
     /// groups, so the firewall can tell this child's traffic apart.
     #[serde(default)]
     pub firewall_group: Option<u32>,
+    /// Receives each stdout line as the child prints it.
+    #[serde(skip)]
+    pub stdout_lines: Option<std::sync::mpsc::Sender<String>>,
 }
 
 impl CommandSpec {
@@ -194,6 +197,7 @@ impl CommandSpec {
             run_as: None,
             terminate_process_group: false,
             firewall_group: None,
+            stdout_lines: None,
         }
     }
 

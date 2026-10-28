@@ -346,6 +346,14 @@ impl App {
                     }
                 }
             },
+            InputMode::Action { text, .. } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                    self.hidden_action = Some(text);
+                } else {
+                    return;
+                }
+                self.input_mode = InputMode::Normal;
+            }
             InputMode::WhatsNew { from, mut scroll } => {
                 let version = crate::constants::APP_VERSION;
                 let must_ack = crate::whats_new::needs_action(&from, version);

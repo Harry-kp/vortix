@@ -36,6 +36,8 @@ impl TunnelCancellation {
 pub struct TunnelExecutionContext {
     pub cancellation: TunnelCancellation,
     pub deadline: Instant,
+    /// What the attempt needs the user to do meanwhile, such as a login link.
+    pub progress: Option<std::sync::mpsc::Sender<String>>,
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cidr::Cidr;
 use crate::control::dns::DnsRequest;
@@ -16,7 +16,7 @@ use crate::openvpn::tunnel::OpenVpnStaticChallengeCredentials;
 use crate::profile::{Profile, ProfileId, ProtocolKind};
 use crate::tunnel::TunnelRevision;
 use crate::tunnel::{AuthorityEpoch, OperationId};
-use crate::tunnel::{TunnelCancellation, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
+use crate::tunnel::{TunnelExecutionContext, TunnelHandle, TunnelKindTag};
 use crate::wireguard::ownership::TunnelOwnershipStore;
 
 use crate::netbird::NbTunnel;
@@ -112,18 +112,10 @@ pub fn start(
     profile: &Profile,
     generation: u64,
     credentials: Option<OpenVpnStaticChallengeCredentials>,
-    cancellation: TunnelCancellation,
-    timeout: Duration,
+    context: TunnelExecutionContext,
 ) -> Result<Live, StartError> {
-    let deadline = Instant::now() + timeout;
-    let mut kind = TunnelKind::new(profile.protocol, settings).for_start(
-        generation,
-        TunnelExecutionContext {
-            cancellation,
-            deadline,
-        },
-        credentials,
-    );
+    let mut kind =
+        TunnelKind::new(profile.protocol, settings).for_start(generation, context, credentials);
     let Ok(result) = panic::catch_unwind(AssertUnwindSafe(|| kind.up(profile))) else {
         let _ = kind.compensate_inflight();
         return Err(StartError::Failed("the protocol adapter panicked".into()));

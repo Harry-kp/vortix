@@ -1243,6 +1243,7 @@ mod tests {
             TunnelExecutionContext {
                 cancellation: crate::tunnel::TunnelCancellation::default(),
                 deadline: Instant::now(),
+                progress: None,
             },
         );
         assert!(matches!(
@@ -1256,6 +1257,7 @@ mod tests {
             TunnelExecutionContext {
                 cancellation,
                 deadline: Instant::now() + Duration::from_secs(30),
+                progress: None,
             },
         );
         assert!(matches!(

@@ -95,7 +95,8 @@ dashboard's Logs panel (`f` until the title names the profile).
 
 Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root only).
 
-- `has no NetBird identity yet`: add a `setup_key` to the `.netbird` file and import it again.
+- `timed out` after a login link: the login was not finished in time. Connect again with
+  `--timeout 300`, or add a `setup_key` to the `.netbird` file.
 - `NetBird refused this device`: the setup key is expired, used up or revoked, or the
   device was removed from the NetBird dashboard. Make a new key.
 - `NetBird management server: …`: `management_url` is wrong or the server is unreachable.

@@ -180,6 +180,11 @@ impl MockRunner {
                 stderr,
                 exit_code,
             } => {
+                if let Some(lines) = &spec.stdout_lines {
+                    for line in String::from_utf8_lossy(&stdout).lines() {
+                        let _ = lines.send(line.to_string());
+                    }
+                }
                 if let Some(limit) = spec.output_limit {
                     if stdout.len() > limit || stderr.len() > limit {
                         return Err(ProcessError::OutputLimitExceeded {

@@ -2649,3 +2649,48 @@ fn f_leaves_the_chart_unflipped() {
     assert!(!app.has_active_animation());
     assert!(!app.is_flipped(&FocusedPanel::Chart));
 }
+
+fn with_action(app: &mut App, name: &str, text: Option<&str>) {
+    let mut snapshot = (*app.control_snapshot).clone();
+    snapshot.actions = text
+        .map(|text| (crate::profile::ProfileId::new(name), text.to_owned()))
+        .into_iter()
+        .collect();
+    snapshot.version += 1;
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
+}
+
+/// A login link must stay on screen until the login completes: it opens by
+/// itself, Esc hides it for good, and it closes when the connect stops waiting.
+#[test]
+fn a_connect_waiting_for_a_login_shows_the_link_until_it_is_done() {
+    let mut app = test_app();
+    let link = "Log in to 'work' within 30s: open https://idp.example/device";
+    with_action(&mut app, "work", Some(link));
+    assert!(matches!(&app.input_mode, InputMode::Action { text, .. } if text == link));
+
+    with_action(&mut app, "work", None);
+    assert!(matches!(app.input_mode, InputMode::Normal));
+
+    with_action(&mut app, "work", Some(link));
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(app.input_mode, InputMode::Normal));
+    app.handle_message(Message::Tick);
+    assert!(
+        matches!(app.input_mode, InputMode::Normal),
+        "a hidden link stays hidden"
+    );
+
+    with_action(
+        &mut app,
+        "work",
+        Some("Log in to 'work' within 30s: open https://idp.example/new"),
+    );
+    assert!(
+        matches!(app.input_mode, InputMode::Action { .. }),
+        "a new link shows again"
+    );
+}
