@@ -571,6 +571,14 @@ pub fn observe(
     Some(session)
 }
 
+/// Remove a deleted profile's state: its identity must not outlive it.
+pub fn forget(driver: MeshDriver, profile_id: &ProfileId) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(driver.state_dir(profile_id)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 /// The custodian's receipt for a daemon Vortix started earlier, if it is still
 /// running.
 #[must_use]

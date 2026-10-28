@@ -1002,7 +1002,14 @@ impl FsProfileStore {
             stage: DeleteStage::Prepared,
         };
         self.save_delete_intent(&intent)?;
-        self.resume_delete(&mut intent)
+        let protocol = intent.protocol;
+        self.resume_delete(&mut intent)?;
+        if let ProtocolKind::Mesh(driver) = protocol {
+            if let Err(error) = crate::mesh::forget(driver, id) {
+                tracing::warn!(%error, "could not remove the deleted network's identity");
+            }
+        }
+        Ok(())
     }
 }
 
