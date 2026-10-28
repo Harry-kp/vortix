@@ -23,6 +23,7 @@ pub mod macos;
 pub mod message;
 #[doc(hidden)]
 pub mod netbird;
+#[doc(hidden)]
 pub mod openvpn;
 pub mod platform;
 #[doc(hidden)]

@@ -219,11 +219,6 @@ fn parse_wireguard_config(content: &str, path: &Path) -> Result<(String, String)
     Ok((name, location))
 }
 
-/// Parse and **validate** an `OpenVPN` config file.
-///
-/// Required: `remote` directive. Must also contain at least one `OpenVPN`-specific
-/// directive (`client`, `dev`, `proto`, `ca`, `cert`, `key`, `tls-auth`, `tls-crypt`)
-/// to distinguish from random text files.
 fn parse_netbird_config(content: &str, path: &Path) -> Result<(String, String), String> {
     let name = path
         .file_stem()
@@ -234,6 +229,11 @@ fn parse_netbird_config(content: &str, path: &Path) -> Result<(String, String), 
     Ok((name, host))
 }
 
+/// Parse and **validate** an `OpenVPN` config file.
+///
+/// Required: `remote` directive. Must also contain at least one `OpenVPN`-specific
+/// directive (`client`, `dev`, `proto`, `ca`, `cert`, `key`, `tls-auth`, `tls-crypt`)
+/// to distinguish from random text files.
 fn parse_openvpn_config(content: &str, path: &Path) -> Result<(String, String), String> {
     let name = path
         .file_stem()

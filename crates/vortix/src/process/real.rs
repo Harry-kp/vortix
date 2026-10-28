@@ -303,17 +303,8 @@ pub(crate) fn run_guardian_entrypoint() -> Result<(), ProcessError> {
     }
     if let Some(gid) = spec.firewall_group {
         use std::os::unix::process::CommandExt as _;
-        // SAFETY: only async-signal-safe syscalls run between fork and exec.
-        #[allow(unsafe_code)]
-        unsafe {
-            command.pre_exec(move || {
-                crate::platform::set_process_supplementary_groups(&[])?;
-                if libc::setgid(gid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // Root keeps root, under `gid` alone: std drops the supplementary groups.
+        command.uid(0).gid(gid);
     }
     command
         .stdin(if spec.stdin_bytes.is_some() {

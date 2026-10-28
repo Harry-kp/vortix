@@ -92,7 +92,7 @@ Then install Vortix using your preferred channel:
 Import a profile and connect:
 
 ```bash
-vortix import ./work.conf       # .conf, .ovpn, URL, or directory
+vortix import ./work.conf       # .conf, .ovpn, .netbird, URL, or directory
 sudo vortix                    # interactive dashboard
 
 # Or stay in the CLI
@@ -109,7 +109,7 @@ Every command, key and panel is in the [usage guide](https://github.com/Harry-kp
 
 | Area | What Vortix provides |
 |---|---|
-| [Protocols](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#profiles) | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles, up to 1024 routes each |
+| [Protocols](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#profiles) | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles, up to 1024 routes each; NetBird networks (`.netbird`), including moving from the NetBird app |
 | [Multi-tunnel](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#several-tunnels-at-once) | Full and split tunnels side by side, one default-route owner, and a Switch or Cancel choice on conflicts |
 | [Telemetry](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#panels) | Throughput, latency, jitter, packet loss, public IP, ISP, and location |
 | [Security Guard](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#security-guard) | IPv4/IPv6 exposure, DNS, encryption and kill-switch state, with one verdict |

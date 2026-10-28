@@ -15,7 +15,7 @@ use crate::process::{CommandSpec, ManagedProcessId, PrivilegeReq};
 use crate::profile::{Profile, ProfileId};
 use crate::tunnel::{TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
 
-/// `NetBird`'s own default; pinned so the kill switch can name the port.
+/// `NetBird`'s own default, pinned so every connect listens on the same port.
 const WIREGUARD_PORT: u16 = 51820;
 /// Root-only, like `NetBird`'s own `/var/lib/netbird`: it holds each network's identity.
 const STATE_ROOT: &str = "/var/lib/vortix/netbird";
@@ -42,8 +42,13 @@ pub struct NetBirdProfile {
 
 impl NetBirdProfile {
     pub fn parse(content: &str) -> Result<Self, String> {
-        let profile: Self =
-            toml::from_str(content).map_err(|error| format!("Invalid NetBird profile: {error}"))?;
+        let profile: Self = toml::from_str(content).map_err(|error: toml::de::Error| {
+            // The error's own text quotes the line, which may hold the setup key.
+            let line = error
+                .span()
+                .map_or(0, |span| content[..span.start].matches('\n').count() + 1);
+            format!("Invalid NetBird profile (line {line}): {}", error.message())
+        })?;
         profile.management_host()?;
         Ok(profile)
     }
@@ -103,13 +108,15 @@ pub fn profile_from_app(dir: &Path) -> Result<String, String> {
     let read = |path: &Path| {
         std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))
     };
-    let active = match read(&dir.join("active_profile.json")) {
+    let active_path = dir.join("active_profile.json");
+    let active = match std::fs::read(&active_path) {
         Ok(bytes) => serde_json::from_slice::<Active>(&bytes)
             .map_err(|error| format!("NetBird's active profile is unreadable: {error}"))?,
-        Err(_) => Active {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Active {
             name: "default".into(),
             username: String::new(),
         },
+        Err(error) => return Err(format!("cannot read {}: {error}", active_path.display())),
     };
     let safe = |part: &str| !part.contains('/') && !part.contains("..");
     let identity = if active.name == "default" {
@@ -300,11 +307,19 @@ impl NbTunnel {
         let content = std::fs::read_to_string(&profile.config_path)?;
         let settings = NetBirdProfile::parse(&content).map_err(TunnelError::Other)?;
         let binary = binary()?;
-        if Path::new(APP_SOCKET).exists() {
+        if answers(Path::new(APP_SOCKET)) {
             return Err(TunnelError::Other(
                 "the NetBird app's service is running, and only one NetBird can run at a time: \
                  stop it with `sudo netbird service stop` (and `sudo netbird service uninstall` \
                  so it stays stopped after a reboot)"
+                    .into(),
+            ));
+        }
+        let socket = socket_path(&profile.id);
+        if other_network_running(&socket) {
+            return Err(TunnelError::Other(
+                "another NetBird network is connected, and only one NetBird can run at a time: \
+                 disconnect it first"
                     .into(),
             ));
         }
@@ -314,7 +329,6 @@ impl NbTunnel {
         if let (Some(identity), false) = (&settings.identity, own_identity.exists()) {
             write_private(&own_identity, &read_app_identity(identity)?)?;
         }
-        let socket = socket_path(&profile.id);
         let _ = std::fs::remove_file(&socket);
 
         let mut identity = ManagedProcessId::generate(profile.id.clone())
@@ -335,6 +349,11 @@ impl NbTunnel {
         daemon
             .env
             .insert("NB_STATE_DIR".into(), state_dir.to_string_lossy().into());
+        // Kernel WireGuard sends from a socket with no group, which the kill
+        // switch could not tell apart; userspace keeps it all in the daemon.
+        daemon
+            .env
+            .insert("NB_WG_KERNEL_DISABLED".into(), "true".into());
         daemon.firewall_group = Some(crate::control::killswitch::TRANSPORT_GROUP);
         let custody = crate::process::custodian::spawn_custodian(
             identity.clone(),
@@ -415,6 +434,7 @@ impl NbTunnel {
             .execution_context
             .as_ref()
             .and_then(|context| context.progress.as_ref());
+        let done = std::sync::atomic::AtomicBool::new(false);
         let outcome = std::thread::scope(|scope| {
             scope.spawn(|| {
                 for line in printed {
@@ -426,7 +446,24 @@ impl NbTunnel {
                     }
                 }
             });
-            crate::process::run(up)
+            // A disconnect must not wait out a login nobody will finish.
+            if let Some(context) = &self.execution_context {
+                let done = &done;
+                scope.spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::Acquire) {
+                        if context.cancellation.is_cancelled() {
+                            let mut down = command(binary, socket, ["down"]);
+                            down.timeout = Some(Duration::from_secs(10));
+                            let _ = crate::process::run(down);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                });
+            }
+            let outcome = crate::process::run(up);
+            done.store(true, std::sync::atomic::Ordering::Release);
+            outcome
         });
         if let Some(key_file) = &key_file {
             let _ = std::fs::remove_file(key_file);
@@ -533,6 +570,25 @@ fn socket_path(profile_id: &ProfileId) -> PathBuf {
         "/var/run/vortix-netbird-{}.sock",
         profile_id.digest_key(8)
     ))
+}
+
+/// A daemon listens on this socket; a file left by a crash does not count.
+fn answers(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+/// Another network's daemon that Vortix started is running.
+fn other_network_running(own: &Path) -> bool {
+    std::fs::read_dir("/var/run").is_ok_and(|entries| {
+        entries.flatten().map(|entry| entry.path()).any(|path| {
+            path != own
+                && path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("vortix-netbird-"))
+                && answers(&path)
+        })
+    })
 }
 
 fn binary() -> Result<PathBuf, TunnelError> {
@@ -832,6 +888,20 @@ mod tests {
         std::fs::write(&elsewhere, APP_CONFIG).unwrap();
         assert!(read_app_identity(&elsewhere).is_err());
         assert!(read_app_identity(Path::new("/etc/passwd")).is_err());
+    }
+
+    /// toml quotes the offending line in its message; the setup key must not
+    /// reach a log or the CLI that way.
+    #[test]
+    fn a_bad_profile_line_is_not_quoted_back() {
+        for text in [
+            "management_url = \"https://a\"\nsetupkey = \"SECRET-KEY-123\"",
+            "management_url = \"https://a\"\nsetup_key = SECRET-KEY-123",
+        ] {
+            let error = NetBirdProfile::parse(text).unwrap_err();
+            assert!(!error.contains("SECRET"), "{error}");
+            assert!(error.contains("line 2"), "{error}");
+        }
     }
 
     #[test]

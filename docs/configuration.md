@@ -47,7 +47,7 @@ api_timeout = 5
 ping_timeout = 2
 
 # Connecting and reconnecting (seconds)
-connect_timeout = 35                     # OpenVPN
+connect_timeout = 35                     # OpenVPN and NetBird, including a NetBird login
 wireguard_handshake_timeout_secs = 20
 wireguard_handshake_stale_secs = 180
 disconnect_timeout = 30
@@ -82,7 +82,7 @@ designed for dark backgrounds.
 ```toml
 [engine]
 openvpn_verbosity = "3"
-connect_timeout_secs = 35                # OpenVPN
+connect_timeout_secs = 35                # OpenVPN and NetBird, including a NetBird login
 wireguard_handshake_timeout_secs = 20    # 1–300
 wireguard_handshake_stale_secs = 180     # 1–86400
 wireguard_health_targets = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]   # up to 64 addresses
@@ -116,13 +116,14 @@ timeout_secs = 5          # default 5, at most 60
 
 Hooks run as you, not root, after the change has happened, with a clean environment plus
 `VORTIX_EVENT`, `VORTIX_EVENT_ID`, `VORTIX_PROFILE_ID`, `VORTIX_PROFILE_NAME` and
-`VORTIX_PROTOCOL`. They cannot block or delay a connect, run at most once per event, and can be
+`VORTIX_PROTOCOL` (`wireguard`, `openvpn` or `netbird`). They cannot block or delay a connect, run at most once per event, and can be
 lost if Vortix crashes. Up to 64 hooks.
 
 ## DNS
 
 When a tunnel carries DNS (WireGuard `DNS =`, or DNS an OpenVPN server pushes), Vortix applies
-it and restores the previous resolvers on disconnect:
+it and restores the previous resolvers on disconnect. A NetBird network's own client sets its
+DNS, and Vortix leaves it alone.
 
 - The tunnel that owns the default route answers every query.
 - A split tunnel's resolvers answer only its search domains (a WireGuard `DNS =` entry that is

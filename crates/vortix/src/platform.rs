@@ -712,13 +712,13 @@ mod ipv6_gate_tests {
     }
 }
 
-/// The address whose route stands for "the internet" when probing the default route.
 /// The interface each `NetBird` daemon Vortix runs is told to create.
 #[cfg(target_os = "macos")]
 pub const NETBIRD_INTERFACE: &str = "utun100";
 #[cfg(target_os = "linux")]
 pub const NETBIRD_INTERFACE: &str = "wt0";
 
+/// The address whose route stands for "the internet" when probing the default route.
 pub(crate) const INTERNET_ROUTE_PROBE: std::net::IpAddr =
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
 

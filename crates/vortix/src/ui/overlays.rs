@@ -863,7 +863,13 @@ pub mod config_viewer {
 
     /// Mask sensitive values like private keys
     fn mask_sensitive_value(key: &str, value: &str) -> String {
-        let sensitive_keys = ["privatekey", "presharedkey", "password", "secret"];
+        let sensitive_keys = [
+            "privatekey",
+            "presharedkey",
+            "password",
+            "secret",
+            "setup_key",
+        ];
 
         let key_lower = key.to_lowercase();
         if sensitive_keys.iter().any(|k| key_lower.contains(k)) {
@@ -878,6 +884,21 @@ pub mod config_viewer {
             }
         } else {
             value.to_string()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn a_netbird_setup_key_is_masked() {
+            let shown = super::mask_sensitive_value(
+                "setup_key",
+                "\"A1B2C3D4-E5F6-7788-99AA-BBCCDDEEFF00\"",
+            );
+            assert!(
+                shown.ends_with("(masked)") && !shown.contains("E5F6"),
+                "{shown}"
+            );
         }
     }
 }

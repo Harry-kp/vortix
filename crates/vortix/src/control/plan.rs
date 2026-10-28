@@ -51,8 +51,8 @@ pub struct PlanInput {
     /// is pinned to the physical gateway before they come up, so a switch
     /// from one full tunnel to another never opens the new one inside the old.
     pub pending_full_endpoints: BTreeSet<IpAddr>,
-    /// Daemon groups of those tunnels, let out before they are up.
-    pub pending_groups: BTreeSet<u32>,
+    /// The daemon group of those tunnels, let out before they are up.
+    pub pending_group: Option<u32>,
     /// A tunnel dropped without being asked to.
     pub dropped: bool,
     /// Interfaces of tunnels being torn down.
@@ -233,12 +233,9 @@ fn firewall(input: &PlanInput) -> (Firewall, KillSwitchState) {
         .difference(&covered)
         .copied()
         .collect::<Vec<_>>();
-    // Every daemon Vortix runs shares one group, so one entry covers them.
     let pending_group = input
-        .pending_groups
-        .iter()
-        .copied()
-        .find(|group| allow.iter().all(|tunnel| tunnel.group != Some(*group)));
+        .pending_group
+        .filter(|group| allow.iter().all(|tunnel| tunnel.group != Some(*group)));
     if !pending.is_empty() || pending_group.is_some() {
         allow.push(ActiveTunnelInfo::endpoint_allowlist(pending, pending_group));
     }
@@ -421,7 +418,7 @@ pub(crate) mod tests {
         let group = crate::control::killswitch::TRANSPORT_GROUP;
         let mut input = input(vec![live("01", "utun4", FULL, 1)]);
         input.kill_switch = KillSwitchMode::AlwaysOn;
-        input.pending_groups = BTreeSet::from([group]);
+        input.pending_group = Some(group);
         let groups = |plan: &NetworkPlan| match &plan.firewall {
             Firewall::Block(allow) => allow
                 .iter()
@@ -436,7 +433,7 @@ pub(crate) mod tests {
         mesh.routes.clear();
         mesh.group = Some(group);
         input.live.push(mesh);
-        input.pending_groups.clear();
+        input.pending_group = None;
         let up = plan(&input);
         assert_eq!(groups(&up), [("wt0".to_string(), group)]);
         assert_eq!(up.primary.as_ref().map(ProfileId::as_str), Some("01"));

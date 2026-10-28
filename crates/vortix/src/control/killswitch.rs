@@ -1371,8 +1371,8 @@ pub struct ActiveTunnelInfo {
     pub group: Option<u32>,
 }
 
-/// The group every tunnel daemon Vortix runs uses, so the kill switch can let
-/// that daemon, and nothing else, reach any address.
+/// The group a mesh network's daemon runs under, so the kill switch can let that
+/// daemon, and nothing else, reach any address.
 pub const TRANSPORT_GROUP: u32 = 51820;
 
 pub(crate) const FIREWALL_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);

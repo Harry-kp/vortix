@@ -377,7 +377,7 @@ impl State {
             })
             .flat_map(|tunnel| tunnel.spec.server_ips.iter().copied())
             .collect();
-        let pending_groups = self
+        let pending_group = self
             .tunnels
             .values()
             .filter(|tunnel| {
@@ -386,8 +386,7 @@ impl State {
                     Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
                 )
             })
-            .filter_map(|tunnel| tunnel.spec.group)
-            .collect();
+            .find_map(|tunnel| tunnel.spec.group);
         let dropped = self
             .tunnels
             .values()
@@ -402,7 +401,7 @@ impl State {
             live,
             pending_endpoints,
             pending_full_endpoints,
-            pending_groups,
+            pending_group,
             dropped,
             releasing,
             kill_switch: self.kill_switch,
