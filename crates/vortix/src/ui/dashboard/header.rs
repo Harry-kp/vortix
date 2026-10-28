@@ -143,13 +143,39 @@ fn with_startup_signal(label: Option<&'static str>, mut line: Line<'static>) -> 
 /// CONNECTED primary line. Vocabulary matches Security Guard's
 /// "split-route — no exit" copy.
 fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> {
+    // A mesh network is a private network, not an internet exit: connected
+    // is the right word for it, with how many of its peers are up.
+    let mesh = app.tunnels().into_iter().find(|tunnel| {
+        tunnel.phase == Phase::Up
+            && matches!(tunnel.protocol, crate::profile::ProtocolKind::Mesh(_))
+    });
+    let title = mesh.map_or_else(
+        || {
+            Span::styled(
+                "\u{25cb} NO EXIT",
+                Style::default()
+                    .fg(theme::current().warning)
+                    .add_modifier(Modifier::BOLD),
+            )
+        },
+        |tunnel| {
+            let peers = &tunnel.details.peers;
+            let up = peers.iter().filter(|peer| peer.connected).count();
+            let name = crate::ui::helpers::truncate_to_width(&tunnel.name, 16);
+            Span::styled(
+                if peers.is_empty() {
+                    format!("\u{25cf} MESH {name}")
+                } else {
+                    format!("\u{25cf} MESH {name} {up}/{}", peers.len())
+                },
+                Style::default()
+                    .fg(theme::current().success)
+                    .add_modifier(Modifier::BOLD),
+            )
+        },
+    );
     Line::from(vec![
-        Span::styled(
-            "\u{25cb} NO EXIT",
-            Style::default()
-                .fg(theme::current().warning)
-                .add_modifier(Modifier::BOLD),
-        ),
+        title,
         helpers::divider_padded(),
         Span::styled(
             "Real: ",
@@ -979,6 +1005,36 @@ mod tests {
         let title_span = &line.spans[0];
         assert_eq!(title_span.style.fg, Some(theme::current().warning));
         assert!(title_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// A connected mesh network reads as connected, with its peers, not as a
+    /// missing exit; a split tunnel alone still says NO EXIT.
+    #[test]
+    fn a_connected_mesh_network_is_not_a_missing_exit() {
+        let mut app = App::new_test();
+        let mut mesh = crate::app::connection::test_view("office", Phase::Up);
+        mesh.protocol = crate::profile::ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+        mesh.details.peers = vec![
+            crate::tunnel::MeshPeer {
+                connected: true,
+                ..Default::default()
+            },
+            crate::tunnel::MeshPeer::default(),
+        ];
+        app.set_tunnels_for_test(vec![mesh], None);
+        let line = render_no_exit_line(&app, Span::raw(" KS:Off"));
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("\u{25cf} MESH office 1/2"), "{text}");
+        assert!(!text.contains("NO EXIT"), "{text}");
+        assert_eq!(line.spans[0].style.fg, Some(theme::current().success));
+
+        app.set_tunnels_for_test(
+            vec![crate::app::connection::test_view("split", Phase::Up)],
+            None,
+        );
+        let line = render_no_exit_line(&app, Span::raw(" KS:Off"));
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("NO EXIT"), "{text}");
     }
 
     #[test]

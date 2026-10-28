@@ -163,6 +163,8 @@ auth_key = "…"                         # optional: a setup key
 After that, `up`, `down`, `status`, the dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`)
 work as for any profile. Vortix runs NetBird's own client with this network's identity in
 `/var/lib/vortix/netbird/`, separate from the app's, and deleting the profile removes it.
+NetBird is a private network, not an internet exit: with it alone the header reads
+`● MESH <name> 3/7` (peers up of all), and your public address stays your own.
 NetBird sets up its own routes and DNS on `wt0` (macOS: `utun100`). One NetBird network can be
 up at a time. Connection Details shows how many peers are up; `P` lists the networks it routes
 to (in use or not, and which is an exit node), then the peers. `status --json` adds them under
