@@ -1,7 +1,7 @@
 # Vortix — context for Claude Code
 
 Vortix is a terminal VPN manager (TUI + CLI) for WireGuard and OpenVPN on macOS
-and Linux. One Rust crate, `crates/vortix`, plus `crates/xtask` for boundary
+and Linux (see North Star). One Rust crate, `crates/vortix`, plus `crates/xtask` for boundary
 lints. It runs as root (`sudo vortix`); there is no helper or daemon.
 
 To fix a reported bug end to end (reproduce → fix → CI → PR → review → merge),
@@ -16,6 +16,28 @@ two decisions: what gets built (`/ideate`, or labelling an issue `approved`) and
 (merging the release PR, which `.claude/hooks/guard-merge.sh` keeps Claude from doing).
 Before merging, the `reviewer` agent (`.claude/agents/reviewer.md`) reviews every change in a
 fresh context.
+
+## North Star
+
+Vortix is **the one keyboard interface for every VPN a person uses** — their company's
+NetBird, their personal Mullvad, plain WireGuard and OpenVPN, and the next ones users ask for —
+**all run by Vortix end to end**, under one UI, one engine, one kill switch, with proof that
+nothing leaks. That is the moat: no vendor app combines other vendors' VPNs or works the same
+over SSH and headless.
+
+- **One fixed experience.** Every VPN gets the same sidebar, keys, panels, Security Guard, kill
+  switch, CLI and JSON. A product adds at most one thing behind one key (a server picker, a
+  peer list, a login step); it never gets its own UI, panel or vocabulary.
+- **Vortix runs it.** Vortix starts, supervises and stops every VPN through the native binaries
+  (`wg-quick`, `openvpn`, `netbird`, …). It never just observes a VPN it has no profile for.
+- **Generic by kind, specific only at the edge.** Code is written once per kind of VPN (config
+  file, provider account, mesh network); a company is a thin driver plus labels, and nothing
+  else branches on it. Contract, kinds and release order: [`docs/adapters.md`](docs/adapters.md).
+- **Releases are features.** Each minor release ships one feature a user can name (e.g.
+  "NetBird"), only when complete and through release QA; patch releases carry fixes.
+
+Every proposal, issue and change is judged against this. Work that does not serve it waits;
+changing it is the maintainer's decision alone.
 
 ## How we work here
 
@@ -176,6 +198,7 @@ fact has one owner; everything else links to it.
 | Live-only workflow | `docs/manual-testing/P0.md` |
 | Test machines, tmux sessions, the VPN lab | `docs/live-testing.md` |
 | Module ownership, a rule, a lesson | this file |
+| How a VPN product plugs in (sources, transports) | `docs/adapters.md` |
 
 `README.md` only summarises and links. A key change touches three places: `app/input.rs`, the
 in-app help (`HELP_TEXT` in `ui/overlays.rs`) and `docs/usage.md`. `cargo xtask check-docs` fails on a broken link or anchor, and `tests/suite/docs_match_code.rs`
