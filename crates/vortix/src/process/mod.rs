@@ -178,6 +178,9 @@ pub struct CommandSpec {
     /// Receives each stdout line as the child prints it.
     #[serde(skip)]
     pub stdout_lines: Option<std::sync::mpsc::Sender<String>>,
+    /// Set to stop the child before its timeout.
+    #[serde(skip)]
+    pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl CommandSpec {
@@ -198,6 +201,7 @@ impl CommandSpec {
             terminate_process_group: false,
             firewall_group: None,
             stdout_lines: None,
+            stop: None,
         }
     }
 

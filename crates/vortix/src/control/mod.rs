@@ -186,6 +186,7 @@ pub struct Config {
     pub config_dir: PathBuf,
     pub tunnels: tunnels::Settings,
     pub openvpn_timeout: Duration,
+    pub mesh_timeout: Duration,
     pub wireguard_timeout: Duration,
     pub auto_reconnect: bool,
     pub reconnect_delay: Duration,
@@ -211,6 +212,9 @@ impl Config {
             openvpn_timeout: Duration::from_secs(
                 config.connect_operation_timeout_secs(ProtocolKind::OpenVpn),
             ),
+            mesh_timeout: Duration::from_secs(config.connect_operation_timeout_secs(
+                ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird),
+            )),
             wireguard_stale_after: Duration::from_secs(config.wireguard_handshake_stale_secs),
             wireguard_timeout: Duration::from_secs(
                 config.connect_operation_timeout_secs(ProtocolKind::WireGuard),
@@ -226,9 +230,8 @@ impl Config {
     #[must_use]
     pub const fn connect_timeout(&self, protocol: crate::profile::ProtocolKind) -> Duration {
         match protocol {
-            crate::profile::ProtocolKind::OpenVpn | crate::profile::ProtocolKind::Mesh(_) => {
-                self.openvpn_timeout
-            }
+            crate::profile::ProtocolKind::OpenVpn => self.openvpn_timeout,
+            crate::profile::ProtocolKind::Mesh(_) => self.mesh_timeout,
             crate::profile::ProtocolKind::WireGuard => self.wireguard_timeout,
         }
     }
@@ -345,13 +348,15 @@ impl Control {
     }
 
     /// Block until `ticket` settles, answering prompts with `prompt` and
-    /// passing each new thing the user must do to `act`.
+    /// passing each new thing the user must do to `act`. With `wait_for_user`,
+    /// the timeout does not run out while the user is doing it.
     pub fn wait(
         &self,
         ticket: u64,
         timeout: Duration,
         mut prompt: impl FnMut(&Prompt) -> Option<Credentials>,
         mut act: impl FnMut(&str),
+        wait_for_user: bool,
     ) -> Result<(), String> {
         let mut deadline = Instant::now() + timeout;
         let mut answered = std::collections::BTreeSet::new();
@@ -365,7 +370,7 @@ impl Control {
             }
             // The user is doing what the connect waits for; the transport
             // bounds that wait itself.
-            if !snapshot.actions.is_empty() {
+            if wait_for_user && !snapshot.actions.is_empty() {
                 deadline = deadline.max(Instant::now() + Duration::from_secs(1));
             }
             for pending in &snapshot.prompts {

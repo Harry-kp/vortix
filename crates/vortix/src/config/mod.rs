@@ -186,8 +186,10 @@ impl AppConfig {
     ) -> u64 {
         let protocol_gate = match protocol {
             crate::profile::ProtocolKind::WireGuard => self.wireguard_handshake_timeout_secs,
-            crate::profile::ProtocolKind::OpenVpn | crate::profile::ProtocolKind::Mesh(_) => {
-                self.connect_timeout
+            crate::profile::ProtocolKind::OpenVpn => self.connect_timeout,
+            // A daemon that failed to connect still has to stop.
+            crate::profile::ProtocolKind::Mesh(_) => {
+                self.connect_timeout.saturating_add(crate::mesh::STOP_SECS)
             }
         };
         protocol_gate.saturating_add(crate::constants::CONTROL_COMPLETION_GRACE_SECS)
@@ -203,8 +205,9 @@ impl AppConfig {
                 config.wireguard_handshake_timeout_secs =
                     gate.clamp(1, crate::wireguard::tunnel::MAX_HANDSHAKE_TIMEOUT.as_secs());
             }
-            crate::profile::ProtocolKind::OpenVpn | crate::profile::ProtocolKind::Mesh(_) => {
-                config.connect_timeout = gate.max(1);
+            crate::profile::ProtocolKind::OpenVpn => config.connect_timeout = gate.max(1),
+            crate::profile::ProtocolKind::Mesh(_) => {
+                config.connect_timeout = gate.saturating_sub(crate::mesh::STOP_SECS).max(1);
             }
         }
         config
@@ -895,7 +898,15 @@ mod tests {
     fn an_explicit_connect_budget_reaches_the_engine() {
         use crate::profile::ProtocolKind;
         let config = AppConfig::default();
-        for protocol in [ProtocolKind::WireGuard, ProtocolKind::OpenVpn] {
+        let mesh = ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+        // A mesh connect also leaves its daemon time to stop.
+        assert_eq!(
+            config.connect_operation_timeout_secs(mesh),
+            config.connect_timeout
+                + crate::mesh::STOP_SECS
+                + crate::constants::CONTROL_COMPLETION_GRACE_SECS
+        );
+        for protocol in [ProtocolKind::WireGuard, ProtocolKind::OpenVpn, mesh] {
             let longer = config.with_connect_budget(protocol, 90);
             assert_eq!(longer.connect_operation_timeout_secs(protocol), 90);
             // A tiny --timeout still leaves a valid config; the wait stops it.

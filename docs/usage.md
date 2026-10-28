@@ -149,7 +149,8 @@ on Linux, NetBird's installer). There are two ways in, both from Import (`i`, or
   the app's own files are never changed.
 - **A new network:** import `netbird` (NetBird's hosted service) or
   `netbird https://netbird.example.com` (your own). The first connect shows a sign-in link:
-  `vortix up` prints it and the dashboard shows it until you finish, and you have 5 minutes.
+  `vortix up` prints it and the dashboard shows it until you finish, and you have 5 minutes
+  (from a terminal; a script's `--timeout` holds).
 
 A profile is a `.netbird` file, so it can also be written by hand, for example with a setup key
 from the NetBird dashboard so no sign-in is needed:
@@ -298,7 +299,7 @@ otherwise `null`.
 | 1 | General error |
 | 2 | Needs root |
 | 3 | Profile not found |
-| 4 | State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start) |
+| 4 | State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start, a second NetBird network or the NetBird app's own service) |
 | 5 | Missing dependency (WireGuard tools, `openvpn`, or on Linux `resolvconf`/`systemd-resolved`) |
 | 6 | Timeout |
 

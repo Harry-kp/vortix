@@ -624,6 +624,34 @@ fn current_groups() -> Result<Vec<u32>, ProcessError> {
     })
 }
 
+/// Wait for the child until `timeout`, or until `stop` is set. `Err` means it
+/// is still running.
+async fn wait_or_stop(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<std::io::Result<std::process::ExitStatus>, tokio::time::error::Elapsed> {
+    let Some(stop) = stop else {
+        return tokio::time::timeout(timeout, child.wait()).await;
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let slice = Duration::from_millis(100)
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        // `wait` is cancel-safe, so polling it in slices loses nothing.
+        match tokio::time::timeout(slice, child.wait()).await {
+            Ok(result) => return Ok(result),
+            Err(elapsed)
+                if stop.load(std::sync::atomic::Ordering::Acquire)
+                    || tokio::time::Instant::now() >= deadline =>
+            {
+                return Err(elapsed);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 async fn terminate_child(child: &mut tokio::process::Child, process_group: bool) {
     if process_group {
         if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
@@ -747,7 +775,8 @@ impl RealRunner {
             let stdout_task = tokio::spawn(drain_bounded(stdout, limit, spec.stdout_lines.clone()));
             let stderr_task = tokio::spawn(drain_bounded(stderr, limit, None));
             let status = if let Some(timeout) = spec.timeout {
-                let Ok(result) = tokio::time::timeout(timeout, child.wait()).await else {
+                let Ok(result) = wait_or_stop(&mut child, timeout, spec.stop.as_deref()).await
+                else {
                     terminate_child(&mut child, spec.terminate_process_group).await;
                     return Err(ProcessError::Timeout {
                         program: spec.program.clone(),
@@ -896,6 +925,28 @@ mod tests {
         let outcome = RealRunner::new().run_blocking(spec).unwrap();
         assert_eq!(outcome.stdout_lossy().trim(), uid.to_string());
         assert_ne!(uid, 0);
+    }
+
+    /// A set stop flag ends the child well before its timeout.
+    #[test]
+    fn a_stop_flag_ends_the_child_early() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut spec = CommandSpec::oneshot("/bin/sleep", vec!["30".into()]);
+        spec.timeout = Some(Duration::from_secs(30));
+        spec.output_limit = Some(1024);
+        spec.stop = Some(stop.clone());
+        let flag = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        assert!(RealRunner::new().run_blocking(spec).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// Lines reach the channel as they are printed, and the output is still kept.

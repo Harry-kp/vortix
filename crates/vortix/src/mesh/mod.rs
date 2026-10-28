@@ -26,6 +26,8 @@ use crate::tunnel::{
 /// Root-only, like a vendor's own state directory: it holds each network's identity.
 const STATE_ROOT: &str = "/var/lib/vortix";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Time a daemon that failed to connect takes to stop, on top of the connect.
+pub const STOP_SECS: u64 = 10;
 /// Time to sign in in a browser once the link shows; `NetBird`'s own is 5 minutes.
 const LOGIN_WAIT: Duration = Duration::from_secs(300);
 
@@ -255,7 +257,7 @@ impl MeshProfile {
             .strip_prefix("https://")
             .map(|rest| (rest, 443))
             .or_else(|| url.strip_prefix("http://").map(|rest| (rest, 80)))
-            .ok_or("server_url must start with https:// or http://")?;
+            .ok_or("the server URL must start with https:// or http://")?;
         let authority = rest.split('/').next().unwrap_or_default();
         let (host, port) = match authority.strip_prefix('[') {
             Some(v6) => v6.split_once(']').unwrap_or((v6, "")),
@@ -265,10 +267,10 @@ impl MeshProfile {
             "" => default_port,
             port => port
                 .parse()
-                .map_err(|_| format!("server_url has a bad port: {port}"))?,
+                .map_err(|_| format!("the server URL has a bad port: {port}"))?,
         };
         if host.is_empty() {
-            return Err("server_url has no host".into());
+            return Err("the server URL has no host".into());
         }
         Ok((host.to_string(), port))
     }
@@ -288,9 +290,10 @@ pub fn app_driver(dir: &Path) -> Option<MeshDriver> {
 #[must_use]
 pub fn profile_from_words(words: &str) -> Option<(MeshDriver, Result<String, String>)> {
     let mut words = words.split_whitespace();
+    let first = words.next()?;
     let driver = MeshDriver::ALL
         .into_iter()
-        .find(|driver| words.next() == Some(driver.slug()))?;
+        .find(|driver| first.eq_ignore_ascii_case(driver.slug()))?;
     let profile = MeshProfile {
         server_url: words.next().unwrap_or(driver.default_server()).to_string(),
         auth_key: None,
@@ -459,7 +462,7 @@ impl MeshTunnel {
         )
         .map_err(|error| TunnelError::Subprocess(format!("{name} custody: {error}")))?;
 
-        let started = self.connect(profile, &settings, &cli, &socket, &state_dir);
+        let started = self.connect(profile, &settings, &cli, &socket, &state_dir, &custody);
         if let Err(error) = started {
             return Err(
                 match crate::process::custodian::remote_stop_after_startup(&custody) {
@@ -495,6 +498,7 @@ impl MeshTunnel {
         cli: &Path,
         socket: &Path,
         state_dir: &Path,
+        custody: &crate::process::CustodianHandshake,
     ) -> Result<(), TunnelError> {
         let driver = self.driver;
         wait_for(socket, self.remaining()?)?;
@@ -515,6 +519,8 @@ impl MeshTunnel {
         up.timeout = Some(budget.max(LOGIN_WAIT));
         let (lines, printed) = std::sync::mpsc::channel();
         up.stdout_lines = Some(lines);
+        let stop_up = std::sync::Arc::new(AtomicBool::new(false));
+        up.stop = Some(stop_up.clone());
         let progress = self
             .execution_context
             .as_ref()
@@ -538,15 +544,20 @@ impl MeshTunnel {
                     }
                 }
             });
-            // `down` ends the wait: on a disconnect, or when no sign-in link
-            // came within the connect's own budget.
+            // On a disconnect, or when no sign-in link came within the connect's
+            // own budget, end it: `down` stops a sign-in; a daemon retrying a
+            // server it cannot reach, and its client, only stop when stopped.
             scope.spawn(|| {
                 while !done.load(Ordering::Acquire) {
                     let cancelled = cancellation.is_some_and(TunnelCancellation::is_cancelled);
                     let overdue = !signing_in.load(Ordering::Acquire) && started.elapsed() > budget;
                     if cancelled || overdue {
                         timed_out.store(overdue, Ordering::Release);
-                        let _ = run(driver, cli, socket, driver.down());
+                        if cancelled {
+                            let _ = run(driver, cli, socket, driver.down());
+                        }
+                        stop_up.store(true, Ordering::Release);
+                        let _ = crate::process::custodian::remote_stop_after_startup(custody);
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(200));
@@ -560,7 +571,15 @@ impl MeshTunnel {
             let _ = std::fs::remove_file(key_file);
         }
         if timed_out.load(Ordering::Acquire) {
-            return Err(TunnelError::Timeout(budget));
+            let server = settings.server().map_or_else(
+                |_| settings.server_url.clone(),
+                |(host, port)| format!("{host}:{port}"),
+            );
+            return Err(TunnelError::Other(format!(
+                "the {} server {server} timed out after {}s: check its address and the network",
+                driver.name(),
+                budget.as_secs()
+            )));
         }
         let outcome = outcome.map_err(|error| TunnelError::Subprocess(error.to_string()))?;
         let after = status(driver, cli, socket)?;
@@ -897,6 +916,10 @@ mod tests {
         );
         assert!(profile_from_words("netbird nb.corp").is_some_and(|(_, text)| text.is_err()));
         assert!(profile_from_words("work.conf").is_none());
+        assert!(
+            profile_from_words("NetBird").is_some(),
+            "the name as the docs write it"
+        );
         assert!(profile_from_words("").is_none());
     }
 

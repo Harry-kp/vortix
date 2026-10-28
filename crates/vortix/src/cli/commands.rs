@@ -3,6 +3,7 @@
 //! Each handler runs headlessly (no TUI), produces
 //! structured output via [`OutputMode`], and exits with semantic exit codes.
 
+use std::io::IsTerminal as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -216,20 +217,32 @@ pub(super) fn run_on(
             })
         },
         |action| eprintln!("{action}"),
+        // A person at a terminal can do what the connect waits for (sign in);
+        // a script cannot, so its `--timeout` holds.
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
     )?;
     Ok(control.snapshot())
 }
 
-pub(super) fn engine_failure_or_exit(mode: OutputMode, command: &str, message: String) -> ! {
-    let (code, exit) = if message.contains("timed out") {
+/// The JSON error code and exit code for an engine failure. A connect times
+/// out either in the CLI's wait or, usually first, at the tunnel itself.
+fn failure_code(message: &str) -> (&'static str, ExitCode) {
+    if message.contains("timed out") || message.contains("did not come up in time") {
         ("timeout", ExitCode::Timeout)
+    } else if message.contains("can run at a time") {
+        // Another network of the same kind, or its vendor's own app, holds it.
+        ("state_conflict", ExitCode::StateConflict)
     } else if message.contains("rejected the credentials") {
         ("authentication_failed", ExitCode::GeneralError)
     } else if message == "cancelled" {
         ("auth_required", ExitCode::GeneralError)
     } else {
         ("control_failed", ExitCode::GeneralError)
-    };
+    }
+}
+
+pub(super) fn engine_failure_or_exit(mode: OutputMode, command: &str, message: String) -> ! {
+    let (code, exit) = failure_code(&message);
     let message = if message == "cancelled" {
         "This profile needs saved credentials. Save them in the TUI (Auth Manager) first."
             .to_owned()
@@ -787,6 +800,34 @@ fn handle_completions(shell: clap_complete::Shell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connect that times out at the tunnel exits 6, as one that outlives
+    /// the CLI's own wait does.
+    #[test]
+    fn both_timeouts_exit_with_the_timeout_code() {
+        for message in [
+            "timed out waiting for the VPN",
+            "Could not connect 'wg08': the tunnel did not come up in time",
+        ] {
+            let (code, exit) = failure_code(message);
+            assert_eq!(
+                (code, exit as i32),
+                ("timeout", ExitCode::Timeout as i32),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            failure_code("Could not connect 'x': boom").0,
+            "control_failed"
+        );
+        let (code, exit) = failure_code(
+            "Could not connect 'b': another NetBird network is connected, and only one NetBird can run at a time: disconnect it first",
+        );
+        assert_eq!(
+            (code, exit as i32),
+            ("state_conflict", ExitCode::StateConflict as i32)
+        );
+    }
 
     #[test]
     fn a_boot_unit_refuses_what_its_format_would_reinterpret() {
