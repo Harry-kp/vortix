@@ -21,7 +21,7 @@ use crate::wireguard::ownership::TunnelOwnershipStore;
 
 use crate::netbird::NbTunnel;
 use crate::openvpn::OvpnTunnel;
-use crate::tunnel::{TunnelError, TunnelStatus};
+use crate::tunnel::TunnelError;
 use crate::wireguard::WgTunnel;
 
 const EPOCH: AuthorityEpoch = AuthorityEpoch(1);
@@ -398,14 +398,6 @@ impl TunnelKind {
             Self::WireGuard(t) => t.down(handle),
             Self::OpenVpn(t) => t.down(handle),
             Self::NetBird(t) => t.down(handle),
-        }
-    }
-
-    pub fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
-        match self {
-            Self::WireGuard(t) => t.status(handle),
-            Self::OpenVpn(t) => t.status(handle),
-            Self::NetBird(t) => t.status(handle),
         }
     }
 

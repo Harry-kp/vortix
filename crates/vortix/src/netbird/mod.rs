@@ -13,10 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::process::{CommandSpec, ManagedProcessId, PrivilegeReq};
 use crate::profile::{Profile, ProfileId};
-use crate::tunnel::{
-    TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelPeerStatus,
-    TunnelStatus,
-};
+use crate::tunnel::{TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
 
 /// `NetBird`'s own default; pinned so the kill switch can name the port.
 const WIREGUARD_PORT: u16 = 51820;
@@ -169,15 +166,12 @@ pub struct Peers {
 pub struct Peer {
     pub fqdn: String,
     pub netbird_ip: String,
-    pub public_key: String,
     pub status: String,
     pub connection_type: String,
     pub transfer_received: u64,
     pub transfer_sent: u64,
     /// Nanoseconds.
     pub latency: u64,
-    #[serde(deserialize_with = "null_as_empty")]
-    pub networks: Vec<String>,
 }
 
 /// Go encodes an empty list as `null`.
@@ -213,7 +207,6 @@ impl Status {
     fn session(&self) -> crate::control::scanner::ActiveSession {
         let peers = &self.peers.details;
         let mut details = crate::tunnel::DetailedConnectionInfo {
-            interface: crate::platform::NETBIRD_INTERFACE.into(),
             internal_ip: self.netbird_ip.clone(),
             endpoint: self
                 .management
@@ -253,27 +246,6 @@ impl Status {
             details,
             ..Default::default()
         }
-    }
-
-    fn tunnel_peers(&self, generation: u64, observed_at: SystemTime) -> Vec<TunnelPeerStatus> {
-        self.peers
-            .details
-            .iter()
-            .map(|peer| TunnelPeerStatus {
-                public_key: peer.public_key.clone(),
-                endpoint: (!peer.fqdn.is_empty()).then(|| peer.fqdn.clone()),
-                allowed_routes: std::iter::once(peer.netbird_ip.clone())
-                    .chain(peer.networks.iter().cloned())
-                    .filter(|route| !route.is_empty())
-                    .collect(),
-                latest_handshake: None,
-                evidence_observed_at: observed_at,
-                evidence_generation: generation,
-                persistent_keepalive: None,
-                bytes_rx: peer.transfer_received,
-                bytes_tx: peer.transfer_sent,
-            })
-            .collect()
     }
 }
 
@@ -412,10 +384,11 @@ impl NbTunnel {
         wait_for(socket, self.remaining()?)?;
         // A fresh daemon reports Idle, not NeedsLogin, so the key goes with
         // every connect; NetBird logs a registered peer in by its own key.
-        let key_file = match &settings.setup_key {
-            Some(key) => Some(write_key_file(state_dir, key)?),
-            None => None,
-        };
+        let key_file = settings
+            .setup_key
+            .as_deref()
+            .map(|key| write_key_file(state_dir, key))
+            .transpose()?;
         let mut args = vec![
             "up".to_string(),
             "--management-url".into(),
@@ -487,29 +460,6 @@ impl NbTunnel {
         }
         crate::process::custodian::remote_stop(&identity).map_err(|error| {
             TunnelError::Subprocess(format!("NetBird daemon did not stop: {error}"))
-        })
-    }
-
-    pub fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
-        if let Some(identity) = &handle.process_ownership {
-            let alive = crate::process::custodian::remote_status(identity)
-                .map_err(|error| TunnelError::Subprocess(format!("NetBird custody: {error}")))?;
-            if !alive {
-                return Err(TunnelError::DaemonExited(
-                    "the NetBird daemon exited".into(),
-                ));
-            }
-        }
-        let observed_at = SystemTime::now();
-        let status = status(&binary()?, &socket_path(&handle.profile_id))?;
-        let peers = status.tunnel_peers(handle.generation, observed_at);
-        Ok(TunnelStatus {
-            handle: handle.clone(),
-            bytes_rx: peers.iter().map(|peer| peer.bytes_rx).sum(),
-            bytes_tx: peers.iter().map(|peer| peer.bytes_tx).sum(),
-            last_handshake: None,
-            observed_at,
-            peers,
         })
     }
 }
@@ -745,16 +695,10 @@ mod tests {
     }"#;
 
     #[test]
-    fn status_reads_connected_daemon_and_peers() {
+    fn status_reads_a_connected_daemon() {
         let status = Status::parse(CONNECTED.as_bytes()).unwrap();
         assert!(status.connected());
         assert!(!status.needs_login());
-        let peers = status.tunnel_peers(7, SystemTime::UNIX_EPOCH);
-        assert_eq!(peers[0].endpoint.as_deref(), Some("db.netbird.cloud"));
-        assert_eq!(peers[0].allowed_routes, ["100.90.1.2", "10.0.0.0/24"]);
-        assert_eq!((peers[0].bytes_rx, peers[0].bytes_tx), (10, 20));
-        assert_eq!(peers[1].endpoint, None);
-        assert!(peers.iter().all(|peer| peer.evidence_generation == 7));
     }
 
     /// The scanner's session: one short name per peer, direct or relayed, and

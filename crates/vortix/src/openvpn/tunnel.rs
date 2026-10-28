@@ -17,9 +17,7 @@ use crate::process::ManagedProcessId;
 use crate::process::{CommandSpec, PrivilegeReq};
 use crate::profile::{unambiguous_legacy_artifact_key, Profile, ProfileId};
 use crate::tunnel::OperationId;
-use crate::tunnel::{
-    TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelStatus,
-};
+use crate::tunnel::{TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
 use tracing::{debug, info, warn};
 
 use crate::openvpn::parser::{forbidden_effective_directive, parse_ovpn_conf};
@@ -1162,27 +1160,6 @@ impl OvpnTunnel {
         }
         self.cleanup_run_artifacts(handle);
         Ok(())
-    }
-
-    pub fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
-        if let Some(identity) = handle.process_ownership.as_ref() {
-            let alive = crate::process::custodian::remote_status(identity).map_err(|error| {
-                TunnelError::Subprocess(format!("OpenVPN custody status: {error}"))
-            })?;
-            if !alive {
-                return Err(TunnelError::DaemonExited(
-                    "OpenVPN custodian reports that the owned child exited".into(),
-                ));
-            }
-        }
-        Ok(TunnelStatus {
-            handle: handle.clone(),
-            bytes_rx: 0,
-            bytes_tx: 0,
-            last_handshake: None,
-            observed_at: SystemTime::now(),
-            peers: Vec::new(),
-        })
     }
 }
 
