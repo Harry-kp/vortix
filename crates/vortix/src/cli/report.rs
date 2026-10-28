@@ -353,8 +353,8 @@ fn print_preview(info: &ReportInfo) {
     );
     println!("    config.toml: {}", info.config_toml_status);
     println!(
-        "    Profiles:    {total} ({wg} WireGuard, {ovpn} OpenVPN, {mesh} {})",
-        crate::mesh::MeshDriver::names()
+        "    Profiles:    {total} ({})",
+        super::profiles::profile_breakdown(wg, ovpn, mesh)
     );
     println!("    Kill switch: {}", info.killswitch_state);
     println!();
@@ -476,8 +476,8 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     let _ = writeln!(body, "config.toml: {}", info.config_toml_status);
     let _ = writeln!(
         body,
-        "Profiles:    {total} ({wg} WireGuard, {ovpn} OpenVPN, {mesh} {})",
-        crate::mesh::MeshDriver::names()
+        "Profiles:    {total} ({})",
+        super::profiles::profile_breakdown(wg, ovpn, mesh)
     );
     let _ = writeln!(body, "Kill switch: {}", info.killswitch_state);
     let _ = writeln!(body, "```\n");
@@ -747,7 +747,7 @@ mod tests {
         assert!(body.contains("0.1.4 (cargo install)"));
         assert!(body.contains("## Dependencies"));
         assert!(body.contains("## Config"));
-        assert!(body.contains("3 (2 WireGuard, 1 OpenVPN, 0 NetBird)"));
+        assert!(body.contains("3 (2 WireGuard, 1 OpenVPN)"));
     }
 
     #[test]

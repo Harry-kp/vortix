@@ -431,6 +431,15 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
             println!("  Protocol:  {}", profile.protocol);
             println!("  Location:  {}", profile.location);
             println!("  Config:    {}", profile.config_path.display());
+            if let crate::profile::ProtocolKind::Mesh(driver) = profile.protocol {
+                if crate::mesh::app_running(driver) {
+                    let [stop, uninstall] = crate::mesh::stop_commands(driver);
+                    println!(
+                        "\n{driver}'s own app is running, and only one {driver} can run at a time."
+                    );
+                    println!("Stop it so Vortix runs it: {stop} && {uninstall}");
+                }
+            }
         }
         OutputMode::Json => print_success(
             mode,
@@ -876,6 +885,17 @@ fn sidecar_protocol(config: &Path) -> Option<String> {
     text.lines()
         .find_map(|line| line.trim().strip_prefix("protocol = "))
         .map(|value| value.trim().trim_matches('"').to_owned())
+}
+
+/// `2 WireGuard, 1 OpenVPN`, plus mesh networks only when there are any.
+pub(crate) fn profile_breakdown(wg: u32, ovpn: u32, mesh: u32) -> String {
+    match mesh {
+        0 => format!("{wg} WireGuard, {ovpn} OpenVPN"),
+        _ => format!(
+            "{wg} WireGuard, {ovpn} OpenVPN, {mesh} {}",
+            crate::mesh::MeshDriver::names()
+        ),
+    }
 }
 
 /// `WireGuard`, `OpenVPN` and mesh-network profiles.

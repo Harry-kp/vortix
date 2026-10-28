@@ -1829,11 +1829,11 @@ pub mod import {
         for driver in crate::mesh::MeshDriver::ALL {
             text.push(Line::from(vec![
                 Span::styled(
-                    format!("  .{}", driver.slug()),
+                    format!("  {} or {}", driver.slug(), driver.app_state_dir()),
                     Style::default().fg(theme::current().success),
                 ),
                 Span::styled(
-                    format!(" → {driver}; {} moves its app", driver.app_state_dir()),
+                    format!(" → {driver}"),
                     Style::default().fg(theme::current().text_secondary),
                 ),
             ]));
@@ -1863,9 +1863,8 @@ pub mod import {
             assert!(output.contains("WireGuard"), "{output}");
             assert!(output.contains(".ovpn"), "{output}");
             assert!(output.contains("OpenVPN"), "{output}");
-            assert!(output.contains(".netbird → NetBird"), "{output}");
             assert!(
-                output.contains("/var/lib/netbird moves its app"),
+                output.contains("netbird or /var/lib/netbird → NetBird"),
                 "{output}"
             );
         }

@@ -693,8 +693,8 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
             println!("  Config dir:  {} ({source})", config_dir.display());
             println!("  Config file: {} ({config_status})", config_file.display());
             println!(
-                "  Profiles:    {total} ({wg_count} WireGuard, {ovpn_count} OpenVPN, {mesh_count} {})",
-                crate::mesh::MeshDriver::names()
+                "  Profiles:    {total} ({})",
+                super::profiles::profile_breakdown(wg_count, ovpn_count, mesh_count)
             );
             println!("  Profiles at: {}", profiles_dir.display());
             println!(
