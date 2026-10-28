@@ -21,6 +21,14 @@ into the VMs. Quit both dashboards first: an open one holds the lock and the imp
 `scripts/vpn-lab.sh down --yes` destroys it when testing is done; OpenVPN credentials must be
 saved again for each droplet (its `credentials.txt`).
 
+## NetBird
+
+The lab's test network is a NetBird Cloud account of the maintainer's (`api.netbird.io`). Its
+reusable setup key is on the lab at `~/.netbird-lab/setup-key` (`0600`); refer to it by path,
+never print or copy it. Test runs register devices there; remove offline ones in the
+dashboard (Peers) now and then. The Mac runs the maintainer's company NetBird, and a host runs
+only one NetBird daemon, so NetBird is never started on the Mac by a check.
+
 ## macOS
 
 Claude never runs `sudo` on the Mac. The user keeps a tmux session `vxrun` with two root

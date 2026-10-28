@@ -308,7 +308,11 @@ pub(crate) fn supplementary_groups_for_user(
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn install_hint(pkg: &str) -> String {
-    format!("brew install {pkg}")
+    match pkg {
+        // NetBird's own tap carries the command without the desktop app.
+        "netbird" => "brew install netbirdio/tap/netbird".to_string(),
+        _ => format!("brew install {pkg}"),
+    }
 }
 
 /// The install command for this machine's package manager.
@@ -392,6 +396,8 @@ sudo apt install wireguard-tools  # Debian/Ubuntu\n\
 sudo pacman -S wireguard-tools    # Arch\n\
 sudo dnf install wireguard-tools  # Fedora"
             .to_string(),
+        // NetBird's own installer adds its package repository.
+        "netbird" => "curl -fsSL https://pkgs.netbird.io/install.sh | sh".to_string(),
         // OpenVPN ships under its eponymous package everywhere.
         "openvpn" => "\
 sudo apt install openvpn  # Debian/Ubuntu\n\

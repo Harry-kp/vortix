@@ -168,7 +168,9 @@ sudo vortix up netbird
 ```
 
 The first connect copies the app's identity, so no setup key or login is needed. Quit and
-remove the NetBird desktop app as well. To go back, disconnect in Vortix and run
+remove the NetBird desktop app as well. On macOS the app also carries the `netbird` command
+(`/usr/local/bin/netbird` points into `NetBird.app`), so install it on its own first, with
+`brew install netbirdio/tap/netbird`, or Vortix cannot run NetBird once the app is gone. To go back, disconnect in Vortix and run
 `sudo netbird service install && sudo netbird service start`; the app's own files were not
 changed.
 

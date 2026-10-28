@@ -51,7 +51,7 @@ behaviour in the engine and one UI, written once:
 |---|---|---|
 | Config file | WireGuard `.conf`, OpenVPN `.ovpn` | Profile; import, rename, delete |
 | Provider account | Mullvad, Proton, IVPN | Account, `Server` catalog (location, load, latency), keys; one server picker, favourites, recents, connect fastest |
-| Mesh network | NetBird, Tailscale, Headscale, Netmaker | Network, `Peer` (address, direct or relayed, latency, handshake), routed networks, exit node, login (SSO link or key); one peers overlay, one networks overlay, one login step |
+| Mesh network | NetBird, Tailscale, Headscale, Netmaker | Network, `MeshPeer` (address, connected, direct or relayed, latency), `RoutedNetwork` (range or domains, in use, exit node), login (a link or a key); one overlay (`P`) for networks and peers, one login step; the daemon runs under the kill switch's transport group |
 
 A company is a **driver**: the code that turns its CLI output or API into that model and
 issues its commands, plus its name and wording in the UI. Nothing outside the driver names the
@@ -80,7 +80,7 @@ The North Star in `CLAUDE.md` is the goal; this is the path.
 | Release | Feature | What users get |
 |---|---|---|
 | — | The seam (no visible change) | One transport enum behind today's WireGuard/OpenVPN dispatch; a source on every profile |
-| 0.6 | NetBird | Add a network (SSO or setup key); connect and disconnect run by Vortix; peers (direct or relayed, latency); company networks and exit node; a kill switch that keeps it working beside other tunnels; an offer to take over NetBird's own system service |
+| 0.6 | NetBird | Add a network (setup key or login link); connect and disconnect run by Vortix; peers (direct or relayed, latency) and the networks it routes to; a kill switch that keeps it working beside other tunnels; moving from the NetBird app with the same device |
 | 0.7 | Mullvad | Add an account by its number; a server picker by country and city with latency, favourites and recents; connect fastest (imported files too); key housekeeping |
 | 0.8 | Always works | Reconnect after sleep, network changes and server address changes, for every adapter; "why can't I reach X?" (which tunnel carries an address, direct or relayed, which DNS answered) |
 | next | Another adapter | Proton, IVPN, corporate VPNs through `openconnect`, as users ask |
