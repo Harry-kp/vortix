@@ -119,17 +119,7 @@ pub fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, boo
     for profile in profiles {
         let session_info = match profile.protocol {
             ProtocolKind::WireGuard => check_wireguard_by_name(&profile.name, &wireguard_statuses),
-            ProtocolKind::NetBird => {
-                crate::netbird::running_owner(&profile.id).map(|custody| ActiveSession {
-                    details: crate::tunnel::DetailedConnectionInfo {
-                        interface: crate::platform::NETBIRD_INTERFACE.into(),
-                        interface_authoritative: true,
-                        pid: Some(custody.pid),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
-            }
+            ProtocolKind::NetBird => crate::netbird::observe(&profile.id),
             ProtocolKind::OpenVpn => {
                 let path_str = profile.config_path.to_str().unwrap_or("");
                 // Match either the exact source config argument or Vortix's

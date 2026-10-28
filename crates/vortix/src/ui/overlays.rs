@@ -518,6 +518,74 @@ pub mod action {
     }
 }
 
+pub mod peers {
+    use crate::tunnel::MeshPeer;
+    use crate::ui::{helpers::centered_rect, theme};
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Paragraph},
+        Frame,
+    };
+
+    /// One line per peer, connected first: name, address, direct or relayed, latency.
+    pub fn lines(peers: &[MeshPeer]) -> Vec<Line<'static>> {
+        let t = theme::current();
+        let mut peers = peers.to_vec();
+        peers.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
+        peers
+            .iter()
+            .map(|peer| {
+                let (mark, color, path) = match (peer.connected, peer.relayed) {
+                    (false, _) => ("○", t.text_secondary, "offline"),
+                    (true, true) => ("●", t.warning, "relayed"),
+                    (true, false) => ("●", t.success, "direct"),
+                };
+                let latency = peer
+                    .latency
+                    .map(|latency| format!("{} ms", latency.as_millis()))
+                    .unwrap_or_default();
+                Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        format!(
+                            "{:<20} {:<16} {path:<8} {latency}",
+                            crate::ui::helpers::truncate_to_width(&peer.name, 20),
+                            peer.address
+                        ),
+                        Style::default().fg(t.text_primary),
+                    ),
+                ])
+            })
+            .collect()
+    }
+
+    pub fn render(frame: &mut Frame, name: &str, peers: &[MeshPeer], scroll: u16) {
+        let area = centered_rect(85, 80, frame.area());
+        crate::ui::helpers::clear_area(frame, area);
+        let t = theme::current();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.border_focused))
+            .title(Span::styled(
+                format!(
+                    " Peers of {name} · {} ",
+                    crate::ui::helpers::peers_summary(peers)
+                ),
+                Style::default()
+                    .fg(t.border_focused)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::from(" [Esc] Close  [↑/↓] Scroll ").centered());
+        frame.render_widget(
+            Paragraph::new(lines(peers))
+                .block(block)
+                .scroll((scroll, 0)),
+            area,
+        );
+    }
+}
+
 pub mod config_viewer {
     //! Config file viewer overlay
 
@@ -915,6 +983,7 @@ pub mod help {
                 ("i", "Import profile (file, dir, URL)"),
                 ("K", "Cycle kill switch mode"),
                 ("y", "Copy VPN IP to clipboard"),
+                ("P", "Peers of a mesh network (NetBird)"),
                 ("Tab/S-Tab,l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),

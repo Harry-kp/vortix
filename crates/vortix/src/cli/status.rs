@@ -31,6 +31,7 @@ pub struct SessionStatus {
     pub internal_ip: Option<String>,
     pub download_bytes: Option<String>,
     pub upload_bytes: Option<String>,
+    pub peers: Vec<crate::tunnel::MeshPeer>,
 }
 
 /// Result of a CLI status scan.
@@ -139,6 +140,7 @@ fn session_status(
         internal_ip: nonempty(&session.details.internal_ip),
         download_bytes: nonempty(&session.details.transfer_rx),
         upload_bytes: nonempty(&session.details.transfer_tx),
+        peers: session.details.peers.clone(),
     };
     let Some(profile) = profile.filter(|profile| profile.protocol == ProtocolKind::WireGuard)
     else {
@@ -195,6 +197,17 @@ struct StatusData {
     observation_complete: bool,
 }
 
+/// One device of a mesh network.
+#[derive(Serialize)]
+struct PeerEntry {
+    name: String,
+    address: String,
+    connected: bool,
+    relayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u128>,
+}
+
 #[derive(Serialize)]
 struct StatusNetwork {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,6 +220,8 @@ struct StatusNetwork {
     download: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     upload: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    peers: Vec<PeerEntry>,
 }
 
 #[derive(Serialize)]
@@ -266,6 +281,12 @@ pub(super) fn handle_status(
                 }
                 if let Some(ul) = &session.upload_bytes {
                     println!("               ↑ {ul}");
+                }
+                if !session.peers.is_empty() {
+                    println!(
+                        "  Peers        {}",
+                        crate::ui::helpers::peers_summary(&session.peers)
+                    );
                 }
                 println!(
                     "  Kill Switch  {} ({})",
@@ -334,6 +355,17 @@ fn status_data(snap: &StatusSnapshot) -> StatusData {
             internal_ip: session.internal_ip.clone(),
             download: session.download_bytes.clone(),
             upload: session.upload_bytes.clone(),
+            peers: session
+                .peers
+                .iter()
+                .map(|peer| PeerEntry {
+                    name: peer.name.clone(),
+                    address: peer.address.clone(),
+                    connected: peer.connected,
+                    relayed: peer.relayed,
+                    latency_ms: peer.latency.map(|latency| latency.as_millis()),
+                })
+                .collect(),
         }),
         security: StatusSecurity {
             killswitch_mode: snap.killswitch_mode.cli_verb().to_string(),
@@ -532,6 +564,7 @@ mod handshake_status_tests {
             internal_ip: None,
             download_bytes: None,
             upload_bytes: None,
+            peers: Vec::new(),
         }
     }
 
@@ -578,6 +611,28 @@ mod handshake_status_tests {
         let others = other_tunnel_lines(&snap).join("\n");
         assert!(others.contains("split (OpenVPN) [utun5]"), "{others}");
         assert!(!others.contains("full"), "{others}");
+    }
+
+    /// A mesh network lists its peers; other tunnels add no `peers` key.
+    #[test]
+    fn a_mesh_network_lists_its_peers_in_json() {
+        let mut mesh = session("work", "wt0");
+        mesh.peers = vec![crate::tunnel::MeshPeer {
+            name: "db".into(),
+            address: "100.90.1.2".into(),
+            connected: true,
+            relayed: true,
+            latency: Some(std::time::Duration::from_micros(12_400)),
+        }];
+        let value = serde_json::to_value(status_data(&tunnels(vec![mesh], None))).unwrap();
+        assert_eq!(
+            value["network"]["peers"],
+            serde_json::json!([{"name": "db", "address": "100.90.1.2", "connected": true,
+                "relayed": true, "latency_ms": 12}])
+        );
+        let plain = tunnels(vec![session("split", "utun5")], None);
+        let value = serde_json::to_value(status_data(&plain)).unwrap();
+        assert!(value["network"].get("peers").is_none());
     }
 
     #[test]

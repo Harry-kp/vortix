@@ -432,6 +432,20 @@ pub struct DetailedConnectionInfo {
     /// adoption path is the narrow exception that must opt out.
     #[serde(default = "default_interface_authoritative")]
     pub interface_authoritative: bool,
+    /// The other devices of a mesh network. Empty for other tunnels.
+    #[serde(default)]
+    pub peers: Vec<MeshPeer>,
+}
+
+/// One device of a mesh network, as its client reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshPeer {
+    pub name: String,
+    pub address: String,
+    pub connected: bool,
+    /// Through a relay rather than direct.
+    pub relayed: bool,
+    pub latency: Option<Duration>,
 }
 
 fn default_interface_authoritative() -> bool {
@@ -459,6 +473,7 @@ impl Default for DetailedConnectionInfo {
             dns_request: crate::control::dns::DnsRequest::default(),
             teardown_config: None,
             interface_authoritative: true,
+            peers: Vec::new(),
         }
     }
 }

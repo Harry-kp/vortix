@@ -171,6 +171,19 @@ pub(crate) fn clear_area(frame: &mut Frame, area: Rect) {
 }
 
 /// Center a rectangle sized as a percentage of the parent area.
+/// `9/13 connected, 2 relayed`: a mesh network's peers in one line.
+pub(crate) fn peers_summary(peers: &[crate::tunnel::MeshPeer]) -> String {
+    let connected = peers.iter().filter(|peer| peer.connected).count();
+    let relayed = peers
+        .iter()
+        .filter(|peer| peer.connected && peer.relayed)
+        .count();
+    match relayed {
+        0 => format!("{connected}/{} connected", peers.len()),
+        _ => format!("{connected}/{} connected, {relayed} relayed", peers.len()),
+    }
+}
+
 pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::vertical([Constraint::Percentage(percent_y)]).flex(Flex::Center);
     let horizontal = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center);

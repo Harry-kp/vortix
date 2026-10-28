@@ -231,6 +231,27 @@ impl App {
         }
     }
 
+    /// List the peers of the focused mesh network.
+    pub(crate) fn open_peers(&mut self) {
+        let Some(profile_id) = self.selected_profile_id() else {
+            return;
+        };
+        if self
+            .tunnel(&profile_id)
+            .is_some_and(|tunnel| !tunnel.details.peers.is_empty())
+        {
+            self.input_mode = InputMode::Peers {
+                profile_id,
+                scroll: 0,
+            };
+        } else {
+            self.show_toast(
+                "No peers: only a connected mesh network such as NetBird has them".into(),
+                ToastType::Info,
+            );
+        }
+    }
+
     /// Open what a connect waits for the user to do, and close it once the
     /// connect no longer waits.
     fn show_action(&mut self, snapshot: &Snapshot) {

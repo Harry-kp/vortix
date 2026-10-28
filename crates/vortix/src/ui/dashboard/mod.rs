@@ -245,6 +245,13 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             confirm_selected,
         } => render_disconnect_all_confirm(frame, *count, *confirm_selected),
         InputMode::Action { text, .. } => super::overlays::action::render(frame, text),
+        InputMode::Peers { profile_id, scroll } => {
+            let peers = app
+                .tunnel(profile_id)
+                .map(|tunnel| (tunnel.name.clone(), tunnel.details.peers.clone()))
+                .unwrap_or_default();
+            super::overlays::peers::render(frame, &peers.0, &peers.1, *scroll);
+        }
         InputMode::WhatsNew { from, scroll } => {
             super::overlays::whats_new::render(frame, from, *scroll);
         }
@@ -470,6 +477,40 @@ mod overlay_tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    /// Connected peers first, each with its path; the title sums them up.
+    #[test]
+    fn peers_list_connected_first_with_their_path() {
+        let mut app = App::new_test();
+        let peer = |name: &str, connected, relayed| crate::tunnel::MeshPeer {
+            name: name.into(),
+            address: format!("100.90.0.{}", name.len()),
+            connected,
+            relayed,
+            latency: connected.then(|| std::time::Duration::from_millis(7)),
+        };
+        let peers = vec![
+            peer("asleep", false, false),
+            peer("db", true, true),
+            peer("ci", true, false),
+        ];
+        let lines: Vec<String> = crate::ui::overlays::peers::lines(&peers)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            lines[0].starts_with("● ci ")
+                && lines[0].contains("direct")
+                && lines[0].ends_with("7 ms")
+        );
+        assert!(lines[1].starts_with("● db ") && lines[1].contains("relayed"));
+        assert!(lines[2].starts_with("○ asleep ") && lines[2].contains("offline"));
+        app.input_mode = InputMode::Peers {
+            profile_id: crate::profile::ProfileId::new("none"),
+            scroll: 0,
+        };
+        assert!(render(&mut app).contains("Peers of"));
     }
 
     /// The whole link fits on screen at 80 columns, with no side border in it.

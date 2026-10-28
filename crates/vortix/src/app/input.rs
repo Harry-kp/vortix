@@ -346,6 +346,21 @@ impl App {
                     }
                 }
             },
+            InputMode::Peers {
+                profile_id,
+                mut scroll,
+            } => {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
+                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'P') => {
+                        self.input_mode = InputMode::Normal;
+                        return;
+                    }
+                    _ => {}
+                }
+                self.input_mode = InputMode::Peers { profile_id, scroll };
+            }
             InputMode::Action { text, .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.hidden_action = Some(text);
@@ -791,6 +806,7 @@ impl crate::app::App {
             }
             KeyCode::Char('i') => self.handle_message(Message::OpenImport),
             KeyCode::Char('y') => self.handle_message(Message::CopyIp),
+            KeyCode::Char('P') => self.open_peers(),
 
             KeyCode::F(1) => self.handle_message(Message::FocusPanel(FocusedPanel::Sidebar)),
             KeyCode::F(2) => {

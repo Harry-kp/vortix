@@ -145,6 +145,7 @@ pub fn profile_from_app(dir: &Path) -> Result<String, String> {
 #[serde(rename_all = "camelCase", default)]
 pub struct Status {
     pub daemon_status: String,
+    pub netbird_ip: String,
     pub management: Server,
     pub peers: Peers,
 }
@@ -152,6 +153,7 @@ pub struct Status {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Server {
+    pub url: String,
     pub error: String,
 }
 
@@ -168,8 +170,12 @@ pub struct Peer {
     pub fqdn: String,
     pub netbird_ip: String,
     pub public_key: String,
+    pub status: String,
+    pub connection_type: String,
     pub transfer_received: u64,
     pub transfer_sent: u64,
+    /// Nanoseconds.
+    pub latency: u64,
     #[serde(deserialize_with = "null_as_empty")]
     pub networks: Vec<String>,
 }
@@ -201,6 +207,52 @@ impl Status {
             self.daemon_status.as_str(),
             "NeedsLogin" | "LoginFailed" | "SessionExpired"
         )
+    }
+
+    /// The session the scanner reports for a running network.
+    fn session(&self) -> crate::control::scanner::ActiveSession {
+        let peers = &self.peers.details;
+        let mut details = crate::tunnel::DetailedConnectionInfo {
+            interface: crate::platform::NETBIRD_INTERFACE.into(),
+            internal_ip: self.netbird_ip.clone(),
+            endpoint: self
+                .management
+                .url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .to_string(),
+            transfer_rx: peers
+                .iter()
+                .map(|peer| peer.transfer_received)
+                .sum::<u64>()
+                .to_string(),
+            transfer_tx: peers
+                .iter()
+                .map(|peer| peer.transfer_sent)
+                .sum::<u64>()
+                .to_string(),
+            ..Default::default()
+        };
+        details.peers = peers
+            .iter()
+            .map(|peer| crate::tunnel::MeshPeer {
+                name: peer
+                    .fqdn
+                    .split('.')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&peer.netbird_ip)
+                    .to_string(),
+                address: peer.netbird_ip.clone(),
+                connected: peer.status == "Connected",
+                relayed: peer.connection_type == "Relayed",
+                latency: (peer.latency > 0).then(|| Duration::from_nanos(peer.latency)),
+            })
+            .collect();
+        crate::control::scanner::ActiveSession {
+            details,
+            ..Default::default()
+        }
     }
 
     fn tunnel_peers(&self, generation: u64, observed_at: SystemTime) -> Vec<TunnelPeerStatus> {
@@ -462,6 +514,21 @@ impl NbTunnel {
     }
 }
 
+/// A running network as the scanner reports it. Without its status (a reader
+/// that is not root cannot ask the daemon) the session still shows, unfilled.
+#[must_use]
+pub fn observe(profile_id: &ProfileId) -> Option<crate::control::scanner::ActiveSession> {
+    let custody = running_owner(profile_id)?;
+    let mut session = binary()
+        .and_then(|binary| status(&binary, &socket_path(profile_id)))
+        .map(|status| status.session())
+        .unwrap_or_default();
+    session.details.interface = crate::platform::NETBIRD_INTERFACE.into();
+    session.details.interface_authoritative = true;
+    session.details.pid = Some(custody.pid);
+    Some(session)
+}
+
 /// The custodian's receipt for a daemon Vortix started earlier, if it is still
 /// running.
 #[must_use]
@@ -651,6 +718,29 @@ mod tests {
         assert_eq!((peers[0].bytes_rx, peers[0].bytes_tx), (10, 20));
         assert_eq!(peers[1].endpoint, None);
         assert!(peers.iter().all(|peer| peer.evidence_generation == 7));
+    }
+
+    /// The scanner's session: one short name per peer, direct or relayed, and
+    /// the management server as the tunnel's server.
+    #[test]
+    fn status_becomes_the_scanned_session() {
+        let session = Status::parse(CONNECTED.as_bytes()).unwrap().session();
+        let details = &session.details;
+        assert_eq!(details.internal_ip, "100.90.1.1/16");
+        assert_eq!(details.endpoint, "api.netbird.io:443");
+        assert_eq!(
+            (details.transfer_rx.as_str(), details.transfer_tx.as_str()),
+            ("10", "20")
+        );
+        assert_eq!(details.peers[0].name, "db");
+        assert!(details.peers[0].connected && !details.peers[0].relayed);
+        assert_eq!(details.peers[0].latency, Some(Duration::from_millis(3)));
+        assert_eq!(details.peers[1].name, "100.90.1.3");
+        assert!(!details.peers[1].connected);
+        assert_eq!(
+            crate::ui::helpers::peers_summary(&details.peers),
+            "1/2 connected"
+        );
     }
 
     #[test]

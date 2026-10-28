@@ -286,6 +286,13 @@ fn render_connected(
             theme::current().text_primary,
         ),
     ];
+    if !details.peers.is_empty() {
+        text.push(helpers::detail_row(
+            "Peers   : ",
+            helpers::peers_summary(&details.peers),
+            theme::current().text_primary,
+        ));
+    }
 
     // `Exit` reflects the ASN/location of the public IPv4 returned by
     // ipinfo.io, which only describes the egress path that the PRIMARY
