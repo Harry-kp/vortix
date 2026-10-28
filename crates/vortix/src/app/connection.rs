@@ -236,10 +236,9 @@ impl App {
         let Some(profile_id) = self.selected_profile_id() else {
             return;
         };
-        if self
-            .tunnel(&profile_id)
-            .is_some_and(|tunnel| !tunnel.details.peers.is_empty())
-        {
+        if self.tunnel(&profile_id).is_some_and(|tunnel| {
+            !tunnel.details.peers.is_empty() || !tunnel.details.networks.is_empty()
+        }) {
             self.input_mode = InputMode::Peers {
                 profile_id,
                 scroll: 0,

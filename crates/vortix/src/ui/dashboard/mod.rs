@@ -246,11 +246,15 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
         } => render_disconnect_all_confirm(frame, *count, *confirm_selected),
         InputMode::Action { text, .. } => super::overlays::action::render(frame, text),
         InputMode::Peers { profile_id, scroll } => {
-            let peers = app
-                .tunnel(profile_id)
-                .map(|tunnel| (tunnel.name.clone(), tunnel.details.peers.clone()))
-                .unwrap_or_default();
-            super::overlays::peers::render(frame, &peers.0, &peers.1, *scroll);
+            if let Some(tunnel) = app.tunnel(profile_id) {
+                super::overlays::peers::render(
+                    frame,
+                    &tunnel.name,
+                    &tunnel.details.networks,
+                    &tunnel.details.peers,
+                    *scroll,
+                );
+            }
         }
         InputMode::WhatsNew { from, scroll } => {
             super::overlays::whats_new::render(frame, from, *scroll);
@@ -482,7 +486,6 @@ mod overlay_tests {
     /// Connected peers first, each with its path; the title sums them up.
     #[test]
     fn peers_list_connected_first_with_their_path() {
-        let mut app = App::new_test();
         let peer = |name: &str, connected, relayed| crate::tunnel::MeshPeer {
             name: name.into(),
             address: format!("100.90.0.{}", name.len()),
@@ -506,11 +509,16 @@ mod overlay_tests {
         );
         assert!(lines[1].starts_with("● db ") && lines[1].contains("relayed"));
         assert!(lines[2].starts_with("○ asleep ") && lines[2].contains("offline"));
-        app.input_mode = InputMode::Peers {
-            profile_id: crate::profile::ProfileId::new("none"),
-            scroll: 0,
-        };
-        assert!(render(&mut app).contains("Peers of"));
+        let networks = vec![crate::tunnel::RoutedNetwork {
+            name: "exit".into(),
+            range: "0.0.0.0/0".into(),
+            selected: true,
+        }];
+        let lines: Vec<String> = crate::ui::overlays::peers::network_lines(&networks)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(lines[0].starts_with("● exit ") && lines[0].ends_with("0.0.0.0/0  exit node"));
     }
 
     /// The whole link fits on screen at 80 columns, with no side border in it.

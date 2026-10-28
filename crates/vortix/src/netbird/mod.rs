@@ -519,14 +519,51 @@ impl NbTunnel {
 #[must_use]
 pub fn observe(profile_id: &ProfileId) -> Option<crate::control::scanner::ActiveSession> {
     let custody = running_owner(profile_id)?;
-    let mut session = binary()
-        .and_then(|binary| status(&binary, &socket_path(profile_id)))
+    let socket = socket_path(profile_id);
+    let binary = binary().ok();
+    let mut session = binary
+        .as_ref()
+        .and_then(|binary| status(binary, &socket).ok())
         .map(|status| status.session())
         .unwrap_or_default();
+    if let Some(binary) = &binary {
+        let mut list = command(binary, &socket, ["networks", "list"]);
+        list.timeout = Some(Duration::from_secs(10));
+        if let Some(listed) = crate::process::run(list)
+            .ok()
+            .filter(crate::process::CommandOutcome::success)
+        {
+            session.details.networks = parse_networks(&listed.stdout_lossy());
+        }
+    }
     session.details.interface = crate::platform::NETBIRD_INTERFACE.into();
     session.details.interface_authoritative = true;
     session.details.pid = Some(custody.pid);
     Some(session)
+}
+
+/// `netbird networks list` has no JSON: blocks of `- ID:`, then `Network:` or
+/// `Domains:`, then `Status:`.
+fn parse_networks(text: &str) -> Vec<crate::tunnel::RoutedNetwork> {
+    let mut networks: Vec<crate::tunnel::RoutedNetwork> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix("- ID: ") {
+            networks.push(crate::tunnel::RoutedNetwork {
+                name: name.to_string(),
+                ..Default::default()
+            });
+        } else if let Some(network) = networks.last_mut() {
+            if let Some(range) = line
+                .strip_prefix("Network: ")
+                .or_else(|| line.strip_prefix("Domains: "))
+            {
+                network.range = range.to_string();
+            } else if let Some(status) = line.strip_prefix("Status: ") {
+                network.selected = status == "Selected";
+            }
+        }
+    }
+    networks
 }
 
 /// The custodian's receipt for a daemon Vortix started earlier, if it is still
@@ -741,6 +778,21 @@ mod tests {
             crate::ui::helpers::peers_summary(&details.peers),
             "1/2 connected"
         );
+    }
+
+    #[test]
+    fn networks_are_read_from_the_plain_list() {
+        let text = "Available Networks:\n\n  - ID: office\n    Network: 10.20.0.0/16\n    Status: Selected\n\n  - ID: exit\n    Network: 0.0.0.0/0\n    Status: Not Selected\n\n  - ID: wiki\n    Domains: wiki.corp.example, git.corp.example\n    Status: Selected\n    Resolved IPs:\n      [wiki.corp.example]: 10.1.1.1\n";
+        let networks = parse_networks(text);
+        assert_eq!(networks.len(), 3);
+        assert_eq!(
+            (networks[0].name.as_str(), networks[0].range.as_str()),
+            ("office", "10.20.0.0/16")
+        );
+        assert!(networks[0].selected && !networks[0].is_exit_node());
+        assert!(!networks[1].selected && networks[1].is_exit_node());
+        assert_eq!(networks[2].range, "wiki.corp.example, git.corp.example");
+        assert!(parse_networks("No networks available.").is_empty());
     }
 
     #[test]

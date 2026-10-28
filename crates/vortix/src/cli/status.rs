@@ -32,6 +32,7 @@ pub struct SessionStatus {
     pub download_bytes: Option<String>,
     pub upload_bytes: Option<String>,
     pub peers: Vec<crate::tunnel::MeshPeer>,
+    pub networks: Vec<crate::tunnel::RoutedNetwork>,
 }
 
 /// Result of a CLI status scan.
@@ -141,6 +142,7 @@ fn session_status(
         download_bytes: nonempty(&session.details.transfer_rx),
         upload_bytes: nonempty(&session.details.transfer_tx),
         peers: session.details.peers.clone(),
+        networks: session.details.networks.clone(),
     };
     let Some(profile) = profile.filter(|profile| profile.protocol == ProtocolKind::WireGuard)
     else {
@@ -222,6 +224,8 @@ struct StatusNetwork {
     upload: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     peers: Vec<PeerEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    networks: Vec<crate::tunnel::RoutedNetwork>,
 }
 
 #[derive(Serialize)]
@@ -366,6 +370,7 @@ fn status_data(snap: &StatusSnapshot) -> StatusData {
                     latency_ms: peer.latency.map(|latency| latency.as_millis()),
                 })
                 .collect(),
+            networks: session.networks.clone(),
         }),
         security: StatusSecurity {
             killswitch_mode: snap.killswitch_mode.cli_verb().to_string(),
@@ -565,6 +570,7 @@ mod handshake_status_tests {
             download_bytes: None,
             upload_bytes: None,
             peers: Vec::new(),
+            networks: Vec::new(),
         }
     }
 

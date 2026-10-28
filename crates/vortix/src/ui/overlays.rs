@@ -519,7 +519,7 @@ pub mod action {
 }
 
 pub mod peers {
-    use crate::tunnel::MeshPeer;
+    use crate::tunnel::{MeshPeer, RoutedNetwork};
     use crate::ui::{helpers::centered_rect, theme};
     use ratatui::{
         style::{Modifier, Style},
@@ -560,7 +560,44 @@ pub mod peers {
             .collect()
     }
 
-    pub fn render(frame: &mut Frame, name: &str, peers: &[MeshPeer], scroll: u16) {
+    /// Routed networks first: ● in use, ○ not, and which one is an exit node.
+    pub fn network_lines(networks: &[RoutedNetwork]) -> Vec<Line<'static>> {
+        let t = theme::current();
+        networks
+            .iter()
+            .map(|network| {
+                let (mark, color) = if network.selected {
+                    ("●", t.success)
+                } else {
+                    ("○", t.text_secondary)
+                };
+                let exit = if network.is_exit_node() {
+                    "  exit node"
+                } else {
+                    ""
+                };
+                Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        format!(
+                            "{:<20} {}{exit}",
+                            crate::ui::helpers::truncate_to_width(&network.name, 20),
+                            network.range
+                        ),
+                        Style::default().fg(t.text_primary),
+                    ),
+                ])
+            })
+            .collect()
+    }
+
+    pub fn render(
+        frame: &mut Frame,
+        name: &str,
+        networks: &[RoutedNetwork],
+        peers: &[MeshPeer],
+        scroll: u16,
+    ) {
         let area = centered_rect(85, 80, frame.area());
         crate::ui::helpers::clear_area(frame, area);
         let t = theme::current();
@@ -577,12 +614,23 @@ pub mod peers {
                     .add_modifier(Modifier::BOLD),
             ))
             .title_bottom(Line::from(" [Esc] Close  [↑/↓] Scroll ").centered());
-        frame.render_widget(
-            Paragraph::new(lines(peers))
-                .block(block)
-                .scroll((scroll, 0)),
-            area,
-        );
+        let heading = |text: &'static str| {
+            Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(t.text_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        };
+        let mut text = Vec::new();
+        if !networks.is_empty() {
+            text.push(heading("Networks"));
+            text.extend(network_lines(networks));
+            text.push(Line::from(""));
+            text.push(heading("Peers"));
+        }
+        text.extend(lines(peers));
+        frame.render_widget(Paragraph::new(text).block(block).scroll((scroll, 0)), area);
     }
 }
 
@@ -983,7 +1031,7 @@ pub mod help {
                 ("i", "Import profile (file, dir, URL)"),
                 ("K", "Cycle kill switch mode"),
                 ("y", "Copy VPN IP to clipboard"),
-                ("P", "Peers of a mesh network (NetBird)"),
+                ("P", "Networks and peers of a mesh network"),
                 ("Tab/S-Tab,l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),

@@ -30,7 +30,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `D` | Sidebar focused: disconnect every tunnel (asks `y`/`n` when two or more are up). Elsewhere: disconnect |
 | `r` | Sidebar focused: reconnect the focused profile, or connect it if it is down. Elsewhere: reconnect |
 | `y` | Copy the VPN IP through the terminal (works over SSH) |
-| `P` | Peers of the focused mesh network (NetBird): connected first, direct or relayed, latency |
+| `P` | Networks and peers of the focused mesh network (NetBird) |
 | `i` | Import a file, directory or URL |
 | `K` | Cycle the kill-switch mode |
 | `j` `k` / `↓` `↑`, `g` `G`, `PgUp` `PgDn` | Move through the list |
@@ -152,8 +152,11 @@ dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`) work the same. Vortix runs 
 own client (`netbird`, which must be installed) with this network's identity in
 `/var/lib/vortix/netbird/`, separate from the NetBird app's. NetBird sets up its own routes and DNS on
 `wt0` (macOS: `utun100`). One NetBird network can be up at a time. Connection Details shows how
-many peers are connected, `P` lists them, and `status --json` adds them under `network.peers`
-(`name`, `address`, `connected`, `relayed`, `latency_ms`).
+many peers are connected. `P` lists the networks it routes to (in use or not, and which is an
+exit node), then the peers. `status --json` adds them under `network.networks` (`name`,
+`range`, `selected`) and `network.peers` (`name`, `address`, `connected`, `relayed`,
+`latency_ms`). Choosing networks and the exit node stays in NetBird's dashboard or
+`netbird networks select`.
 
 To move from the NetBird app, keeping the same device, address and login:
 

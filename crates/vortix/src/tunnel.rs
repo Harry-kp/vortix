@@ -435,6 +435,25 @@ pub struct DetailedConnectionInfo {
     /// The other devices of a mesh network. Empty for other tunnels.
     #[serde(default)]
     pub peers: Vec<MeshPeer>,
+    /// Networks a mesh network routes to, and whether each is in use.
+    #[serde(default)]
+    pub networks: Vec<RoutedNetwork>,
+}
+
+/// A network (an address range, or domains) a mesh network routes to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutedNetwork {
+    pub name: String,
+    pub range: String,
+    pub selected: bool,
+}
+
+impl RoutedNetwork {
+    /// Routes all traffic: an exit node.
+    #[must_use]
+    pub fn is_exit_node(&self) -> bool {
+        matches!(self.range.as_str(), "0.0.0.0/0" | "::/0")
+    }
 }
 
 /// One device of a mesh network, as its client reports it.
@@ -474,6 +493,7 @@ impl Default for DetailedConnectionInfo {
             teardown_config: None,
             interface_authoritative: true,
             peers: Vec::new(),
+            networks: Vec::new(),
         }
     }
 }
