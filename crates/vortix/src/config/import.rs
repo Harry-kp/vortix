@@ -64,7 +64,13 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
     // 3. Check file existence and type; a mesh vendor's name adds its network.
     if !path.exists() {
         if let Some((driver, profile)) = crate::mesh::profile_from_words(input) {
-            return stage_mesh_profile(driver, &profile?).map(ImportTarget::File);
+            let profile = profile?;
+            if let Some(existing) = joined_already(driver, &profile) {
+                return Err(format!(
+                    "'{existing}' already joins this {driver} network; connect it with: sudo vortix up {existing}"
+                ));
+            }
+            return stage_mesh_profile(driver, &profile).map(ImportTarget::File);
         }
         return Err(format!("Path not found: {input}"));
     }
@@ -79,6 +85,31 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
     } else {
         Err("Invalid path type (not a file or directory)".to_string())
     }
+}
+
+/// The existing profile for the same mesh network, so adding it again does
+/// not leave two that cannot both run.
+fn joined_already(driver: crate::mesh::MeshDriver, profile: &str) -> Option<String> {
+    let server = |text: &str| {
+        crate::mesh::MeshProfile::parse(text).ok().map(|profile| {
+            profile
+                .server_url
+                .trim_end_matches('/')
+                .to_ascii_lowercase()
+        })
+    };
+    let wanted = server(profile)?;
+    crate::config::profiles::load_profiles()
+        .into_iter()
+        .filter(|existing| existing.protocol == crate::profile::ProtocolKind::Mesh(driver))
+        .find(|existing| {
+            std::fs::read_to_string(&existing.config_path)
+                .ok()
+                .and_then(|text| server(&text))
+                .as_ref()
+                == Some(&wanted)
+        })
+        .map(|existing| existing.name)
 }
 
 /// Stage the profile that takes over a mesh vendor app's network.

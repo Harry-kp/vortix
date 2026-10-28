@@ -146,9 +146,15 @@ pub fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, boo
         }
     }
 
+    // A mesh daemon's supervision record is root's: without root a running
+    // network looks absent, which must read as unknown, not disconnected.
+    let mesh_observation_complete = crate::platform::is_root()
+        || !profiles
+            .iter()
+            .any(|profile| matches!(profile.protocol, ProtocolKind::Mesh(_)));
     (
         active,
-        wireguard_observation_complete && openvpn_observation_complete,
+        wireguard_observation_complete && openvpn_observation_complete && mesh_observation_complete,
     )
 }
 
@@ -578,6 +584,28 @@ fn parse_ps_etime(etime: &str) -> Option<std::time::Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without root a running mesh network cannot be seen, so a scan that
+    /// includes one is incomplete: unknown, never "disconnected".
+    #[test]
+    fn a_mesh_network_is_unknown_without_root() {
+        if crate::platform::is_root() {
+            return;
+        }
+        let profile = VpnProfile {
+            id: crate::profile::ProfileId::new("e".repeat(64)),
+            name: "office".into(),
+            protocol: ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird),
+            location: String::new(),
+            config_path: PathBuf::from("/nonexistent/office.netbird"),
+            last_used: None,
+            group: None,
+        };
+        let (sessions, complete) = scan_active_profiles(&[profile]);
+        assert!(sessions.is_empty());
+        assert!(!complete);
+        assert!(scan_active_profiles(&[]).1);
+    }
 
     use std::time::Duration;
 

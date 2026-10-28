@@ -52,7 +52,7 @@ pub struct StatusSnapshot {
 /// Printed instead of "Disconnected" when nothing was seen but the scan was
 /// incomplete: an unprivileged `status` cannot see `WireGuard` tunnels.
 const UNKNOWN_HEADLINE: &str =
-    "? Tunnel state unknown: WireGuard tunnels are only visible to root. Run: sudo vortix status";
+    "? Tunnel state unknown: VPN tunnels are only visible to root. Run: sudo vortix status";
 
 impl StatusSnapshot {
     /// Nothing seen, but the scan could not see everything.

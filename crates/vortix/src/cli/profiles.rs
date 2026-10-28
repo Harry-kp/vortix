@@ -439,6 +439,19 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
                     );
                     println!("Stop it so Vortix runs it: {stop} && {uninstall}");
                 }
+                let signs_in = std::fs::read_to_string(&profile.config_path)
+                    .ok()
+                    .and_then(|text| crate::mesh::MeshProfile::parse(&text).ok())
+                    .is_some_and(|mesh| mesh.auth_key.is_none() && mesh.identity.is_none());
+                println!(
+                    "\nNext: sudo vortix up {}{}",
+                    profile.name,
+                    if signs_in {
+                        "  (it shows a link to sign in)"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
         OutputMode::Json => print_success(

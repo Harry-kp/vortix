@@ -91,6 +91,7 @@ pub enum Commands {
     ///     sudo vortix up vpn-b --yes            Replace a conflicting tunnel
     ///     sudo vortix up                        Reconnect to last used profile
     #[command(visible_alias = "connect")]
+    #[command(verbatim_doc_comment)]
     Up {
         /// Profile name to connect to (omit to reconnect to last used)
         #[arg(value_hint = ValueHint::Other)]
@@ -125,6 +126,7 @@ pub enum Commands {
     ///     sudo vortix down --all        Explicit "all" (script clarity)
     ///     sudo vortix down --json       Disconnect with JSON result
     #[command(visible_alias = "disconnect")]
+    #[command(verbatim_doc_comment)]
     Down {
         /// Profile to disconnect. Omit (or use --all) to disconnect every
         /// active tunnel.
@@ -153,6 +155,7 @@ pub enum Commands {
     ///     sudo vortix reconnect            Cycle every active tunnel
     ///     sudo vortix reconnect personal   Cycle only 'personal'
     ///     sudo vortix reconnect --json     Reconnect with JSON result
+    #[command(verbatim_doc_comment)]
     Reconnect {
         /// Profile to cycle. Omit to cycle every currently-Connected
         /// tunnel.
@@ -177,6 +180,7 @@ pub enum Commands {
     ///     vortix status --brief                  One-line summary
     ///     vortix status --watch                  Live updates every 2s
     ///     vortix status --watch --json           NDJSON stream for monitoring
+    #[command(verbatim_doc_comment)]
     Status {
         /// Continuously update (streams NDJSON in --json mode)
         #[arg(short, long)]
@@ -203,6 +207,7 @@ pub enum Commands {
     ///     vortix list --names-only              Profile names for scripting
     ///     vortix list --json | jq '.data[].name' Extract names via jq
     #[command(visible_alias = "ls")]
+    #[command(verbatim_doc_comment)]
     List {
         /// Sort by: name, protocol, last-used [default: name]
         #[arg(short, long, value_name = "FIELD")]
@@ -223,15 +228,20 @@ pub enum Commands {
 
     /// Import VPN profile(s) from a file, directory, or URL
     ///
-    /// Supports `.conf` (`WireGuard`), `.ovpn` (`OpenVPN`), `.netbird` (a `NetBird` mesh network), directories for bulk import,
-    /// and http/https URLs for remote config download.
+    /// Supports `.conf` (`WireGuard`), `.ovpn` (`OpenVPN`), `.netbird` (`NetBird`), directories
+    /// for bulk import, and http/https URLs for remote config download. For `NetBird`, `netbird`
+    /// adds a network that signs in on first connect, and `/var/lib/netbird` moves the `NetBird`
+    /// app's network here.
     ///
     /// EXAMPLES:
     ///     vortix import ./work.conf             Import a `WireGuard` profile
     ///     vortix import ./configs/              Bulk import from directory
     ///     vortix import <https://example.com/vpn.conf>
+    ///     sudo vortix import netbird            Join `NetBird` (or `netbird <server URL>`)
+    ///     sudo vortix import /var/lib/netbird   Move from the `NetBird` app
+    #[command(verbatim_doc_comment)]
     Import {
-        /// Path to `.conf`/`.ovpn`/`.netbird` file, directory, or URL
+        /// Path to a `.conf`/`.ovpn`/`.netbird` file, directory or URL, or `netbird`
         #[arg(value_hint = ValueHint::AnyPath)]
         file: String,
     },
@@ -244,6 +254,7 @@ pub enum Commands {
     ///     vortix show work-vpn                  Parsed config with masked secrets
     ///     vortix show work-vpn --raw            Raw `.conf`/`.ovpn` file contents
     ///     vortix show work-vpn --json           Parsed config as JSON
+    #[command(verbatim_doc_comment)]
     Show {
         /// Profile name
         #[arg(value_hint = ValueHint::Other)]
@@ -264,6 +275,7 @@ pub enum Commands {
     ///     vortix delete old-vpn --yes           Delete without prompting
     ///     vortix delete old-vpn --json          JSON result
     #[command(visible_alias = "rm")]
+    #[command(verbatim_doc_comment)]
     Delete {
         /// Profile name to delete
         #[arg(value_hint = ValueHint::Other)]
@@ -279,6 +291,7 @@ pub enum Commands {
     /// EXAMPLES:
     ///     vortix rename old-vpn new-vpn
     #[command(visible_alias = "mv")]
+    #[command(verbatim_doc_comment)]
     Rename {
         /// Current profile name
         old: String,
@@ -308,6 +321,7 @@ pub enum Commands {
     ///     sudo vortix killswitch vpn-only              Always engaged
     ///     vortix killswitch --json                     JSON with mode and state
     #[command(name = "killswitch")]
+    #[command(verbatim_doc_comment)]
     KillSwitch {
         /// Target mode: off, block-on-drop, vpn-only (omit to show current)
         mode: Option<String>,
@@ -320,6 +334,7 @@ pub enum Commands {
     /// EXAMPLES:
     ///     sudo vortix release-killswitch
     #[command(name = "release-killswitch", alias = "release-kill-switch")]
+    #[command(verbatim_doc_comment)]
     ReleaseKillSwitch,
 
     /// Connect a profile when the computer starts
@@ -334,6 +349,7 @@ pub enum Commands {
     ///     vortix autoconnect                   Show the current setting
     ///     sudo vortix autoconnect work-vpn     Connect 'work-vpn' at boot
     ///     sudo vortix autoconnect off          Stop connecting at boot
+    #[command(verbatim_doc_comment)]
     Autoconnect {
         /// Profile to connect at boot, or `off` (omit to show the current setting)
         #[arg(value_hint = ValueHint::Other)]
@@ -345,18 +361,21 @@ pub enum Commands {
     /// EXAMPLES:
     ///     vortix info
     ///     vortix info --json
+    #[command(verbatim_doc_comment)]
     Info,
 
     /// Update a `cargo install` of vortix to the latest version from crates.io
     ///
     /// EXAMPLES:
     ///     vortix update
+    #[command(verbatim_doc_comment)]
     Update,
 
     /// Generate a pre-filled bug report with system diagnostics
     ///
     /// EXAMPLES:
     ///     vortix report
+    #[command(verbatim_doc_comment)]
     Report,
 
     /// Audit open sockets and which interface routes them
@@ -371,6 +390,7 @@ pub enum Commands {
     ///     vortix audit --json                   Structured JSON envelope
     ///     vortix audit --pid 12345              Filter to one process
     ///     vortix audit --vpn-only               Only sockets on the tunnel interface
+    #[command(verbatim_doc_comment)]
     Audit {
         /// Filter results to a single PID.
         #[arg(long)]
@@ -387,6 +407,7 @@ pub enum Commands {
     ///     vortix completions bash > ~/.local/share/bash-completion/completions/vortix
     ///     vortix completions zsh > ~/.zfunc/_vortix
     ///     vortix completions fish > ~/.config/fish/completions/vortix.fish
+    #[command(verbatim_doc_comment)]
     Completions {
         /// Target shell: bash, zsh, fish, powershell
         shell: clap_complete::Shell,
