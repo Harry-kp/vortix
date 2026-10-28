@@ -743,7 +743,9 @@ impl App {
     }
 
     fn apply_public_ipv4(&mut self, ip: String) {
-        let is_connected = self.has_active_connection();
+        // Only a tunnel that carries the internet should change the public
+        // address; a split tunnel or a mesh network keeping it is expected.
+        let carries_internet = self.primary_id().is_some();
         let old_ip = self.runtime.public_ip.clone();
 
         if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
@@ -771,7 +773,7 @@ impl App {
             self.runtime.ip_unchanged_warned = false;
             self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
         }
-        if is_connected
+        if carries_internet
             && self.runtime.real_ip.as_deref() == Some(ip.as_str())
             && !self.runtime.ip_unchanged_warned
         {

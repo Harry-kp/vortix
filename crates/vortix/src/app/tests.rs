@@ -1226,6 +1226,11 @@ fn public_ip_matching_pre_vpn_ip_reports_a_leak() {
     use crate::telemetry::TelemetryUpdate;
     let mut app = test_app();
     set_connected(&mut app, "test");
+    // The tunnel carries the internet, so the public address must change.
+    let mut snapshot = (*app.control_snapshot).clone();
+    snapshot.primary = Some(crate::profile::ProfileId::new("test"));
+    snapshot.version += 1;
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
     app.runtime.real_ip = Some("1.2.3.4".to_string());
     app.runtime.public_ip = "5.6.7.8".to_string();
 
@@ -2693,4 +2698,41 @@ fn a_connect_waiting_for_a_login_shows_the_link_until_it_is_done() {
         matches!(app.input_mode, InputMode::Action { .. }),
         "a new link shows again"
     );
+}
+
+/// The public address only has to change when a tunnel carries the internet.
+/// With a split tunnel or a mesh network alone it stays, and warning "possible
+/// leak" then was a false alarm on every connect.
+#[test]
+fn only_an_internet_tunnel_is_expected_to_change_the_public_address() {
+    use crate::telemetry::TelemetryUpdate;
+    let warned = |ip: &str| {
+        crate::logger::get_logs()
+            .iter()
+            .any(|entry| entry.message.contains(&format!("pre-VPN address ({ip})")))
+    };
+    let probe = |app: &mut App, ip: &str| {
+        app.runtime.real_ip = Some(ip.to_string());
+        app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+            crate::telemetry::EgressIdentity {
+                public_ip: ip.to_string(),
+                isp: None,
+                location: None,
+            },
+        )));
+    };
+
+    let mut split_only = test_app();
+    set_connected(&mut split_only, "office");
+    probe(&mut split_only, "198.51.100.77");
+    assert!(!warned("198.51.100.77"));
+
+    let mut full = test_app();
+    set_connected(&mut full, "wg08");
+    let mut snapshot = (*full.control_snapshot).clone();
+    snapshot.primary = Some(crate::profile::ProfileId::new("wg08"));
+    snapshot.version += 1;
+    full.apply_control_snapshot(std::sync::Arc::new(snapshot));
+    probe(&mut full, "198.51.100.78");
+    assert!(warned("198.51.100.78"));
 }
