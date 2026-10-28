@@ -11,6 +11,7 @@
 mod netbird;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -18,12 +19,15 @@ use serde::{Deserialize, Serialize};
 use crate::process::{CommandSpec, ManagedProcessId, PrivilegeReq};
 use crate::profile::{Profile, ProfileId};
 use crate::tunnel::{
-    MeshPeer, RoutedNetwork, TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag,
+    MeshPeer, RoutedNetwork, TunnelCancellation, TunnelError, TunnelExecutionContext, TunnelHandle,
+    TunnelKindTag,
 };
 
 /// Root-only, like a vendor's own state directory: it holds each network's identity.
 const STATE_ROOT: &str = "/var/lib/vortix";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Time to sign in in a browser once the link shows; `NetBird`'s own is 5 minutes.
+const LOGIN_WAIT: Duration = Duration::from_secs(300);
 
 /// A mesh network vendor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -74,6 +78,23 @@ impl MeshDriver {
         Self::ALL
             .into_iter()
             .find(|driver| driver.slug() == extension)
+    }
+
+    /// The mark its daemon puts on its own traffic (Linux), which the kill
+    /// switch lets out. Kernel `WireGuard` sends from a socket with no process
+    /// group, so the group alone does not cover it there.
+    #[must_use]
+    pub const fn transport_mark(self) -> Option<u32> {
+        match self {
+            Self::NetBird => Some(netbird::MARK),
+        }
+    }
+
+    /// Its hosted service, for a network added by name alone.
+    const fn default_server(self) -> &'static str {
+        match self {
+            Self::NetBird => "https://api.netbird.io",
+        }
     }
 
     /// Where its own app keeps its identity: importing this folder moves the
@@ -187,8 +208,9 @@ struct AppInstall {
     socket: &'static str,
     /// The file in its state directory (and in Vortix's) that holds the identity.
     identity: &'static str,
-    /// Stop its service, then keep it stopped after a reboot.
-    stop: [&'static str; 2],
+    /// Its CLI's arguments that stop its service, then keep it stopped after
+    /// a reboot.
+    stop: [&'static [&'static str]; 2],
 }
 
 /// The daemon's program, arguments and environment.
@@ -259,6 +281,25 @@ pub fn app_driver(dir: &Path) -> Option<MeshDriver> {
     MeshDriver::ALL
         .into_iter()
         .find(|driver| dir.join(driver.app().identity).is_file())
+}
+
+/// `netbird` or `netbird https://nb.example.com`, typed where a file would go:
+/// a profile for that network that signs in on first connect.
+#[must_use]
+pub fn profile_from_words(words: &str) -> Option<(MeshDriver, Result<String, String>)> {
+    let mut words = words.split_whitespace();
+    let driver = MeshDriver::ALL
+        .into_iter()
+        .find(|driver| words.next() == Some(driver.slug()))?;
+    let profile = MeshProfile {
+        server_url: words.next().unwrap_or(driver.default_server()).to_string(),
+        auth_key: None,
+        identity: None,
+    };
+    let text = profile
+        .server()
+        .and_then(|_| toml::to_string(&profile).map_err(|error| error.to_string()));
+    Some((driver, text))
 }
 
 /// The profile file that moves the vendor app's active network here.
@@ -370,11 +411,11 @@ impl MeshTunnel {
         let settings = MeshProfile::parse(&content).map_err(TunnelError::Other)?;
         let cli = binary(driver.slug())?;
         let app = driver.app();
-        if answers(Path::new(app.socket)) {
+        if app_running(driver) {
+            let [stop, uninstall] = stop_commands(driver);
             return Err(TunnelError::Other(format!(
                 "the {name} app's service is running, and only one {name} can run at a time: \
-                 stop it with `{}` (and `{}` so it stays stopped after a reboot)",
-                app.stop[0], app.stop[1]
+                 stop it with `{stop}` (and `{uninstall}` so it stays stopped after a reboot)"
             )));
         }
         let socket = driver.socket(&profile.id);
@@ -469,45 +510,57 @@ impl MeshTunnel {
             driver.control(socket),
             driver.up(settings, key_file.as_deref()),
         );
-        let timeout = self.remaining()?;
-        up.timeout = Some(timeout);
+        // A sign-in gets its own window; anything else keeps the connect's.
+        let budget = self.remaining()?;
+        up.timeout = Some(budget.max(LOGIN_WAIT));
         let (lines, printed) = std::sync::mpsc::channel();
         up.stdout_lines = Some(lines);
         let progress = self
             .execution_context
             .as_ref()
             .and_then(|context| context.progress.as_ref());
-        let done = std::sync::atomic::AtomicBool::new(false);
+        let cancellation = self
+            .execution_context
+            .as_ref()
+            .map(|context| &context.cancellation);
+        let done = AtomicBool::new(false);
+        let signing_in = AtomicBool::new(false);
+        let timed_out = AtomicBool::new(false);
+        let started = Instant::now();
         let outcome = std::thread::scope(|scope| {
             scope.spawn(|| {
                 for line in printed {
-                    if let (Some(text), Some(progress)) = (
-                        login_notice(&line, &profile.display_name, timeout),
-                        progress,
-                    ) {
-                        let _ = progress.send(text);
+                    if let Some(text) = login_notice(&line, &profile.display_name, LOGIN_WAIT) {
+                        signing_in.store(true, Ordering::Release);
+                        if let Some(progress) = progress {
+                            let _ = progress.send(text);
+                        }
                     }
                 }
             });
-            // A disconnect must not wait out a login nobody will finish.
-            if let Some(context) = &self.execution_context {
-                let done = &done;
-                scope.spawn(move || {
-                    while !done.load(std::sync::atomic::Ordering::Acquire) {
-                        if context.cancellation.is_cancelled() {
-                            let _ = run(driver, cli, socket, driver.down());
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(200));
+            // `down` ends the wait: on a disconnect, or when no sign-in link
+            // came within the connect's own budget.
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let cancelled = cancellation.is_some_and(TunnelCancellation::is_cancelled);
+                    let overdue = !signing_in.load(Ordering::Acquire) && started.elapsed() > budget;
+                    if cancelled || overdue {
+                        timed_out.store(overdue, Ordering::Release);
+                        let _ = run(driver, cli, socket, driver.down());
+                        return;
                     }
-                });
-            }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            });
             let outcome = crate::process::run(up);
-            done.store(true, std::sync::atomic::Ordering::Release);
+            done.store(true, Ordering::Release);
             outcome
         });
         if let Some(key_file) = &key_file {
             let _ = std::fs::remove_file(key_file);
+        }
+        if timed_out.load(Ordering::Acquire) {
+            return Err(TunnelError::Timeout(budget));
         }
         let outcome = outcome.map_err(|error| TunnelError::Subprocess(error.to_string()))?;
         let after = status(driver, cli, socket)?;
@@ -569,6 +622,45 @@ pub fn observe(
     session.details.interface_authoritative = true;
     session.details.pid = Some(custody.pid);
     Some(session)
+}
+
+/// The vendor's own app has its service running, which Vortix cannot run beside.
+#[must_use]
+pub fn app_running(driver: MeshDriver) -> bool {
+    answers(Path::new(driver.app().socket))
+}
+
+/// What a user types to stop the vendor app's service and keep it stopped.
+#[must_use]
+pub fn stop_commands(driver: MeshDriver) -> [String; 2] {
+    driver
+        .app()
+        .stop
+        .map(|args| format!("sudo {} {}", driver.slug(), args.join(" ")))
+}
+
+/// Stop the vendor app's service and keep it stopped after a reboot. Its
+/// files stay, so reinstalling the service is the way back.
+pub fn stop_app(driver: MeshDriver) -> Result<(), String> {
+    let cli = binary(driver.slug()).map_err(|error| error.to_string())?;
+    for args in driver.app().stop {
+        let mut spec = CommandSpec::oneshot(
+            cli.to_string_lossy(),
+            args.iter().map(ToString::to_string).collect(),
+        )
+        .privilege(PrivilegeReq::Root);
+        spec.timeout = Some(Duration::from_secs(30));
+        let outcome = crate::process::run(spec).map_err(|error| error.to_string())?;
+        if !outcome.success() {
+            return Err(format!(
+                "`{} {}` failed: {}",
+                driver.slug(),
+                args.join(" "),
+                String::from_utf8_lossy(&outcome.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Remove a deleted profile's state: its identity must not outlive it.
@@ -676,17 +768,28 @@ fn login_notice(line: &str, name: &str, timeout: Duration) -> Option<String> {
 
 fn up_failure(driver: MeshDriver, status: &MeshStatus, stderr: &str) -> TunnelError {
     let name = driver.name();
-    match &status.state {
-        MeshState::NeedsLogin(why) => {
-            return TunnelError::AuthFailed(format!("{name} refused this device ({why})"));
-        }
-        _ if !status.error.is_empty() => {
-            return TunnelError::Subprocess(format!("{name} server: {}", status.error));
-        }
-        _ => {}
+    // An unreachable server also leaves a new device needing a login; the
+    // server is the cause to report.
+    if !status.error.is_empty() {
+        return TunnelError::Other(format!("{name} server: {}", status.error));
+    }
+    let unreachable = [
+        "deadline exceeded",
+        "connection refused",
+        "no such host",
+        "network is unreachable",
+    ];
+    if unreachable.iter().any(|sign| stderr.contains(sign)) {
+        return TunnelError::Other(format!(
+            "the {name} server {} cannot be reached: check its address and the network",
+            status.server
+        ));
+    }
+    if let MeshState::NeedsLogin(why) = &status.state {
+        return TunnelError::AuthFailed(format!("{name} refused this device ({why})"));
     }
     let detail = stderr.trim();
-    TunnelError::Subprocess(if detail.is_empty() {
+    TunnelError::Other(if detail.is_empty() {
         format!("{name} did not connect ({:?})", status.state)
     } else {
         format!("{} up: {detail}", driver.slug())
@@ -776,6 +879,27 @@ mod tests {
         assert_eq!(MeshDriver::from_extension("conf"), None);
     }
 
+    /// Typing the vendor's name adds its hosted network; a URL after it, a
+    /// self-hosted one. Anything else is not a mesh network.
+    #[test]
+    fn a_network_is_added_by_name() {
+        let profile = |words: &str| {
+            let (driver, text) = profile_from_words(words)?;
+            Some((driver, MeshProfile::parse(&text.ok()?).ok()?.server_url))
+        };
+        assert_eq!(
+            profile("netbird"),
+            Some((MeshDriver::NetBird, "https://api.netbird.io".into()))
+        );
+        assert_eq!(
+            profile(" netbird  https://nb.corp.example:33073 "),
+            Some((MeshDriver::NetBird, "https://nb.corp.example:33073".into()))
+        );
+        assert!(profile_from_words("netbird nb.corp").is_some_and(|(_, text)| text.is_err()));
+        assert!(profile_from_words("work.conf").is_none());
+        assert!(profile_from_words("").is_none());
+    }
+
     #[test]
     fn only_the_login_link_becomes_a_notice() {
         let notice = |line| login_notice(line, "work", Duration::from_secs(60));
@@ -793,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn up_failure_names_the_refusal_then_the_server_then_the_client() {
+    fn up_failure_names_the_server_then_the_refusal_then_the_client() {
         let failure = |state, error: &str, stderr| {
             up_failure(
                 MeshDriver::NetBird,
@@ -809,15 +933,31 @@ mod tests {
             failure(MeshState::NeedsLogin("SessionExpired".into()), "", ""),
             TunnelError::AuthFailed(_)
         ));
+        assert!(failure(
+            MeshState::NeedsLogin("NeedsLogin".into()),
+            "dial tcp: i/o timeout",
+            ""
+        )
+        .to_string()
+        .ends_with("NetBird server: dial tcp: i/o timeout"));
         assert!(
             failure(MeshState::default(), "dial tcp: refused", "ignored")
                 .to_string()
                 .contains("dial tcp: refused")
         );
+        assert!(failure(MeshState::default(), "", "interface wt0 is busy\n")
+            .to_string()
+            .ends_with("netbird up: interface wt0 is busy"));
+        // NetBird reports a server it cannot reach as a failed login.
+        let unreachable = failure(
+            MeshState::NeedsLogin("LoginFailed".into()),
+            "",
+            "Error: daemon up failed: login backoff cycle failed: rpc error: code = DeadlineExceeded desc = create connection: dial context: context deadline exceeded",
+        );
+        assert!(!matches!(unreachable, TunnelError::AuthFailed(_)));
         assert!(
-            failure(MeshState::default(), "", "context deadline exceeded\n")
-                .to_string()
-                .ends_with("netbird up: context deadline exceeded")
+            unreachable.to_string().contains("cannot be reached"),
+            "{unreachable}"
         );
     }
 

@@ -524,6 +524,7 @@ mod nft_policy {
         OutputInterface(String),
         Destination(Cidr),
         Group(u32),
+        Mark(u32),
         Dhcp,
     }
 
@@ -619,6 +620,10 @@ mod nft_policy {
             if let Some(group) = tunnel.group {
                 writeln!(ruleset, "    meta skgid {group} accept").unwrap();
             }
+            // nft reads a mark back as eight hex digits.
+            if let Some(mark) = tunnel.mark {
+                writeln!(ruleset, "    meta mark {mark:#010x} accept").unwrap();
+            }
             for endpoint in &tunnel.server_ips {
                 match endpoint {
                     IpAddr::V4(ip) => writeln!(ruleset, "    ip daddr {ip} accept").unwrap(),
@@ -648,6 +653,12 @@ mod nft_policy {
             .and_then(|rest| rest.strip_suffix(" accept"))
         {
             return group.parse().ok().map(AcceptRule::Group);
+        }
+        if let Some(mark) = line
+            .strip_prefix("meta mark 0x")
+            .and_then(|rest| rest.strip_suffix(" accept"))
+        {
+            return u32::from_str_radix(mark, 16).ok().map(AcceptRule::Mark);
         }
         if let Some(interface) = line
             .strip_prefix("oifname \"")
@@ -823,7 +834,8 @@ mod tests {
 
     #[test]
     fn endpoint_allowlist_emits_no_interface_rule() {
-        let policy = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()], None);
+        let policy =
+            ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()], None, None);
         let rules = nft(&[policy]);
         assert!(rules.contains("ip daddr 1.2.3.4 accept"));
         assert!(!rules.contains("oifname \"\" accept"));
@@ -836,7 +848,8 @@ mod tests {
         let group = crate::control::killswitch::TRANSPORT_GROUP;
         let mut mesh = tunnel("wt0", &[], &[], false);
         mesh.group = Some(group);
-        let pending = ActiveTunnelInfo::endpoint_allowlist(Vec::new(), Some(group));
+        mesh.mark = Some(0x1BD00);
+        let pending = ActiveTunnelInfo::endpoint_allowlist(Vec::new(), Some(group), Some(0x1BD00));
         for active in [vec![mesh], vec![pending]] {
             let rules = nft(&active);
             assert_eq!(
@@ -848,6 +861,10 @@ mod tests {
             assert!(!nft_policy::snapshot_matches(
                 &active,
                 &rules.replace("    meta skgid 51820 accept\n", "")
+            ));
+            assert!(!nft_policy::snapshot_matches(
+                &active,
+                &rules.replace("    meta mark 0x0001bd00 accept\n", "")
             ));
         }
     }

@@ -353,7 +353,7 @@ impl Control {
         mut prompt: impl FnMut(&Prompt) -> Option<Credentials>,
         mut act: impl FnMut(&str),
     ) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
+        let mut deadline = Instant::now() + timeout;
         let mut answered = std::collections::BTreeSet::new();
         let mut shown = std::collections::BTreeSet::new();
         loop {
@@ -362,6 +362,11 @@ impl Control {
                 if shown.insert(action.clone()) {
                     act(action);
                 }
+            }
+            // The user is doing what the connect waits for; the transport
+            // bounds that wait itself.
+            if !snapshot.actions.is_empty() {
+                deadline = deadline.max(Instant::now() + Duration::from_secs(1));
             }
             for pending in &snapshot.prompts {
                 if answered.insert(pending.id) {

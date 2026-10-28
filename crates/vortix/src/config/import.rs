@@ -61,8 +61,11 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
     // 2. Expand Path
     let path = expand_home(input);
 
-    // 3. Check file existence and type
+    // 3. Check file existence and type; a mesh vendor's name adds its network.
     if !path.exists() {
+        if let Some((driver, profile)) = crate::mesh::profile_from_words(input) {
+            return stage_mesh_profile(driver, &profile?).map(ImportTarget::File);
+        }
         return Err(format!("Path not found: {input}"));
     }
 
@@ -78,14 +81,18 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
     }
 }
 
-/// Stage the profile that takes over a mesh vendor app's network, where
-/// downloads are staged, so both importers clean it up the same way.
+/// Stage the profile that takes over a mesh vendor app's network.
 fn mesh_app_profile(
     driver: crate::mesh::MeshDriver,
     state_dir: &std::path::Path,
 ) -> Result<PathBuf, String> {
+    stage_mesh_profile(driver, &crate::mesh::profile_from_app(driver, state_dir)?)
+}
+
+/// Write a generated mesh profile where downloads are staged, so both
+/// importers clean it up the same way.
+fn stage_mesh_profile(driver: crate::mesh::MeshDriver, profile: &str) -> Result<PathBuf, String> {
     use std::io::Write as _;
-    let profile = crate::mesh::profile_from_app(driver, state_dir)?;
     let dir = crate::config::get_config_dir()
         .map_err(|error| format!("cannot resolve the download directory: {error}"))?
         .join("downloads");

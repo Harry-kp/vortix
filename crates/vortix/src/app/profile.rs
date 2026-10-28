@@ -247,8 +247,8 @@ impl App {
 
         self.runtime.sort_profiles();
 
-        if let Some(name) = last_imported_name {
-            if let Some(idx) = self.runtime.profiles.iter().position(|p| p.name == name) {
+        if let Some(name) = &last_imported_name {
+            if let Some(idx) = self.runtime.profiles.iter().position(|p| &p.name == name) {
                 self.profile_list_state.select(Some(idx));
             }
         }
@@ -256,6 +256,41 @@ impl App {
         if should_close_overlay {
             self.handle_message(Message::CloseOverlay);
         }
+        // The vendor's own app would keep this network from connecting.
+        let driver = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|profile| Some(&profile.name) == last_imported_name.as_ref())
+            .and_then(|profile| match profile.protocol {
+                crate::profile::ProtocolKind::Mesh(driver) => Some(driver),
+                _ => None,
+            });
+        if let Some(driver) = driver.filter(|driver| crate::mesh::app_running(*driver)) {
+            self.input_mode = InputMode::ConfirmTakeover {
+                driver,
+                confirm_selected: true,
+            };
+        }
+    }
+
+    /// Stop a mesh vendor app's service, off the UI thread.
+    pub(crate) fn take_over_app(&mut self, driver: crate::mesh::MeshDriver) {
+        let tx = self.runtime.cmd_tx.clone();
+        self.show_toast(format!("Stopping {driver}'s own service…"), ToastType::Info);
+        std::thread::spawn(move || {
+            let toast = match crate::mesh::stop_app(driver) {
+                Ok(()) => (
+                    format!("{driver}'s own service is stopped. Connect to go on."),
+                    ToastType::Success,
+                ),
+                Err(error) => (
+                    format!("Could not stop {driver}: {error}"),
+                    ToastType::Error,
+                ),
+            };
+            let _ = tx.send(crate::message::Message::Toast(toast.0, toast.1));
+        });
     }
 
     /// Import a single VPN profile file

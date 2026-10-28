@@ -27,6 +27,8 @@ pub struct Spec {
     /// The group its daemon runs under, for a transport that needs the firewall
     /// to let it reach any address.
     pub group: Option<u32>,
+    /// The mark that daemon puts on its own traffic, which the firewall lets out.
+    pub mark: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +354,7 @@ impl State {
                     dns: tunnel.spec.dns.clone(),
                     rank: tunnel.rank,
                     group: tunnel.spec.group,
+                    mark: tunnel.spec.mark,
                 })
             })
             .collect();
@@ -387,6 +390,16 @@ impl State {
                 )
             })
             .find_map(|tunnel| tunnel.spec.group);
+        let pending_mark = self
+            .tunnels
+            .values()
+            .filter(|tunnel| {
+                matches!(
+                    tunnel.phase,
+                    Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
+                )
+            })
+            .find_map(|tunnel| tunnel.spec.mark);
         let dropped = self
             .tunnels
             .values()
@@ -402,6 +415,7 @@ impl State {
             pending_endpoints,
             pending_full_endpoints,
             pending_group,
+            pending_mark,
             dropped,
             releasing,
             kill_switch: self.kill_switch,
@@ -485,6 +499,7 @@ mod tests {
 
     fn spec(id: &str, route: &str) -> Spec {
         Spec {
+            mark: None,
             group: None,
             profile_id: ProfileId::new(id),
             name: id.into(),

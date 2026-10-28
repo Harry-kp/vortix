@@ -245,6 +245,10 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             confirm_selected,
         } => render_disconnect_all_confirm(frame, *count, *confirm_selected),
         InputMode::Action { text, .. } => super::overlays::action::render(frame, text),
+        InputMode::ConfirmTakeover {
+            driver,
+            confirm_selected,
+        } => render_takeover_confirm(frame, *driver, *confirm_selected),
         InputMode::Peers { profile_id, scroll } => {
             if let Some(tunnel) = app.tunnel(profile_id) {
                 super::overlays::peers::render(
@@ -310,6 +314,34 @@ fn render_delete_confirm(frame: &mut Frame, name: &str, confirm_selected: bool) 
             confirm_label: "Delete",
             width: dialog_w,
             height: 7,
+        },
+    );
+}
+
+/// The overlay offering to stop a mesh vendor's own app so Vortix runs it.
+fn render_takeover_confirm(
+    frame: &mut Frame,
+    driver: crate::mesh::MeshDriver,
+    confirm_selected: bool,
+) {
+    use super::overlays::confirm_dialog::{self, ConfirmDialogConfig};
+    let text = |line: String| Line::from(Span::raw(line));
+    confirm_dialog::render(
+        frame,
+        ConfirmDialogConfig {
+            title: " Take over from the app ",
+            body: vec![
+                Line::from(""),
+                text(format!("{driver}'s own app is running, and only one")),
+                text(format!("{driver} can run at a time. Stop its service so")),
+                text("Vortix runs it from now on? Its files stay, so".into()),
+                text("reinstalling its service brings it back.".into()),
+            ],
+            border_color: theme::current().warning,
+            confirm_selected,
+            confirm_label: "Stop it",
+            width: 56,
+            height: 10,
         },
     );
 }
@@ -519,6 +551,25 @@ mod overlay_tests {
             .map(ToString::to_string)
             .collect();
         assert!(lines[0].starts_with("● exit ") && lines[0].ends_with("0.0.0.0/0  exit node"));
+    }
+
+    /// The offer to take over names the vendor and fits at 80×24.
+    #[test]
+    fn the_take_over_offer_is_whole() {
+        let mut app = App::new_test();
+        app.input_mode = InputMode::ConfirmTakeover {
+            driver: crate::mesh::MeshDriver::NetBird,
+            confirm_selected: true,
+        };
+        let screen = render(&mut app);
+        for text in [
+            "Take over from the app",
+            "NetBird's own app is running",
+            "brings it back",
+            "Stop it",
+        ] {
+            assert!(screen.contains(text), "{text}: {screen}");
+        }
     }
 
     /// The whole link fits on screen at 80 columns, with no side border in it.

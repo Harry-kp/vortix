@@ -135,44 +135,39 @@ use [hooks](configuration.md#hooks) instead.
 
 ### NetBird networks
 
-A NetBird network is a `.netbird` file that names its management server, and optionally a
-setup key from the NetBird dashboard (Setup Keys):
+NetBird's `netbird` command must be installed (`brew install netbirdio/tap/netbird` on macOS;
+on Linux, NetBird's installer). There are two ways in, both from Import (`i`, or
+`sudo vortix import`):
+
+- **Moving from the NetBird app:** import `/var/lib/netbird`. Its active network becomes the
+  profile `netbird`, and the first connect keeps the same device, address and login. Only one
+  NetBird runs at a time, so the dashboard then offers to stop the app's own service (the CLI
+  prints the two commands: `sudo netbird service stop && sudo netbird service uninstall`).
+  Quit and remove the NetBird desktop app too; on macOS install the `netbird` command first,
+  because the app carries it (`/usr/local/bin/netbird` points into `NetBird.app`). To go back,
+  disconnect in Vortix and run `sudo netbird service install && sudo netbird service start`;
+  the app's own files are never changed.
+- **A new network:** import `netbird` (NetBird's hosted service) or
+  `netbird https://netbird.example.com` (your own). The first connect shows a sign-in link:
+  `vortix up` prints it and the dashboard shows it until you finish, and you have 5 minutes.
+
+A profile is a `.netbird` file, so it can also be written by hand, for example with a setup key
+from the NetBird dashboard so no sign-in is needed:
 
 ```toml
 server_url = "https://api.netbird.io"   # its management server, or your own
 auth_key = "…"                         # optional: a setup key
 ```
 
-Without a setup key, a device that must log in (the first time, or when its login expires)
-gets a link: `vortix up` prints it and the dashboard shows it until the login completes. Log in
-within the connect timeout; `--timeout 300` gives more time.
-
-`vortix import work.netbird` adds it like any other profile, and `up`, `down`, `status`, the
-dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`) work the same. Vortix runs NetBird's
-own client (`netbird`, which must be installed) with this network's identity in
-`/var/lib/vortix/netbird/`, separate from the NetBird app's. NetBird sets up its own routes and DNS on
-`wt0` (macOS: `utun100`). One NetBird network can be up at a time. Connection Details shows how
-many peers are connected. `P` lists the networks it routes to (in use or not, and which is an
-exit node), then the peers. `status --json` adds them under `network.networks` (`name`,
-`range`, `selected`) and `network.peers` (`name`, `address`, `connected`, `relayed`,
-`latency_ms`). Choosing networks and the exit node stays in NetBird's dashboard or
-`netbird networks select`.
-
-To move from the NetBird app, keeping the same device, address and login:
-
-```bash
-sudo vortix import /var/lib/netbird      # its active network becomes the profile "netbird"
-sudo netbird service stop                # Vortix will not run beside it
-sudo netbird service uninstall           # so it does not start again at boot
-sudo vortix up netbird
-```
-
-The first connect copies the app's identity, so no setup key or login is needed. Quit and
-remove the NetBird desktop app as well. On macOS the app also carries the `netbird` command
-(`/usr/local/bin/netbird` points into `NetBird.app`), so install it on its own first, with
-`brew install netbirdio/tap/netbird`, or Vortix cannot run NetBird once the app is gone. To go back, disconnect in Vortix and run
-`sudo netbird service install && sudo netbird service start`; the app's own files were not
-changed.
+After that, `up`, `down`, `status`, the dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`)
+work as for any profile. Vortix runs NetBird's own client with this network's identity in
+`/var/lib/vortix/netbird/`, separate from the app's, and deleting the profile removes it.
+NetBird sets up its own routes and DNS on `wt0` (macOS: `utun100`). One NetBird network can be
+up at a time. Connection Details shows how many peers are up; `P` lists the networks it routes
+to (in use or not, and which is an exit node), then the peers. `status --json` adds them under
+`network.networks` (`name`, `range`, `selected`) and `network.peers` (`name`, `address`,
+`connected`, `relayed`, `latency_ms`). Choosing networks and the exit node stays in NetBird's
+dashboard or `netbird networks select`.
 
 ## Connecting
 
@@ -251,9 +246,10 @@ so between boot and that first run nothing is blocked; [connecting at boot](#con
 shortens that gap to the time the network takes to come up. macOS uses a `pf` anchor of its own,
 Linux an `nftables` table.
 
-A NetBird network reaches its peers and relays at addresses nobody knows in advance, so Vortix
-runs its daemon under group 51820 and the blocking modes let that group's traffic out to any
-address, while it connects and while it is up. Every other process stays blocked.
+A NetBird network reaches its peers and relays at addresses nobody knows in advance, so the
+blocking modes let NetBird's own daemon out to any address, while it connects and while it is
+up: Vortix runs it under group 51820, and on Linux NetBird also marks its traffic (`0x1BD00`),
+which covers its kernel WireGuard. Every other process stays blocked.
 
 ## Diagnostics
 

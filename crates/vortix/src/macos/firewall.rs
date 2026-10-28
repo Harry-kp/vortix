@@ -664,6 +664,7 @@ mod tests {
         let active = vec![ActiveTunnelInfo::endpoint_allowlist(
             vec!["198.51.100.7".parse().unwrap()],
             None,
+            None,
         )];
         let anchor = PfFirewall::generate_pf_rules(&active);
         let root = "anchor \"com.apple/*\" all\n";
@@ -694,6 +695,7 @@ mod tests {
     #[test]
     fn pfctl_normalization_is_exact_and_rejects_semantic_suffixes() {
         let active = vec![ActiveTunnelInfo {
+            mark: None,
             group: None,
             interface: "utun4".into(),
             server_ips: vec!["198.51.100.7".parse().unwrap()],
@@ -833,7 +835,8 @@ mod tests {
 
     #[test]
     fn endpoint_allowlist_emits_no_interface_rule() {
-        let policy = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()], None);
+        let policy =
+            ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()], None, None);
         let rules = PfFirewall::generate_pf_rules(&[policy]);
         assert!(rules.contains("pass out quick to 1.2.3.4"));
         assert!(!rules.contains("pass out quick on  all"));
@@ -869,6 +872,7 @@ mod tests {
         // pf accepts raw v6 syntax. Confirm the IpAddr Display impl
         // produces the v6 form.
         let t = ActiveTunnelInfo {
+            mark: None,
             group: None,
             interface: "utun13".to_string(),
             server_ips: vec!["2001:db8::1".parse().unwrap()],
@@ -966,6 +970,7 @@ block drop out quick all
     #[test]
     fn snapshot_single_primary() {
         let t = ActiveTunnelInfo {
+            mark: None,
             group: None,
             interface: "utun3".to_string(),
             server_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
@@ -1003,6 +1008,7 @@ block drop out quick all
     #[test]
     fn snapshot_primary_plus_secondary() {
         let prim = ActiveTunnelInfo {
+            mark: None,
             group: None,
             interface: "utun3".to_string(),
             server_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
@@ -1010,6 +1016,7 @@ block drop out quick all
             is_primary: true,
         };
         let sec = ActiveTunnelInfo {
+            mark: None,
             group: None,
             interface: "utun4".to_string(),
             server_ips: vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))],

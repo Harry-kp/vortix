@@ -157,6 +157,7 @@ fn parse(
     let mut routes = BTreeSet::new();
     let mut server_ips = BTreeSet::new();
     let mut group = None;
+    let mut mark = None;
     let mut resolve = |host: &str, port: u16, servers: &mut BTreeSet<IpAddr>| {
         if let Some(address) = cache.resolve(host, port) {
             servers.insert(address);
@@ -203,6 +204,7 @@ fn parse(
             let (host, port) = crate::mesh::MeshProfile::parse(body)?.server()?;
             resolve(&host, port, &mut server_ips);
             group = Some(crate::control::killswitch::TRANSPORT_GROUP);
+            mark = driver.transport_mark();
             (ProtocolKind::Mesh(driver), DnsRequest::default())
         }
     };
@@ -216,6 +218,7 @@ fn parse(
         server_ips,
         dns,
         group,
+        mark,
     })
 }
 
@@ -252,6 +255,7 @@ mod tests {
             spec.group,
             Some(crate::control::killswitch::TRANSPORT_GROUP)
         );
+        assert_eq!(spec.mark, Some(0x1BD00));
         assert_eq!(
             spec.server_ips.into_iter().collect::<Vec<_>>(),
             ["127.0.0.1".parse::<IpAddr>().unwrap()]

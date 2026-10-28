@@ -16,10 +16,7 @@ pub(super) const APP: AppInstall = AppInstall {
     state_dir: "/var/lib/netbird",
     socket: "/var/run/netbird.sock",
     identity: "default.json",
-    stop: [
-        "sudo netbird service stop",
-        "sudo netbird service uninstall",
-    ],
+    stop: [&["service", "stop"], &["service", "uninstall"]],
 };
 
 pub(super) fn daemon(state_dir: &Path) -> Launch {
@@ -31,12 +28,7 @@ pub(super) fn daemon(state_dir: &Path) -> Launch {
             "--log-file".into(),
             state_dir.join("netbird.log").to_string_lossy().into(),
         ],
-        env: vec![
-            ("NB_STATE_DIR", state_dir.to_string_lossy().into()),
-            // Kernel WireGuard sends from a socket with no group, which the kill
-            // switch could not tell apart; userspace keeps it all in the daemon.
-            ("NB_WG_KERNEL_DISABLED", "true".into()),
-        ],
+        env: vec![("NB_STATE_DIR", state_dir.to_string_lossy().into())],
     }
 }
 
@@ -67,6 +59,10 @@ pub(super) fn up(profile: &MeshProfile, key_file: Option<&Path>, interface: &str
     }
     args
 }
+
+/// `NetBird`'s control-plane mark on Linux: its management, signal, relay and
+/// STUN traffic, and every packet its kernel `WireGuard` socket sends.
+pub(super) const MARK: u32 = 0x1BD00;
 
 pub(super) const DOWN: &[&str] = &["down"];
 pub(super) const STATUS: &[&str] = &["status", "--json"];

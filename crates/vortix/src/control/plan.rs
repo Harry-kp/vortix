@@ -25,6 +25,8 @@ pub struct LiveTunnel {
     pub rank: u64,
     /// The group its daemon runs under, which the firewall lets out.
     pub group: Option<u32>,
+    /// The mark its daemon puts on its own traffic, which the firewall lets out.
+    pub mark: Option<u32>,
 }
 
 impl LiveTunnel {
@@ -53,6 +55,8 @@ pub struct PlanInput {
     pub pending_full_endpoints: BTreeSet<IpAddr>,
     /// The daemon group of those tunnels, let out before they are up.
     pub pending_group: Option<u32>,
+    /// The daemon mark of those tunnels, let out before they are up.
+    pub pending_mark: Option<u32>,
     /// A tunnel dropped without being asked to.
     pub dropped: bool,
     /// Interfaces of tunnels being torn down.
@@ -222,6 +226,7 @@ fn firewall(input: &PlanInput) -> (Firewall, KillSwitchState) {
             declared_cidrs: tunnel.routes.iter().copied().collect(),
             is_primary: tunnel.is_full(),
             group: tunnel.group,
+            mark: tunnel.mark,
         })
         .collect::<Vec<_>>();
     let covered = allow
@@ -236,8 +241,15 @@ fn firewall(input: &PlanInput) -> (Firewall, KillSwitchState) {
     let pending_group = input
         .pending_group
         .filter(|group| allow.iter().all(|tunnel| tunnel.group != Some(*group)));
-    if !pending.is_empty() || pending_group.is_some() {
-        allow.push(ActiveTunnelInfo::endpoint_allowlist(pending, pending_group));
+    let pending_mark = input
+        .pending_mark
+        .filter(|mark| allow.iter().all(|tunnel| tunnel.mark != Some(*mark)));
+    if !pending.is_empty() || pending_group.is_some() || pending_mark.is_some() {
+        allow.push(ActiveTunnelInfo::endpoint_allowlist(
+            pending,
+            pending_group,
+            pending_mark,
+        ));
     }
     (Firewall::Block(allow), KillSwitchState::Blocking)
 }
@@ -252,6 +264,7 @@ pub(crate) mod tests {
     pub fn live(id: &str, iface: &str, route: &str, rank: u64) -> LiveTunnel {
         LiveTunnel {
             group: None,
+            mark: None,
             profile_id: ProfileId::new(id),
             interface: iface.into(),
             routes: BTreeSet::from([route.parse().unwrap()]),
@@ -419,6 +432,7 @@ pub(crate) mod tests {
         let mut input = input(vec![live("01", "utun4", FULL, 1)]);
         input.kill_switch = KillSwitchMode::AlwaysOn;
         input.pending_group = Some(group);
+        input.pending_mark = Some(0x1BD00);
         let groups = |plan: &NetworkPlan| match &plan.firewall {
             Firewall::Block(allow) => allow
                 .iter()
@@ -432,8 +446,10 @@ pub(crate) mod tests {
         let mut mesh = live("02", "wt0", "10.0.0.0/8", 2);
         mesh.routes.clear();
         mesh.group = Some(group);
+        mesh.mark = Some(0x1BD00);
         input.live.push(mesh);
         input.pending_group = None;
+        input.pending_mark = None;
         let up = plan(&input);
         assert_eq!(groups(&up), [("wt0".to_string(), group)]);
         assert_eq!(up.primary.as_ref().map(ProfileId::as_str), Some("01"));
