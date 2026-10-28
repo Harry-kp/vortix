@@ -359,7 +359,9 @@ pub(super) fn handle_import(
         }
         Ok(ImportTarget::File(path)) => {
             let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "import");
-            match import_profile_via_control(&path, config, config_dir) {
+            let imported = import_profile_via_control(&path, config, config_dir);
+            crate::config::import::cleanup_temp_download(&path);
+            match imported {
                 Ok(profile) => {
                     print_import_success(&profile, mode);
                     0

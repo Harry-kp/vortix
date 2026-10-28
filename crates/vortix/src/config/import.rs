@@ -69,11 +69,30 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
     // 4. Determine Type
     if path.is_file() {
         Ok(ImportTarget::File(path))
+    } else if crate::netbird::is_app_state_dir(&path) {
+        netbird_app_profile(&path).map(ImportTarget::File)
     } else if path.is_dir() {
         Ok(ImportTarget::Directory(path))
     } else {
         Err("Invalid path type (not a file or directory)".to_string())
     }
+}
+
+/// Stage the `.netbird` profile that takes over the `NetBird` app's network, where
+/// downloads are staged, so both importers clean it up the same way.
+fn netbird_app_profile(state_dir: &std::path::Path) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    let profile = crate::netbird::profile_from_app(state_dir)?;
+    let dir = crate::config::get_config_dir()
+        .map_err(|error| format!("cannot resolve the download directory: {error}"))?
+        .join("downloads");
+    crate::config::owned_file::create_private_dir_all(&dir)
+        .map_err(|error| format!("cannot create the download directory: {error}"))?;
+    let path = crate::config::profiles::get_unique_path(&dir, "netbird.netbird");
+    crate::config::owned_file::open_user_file(&path, false)
+        .and_then(|mut file| file.write_all(profile.as_bytes()))
+        .map_err(|error| format!("cannot stage the NetBird profile: {error}"))?;
+    Ok(path)
 }
 
 #[cfg(test)]

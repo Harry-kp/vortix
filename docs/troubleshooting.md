@@ -99,6 +99,8 @@ Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root on
 - `NetBird refused this device`: the setup key is expired, used up or revoked, or the
   device was removed from the NetBird dashboard. Make a new key.
 - `NetBird management server: …`: `management_url` is wrong or the server is unreachable.
+- `the NetBird app's service is running`: only one NetBird can run on a computer. Stop the
+  app's service as the message says ([moving from the NetBird app](usage.md#netbird-networks)).
 
 ## DNS
 

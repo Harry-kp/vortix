@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::process::{CommandSpec, ManagedProcessId, PrivilegeReq};
 use crate::profile::{Profile, ProfileId};
@@ -24,14 +24,23 @@ const WIREGUARD_PORT: u16 = 51820;
 const STATE_ROOT: &str = "/var/lib/vortix/netbird";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Where the `NetBird` app keeps its identity, on macOS and Linux alike.
+pub const APP_STATE_DIR: &str = "/var/lib/netbird";
+/// The `NetBird` app's daemon socket; present while its service runs.
+const APP_SOCKET: &str = "/var/run/netbird.sock";
+
 /// What a `.netbird` profile file holds.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetBirdProfile {
     pub management_url: String,
     /// Registers this device on first connect; unused once it has an identity.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_key: Option<String>,
+    /// The `NetBird` app's identity file, copied in on first connect so this
+    /// device stays the same peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<PathBuf>,
 }
 
 impl NetBirdProfile {
@@ -66,6 +75,69 @@ impl NetBirdProfile {
         }
         Ok((host.to_string(), port))
     }
+}
+
+/// The `NetBird` app's state directory: its active profile becomes a `.netbird`
+/// profile that takes over that identity.
+#[must_use]
+pub fn is_app_state_dir(dir: &Path) -> bool {
+    dir.join("default.json").is_file()
+}
+
+/// The `.netbird` profile that moves the `NetBird` app's active network here.
+pub fn profile_from_app(dir: &Path) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Active {
+        name: String,
+        #[serde(default)]
+        username: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Url {
+        scheme: String,
+        host: String,
+    }
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(rename = "ManagementURL")]
+        management_url: Url,
+    }
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))
+    };
+    let active = match read(&dir.join("active_profile.json")) {
+        Ok(bytes) => serde_json::from_slice::<Active>(&bytes)
+            .map_err(|error| format!("NetBird's active profile is unreadable: {error}"))?,
+        Err(_) => Active {
+            name: "default".into(),
+            username: String::new(),
+        },
+    };
+    let safe = |part: &str| !part.contains('/') && !part.contains("..");
+    let identity = if active.name == "default" {
+        dir.join("default.json")
+    } else if safe(&active.name) && safe(&active.username) {
+        dir.join(&active.username)
+            .join(format!("{}.json", active.name))
+    } else {
+        return Err(format!(
+            "NetBird's active profile has a bad name: {}",
+            active.name
+        ));
+    };
+    let config: Config = serde_json::from_slice(&read(&identity)?)
+        .map_err(|error| format!("{} is not a NetBird profile: {error}", identity.display()))?;
+    let profile = NetBirdProfile {
+        management_url: format!(
+            "{}://{}",
+            config.management_url.scheme, config.management_url.host
+        ),
+        setup_key: None,
+        identity: Some(identity),
+    };
+    profile.management_host()?;
+    toml::to_string(&profile).map_err(|error| error.to_string())
 }
 
 /// The part of `netbird status --json` Vortix reads.
@@ -204,8 +276,20 @@ impl NbTunnel {
         let content = std::fs::read_to_string(&profile.config_path)?;
         let settings = NetBirdProfile::parse(&content).map_err(TunnelError::Other)?;
         let binary = binary()?;
+        if Path::new(APP_SOCKET).exists() {
+            return Err(TunnelError::Other(
+                "the NetBird app's service is running, and only one NetBird can run at a time: \
+                 stop it with `sudo netbird service stop` (and `sudo netbird service uninstall` \
+                 so it stays stopped after a reboot)"
+                    .into(),
+            ));
+        }
         let state_dir = Path::new(STATE_ROOT).join(profile.id.digest_key(8));
         create_private_dir(&state_dir)?;
+        let own_identity = state_dir.join("default.json");
+        if let (Some(identity), false) = (&settings.identity, own_identity.exists()) {
+            write_private(&own_identity, &read_app_identity(identity)?)?;
+        }
         let socket = socket_path(&profile.id);
         let _ = std::fs::remove_file(&socket);
 
@@ -464,17 +548,52 @@ fn create_private_dir(dir: &Path) -> Result<(), TunnelError> {
     Ok(())
 }
 
-fn write_key_file(state_dir: &Path, key: &str) -> Result<PathBuf, TunnelError> {
+/// The profile file is user-editable but read as root, so only a root-owned
+/// `.json` file inside the `NetBird` app's state directory is accepted.
+fn read_app_identity(path: &Path) -> Result<Vec<u8>, TunnelError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let refuse = |why: &str| {
+        TunnelError::Other(format!(
+            "cannot use {} as the NetBird app's identity: {why}",
+            path.display()
+        ))
+    };
+    let real = path
+        .canonicalize()
+        .map_err(|error| refuse(&error.to_string()))?;
+    let root = Path::new(APP_STATE_DIR)
+        .canonicalize()
+        .map_err(|error| refuse(&error.to_string()))?;
+    let meta = std::fs::metadata(&real).map_err(|error| refuse(&error.to_string()))?;
+    if !real.starts_with(&root)
+        || real.extension().and_then(std::ffi::OsStr::to_str) != Some("json")
+        || !meta.is_file()
+        || meta.uid() != 0
+    {
+        return Err(refuse(&format!(
+            "it must be a root-owned .json file in {APP_STATE_DIR}"
+        )));
+    }
+    std::fs::read(&real).map_err(|error| refuse(&error.to_string()))
+}
+
+/// Root-only, and never over an existing file.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), TunnelError> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
-    let path = state_dir.join("setup-key");
-    let _ = std::fs::remove_file(&path);
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)?
-        .write_all(key.trim().as_bytes())?;
+        .open(path)?
+        .write_all(bytes)?;
+    Ok(())
+}
+
+fn write_key_file(state_dir: &Path, key: &str) -> Result<PathBuf, TunnelError> {
+    let path = state_dir.join("setup-key");
+    let _ = std::fs::remove_file(&path);
+    write_private(&path, key.trim().as_bytes())?;
     Ok(path)
 }
 
@@ -538,6 +657,52 @@ mod tests {
         assert!(up_failure(&status, "context deadline exceeded\n")
             .to_string()
             .ends_with("netbird up: context deadline exceeded"));
+    }
+
+    const APP_CONFIG: &str = r#"{"PrivateKey": "secret", "ManagementURL":
+        {"Scheme": "https", "Host": "nb.corp.example:443", "Path": ""}}"#;
+
+    #[test]
+    fn the_app_default_profile_becomes_a_netbird_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("default.json"), APP_CONFIG).unwrap();
+        assert!(is_app_state_dir(dir.path()));
+        let profile = NetBirdProfile::parse(&profile_from_app(dir.path()).unwrap()).unwrap();
+        assert_eq!(profile.management_url, "https://nb.corp.example:443");
+        assert_eq!(profile.identity, Some(dir.path().join("default.json")));
+        assert_eq!(profile.setup_key, None);
+    }
+
+    #[test]
+    fn the_app_active_user_profile_is_the_one_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("default.json"), "{}").unwrap();
+        std::fs::create_dir(dir.path().join("alice")).unwrap();
+        std::fs::write(dir.path().join("alice/work.json"), APP_CONFIG).unwrap();
+        let active = |json: &str| {
+            std::fs::write(dir.path().join("active_profile.json"), json).unwrap();
+            profile_from_app(dir.path())
+        };
+        let profile =
+            NetBirdProfile::parse(&active(r#"{"name": "work", "username": "alice"}"#).unwrap())
+                .unwrap();
+        assert_eq!(profile.identity, Some(dir.path().join("alice/work.json")));
+        assert!(active(r#"{"name": "../work", "username": "alice"}"#).is_err());
+        assert!(active(r#"{"name": "default", "username": ""}"#)
+            .unwrap_err()
+            .contains("is not a NetBird profile"));
+        assert!(!is_app_state_dir(&dir.path().join("alice")));
+    }
+
+    /// The profile is user-editable but read as root: an identity outside the
+    /// app's state directory is refused, never copied.
+    #[test]
+    fn an_identity_outside_the_app_state_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("default.json");
+        std::fs::write(&elsewhere, APP_CONFIG).unwrap();
+        assert!(read_app_identity(&elsewhere).is_err());
+        assert!(read_app_identity(Path::new("/etc/passwd")).is_err());
     }
 
     #[test]

@@ -148,6 +148,20 @@ own client (`netbird`, which must be installed) with this network's identity in
 `/var/lib/vortix/netbird/`, separate from the NetBird app's. NetBird sets up its own routes and DNS on
 `wt0` (macOS: `utun100`). One NetBird network can be up at a time.
 
+To move from the NetBird app, keeping the same device, address and login:
+
+```bash
+sudo vortix import /var/lib/netbird      # its active network becomes the profile "netbird"
+sudo netbird service stop                # Vortix will not run beside it
+sudo netbird service uninstall           # so it does not start again at boot
+sudo vortix up netbird
+```
+
+The first connect copies the app's identity, so no setup key or login is needed. Quit and
+remove the NetBird desktop app as well. To go back, disconnect in Vortix and run
+`sudo netbird service install && sudo netbird service start`; the app's own files were not
+changed.
+
 ## Connecting
 
 ```bash
