@@ -17,6 +17,7 @@ pub(super) const APP: AppInstall = AppInstall {
     socket: "/var/run/netbird.sock",
     identity: "default.json",
     stop: [&["service", "stop"], &["service", "uninstall"]],
+    managed: ("io.netbird.client", "managementURL"),
 };
 
 pub(super) fn daemon(state_dir: &Path) -> Launch {

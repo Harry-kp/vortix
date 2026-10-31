@@ -213,6 +213,8 @@ struct AppInstall {
     /// Its CLI's arguments that stop its service, then keep it stopped after
     /// a reboot.
     stop: [&'static [&'static str]; 2],
+    /// The macOS device-management domain and key that pin its server.
+    managed: (&'static str, &'static str),
 }
 
 /// The daemon's program, arguments and environment.
@@ -414,6 +416,11 @@ impl MeshTunnel {
         let settings = MeshProfile::parse(&content).map_err(TunnelError::Other)?;
         let cli = binary(driver.slug())?;
         let app = driver.app();
+        if let Some(message) = crate::platform::managed_setting(app.managed.0, app.managed.1)
+            .and_then(|pinned| pinned_elsewhere(name, &settings, &pinned))
+        {
+            return Err(TunnelError::Other(message));
+        }
         if app_running(driver) {
             let [stop, uninstall] = stop_commands(driver);
             return Err(TunnelError::Other(format!(
@@ -879,6 +886,26 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), TunnelError> {
     Ok(())
 }
 
+/// An organization that manages the vendor's app here pins its server for every
+/// copy of the client, Vortix's too, so a profile for another server cannot connect.
+fn pinned_elsewhere(name: &str, settings: &MeshProfile, pinned: &str) -> Option<String> {
+    let (pinned, pinned_port) = MeshProfile {
+        server_url: pinned.trim().to_string(),
+        auth_key: None,
+        identity: None,
+    }
+    .server()
+    .ok()?;
+    let (ours, port) = settings.server().ok()?;
+    (!pinned.eq_ignore_ascii_case(&ours) || pinned_port != port).then(|| {
+        format!(
+            "your organization manages {name} on this computer, so it connects only to \
+             {pinned}; this network ({ours}) cannot be used here: use it on another device, \
+             or ask your IT team"
+        )
+    })
+}
+
 fn write_key_file(state_dir: &Path, key: &str) -> Result<PathBuf, TunnelError> {
     let path = state_dir.join("auth-key");
     let _ = std::fs::remove_file(&path);
@@ -889,6 +916,31 @@ fn write_key_file(state_dir: &Path, key: &str) -> Result<PathBuf, TunnelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_pinned_by_the_organization_refuses_any_other() {
+        let profile = |url: &str| MeshProfile {
+            server_url: url.into(),
+            auth_key: None,
+            identity: None,
+        };
+        let company = profile("https://nb.corp.example:443");
+        assert_eq!(
+            pinned_elsewhere("NetBird", &company, "https://NB.corp.example/\n"),
+            None
+        );
+        let message = pinned_elsewhere(
+            "NetBird",
+            &profile("https://api.netbird.io"),
+            "https://nb.corp.example",
+        )
+        .unwrap();
+        assert!(
+            message.contains("only to nb.corp.example") && message.contains("(api.netbird.io)")
+        );
+        assert!(pinned_elsewhere("NetBird", &company, "https://nb.corp.example:33073").is_some());
+        assert_eq!(pinned_elsewhere("NetBird", &company, "not a url"), None);
+    }
 
     #[test]
     fn a_driver_is_found_by_its_extension_only() {

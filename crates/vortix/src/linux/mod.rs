@@ -24,6 +24,12 @@ pub use socket_audit::ProcSocketAudit;
 
 const POLICY_COMMENT_PREFIX: &str = "vortix-policy:";
 
+/// Device management pins no app settings on Linux.
+#[must_use]
+pub fn managed_setting(_domain: &str, _key: &str) -> Option<String> {
+    None
+}
+
 /// Report line for this OS, e.g. `Ubuntu 24.04 LTS (kernel 6.8.0)`.
 #[must_use]
 pub fn os_description() -> String {

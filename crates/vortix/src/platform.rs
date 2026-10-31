@@ -6,7 +6,7 @@ pub use crate::linux::autoconnect;
 pub use crate::linux::{
     clipboard_commands,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
-    os_description, FIREWALL_TOOL,
+    managed_setting, os_description, FIREWALL_TOOL,
 };
 #[cfg(target_os = "linux")]
 pub use crate::linux::{
@@ -19,7 +19,7 @@ pub use crate::macos::autoconnect;
 pub use crate::macos::{
     clipboard_commands,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
-    os_description, FIREWALL_TOOL,
+    managed_setting, os_description, FIREWALL_TOOL,
 };
 #[cfg(target_os = "macos")]
 pub use crate::macos::{

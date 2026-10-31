@@ -34,6 +34,22 @@ pub fn os_description() -> String {
     }
 }
 
+/// A setting the organization's device management pins for an app; keys
+/// match in any case, as the apps read them.
+#[must_use]
+pub fn managed_setting(domain: &str, key: &str) -> Option<String> {
+    let file = format!("/Library/Managed Preferences/{domain}.plist");
+    let outcome = crate::process::simple_output("plutil", &["-convert", "json", "-o", "-", &file])?;
+    let settings: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&outcome.stdout_lossy()).ok()?;
+    settings
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .and_then(|(_, value)| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// The kill-switch firewall tool and its version flag (none for `pfctl`).
 pub const FIREWALL_TOOL: (&str, &[&str]) = ("pfctl", &[]);
 
