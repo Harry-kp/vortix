@@ -1071,10 +1071,18 @@ fn build_resolvconf_apply_spec(interface: &str, body: Vec<u8>) -> CommandSpec {
 /// Splits each row on its **first** colon only. Splitting on every colon
 /// truncated every IPv6 answer at its first one, so a link's real
 /// `Current DNS Server: fe80::1` was reported as the string `fe80`.
+/// A link with `Default Route: no`, such as a mesh network's, answers only
+/// its own domains, so it is not the system's resolver.
 pub(crate) fn parse_resolvectl_status_server(text: &str) -> Option<String> {
     let mut current = Vec::new();
     let mut configured = Vec::new();
-    for line in text.lines() {
+    let answers_everything =
+        |link: &&str| !link.lines().any(|line| line.trim() == "Default Route: no");
+    for line in text
+        .split("\nLink ")
+        .filter(answers_everything)
+        .flat_map(str::lines)
+    {
         let trimmed = line.trim();
         let Some((label, values)) = trimmed.split_once(':') else {
             continue;
@@ -1892,6 +1900,26 @@ Current DNS Server: fe80::1
             "a routable resolver configured on the link must win over a link-local one"
         );
         assert_ne!(parsed.as_deref(), Some("fe80"), "never report a fragment");
+    }
+
+    #[test]
+    fn resolvectl_status_skips_a_link_that_answers_only_its_own_domains() {
+        let output = "\
+Link 3 (wlp3s0)
+Current DNS Server: fe80::1
+       DNS Servers: 192.168.1.100 fe80::1
+     Default Route: yes
+
+Link 57 (wt0)
+Current DNS Server: 100.126.242.55
+       DNS Servers: 100.126.242.55
+        DNS Domain: netbird.cloud
+     Default Route: no
+";
+        assert_eq!(
+            parse_resolvectl_status_server(output),
+            Some("192.168.1.100".to_string())
+        );
     }
 
     #[test]
