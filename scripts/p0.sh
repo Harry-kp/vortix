@@ -365,12 +365,23 @@ S10() { # credentials and secrets: P0-14, P0-37
     check S10 "auth files are private" test -z "$(find "$CONFIG/auth" -type f ! -perm 600 2>/dev/null)"
 }
 
+netbird_ready() { # id — NetBird is installed and free for Vortix to run
+    command -v netbird >/dev/null || { record SKIP "$1" "netbird is not installed"; return 1; }
+    [ ! -S /var/run/netbird.sock ] || { record SKIP "$1" "the NetBird app's own service is running here"; return 1; }
+}
+# macOS: an organization's device management pins NetBird to its own server.
+netbird_pinned() { [ "$OS" = Darwin ] && plutil -convert json -o - "/Library/Managed Preferences/io.netbird.client.plist" 2>/dev/null | grep -qi '"managementurl"'; }
+
 S11() { # NetBird run by Vortix: P0-44
-    need S11 NETBIRD || return
-    command -v netbird >/dev/null || { record SKIP S11 "netbird is not installed"; return; }
-    [ -S /var/run/netbird.sock ] && { record SKIP S11 "the NetBird app's own service is running here"; return; }
+    need S11 NETBIRD && netbird_ready S11 || return
     local iface=wt0; [ "$OS" = Darwin ] && iface=utun100
     local has_iface out
+    if netbird_pinned; then # the lab's network is refused up front, in plain words
+        out=$(vx up "$NETBIRD" --timeout 60 2>&1)
+        check S11 "managed: up $NETBIRD is refused, naming the server it is set to use" contains "$out" "NetBird on this computer is set to use"
+        check S11 "managed: no netbird process is left" test -z "$(pgrep -x netbird)"
+        return
+    fi
     has_iface() { if [ "$OS" = Darwin ]; then /sbin/ifconfig "$iface" >/dev/null 2>&1; else ip link show "$iface" >/dev/null 2>&1; fi; }
     check S11 "up $NETBIRD exits 0" test "$(rc vx up "$NETBIRD" --timeout 60)" = 0
     check S11 "its interface $iface is up" has_iface
@@ -392,13 +403,88 @@ S11() { # NetBird run by Vortix: P0-44
     command -v wg >/dev/null && check S11 "wg still lists interfaces afterwards" wg show all dump
 }
 
+S12() { # a company NetBird beside a personal VPN, as a user's day goes: P0-47
+    need S12 NETBIRD FULL && netbird_ready S12 || return
+    netbird_pinned && { record SKIP S12 "an organization pins NetBird here to its own server"; return; }
+    local iface=wt0; [ "$OS" = Darwin ] && iface=utun100
+    route_dev() { if [ "$OS" = Darwin ]; then route -n get "$1" 2>/dev/null | awk '/interface:/{print $2}'; else ip route get "$1" 2>/dev/null | grep -o 'dev [^ ]*' | cut -d' ' -f2; fi; }
+    mesh_peer() { # an address inside the mesh network, next to ours
+        local a; if [ "$OS" = Darwin ]; then a=$(/sbin/ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2}'); else a=$(ip -4 -br addr show "$iface" 2>/dev/null | awk '{print $3}' | cut -d/ -f1); fi
+        [ -n "$a" ] && echo "${a%.*}.$(( ${a##*.} == 1 ? 2 : 1 ))"
+    }
+    nb_up() { contains "$(vx status --json | tr -d ' \n')" "\"state\":\"connected\",\"profile\":\"$NETBIRD\""; }
+    mesh_on_mesh() { local p; p=$(mesh_peer) && [ "$(route_dev "$p")" = "$iface" ]; }
+    internet_via_vpn() { local d; d=$(route_dev "$PROBE_IP"); [ -n "$d" ] && [ "$d" != "$PHYS" ] && [ "$(egress)" = 200 ]; }
+    internet_direct() { [ "$(route_dev "$PROBE_IP")" = "$PHYS" ] && [ "$(egress)" = 200 ]; }
+    local PHYS dns_before rules_before
+    PHYS=$(route_dev "$PROBE_IP"); dns_before=$(dns_state)
+    [ "$OS" = Darwin ] || rules_before=$(ip rule | wc -l)
+
+    # Morning: the company network, then the personal VPN for the internet.
+    check S12 "company: up $NETBIRD exits 0" test "$(rc vx up "$NETBIRD" --timeout 60)" = 0
+    check S12 "company alone: internet stays direct" internet_direct
+    check S12 "personal: up $FULL beside it exits 0" test "$(rc vx up "$FULL" --timeout 60)" = 0
+    check S12 "both: internet goes through $FULL" internet_via_vpn
+    check S12 "both: company addresses still go through $iface" mesh_on_mesh
+    check S12 "both: $NETBIRD stays connected" nb_up
+    check S12 "both: $FULL's resolver is applied" test "$(dns_state)" != "$dns_before"
+    if [ -n "$HAVE_TMUX" ]; then
+        tui_start 80 24; sleep 3
+        check S12 "TUI header shows the personal exit, not the mesh" connected "$FULL"
+        check S12 "TUI lists the company network too" contains "$(frame)" "$NETBIRD"
+        tui_stop
+    fi
+    if [ -n "$OVPN" ]; then # switch personal VPNs; the company network must not notice
+        check S12 "switch: up $OVPN --yes exits 0" test "$(rc vx up "$OVPN" --yes --timeout 60)" = 0
+        sleep 3
+        check S12 "switch: internet goes through $OVPN" internet_via_vpn
+        check S12 "switch: company addresses still go through $iface" mesh_on_mesh
+        check S12 "switch: $NETBIRD stays connected" nb_up
+        vx down "$OVPN" >/dev/null 2>&1
+    else
+        vx down "$FULL" >/dev/null 2>&1
+    fi
+    sleep 2
+    check S12 "personal off: internet is direct again" internet_direct
+    check S12 "personal off: $NETBIRD stays connected" nb_up
+    check S12 "personal off: company addresses still go through $iface" mesh_on_mesh
+    vx down "$NETBIRD" >/dev/null 2>&1
+
+    # The other order: the company network joins through the personal VPN.
+    vx up "$FULL" --timeout 60 >/dev/null 2>&1
+    check S12 "late join: up $NETBIRD through $FULL exits 0" test "$(rc vx up "$NETBIRD" --timeout 60)" = 0
+    check S12 "late join: company addresses go through $iface" mesh_on_mesh
+    check S12 "late join: internet still goes through $FULL" internet_via_vpn
+    check S12 "company off first: down $NETBIRD exits 0" test "$(rc vx down "$NETBIRD")" = 0
+    check S12 "company off first: $FULL keeps the internet" internet_via_vpn
+    vx down "$FULL" >/dev/null 2>&1; sleep 1
+    check S12 "no netbird process is left" test -z "$(pgrep -x netbird)"
+    check S12 "no tunnel is left" test "$(tunnels)" = "$BASE_TUNNELS"
+    check S12 "DNS is restored exactly" test "$(dns_state)" = "$dns_before"
+    [ "$OS" = Darwin ] || check S12 "no routing rule is left" test "$(ip rule | wc -l)" = "$rules_before"
+
+    # vpn-only: the company network works; without the personal VPN nothing else leaves.
+    may_block S12 || return
+    vx killswitch vpn-only >/dev/null 2>&1
+    vx up "$FULL" --timeout 60 >/dev/null 2>&1
+    check S12 "vpn-only: up $NETBIRD beside $FULL exits 0" test "$(rc vx up "$NETBIRD" --timeout 60)" = 0
+    check S12 "vpn-only: internet goes through $FULL" internet_via_vpn
+    check S12 "vpn-only: company addresses go through $iface" mesh_on_mesh
+    vx down "$FULL" >/dev/null 2>&1; sleep 2
+    check S12 "vpn-only, personal off: other traffic is blocked" test "$(egress)" != 200
+    check S12 "vpn-only, personal off: $NETBIRD stays connected" nb_up
+    vx down "$NETBIRD" >/dev/null 2>&1
+    vx killswitch off >/dev/null 2>&1
+    check S12 "off: egress is back" test "$(egress)" = 200
+}
+
 # ── run ─────────────────────────────────────────────────────────────────
 reset_host
 BASE_TUNNELS=$(tunnels)
 echo "== P0 on $OS, $(date -u +%FT%TZ), $("$VX" --version 2>/dev/null) =="
 [ -n "$PROBE_IP" ] || echo "note: example.com did not resolve; egress checks will be skipped"
 [ -n "$HAVE_TMUX" ] || echo "note: tmux is not installed; TUI checks will be skipped"
-for s in ${*:-S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11}; do
+for s in ${*:-S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12}; do
     reset_host
     "$s"
 done
