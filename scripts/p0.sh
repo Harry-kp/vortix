@@ -378,8 +378,8 @@ S11() { # NetBird run by Vortix: P0-44
     local has_iface out
     if netbird_pinned; then # the lab's network is refused up front, in plain words
         out=$(vx up "$NETBIRD" --timeout 60 2>&1)
-        check S11 "managed: up $NETBIRD is refused, naming the organization" contains "$out" "your organization manages NetBird"
-        check S11 "managed: no netbird process was started" test -z "$(pgrep -x netbird)"
+        check S11 "managed: up $NETBIRD is refused, naming the server it is set to use" contains "$out" "NetBird on this computer is set to use"
+        check S11 "managed: no netbird process is left" test -z "$(pgrep -x netbird)"
         return
     fi
     has_iface() { if [ "$OS" = Darwin ]; then /sbin/ifconfig "$iface" >/dev/null 2>&1; else ip link show "$iface" >/dev/null 2>&1; fi; }

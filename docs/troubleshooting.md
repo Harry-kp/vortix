@@ -106,9 +106,10 @@ Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root on
 - `NetBird server: …`: `server_url` is wrong or the server is unreachable.
 - `the NetBird app's service is running`: only one NetBird can run on a computer. Stop the
   app's service as the message says ([moving from the NetBird app](usage.md#netbird-networks)).
-- `your organization manages NetBird on this computer`: a device-management profile (macOS)
-  pins NetBird to the organization's server, for every NetBird client on the Mac, Vortix's too.
-  Only that server's network connects there; use the other network on another device.
+- `NetBird on this computer is set to use <server>, not <yours>`: something on this computer,
+  usually an organization's device management, makes every NetBird client use its server,
+  Vortix's too. Only that server's network connects there; use the other network on another
+  device.
 
 ## DNS
 

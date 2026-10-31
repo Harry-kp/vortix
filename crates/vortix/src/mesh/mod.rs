@@ -213,8 +213,6 @@ struct AppInstall {
     /// Its CLI's arguments that stop its service, then keep it stopped after
     /// a reboot.
     stop: [&'static [&'static str]; 2],
-    /// The macOS device-management domain and key that pin its server.
-    managed: (&'static str, &'static str),
 }
 
 /// The daemon's program, arguments and environment.
@@ -416,11 +414,6 @@ impl MeshTunnel {
         let settings = MeshProfile::parse(&content).map_err(TunnelError::Other)?;
         let cli = binary(driver.slug())?;
         let app = driver.app();
-        if let Some(message) = crate::platform::managed_setting(app.managed.0, app.managed.1)
-            .and_then(|pinned| pinned_elsewhere(name, &settings, &pinned))
-        {
-            return Err(TunnelError::Other(message));
-        }
         if app_running(driver) {
             let [stop, uninstall] = stop_commands(driver);
             return Err(TunnelError::Other(format!(
@@ -593,6 +586,7 @@ impl MeshTunnel {
         if !outcome.success() || after.state != MeshState::Connected {
             return Err(up_failure(
                 driver,
+                settings,
                 &after,
                 &String::from_utf8_lossy(&outcome.stderr),
             ));
@@ -792,8 +786,16 @@ fn login_notice(line: &str, name: &str, timeout: Duration) -> Option<String> {
     })
 }
 
-fn up_failure(driver: MeshDriver, status: &MeshStatus, stderr: &str) -> TunnelError {
+fn up_failure(
+    driver: MeshDriver,
+    settings: &MeshProfile,
+    status: &MeshStatus,
+    stderr: &str,
+) -> TunnelError {
     let name = driver.name();
+    if let Some(message) = server_overridden(name, settings, &status.server) {
+        return TunnelError::Other(message);
+    }
     // An unreachable server also leaves a new device needing a login; the
     // server is the cause to report.
     if !status.error.is_empty() {
@@ -886,22 +888,16 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), TunnelError> {
     Ok(())
 }
 
-/// An organization that manages the vendor's app here pins its server for every
-/// copy of the client, Vortix's too, so a profile for another server cannot connect.
-fn pinned_elsewhere(name: &str, settings: &MeshProfile, pinned: &str) -> Option<String> {
-    let (pinned, pinned_port) = MeshProfile {
-        server_url: pinned.trim().to_string(),
-        auth_key: None,
-        identity: None,
-    }
-    .server()
-    .ok()?;
-    let (ours, port) = settings.server().ok()?;
-    (!pinned.eq_ignore_ascii_case(&ours) || pinned_port != port).then(|| {
+/// The daemon reports a server other than the profile's when something on
+/// this computer overrides it, such as an organization's device management.
+fn server_overridden(name: &str, settings: &MeshProfile, reported: &str) -> Option<String> {
+    let (host, port) = reported.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let (ours, our_port) = settings.server().ok()?;
+    (!host.eq_ignore_ascii_case(&ours) || port != our_port).then(|| {
         format!(
-            "your organization manages {name} on this computer, so it connects only to \
-             {pinned}; this network ({ours}) cannot be used here: use it on another device, \
-             or ask your IT team"
+            "{name} on this computer is set to use {host}, not {ours} (your organization may \
+             manage it): use this network on another device, or ask your IT team"
         )
     })
 }
@@ -918,28 +914,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_server_pinned_by_the_organization_refuses_any_other() {
-        let profile = |url: &str| MeshProfile {
-            server_url: url.into(),
+    fn a_server_overridden_on_this_computer_is_named() {
+        let company = MeshProfile {
+            server_url: "https://nb.corp.example".into(),
             auth_key: None,
             identity: None,
         };
-        let company = profile("https://nb.corp.example:443");
         assert_eq!(
-            pinned_elsewhere("NetBird", &company, "https://NB.corp.example/\n"),
+            server_overridden("NetBird", &company, "nb.corp.example:443"),
             None
         );
-        let message = pinned_elsewhere(
-            "NetBird",
-            &profile("https://api.netbird.io"),
-            "https://nb.corp.example",
-        )
-        .unwrap();
-        assert!(
-            message.contains("only to nb.corp.example") && message.contains("(api.netbird.io)")
-        );
-        assert!(pinned_elsewhere("NetBird", &company, "https://nb.corp.example:33073").is_some());
-        assert_eq!(pinned_elsewhere("NetBird", &company, "not a url"), None);
+        assert_eq!(server_overridden("NetBird", &company, ""), None);
+        let message = server_overridden("NetBird", &company, "spider.example.com:443").unwrap();
+        assert!(message.contains("set to use spider.example.com, not nb.corp.example"));
+        assert!(server_overridden("NetBird", &company, "nb.corp.example:33073").is_some());
     }
 
     #[test]
@@ -996,6 +984,11 @@ mod tests {
         let failure = |state, error: &str, stderr| {
             up_failure(
                 MeshDriver::NetBird,
+                &MeshProfile {
+                    server_url: "https://api.netbird.io".into(),
+                    auth_key: None,
+                    identity: None,
+                },
                 &MeshStatus {
                     state,
                     error: error.into(),
