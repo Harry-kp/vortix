@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-10-31
+
+### Bug Fixes
+
+- NetBird keeps secrets out of errors, runs once, and stays inside the kill switch
+- NetBird reads right where a user meets it
+- Deleting a mesh profile removes its identity
+- WireGuard and OpenVPN users see no NetBird noise
+- NetBird from the command line: help, import and status
+- NetBird connects from the CLI end in time, with the right exit code
+- Warn about an unchanged public address only when a tunnel carries the internet
+- The header shows a connected mesh network as connected
+- NetBird names an overridden server; smoke set covers NetBird beside a personal VPN ([#410](https://github.com/Harry-kp/vortix/pull/410))
+- The shown DNS server skips a link that answers only its own domains
+- Warn about an unchanged public IPv6 only when a tunnel carries the internet
+
+### Documentation
+
+- NetBird live workflows, the lab's test network, install hints
+
+### Features
+
+- Run NetBird networks from a .netbird profile
+- The kill switch lets a NetBird daemon reach its peers
+- Move from the NetBird app with `vortix import /var/lib/netbird`
+- Log in to a NetBird network from the link it prints
+- See a mesh network's peers
+- See the networks a mesh network routes to
+- Onboard to NetBird from the dashboard, and keep WireGuard working beside it
+
+### Refactor
+
+- Drop the transport status call nothing makes
+- Mesh networks are a kind, NetBird is a driver
+
+
+
 ## [0.5.5] - 2026-10-24
 
 ### Security
