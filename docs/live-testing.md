@@ -26,8 +26,10 @@ saved again for each droplet (its `credentials.txt`).
 The lab's test network is a NetBird Cloud account of the maintainer's (`api.netbird.io`). Its
 reusable setup key is on the lab at `~/.netbird-lab/setup-key` (`0600`); refer to it by path,
 never print or copy it. Test runs register devices there; remove offline ones in the
-dashboard (Peers) now and then. The Mac runs the maintainer's company NetBird, and a host runs
-only one NetBird daemon, so NetBird is never started on the Mac by a check.
+dashboard (Peers) now and then. The Mac runs the maintainer's company NetBird, pinned to the company's
+server by device management, so the test network never connects there: on the Mac, S11 checks
+that refusal and S12 skips. A host runs only one NetBird daemon; the company service must be
+stopped (`sudo netbird service stop`, by the maintainer) before either runs.
 
 ## macOS
 
