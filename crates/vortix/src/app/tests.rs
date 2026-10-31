@@ -2736,3 +2736,35 @@ fn only_an_internet_tunnel_is_expected_to_change_the_public_address() {
     probe(&mut full, "198.51.100.78");
     assert!(warned("198.51.100.78"));
 }
+
+#[test]
+fn only_an_internet_tunnel_is_expected_to_change_the_public_ipv6() {
+    use crate::telemetry::TelemetryUpdate;
+    let warned = |ip: &str| {
+        crate::logger::get_logs().iter().any(|entry| {
+            entry
+                .message
+                .contains(&format!("IPv6 leak detected — public {ip}"))
+        })
+    };
+    let probe = |app: &mut App, ip: &str| {
+        app.runtime.real_ipv6 = Some(ip.to_string());
+        app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(Some(
+            ip.to_string(),
+        ))));
+    };
+
+    let mut mesh_only = test_app();
+    set_connected(&mut mesh_only, "p0mesh");
+    probe(&mut mesh_only, "2001:db8::77");
+    assert!(!warned("2001:db8::77"));
+
+    let mut full = test_app();
+    set_connected(&mut full, "wg08");
+    let mut snapshot = (*full.control_snapshot).clone();
+    snapshot.primary = Some(crate::profile::ProfileId::new("wg08"));
+    snapshot.version += 1;
+    full.apply_control_snapshot(std::sync::Arc::new(snapshot));
+    probe(&mut full, "2001:db8::78");
+    assert!(warned("2001:db8::78"));
+}

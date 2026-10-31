@@ -676,7 +676,8 @@ impl App {
                         self.runtime.real_ipv6_from_cache = false;
                     }
                 }
-                if is_connected {
+                // As for IPv4: only a tunnel that carries the internet should change it.
+                if self.primary_id().is_some() {
                     if let (Some(real), Some(public)) = (&self.runtime.real_ipv6, &observed) {
                         if real == public {
                             self.log(&format!(
