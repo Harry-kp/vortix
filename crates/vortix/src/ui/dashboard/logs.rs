@@ -16,12 +16,12 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(theme::current().border_default)
     };
 
-    if let crate::app::state::LogsSource::OpenVpn(target) = app.logs_source.clone() {
+    if let crate::app::state::LogsSource::Tunnel(target) = app.logs_source.clone() {
         let known = target
             .as_ref()
             .is_none_or(|id| app.runtime.profiles.iter().any(|profile| &profile.id == id));
         if known {
-            render_openvpn(frame, app, area, border_style, target.as_ref());
+            render_tunnel_log(frame, app, area, border_style, target.as_ref());
             return;
         }
         // The profile was deleted while its log was on screen.
@@ -154,10 +154,10 @@ fn render_scrolled(frame: &mut Frame, app: &mut App, area: Rect, inner: Rect, li
     );
 }
 
-/// Lines of an `OpenVPN` log kept in memory; the rest of a long session is on disk.
-const OPENVPN_LOG_TAIL: usize = 2000;
+/// Lines of a tunnel's log kept in memory; the rest of a long session is on disk.
+const TUNNEL_LOG_TAIL: usize = 2000;
 
-fn render_openvpn(
+fn render_tunnel_log(
     frame: &mut Frame,
     app: &mut App,
     area: Rect,
@@ -165,16 +165,24 @@ fn render_openvpn(
     target: Option<&crate::profile::ProfileId>,
 ) {
     let profile = target.and_then(|id| app.runtime.profiles.iter().find(|p| &p.id == id));
-    let path = profile.map(|profile| {
-        let run_dir = app.runtime.config_dir.join(constants::OPENVPN_RUN_DIR);
-        crate::openvpn::runtime_log_path(&run_dir, profile.id.as_str(), &profile.name)
+    let path = profile.and_then(|profile| match profile.protocol {
+        crate::profile::ProtocolKind::OpenVpn => {
+            let run_dir = app.runtime.config_dir.join(constants::OPENVPN_RUN_DIR);
+            Some(crate::openvpn::runtime_log_path(
+                &run_dir,
+                profile.id.as_str(),
+                &profile.name,
+            ))
+        }
+        crate::profile::ProtocolKind::Mesh(driver) => Some(driver.log_path(&profile.id)),
+        crate::profile::ProtocolKind::WireGuard => None,
     });
-    let name = profile.map(|profile| profile.name.clone());
+    let name = profile.map(|profile| format!("{} · {}", profile.name, profile.protocol));
     let live = target.is_some_and(|id| app.tunnel_is_active(id));
     let has_log = path
         .as_deref()
-        .is_some_and(|path| refresh_openvpn_log(app, path));
-    let modified = app.openvpn_log.as_ref().and_then(|cached| cached.modified);
+        .is_some_and(|path| refresh_tunnel_log(app, path));
+    let modified = app.tunnel_log.as_ref().and_then(|cached| cached.modified);
 
     let session = match (has_log, live) {
         (_, true) => " · LIVE".to_string(),
@@ -195,8 +203,8 @@ fn render_openvpn(
         " [Paused]"
     };
     let title = match name {
-        Some(name) => format!(" {name} · OpenVPN log{session}{paused} "),
-        None => format!(" OpenVPN log{paused} "),
+        Some(name) => format!(" {name} log{session}{paused} "),
+        None => format!(" VPN log{paused} "),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -205,10 +213,10 @@ fn render_openvpn(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let cached = app.openvpn_log.as_ref().filter(|_| has_log);
+    let cached = app.tunnel_log.as_ref().filter(|_| has_log);
     let Some(cached) = cached.filter(|cached| !cached.lines.is_empty()) else {
         frame.render_widget(
-            Paragraph::new("No OpenVPN log yet. It appears after an OpenVPN profile connects.")
+            Paragraph::new("No VPN log yet. It appears once a profile connects.")
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: true }),
             inner,
@@ -224,14 +232,14 @@ fn render_openvpn(
     render_scrolled(frame, app, area, inner, lines);
 }
 
-/// Keep `app.openvpn_log` holding the tail of the log at `path`, re-read only
+/// Keep `app.tunnel_log` holding the tail of the log at `path`, re-read only
 /// when its size or modification time changed. False when there is no file.
-fn refresh_openvpn_log(app: &mut App, path: &std::path::Path) -> bool {
+fn refresh_tunnel_log(app: &mut App, path: &std::path::Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
     let modified = metadata.modified().ok();
-    let fresh = app.openvpn_log.as_ref().is_some_and(|cached| {
+    let fresh = app.tunnel_log.as_ref().is_some_and(|cached| {
         cached.path == path && cached.modified == modified && cached.len == metadata.len()
     });
     if !fresh {
@@ -240,8 +248,8 @@ fn refresh_openvpn_log(app: &mut App, path: &std::path::Path) -> bool {
         };
         let text = String::from_utf8_lossy(&text);
         let lines = text.lines().collect::<Vec<_>>();
-        let start = lines.len().saturating_sub(OPENVPN_LOG_TAIL);
-        app.openvpn_log = Some(crate::app::state::OpenVpnLogFile {
+        let start = lines.len().saturating_sub(TUNNEL_LOG_TAIL);
+        app.tunnel_log = Some(crate::app::state::TunnelLogFile {
             path: path.to_path_buf(),
             modified,
             len: metadata.len(),
@@ -322,17 +330,17 @@ mod tests {
     }
 
     #[test]
-    fn f_steps_through_each_active_openvpn_tunnel_then_back_to_events() {
+    fn f_steps_through_each_active_logged_tunnel_then_back_to_events() {
         let (mut app, _dir) = app_with(&[("corp", true, 1), ("home", true, 2), ("lab", false, 3)]);
         press_f(&mut app, 4);
         assert_eq!(
             app.logs_source,
-            LogsSource::OpenVpn(Some(ProfileId::new("corp")))
+            LogsSource::Tunnel(Some(ProfileId::new("corp")))
         );
         press_f(&mut app, 1);
         assert_eq!(
             app.logs_source,
-            LogsSource::OpenVpn(Some(ProfileId::new("home")))
+            LogsSource::Tunnel(Some(ProfileId::new("home")))
         );
         press_f(&mut app, 1);
         assert_eq!(app.logs_source, LogsSource::Events);
@@ -342,24 +350,59 @@ mod tests {
     #[test]
     fn with_no_tunnel_up_only_the_last_connected_profile_has_a_step() {
         let (app, _dir) = app_with(&[("corp", false, 5), ("home", false, 9), ("lab", false, 0)]);
-        assert_eq!(app.openvpn_log_steps(), vec![Some(ProfileId::new("home"))]);
+        assert_eq!(app.tunnel_log_steps(), vec![Some(ProfileId::new("home"))]);
         let (never, _dir) = app_with(&[("corp", false, 0)]);
-        assert_eq!(never.openvpn_log_steps(), vec![None]);
+        assert_eq!(never.tunnel_log_steps(), vec![None]);
     }
 
     #[test]
-    fn without_openvpn_profiles_the_cycle_is_unchanged() {
+    fn without_logged_profiles_the_cycle_is_unchanged() {
         let (mut app, _dir) = app_with(&[]);
         press_f(&mut app, 4);
         assert_eq!(app.logs_source, LogsSource::Events);
         assert_eq!(app.log_level_filter, None);
     }
 
+    /// A mesh network's daemon log joins the cycle like `OpenVPN`'s; `WireGuard`
+    /// writes none, so it never does.
+    #[test]
+    fn a_netbird_network_has_its_own_log_step() {
+        let (mut app, _dir) = app_with(&[("corp", true, 1)]);
+        for (name, protocol) in [
+            ("work", ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird)),
+            ("home", ProtocolKind::WireGuard),
+        ] {
+            app.runtime
+                .profiles
+                .push(crate::config::profiles::VpnProfile {
+                    id: ProfileId::new(name),
+                    name: name.to_string(),
+                    protocol,
+                    config_path: app.runtime.config_dir.join(name),
+                    location: String::new(),
+                    last_used: None,
+                    group: None,
+                });
+            let mut view = crate::app::connection::test_view(name, Phase::Up);
+            view.profile_id = ProfileId::new(name);
+            view.protocol = protocol;
+            std::sync::Arc::make_mut(&mut app.control_snapshot)
+                .tunnels
+                .push(view);
+        }
+        assert_eq!(
+            app.tunnel_log_steps(),
+            vec![Some(ProfileId::new("corp")), Some(ProfileId::new("work"))]
+        );
+        app.logs_source = LogsSource::Tunnel(Some(ProfileId::new("work")));
+        assert!(panel(&mut app).contains("work · NetBird log · LIVE"));
+    }
+
     #[test]
     fn the_title_says_live_then_last_session() {
         let (mut app, _dir) = app_with(&[("corp", true, 1)]);
         write_log(&app, "corp", "Initialization Sequence Completed\n");
-        app.logs_source = LogsSource::OpenVpn(Some(ProfileId::new("corp")));
+        app.logs_source = LogsSource::Tunnel(Some(ProfileId::new("corp")));
         let live = panel(&mut app);
         assert!(live.contains("corp · OpenVPN log · LIVE"), "{live}");
         assert!(live.contains("Initialization Sequence Completed"), "{live}");
@@ -379,10 +422,10 @@ mod tests {
     #[test]
     fn a_missing_log_says_so_and_a_deleted_profile_returns_to_events() {
         let (mut app, _dir) = app_with(&[("corp", false, 0)]);
-        app.logs_source = LogsSource::OpenVpn(None);
-        assert!(panel(&mut app).contains("No OpenVPN log yet"));
+        app.logs_source = LogsSource::Tunnel(None);
+        assert!(panel(&mut app).contains("No VPN log yet"));
 
-        app.logs_source = LogsSource::OpenVpn(Some(ProfileId::new("gone")));
+        app.logs_source = LogsSource::Tunnel(Some(ProfileId::new("gone")));
         let body = panel(&mut app);
         assert_eq!(app.logs_source, LogsSource::Events);
         assert!(body.contains("Event Log"), "{body}");

@@ -93,7 +93,7 @@ dashboard's Logs panel (`f` until the title names the profile).
 
 ## NetBird
 
-Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root only).
+Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root only); the dashboard shows it in the Logs panel (`f`).
 
 - `the sign-in was not finished within 5 min`: connect again for a new link, or add an
   `auth_key` (a setup key) to the `.netbird` file. A link that returns to `localhost` works only

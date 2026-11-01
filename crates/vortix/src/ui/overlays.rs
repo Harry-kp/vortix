@@ -1106,7 +1106,7 @@ pub mod help {
             &[
                 ("j / ↓", "Scroll down"),
                 ("k / ↑", "Scroll up"),
-                ("f", "Cycle level filter, then OpenVPN logs"),
+                ("f", "Cycle level filter, then each VPN's own log"),
                 ("L", "Clear logs"),
             ],
         ),
