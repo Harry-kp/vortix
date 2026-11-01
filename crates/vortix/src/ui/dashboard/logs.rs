@@ -243,12 +243,14 @@ fn refresh_tunnel_log(app: &mut App, path: &std::path::Path) -> bool {
         cached.path == path && cached.modified == modified && cached.len == metadata.len()
     });
     if !fresh {
-        let Ok(text) = std::fs::read(path) else {
+        let Ok(text) = read_end(path, metadata.len()) else {
             return false;
         };
         let text = String::from_utf8_lossy(&text);
         let lines = text.lines().collect::<Vec<_>>();
-        let start = lines.len().saturating_sub(TUNNEL_LOG_TAIL);
+        // A cut first line is dropped; whole lines only.
+        let skip = usize::from(metadata.len() > TUNNEL_LOG_READ);
+        let start = lines.len().saturating_sub(TUNNEL_LOG_TAIL).max(skip);
         app.tunnel_log = Some(crate::app::state::TunnelLogFile {
             path: path.to_path_buf(),
             modified,
@@ -260,6 +262,21 @@ fn refresh_tunnel_log(app: &mut App, path: &std::path::Path) -> bool {
         });
     }
     true
+}
+
+/// Bytes read from the end of a tunnel's log: a daemon log can grow to many
+/// megabytes, and only its last lines are shown.
+const TUNNEL_LOG_READ: u64 = 512 * 1024;
+
+fn read_end(path: &std::path::Path, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(
+        len.saturating_sub(TUNNEL_LOG_READ),
+    ))?;
+    let mut bytes = Vec::new();
+    file.take(TUNNEL_LOG_READ).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn event_log_title(auto_scroll: bool, filter_label: &str) -> String {
@@ -396,6 +413,25 @@ mod tests {
         );
         app.logs_source = LogsSource::Tunnel(Some(ProfileId::new("work")));
         assert!(panel(&mut app).contains("work · NetBird log · LIVE"));
+    }
+
+    /// A long log is read from its end, and a line the cut splits is dropped.
+    #[test]
+    fn a_long_log_shows_its_last_whole_lines() {
+        let (mut app, _dir) = app_with(&[("corp", true, 1)]);
+        let line = "x".repeat(99);
+        let body = (0..10_000)
+            .flat_map(|n| [format!("{n:05}"), " ".into(), line.clone(), "\n".into()])
+            .collect::<String>();
+        write_log(&app, "corp", &body);
+        app.logs_source = LogsSource::Tunnel(Some(ProfileId::new("corp")));
+        panel(&mut app);
+        let lines = &app.tunnel_log.as_ref().unwrap().lines;
+        assert_eq!(lines.last().unwrap(), &format!("09999 {line}"));
+        assert!(
+            lines.iter().all(|kept| kept.len() == 105),
+            "only whole lines"
+        );
     }
 
     #[test]
