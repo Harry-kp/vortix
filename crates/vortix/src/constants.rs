@@ -246,13 +246,11 @@ pub const PROMPT_IMPORT_PATH: &str = "Paste a path, link or name:";
 
 // === Flip Panel (Back-View) Titles ===
 
-/// Back-view title for the Connection Details panel.
-pub const TITLE_FLIP_HEALTH: &str = " ◀ Health ";
 /// Back-view title for the Security Guard panel.
 pub const TITLE_FLIP_EVIDENCE: &str = " ◀ Evidence ";
-/// Back-view title for the Network Throughput panel.
+/// Back-view title for the Connection Details panel.
 pub const TITLE_FLIP_ROUTES: &str = " ◀ Routes & peers ";
-/// Front hint on the Network Throughput panel.
+/// Front hint on the Connection Details panel.
 pub const FLIP_ROUTES_HINT: &str = " [f] routes & peers ";
 /// Footer hint shown on every flipped panel.
 pub const FLIP_BACK_HINT: &str = " [f] flip back ";

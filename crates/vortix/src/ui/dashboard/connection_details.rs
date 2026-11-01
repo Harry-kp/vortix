@@ -48,18 +48,9 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style)
         .padding(Padding::horizontal(1))
         .title(" Connection Details ");
-    // The flip side explains a degraded tunnel or a failed connect.
-    let degraded = focused_snap.is_some_and(|tunnel| {
-        matches!(
-            tunnel.health,
-            crate::tunnel::ConnectionHealth::Degraded { .. }
-        )
-    });
-    let failed = focused_profile_id
-        .as_ref()
-        .is_some_and(|id| app.control_snapshot.failures.contains_key(id));
-    if degraded || failed {
-        block = block.title_bottom(helpers::border_hint(constants::FLIP_WHY_HINT));
+    // The back lists routes and peers once the focused profile has a tunnel.
+    if focused_snap.is_some() {
+        block = block.title_bottom(helpers::border_hint(constants::FLIP_ROUTES_HINT));
     }
 
     let inner = block.inner(area);
@@ -745,6 +736,12 @@ fn config_has_fwmark(raw: &str) -> bool {
     false
 }
 
+/// Wide enough (zoomed) for every column; narrower, one short status each.
+const FULL_COLUMNS: usize = 46;
+
+/// The back: where the focused profile's traffic goes. Its routes (a mesh
+/// network's routed networks) and who it talks to (a mesh network's peers,
+/// else the server), the same layout for every kind of VPN.
 fn render_back(
     frame: &mut Frame,
     app: &App,
@@ -752,80 +749,224 @@ fn render_back(
     area: Rect,
     border_style: Style,
 ) {
+    let tunnel = profile_id.and_then(|id| app.tunnel(id));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .padding(Padding::horizontal(1))
-        .title(constants::TITLE_FLIP_HEALTH)
+        .title(constants::TITLE_FLIP_ROUTES)
         .title_bottom(helpers::border_hint(constants::FLIP_BACK_HINT));
-
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let mut text = build_health(app, profile_id, inner.width as usize);
-    let max_lines = inner.height as usize;
-    text.truncate(max_lines);
-    frame.render_widget(Paragraph::new(text), inner);
+    let width = usize::from(inner.width);
+    let dim = Style::default().fg(theme::current().text_secondary);
+    let Some(tunnel) = tunnel else {
+        let text = if profile_id.is_some() {
+            "Not connected: connect it to see its routes and peers."
+        } else {
+            "Select a profile to see its routes and peers."
+        };
+        frame.render_widget(
+            Paragraph::new(helpers::wrapped_lines(text, width, 0, dim)),
+            inner,
+        );
+        return;
+    };
+    let heading =
+        |text: String| Line::styled(text, Style::default().fg(theme::current().accent_primary));
+    let routes = route_lines(tunnel, width);
+    let peers: Vec<Line<'static>> = if !tunnel.details.peers.is_empty() {
+        peer_lines(&tunnel.details.peers, width)
+    } else if tunnel.details.endpoint.is_empty() {
+        Vec::new()
+    } else {
+        vec![mark_line(
+            true,
+            &tunnel.details.endpoint,
+            &tunnel.details.latest_handshake,
+            width,
+        )]
+    };
+    let peers_title = if tunnel.details.peers.is_empty() {
+        "Peers".to_string()
+    } else {
+        format!("Peers  {}", helpers::peers_summary(&tunnel.details.peers))
+    };
+    // Two headings and a blank line; the rest is shared so Peers always shows.
+    let budget = usize::from(inner.height).saturating_sub(3);
+    let routes_room = routes
+        .len()
+        .min(budget.saturating_sub(peers.len().min(budget / 2)));
+    let peers_room = budget.saturating_sub(routes_room);
+    let mut lines = vec![heading("Routes".into())];
+    lines.extend(section(routes, routes_room, dim));
+    lines.push(Line::from(""));
+    lines.push(heading(peers_title));
+    lines.extend(section(peers, peers_room, dim));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The flip side for the selected profile: how its tunnel is doing and why, or why its last
-/// connect failed.
-fn build_health(app: &App, profile_id: Option<&ProfileId>, width: usize) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(theme::current().text_secondary);
-    let row = |label: &str, value: &str| helpers::reading_rows(label, 7, value, None, width);
-    let Some(profile_id) = profile_id else {
-        return helpers::wrapped_lines("Select a profile to see its health.", width, 0, dim);
-    };
-    let name = app
-        .runtime
-        .profiles
-        .iter()
-        .find(|profile| &profile.id == profile_id)
-        .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone());
-    let mut lines = row("Profile", &name);
-    let failure = app.control_snapshot.failures.get(profile_id);
-    if let Some(error) = failure {
-        lines.push(Line::from(Span::styled("Last attempt failed:", dim)));
-        lines.extend(helpers::wrapped_lines(
-            error,
-            width,
-            2,
-            Style::default().fg(theme::current().error),
-        ));
+/// The routes section: a mesh network's routed networks (in use or not, the
+/// exit node), else the routes the tunnel carries.
+fn route_lines(tunnel: &crate::control::TunnelView, width: usize) -> Vec<Line<'static>> {
+    let networks = &tunnel.details.networks;
+    if networks.is_empty() {
+        return tunnel
+            .routes
+            .iter()
+            .map(|route| mark_line(true, &route.to_string(), "", width))
+            .collect();
     }
-    let Some(tunnel) = app.tunnel(profile_id) else {
-        if failure.is_none() {
-            lines.extend(helpers::wrapped_lines(
-                "No connection yet this session.",
+    if width < FULL_COLUMNS {
+        let names = column(
+            networks.iter().map(|network| network.name.as_str()),
+            width,
+            5,
+        );
+        return networks
+            .iter()
+            .map(|network| {
+                let exit = if network.is_exit_node() { " exit" } else { "" };
+                mark_line(
+                    network.selected,
+                    &format!(
+                        "{:<names$}{exit}",
+                        helpers::truncate_to_width(&network.name, names)
+                    ),
+                    "",
+                    width,
+                )
+            })
+            .collect();
+    }
+    // Every column after the name keeps its room: range plus "  exit node".
+    let after = networks
+        .iter()
+        .map(|network| network.range.len() + 11)
+        .max()
+        .unwrap_or(0);
+    let names = column(
+        networks.iter().map(|network| network.name.as_str()),
+        width,
+        after,
+    );
+    networks
+        .iter()
+        .map(|network| {
+            let exit = if network.is_exit_node() {
+                "  exit node"
+            } else {
+                ""
+            };
+            mark_line(
+                network.selected,
+                &format!(
+                    "{:<names$} {}{exit}",
+                    helpers::truncate_to_width(&network.name, names),
+                    network.range
+                ),
+                "",
                 width,
-                0,
-                dim,
-            ));
-        }
+            )
+        })
+        .collect()
+}
+
+/// A name column as wide as the longest name, leaving `after` columns for
+/// what follows it (and never under 8).
+fn column<'a>(names: impl Iterator<Item = &'a str>, width: usize, after: usize) -> usize {
+    names
+        .map(unicode_width::UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(after + 3).max(8))
+}
+
+/// A section's lines in `room` rows: `none` when empty, else as many as fit
+/// and `… N more (z)` for the rest.
+fn section(lines: Vec<Line<'static>>, room: usize, dim: Style) -> Vec<Line<'static>> {
+    if lines.is_empty() {
+        return vec![Line::styled("none", dim)];
+    }
+    if lines.len() <= room.max(1) {
         return lines;
+    }
+    let shown = room.saturating_sub(1).max(1);
+    let more = lines.len() - shown;
+    let mut kept: Vec<_> = lines.into_iter().take(shown).collect();
+    kept.push(Line::styled(format!("… {more} more (z)"), dim));
+    kept
+}
+
+/// `● text  detail`, green when in use, grey otherwise, fitted to the panel.
+fn mark_line(active: bool, text: &str, detail: &str, width: usize) -> Line<'static> {
+    let t = theme::current();
+    let (mark, color) = if active {
+        ("●", t.success)
+    } else {
+        ("○", t.text_secondary)
     };
-    let for_how_long = helpers::format_relative_time(tunnel.since);
-    let state = match tunnel.phase {
-        Phase::Up => format!("up for {for_how_long}"),
-        Phase::Starting => format!("connecting for {for_how_long}"),
-        Phase::AwaitingCredentials => "waiting for credentials".to_string(),
-        Phase::Waiting { .. } => format!("reconnecting for {for_how_long}"),
-        Phase::Stopping => "disconnecting".to_string(),
+    let text = if detail.is_empty() {
+        text.to_string()
+    } else {
+        format!("{text}  {detail}")
     };
-    lines.extend(row("State", &state));
-    let drops = match tunnel.last_drop {
-        Some(at) if tunnel.drops > 0 => format!(
-            "{} · last {}",
-            tunnel.drops,
-            helpers::format_system_time_local(at)
-        ),
-        _ => "none".to_string(),
-    };
-    lines.extend(row("Drops", &drops));
-    lines.extend(row("Health", &tunnel.health.describe()));
-    lines.extend(row("Routes", &helpers::list_or_none(&tunnel.routes)));
-    lines.extend(row("DNS", &helpers::list_or_none(&tunnel.dns)));
-    lines
+    helpers::fit_line(
+        Line::from(vec![
+            Span::styled(format!("{mark} "), Style::default().fg(color)),
+            Span::styled(text, Style::default().fg(t.text_primary)),
+        ]),
+        width,
+    )
+}
+
+/// One line per mesh peer, connected first. Zoomed: name, address, direct or
+/// relayed, latency. Narrower: the name and the one status that matters.
+fn peer_lines(peers: &[crate::tunnel::MeshPeer], width: usize) -> Vec<Line<'static>> {
+    let t = theme::current();
+    let mut peers = peers.to_vec();
+    peers.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
+    let compact = width < FULL_COLUMNS;
+    // Address, path and latency after the name; compact, one status.
+    let names = column(
+        peers.iter().map(|peer| peer.name.as_str()),
+        width,
+        if compact { 8 } else { 33 },
+    );
+    peers
+        .iter()
+        .map(|peer| {
+            let (mark, color, path) = match (peer.connected, peer.relayed) {
+                (false, _) => ("○", t.text_secondary, "offline"),
+                (true, true) => ("●", t.warning, "relayed"),
+                (true, false) => ("●", t.success, "direct"),
+            };
+            let latency = peer
+                .latency
+                .map(|latency| format!("{} ms", latency.as_millis()))
+                .unwrap_or_default();
+            let name = helpers::truncate_to_width(&peer.name, names);
+            let rest = if compact {
+                if path == "direct" && !latency.is_empty() {
+                    latency
+                } else {
+                    path.to_string()
+                }
+            } else {
+                format!("{:<16} {path:<8} {latency}", peer.address)
+            };
+            helpers::fit_line(
+                Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        format!("{name:<names$} {rest}"),
+                        Style::default().fg(t.text_primary),
+                    ),
+                ]),
+                width,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -967,103 +1108,107 @@ mod tests {
         assert!(stale.contains("Your IP : unavailable"), "{stale}");
     }
 
-    fn health_face(app: &mut App) -> String {
+    /// The back of Details at `width` columns (29 is the panel at 80×24, more is zoomed).
+    fn back_at(app: &mut App, width: u16) -> String {
         app.flip_state_mut(crate::app::FocusedPanel::ConnectionDetails)
             .set_showing_back(true);
-        render_to_string(app, 40, 16)
+        render_to_string(app, width, 16)
     }
 
-    fn one_profile(name: &str) -> App {
+    fn mesh_app() -> App {
         let mut app = App::new_test();
-        app.runtime
-            .profiles
-            .push(make_profile(name, PathBuf::from("/tmp/p.conf")));
+        let mut profile = make_profile("work", PathBuf::from("/tmp/w.netbird"));
+        profile.protocol = ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+        app.runtime.profiles.push(profile);
         app.profile_list_state.select(Some(0));
+        let mut mesh = crate::app::connection::test_view("work", Phase::Up);
+        mesh.protocol = ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+        mesh.details.networks = vec![
+            crate::tunnel::RoutedNetwork {
+                name: "euc1-stag-001-public-nic-v1.bsstag.com".into(),
+                range: "10.20.0.0/16".into(),
+                selected: true,
+            },
+            crate::tunnel::RoutedNetwork {
+                name: "Exit Node".into(),
+                range: "0.0.0.0/0, ::/0".into(),
+                selected: false,
+            },
+        ];
+        let peer = |name: &str, connected, relayed| crate::tunnel::MeshPeer {
+            name: name.into(),
+            address: "100.90.0.1".into(),
+            connected,
+            relayed,
+            latency: connected.then(|| Duration::from_millis(41)),
+        };
+        mesh.details.peers = vec![
+            peer("asleep", false, false),
+            peer("gw", true, true),
+            peer("laptop", true, false),
+        ];
+        app.set_tunnels_for_test(vec![mesh], None);
         app
     }
 
+    /// In the panel's own width, each network and peer keeps one short status:
+    /// exit, relayed, offline or latency.
     #[test]
-    fn health_says_when_a_profile_has_not_connected_yet() {
-        let mut app = one_profile("wg07");
-        let front = render_to_string(&mut app, 40, 16);
-        assert!(!front.contains("[f] why"), "{front}");
-        let out = health_face(&mut app);
-        assert!(out.contains("No connection yet this session."), "{out}");
+    fn the_back_lists_routes_and_peers_compactly_in_the_panel() {
+        let mut app = mesh_app();
+        let screen = back_at(&mut app, 29);
+        for shown in [
+            "Routes & peers",
+            "euc1-stag",
+            "Exit Node",
+            "exit",
+            "Peers",
+            "relayed",
+            "41 ms",
+            "offline",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        assert!(
+            screen.find("gw").unwrap() < screen.find("asleep").unwrap(),
+            "connected first"
+        );
     }
 
+    /// Zoomed, every column shows: whole names, ranges, addresses.
     #[test]
-    fn health_shows_why_the_last_attempt_failed() {
-        let mut app = one_profile("wg07");
-        let id = app.runtime.profiles[0].id.clone();
-        std::sync::Arc::make_mut(&mut app.control_snapshot)
-            .failures
-            .insert(id, "Could not connect 'wg07': handshake timed out".into());
-        let front = render_to_string(&mut app, 40, 16);
-        assert!(front.contains("[f] why"), "{front}");
-        let out = health_face(&mut app);
-        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(words.contains("Last attempt failed:"), "{out}");
-        assert!(words.contains("handshake timed out"), "{out}");
+    fn zoomed_the_back_shows_every_column() {
+        let mut app = mesh_app();
+        let screen = back_at(&mut app, 100);
+        for shown in [
+            "euc1-stag-001-public-nic-v1.bsstag.com",
+            "10.20.0.0/16",
+            "exit node",
+            "100.90.0.1",
+            "direct",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
     }
 
-    /// Uptime is a duration, not a past moment: three days up reads `up for 3d`.
+    /// A `WireGuard` tunnel shows what it routes and its server; a profile that
+    /// is not connected says so.
     #[test]
-    fn health_gives_uptime_without_ago() {
-        let mut app = one_profile("wg07");
-        let mut view = crate::app::connection::test_view("wg07", Phase::Up);
-        view.profile_id = app.runtime.profiles[0].id.clone();
-        view.since = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 3);
-        app.set_tunnels_for_test(vec![view], None);
-        let out = health_face(&mut app);
-        assert!(out.contains("State  : up for 3d "), "{out}");
-        assert!(!out.contains("ago"), "{out}");
-    }
-
-    /// A reconnect that gave up keeps its tunnel in `Waiting`; its failure is the answer.
-    #[test]
-    fn health_of_a_tunnel_that_gave_up_reconnecting_says_why() {
-        let mut app = one_profile("wg07");
-        let mut view = crate::app::connection::test_view("wg07", Phase::Waiting { retry_at: None });
-        view.profile_id = app.runtime.profiles[0].id.clone();
-        std::sync::Arc::make_mut(&mut app.control_snapshot)
-            .failures
-            .insert(
-                view.profile_id.clone(),
-                "Could not connect 'wg07': timed out".into(),
-            );
-        app.set_tunnels_for_test(vec![view], None);
-        let front = render_to_string(&mut app, 40, 16);
-        assert!(front.contains("[f] why"), "{front}");
-        let out = health_face(&mut app);
-        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(words.contains("Last attempt failed:"), "{out}");
-        assert!(words.contains("reconnecting for"), "{out}");
-    }
-
-    #[test]
-    fn health_of_a_degraded_tunnel_names_the_reason_drops_routes_and_dns() {
-        let mut app = one_profile("wg07");
-        let mut view = crate::app::connection::test_view("wg07", Phase::Up);
-        view.profile_id = app.runtime.profiles[0].id.clone();
-        view.since = std::time::SystemTime::now();
-        view.drops = 2;
-        view.last_drop = Some(std::time::SystemTime::now());
-        view.health = crate::tunnel::ConnectionHealth::Degraded {
-            reason: crate::tunnel::DegradedReason::HandshakeStale {
-                seconds_since_last_handshake: 90,
-            },
-        };
-        view.routes = vec![v4("0.0.0.0/0")];
-        view.dns = vec!["10.2.0.1".parse().unwrap()];
-        app.set_tunnels_for_test(vec![view], None);
-        let front = render_to_string(&mut app, 40, 16);
-        assert!(front.contains("[f] why"), "{front}");
-        let out = health_face(&mut app);
-        assert!(out.contains("Drops  : 2 · last "), "{out}");
-        assert!(out.contains("State  : up for 0s"), "{out}");
-        assert!(out.contains("handshake stale for 90s"), "{out}");
-        assert!(out.contains("Routes : 0.0.0.0/0"), "{out}");
-        assert!(out.contains("DNS    : 10.2.0.1"), "{out}");
+    fn the_back_of_a_wireguard_tunnel_shows_routes_and_server() {
+        let mut app = App::new_test();
+        app.runtime
+            .profiles
+            .push(make_profile("home", PathBuf::from("/tmp/h.conf")));
+        app.profile_list_state.select(Some(0));
+        assert!(back_at(&mut app, 29).contains("Not connected"));
+        let mut wg = crate::app::connection::test_view("home", Phase::Up);
+        wg.routes = vec![v4("10.8.0.0/24")];
+        wg.details.endpoint = "203.0.113.7:51820".into();
+        app.set_tunnels_for_test(vec![wg], None);
+        let screen = back_at(&mut app, 40);
+        for shown in ["10.8.0.0/24", "203.0.113.7:51820"] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
     }
 
     // ───────────── role_line: pure-function variants ─────────────

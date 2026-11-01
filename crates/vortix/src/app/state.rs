@@ -33,14 +33,14 @@ impl FocusedPanel {
     /// Whether `f` flips this panel to the face explaining its front.
     #[must_use]
     pub fn flips(&self) -> bool {
-        matches!(self, Self::ConnectionDetails | Self::Security | Self::Chart)
+        matches!(self, Self::ConnectionDetails | Self::Security)
     }
 
     /// What its back shows, for the footer and the action menu.
     #[must_use]
     pub const fn flip_label(&self) -> &'static str {
         match self {
-            Self::Chart => "Routes",
+            Self::ConnectionDetails => "Routes",
             _ => "Why",
         }
     }
