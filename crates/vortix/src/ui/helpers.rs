@@ -96,7 +96,6 @@ pub(crate) fn render_scrolled(
     };
     frame.render_widget(shown, inner);
 
-    // Scrollbar
     let scrollbar = Scrollbar::default()
         .orientation(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("↑"))

@@ -134,6 +134,10 @@ fn inactive_color() -> Color {
     theme::current().inactive
 }
 
+fn secondary_color() -> Color {
+    theme::current().text_secondary
+}
+
 /// Look up a sigil by its [`SigilId`]. Panics if the catalog is
 /// missing an entry for the requested ID — caught by
 /// `tests::every_sigil_id_has_a_catalog_entry`.
@@ -306,7 +310,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{25cb}",
         label: "Not in use",
         description: "A route the network offers but does not use, or a peer that is offline.",
-        color: inactive_color,
+        color: secondary_color,
         bold: false,
         dim: false,
         category: SigilCategory::RoutesAndPeers,

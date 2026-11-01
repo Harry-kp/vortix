@@ -146,6 +146,8 @@ pub struct App {
     pub logs_scroll: u16,
     /// How far the Details back (peers and routes) is scrolled.
     pub routes_scroll: usize,
+    /// How far it can scroll, as the last render found (set while drawing).
+    pub(crate) routes_max_scroll: std::cell::Cell<usize>,
     pub logs_auto_scroll: bool,
     pub logs_max_scroll: u16,
     pub log_level_filter: Option<crate::logger::LogLevel>,
@@ -232,6 +234,7 @@ impl App {
 
             logs_scroll: 0,
             routes_scroll: 0,
+            routes_max_scroll: std::cell::Cell::new(0),
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
@@ -388,6 +391,7 @@ impl App {
 
             logs_scroll: 0,
             routes_scroll: 0,
+            routes_max_scroll: std::cell::Cell::new(0),
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,

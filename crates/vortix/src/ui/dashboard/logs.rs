@@ -111,8 +111,13 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    render_log_lines(frame, app, area, inner, &lines);
+}
+
+/// Either log's lines, following the end unless the user scrolled up.
+fn render_log_lines(frame: &mut Frame, app: &mut App, area: Rect, inner: Rect, lines: &[Line]) {
     let position = (!app.logs_auto_scroll).then_some(usize::from(app.logs_scroll));
-    let max = helpers::render_scrolled(frame, area, inner, &lines, position);
+    let max = helpers::render_scrolled(frame, area, inner, lines, position);
     app.logs_max_scroll = u16::try_from(max).unwrap_or(u16::MAX);
 }
 
@@ -191,9 +196,7 @@ fn render_tunnel_log(
         .iter()
         .map(|line| Line::styled(line.clone(), style))
         .collect();
-    let position = (!app.logs_auto_scroll).then_some(usize::from(app.logs_scroll));
-    let max = helpers::render_scrolled(frame, area, inner, &lines, position);
-    app.logs_max_scroll = u16::try_from(max).unwrap_or(u16::MAX);
+    render_log_lines(frame, app, area, inner, &lines);
 }
 
 /// Keep `app.tunnel_log` holding the tail of the log at `path`, re-read only

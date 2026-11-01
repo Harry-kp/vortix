@@ -800,7 +800,14 @@ fn render_back(
     all.push(Line::from(""));
     all.push(heading(format!("Routes  {}", routes.len())));
     all.extend(or_none(routes, dim));
-    helpers::render_scrolled(frame, area, inner, &all, Some(app.routes_scroll));
+    let max = helpers::render_scrolled(frame, area, inner, &all, Some(app.routes_scroll));
+    app.routes_max_scroll.set(max);
+    // A list longer than the panel says how to scroll it, on the bottom border.
+    if max > 0 && area.width > 16 {
+        let hint = helpers::border_hint(" j/k scroll ");
+        let at = Rect::new(area.x + 1, area.bottom().saturating_sub(1), 12, 1);
+        frame.render_widget(hint, at);
+    }
 }
 
 /// The routes section: a mesh network's routed networks (in use or not, the
@@ -1151,7 +1158,10 @@ mod tests {
         app.focused_panel = crate::app::FocusedPanel::ConnectionDetails;
         let top = back_at(&mut app, 100, 16);
         assert!(
-            top.contains("Routes  650") && top.contains("↓") && !top.contains("net-020"),
+            top.contains("Routes  650")
+                && top.contains("↓")
+                && top.contains("j/k scroll")
+                && !top.contains("net-020"),
             "{top}"
         );
         for _ in 0..20 {
