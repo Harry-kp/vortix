@@ -1007,6 +1007,24 @@ mod tests {
         assert!(title_span.style.add_modifier.contains(Modifier::BOLD));
     }
 
+    /// A mesh network using an exit node carries the internet, so the header
+    /// names it as the connection with its exit, not as MESH or NO EXIT.
+    #[test]
+    fn a_mesh_network_using_an_exit_node_is_the_connection() {
+        let mut app = App::new_test();
+        let mut mesh = crate::app::connection::test_view("office", Phase::Up);
+        mesh.protocol = crate::profile::ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+        app.set_tunnels_for_test(vec![mesh], Some(ProfileId::new("office")));
+        app.runtime.public_ip = "142.93.210.180".into();
+        let text = render_to_string(&app, 100, 1);
+        assert!(text.starts_with("\u{25cf} CONNECTED ("), "{text}");
+        assert!(text.contains("142.93.210.180"), "{text}");
+        assert!(
+            !text.contains("MESH") && !text.contains("NO EXIT"),
+            "{text}"
+        );
+    }
+
     /// A connected mesh network reads as connected, with its peers, not as a
     /// missing exit; a split tunnel alone still says NO EXIT.
     #[test]

@@ -653,6 +653,18 @@ impl Engine {
                 .collect();
             self.observe_wireguard_health(&result.sessions);
         }
+        let mut result = result;
+        if let Some(previous) = &self.scan {
+            for current in &mut result.sessions {
+                if current.details.networks.is_empty() {
+                    // ponytail: one failed `networks list` reads as none; keep the last list
+                    // so the exit node does not flicker. A network losing every route waits a scan.
+                    if let Some(before) = session(&previous.sessions, &current.name) {
+                        current.details.networks = before.details.networks.clone();
+                    }
+                }
+            }
+        }
         self.scan = Some(result);
     }
 
@@ -1096,14 +1108,14 @@ impl Engine {
                 last_drop: tunnel.last_drop,
             })
             .collect::<Vec<_>>();
-        let intended_servers = target
-            .primary
+        let primary = carries_internet(target.primary.as_ref(), &tunnels);
+        let intended_servers = primary
             .as_ref()
             .and_then(|primary| tunnels.iter().find(|tunnel| &tunnel.profile_id == primary))
             .map(|tunnel| tunnel.dns.clone())
             .unwrap_or_default();
         let dns = super::DnsView {
-            status: if target.primary.is_none() {
+            status: if primary.is_none() {
                 super::DnsSecurityStatus::NotActive
             } else if intended_servers.is_empty() {
                 super::DnsSecurityStatus::NotRequested
@@ -1131,7 +1143,6 @@ impl Engine {
         for tunnel in &tunnels {
             routes.insert(tunnel.profile_id.clone(), tunnel.routes.clone());
         }
-        let primary = carries_internet(target.primary.as_ref(), &tunnels);
         let next = Snapshot {
             version: self.published.version,
             tunnels,

@@ -170,7 +170,7 @@ pub enum Commands {
     ///
     /// JSON OUTPUT:
     ///     data.connections  every tunnel, whatever its state
-    ///     data.primary      profile that carries the internet, or null
+    ///     data.primary      profile internet traffic goes through, or null
     ///     data.connection   the primary (or else the first tunnel) while
     ///                       it is connected; null otherwise
     ///

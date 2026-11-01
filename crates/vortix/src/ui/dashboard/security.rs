@@ -1404,6 +1404,13 @@ fn address_evidence(app: &App, s: &PanelState, w: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// The tunnel carrying the internet is a mesh network, whose daemon owns DNS.
+fn primary_is_mesh(app: &App) -> bool {
+    app.primary_id()
+        .and_then(|id| app.tunnel(id))
+        .is_some_and(|tunnel| matches!(tunnel.protocol, crate::profile::ProtocolKind::Mesh(_)))
+}
+
 fn dns_evidence(app: &App, s: &PanelState, w: usize) -> Vec<Line<'static>> {
     use crate::control::DnsSecurityStatus;
     let asked = crate::ui::helpers::list_or_none(&app.control_snapshot.dns.intended_servers);
@@ -1420,6 +1427,9 @@ fn dns_evidence(app: &App, s: &PanelState, w: usize) -> Vec<Line<'static>> {
             DnsSecurityStatus::Protected => "Queries go to the tunnel's resolvers.",
             DnsSecurityStatus::Unverified => {
                 "The tunnel's resolvers could not be applied: queries may use your normal ones."
+            }
+            DnsSecurityStatus::NotRequested if primary_is_mesh(app) => {
+                "The network's own client sets DNS; Vortix does not check it."
             }
             DnsSecurityStatus::NotRequested => {
                 "The profile sets no DNS, so queries use your normal resolver."

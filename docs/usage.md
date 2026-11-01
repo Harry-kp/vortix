@@ -308,9 +308,10 @@ install it exits 1 and names the right way, such as `brew upgrade vortix`.
 `status --watch --json` prints one object per line. `report` and `completions` always print
 plain text.
 
-In `status --json`, `data.connections` lists every tunnel, `data.primary` names the one that carries
-the internet: the one that owns the default route, or a NetBird network using an exit node (or `null`), and `data.connection` is the primary (or, without one, the first tunnel) while it is connected,
-otherwise `null`.
+In `status --json`, `data.connections` lists every tunnel, `data.primary` names the one the kernel
+sends internet traffic through (a full tunnel, or a NetBird network using an exit node; `null`
+without one), and `data.connection` is the primary (or, without one, the first tunnel) while it
+is connected, otherwise `null`.
 
 | Exit code | Meaning |
 |---|---|

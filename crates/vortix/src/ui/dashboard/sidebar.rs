@@ -16,7 +16,7 @@
 //!   ' '  Disconnected, no fail   → Color::Reset
 //! ```
 //!
-//! The primary tunnel (kernel-truth holder of the default route, per
+//! The primary tunnel (the one internet traffic goes through, per
 //! `App::primary_id`) is suffixed with ` *` after the profile name to
 //! cross-correlate with the header's primary marker.
 //!
