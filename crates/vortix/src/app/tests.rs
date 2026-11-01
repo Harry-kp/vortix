@@ -58,8 +58,6 @@ fn set_phase(app: &mut App, name: &str, phase: crate::control::Phase) {
             ..Default::default()
         },
         health: crate::tunnel::ConnectionHealth::default(),
-        drops: 0,
-        last_drop: None,
     });
     snapshot
         .tunnels
@@ -2453,8 +2451,6 @@ fn an_unexpected_drop_counts_once() {
         dns: Vec::new(),
         details: crate::tunnel::DetailedConnectionInfo::default(),
         health: crate::tunnel::ConnectionHealth::default(),
-        drops: 0,
-        last_drop: None,
     };
     // Up -> Waiting -> Starting all happened between two polls: the app
     // never saw Waiting, so only the engine's count can report the drop.

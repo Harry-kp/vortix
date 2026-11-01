@@ -76,7 +76,6 @@ pub(super) struct Engine {
     cancel: BTreeMap<ProfileId, TunnelCancellation>,
     errors: BTreeMap<ProfileId, String>,
     /// The last connect failure per profile, kept until it comes up.
-    failures: BTreeMap<ProfileId, String>,
     actions: BTreeMap<ProfileId, String>,
     prompts: BTreeMap<u64, Prompt>,
     waits: BTreeMap<u64, Wait>,
@@ -189,7 +188,6 @@ impl Engine {
             up_at: BTreeMap::new(),
             cancel: BTreeMap::new(),
             errors: BTreeMap::new(),
-            failures: BTreeMap::new(),
             actions: BTreeMap::new(),
             prompts: BTreeMap::new(),
             waits: BTreeMap::new(),
@@ -517,7 +515,6 @@ impl Engine {
                     live.dns(),
                 );
                 self.live.insert(profile_id.clone(), live);
-                self.failures.remove(profile_id);
                 self.up_at.insert(profile_id.clone(), Instant::now());
                 self.last_connected
                     .insert(profile_id.clone(), SystemTime::now());
@@ -563,7 +560,6 @@ impl Engine {
                     .map(|attempt| Instant::now() + self.backoff(attempt));
                 let text = format!("Could not connect '{name}': {error}");
                 self.errors.insert(profile_id.clone(), text.clone());
-                self.failures.insert(profile_id.clone(), text.clone());
                 self.state.start_failed(profile_id, retry_at);
                 self.notice(Level::Error, text);
                 if attempt.is_some() && retry_at.is_none() {
@@ -1109,8 +1105,6 @@ impl Engine {
                     .get(&tunnel.spec.profile_id)
                     .map(|(health, _)| health.clone())
                     .unwrap_or_default(),
-                drops: tunnel.drops,
-                last_drop: tunnel.last_drop,
             })
             .collect::<Vec<_>>();
         let primary = carries_internet(target.primary.as_ref(), &tunnels);
@@ -1167,7 +1161,6 @@ impl Engine {
             last_connected: self.last_connected.clone(),
             net_error: self.apply_error.clone(),
             drops: self.drops,
-            failures: self.failures.clone(),
             actions: self.actions.clone(),
         };
         if next == self.published {

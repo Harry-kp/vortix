@@ -216,6 +216,18 @@ impl App {
             FocusedPanel::Logs => {
                 self.scroll_logs_down();
             }
+            FocusedPanel::ConnectionDetails
+                if self.is_flipped(&FocusedPanel::ConnectionDetails) =>
+            {
+                let lines = self
+                    .focused_profile_id()
+                    .and_then(|id| self.tunnel(&id))
+                    .map_or(0, |tunnel| {
+                        tunnel.details.peers.len()
+                            + tunnel.details.networks.len().max(tunnel.routes.len())
+                    });
+                self.routes_scroll = (self.routes_scroll + 1).min(lines);
+            }
             _ => {}
         }
     }
@@ -237,6 +249,9 @@ impl App {
             }
             FocusedPanel::Logs => {
                 self.scroll_logs_up();
+            }
+            FocusedPanel::ConnectionDetails => {
+                self.routes_scroll = self.routes_scroll.saturating_sub(1);
             }
             _ => {}
         }

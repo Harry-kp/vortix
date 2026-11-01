@@ -2,7 +2,7 @@
 #
 # Cinematic tour of the connected experience, top to bottom:
 # launch → help → profile sidebar → sort → config peek → connect (real handshake)
-# → throughput → flip Chart → flip Connection Details → zoom → Security Guard
+# → throughput → flip Connection Details (routes & peers) → zoom → Security Guard
 # → flip Security Guard → log filter → action menu → kill-switch cycle → disconnect.
 #
 # Records ~70 s; output lands at assets/demo.gif.
@@ -74,15 +74,11 @@ Sleep 3s
 Type "s"
 Sleep 1800ms
 
-# === Act 7 — flip Chart panel (round trip) ===
+# === Act 7 — focus the throughput chart ===
 Tab
-Sleep 1200ms
-Type "f"
-Sleep 2500ms
-Type "f"
 Sleep 1500ms
 
-# === Act 9 — flip Connection Details (round trip) + zoom ===
+# === Act 9 — flip Connection Details to routes & peers (round trip) + zoom ===
 Tab
 Sleep 1200ms
 Type "f"

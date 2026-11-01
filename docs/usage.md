@@ -100,13 +100,13 @@ show why its verdict says what it does. Details has `[f] routes & peers` in its 
 the focused profile is connected; Security has `[f] why` when the verdict is `PARTIAL` or
 `EXPOSED`.
 
-- **Routes & peers** (Details): the focused profile's tunnel, the same layout for every VPN.
-  Routes: what it routes (WireGuard's allowed IPs, OpenVPN's pushed routes), or a mesh
-  network's routed networks, in use or not and which is the exit node. Peers: a mesh network's
-  peers, connected first, with how many are up, else the server it talks to and the last
-  handshake. In the panel each line keeps one status (exit, relayed, offline or latency);
-  zoomed (`z`), every column shows: whole names, ranges, addresses. A section that does not fit
-  ends in `… N more (z)`.
+- **Routes & peers** (Details): the focused profile's tunnel, the same layout for every VPN,
+  peers first. Peers: a mesh network's peers, connected first, else the server it talks to and
+  the last handshake. Routes, with their count: what it routes (WireGuard's allowed IPs,
+  OpenVPN's pushed routes), or a mesh network's routed networks, in use or not and which is the
+  exit node. In the panel each line keeps one status (exit, relayed, offline or latency); zoomed
+  (`z`), every column shows: whole names, ranges, addresses. A list longer than the panel
+  scrolls with `j`/`k` (the last line says how many more, the first how many above).
 - **Evidence** (Security): each reading behind the verdict with its age: exit and real
   addresses, the resolvers the tunnel asked for against the ones in use, the kill switch
   with what it does, and the cipher. The failing checks come first; when they do not all fit, the last line says

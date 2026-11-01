@@ -332,19 +332,11 @@ fn render_connected(
         theme::current().yellow,
     ));
 
-    if let crate::tunnel::ConnectionHealth::Degraded {
-        reason:
-            crate::tunnel::DegradedReason::WireGuardPeerStale {
-                allowed_routes,
-                seconds_since_last_handshake,
-                ..
-            },
-    } = &snap.health
-    {
-        let route = allowed_routes.first().map_or("route", String::as_str);
+    // Any degraded reason, in the words the CLI uses.
+    if let crate::tunnel::ConnectionHealth::Degraded { reason } = &snap.health {
         text.push(helpers::detail_row(
             "Health  : ",
-            format!("Handshake stale {seconds_since_last_handshake}s ({route})"),
+            reason.describe(),
             theme::current().warning,
         ));
     }
@@ -750,11 +742,25 @@ fn render_back(
     border_style: Style,
 ) {
     let tunnel = profile_id.and_then(|id| app.tunnel(id));
+    let title = tunnel.map_or_else(
+        || constants::TITLE_FLIP_ROUTES.to_string(),
+        |tunnel| {
+            format!(
+                "{}· {} ({}) ",
+                constants::TITLE_FLIP_ROUTES,
+                tunnel.name,
+                tunnel.protocol
+            )
+        },
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .padding(Padding::horizontal(1))
-        .title(constants::TITLE_FLIP_ROUTES)
+        .title(helpers::truncate_to_width(
+            &title,
+            usize::from(area.width.saturating_sub(2)),
+        ))
         .title_bottom(helpers::border_hint(constants::FLIP_BACK_HINT));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -787,22 +793,13 @@ fn render_back(
             width,
         )]
     };
-    let peers_title = if tunnel.details.peers.is_empty() {
-        "Peers".to_string()
-    } else {
-        format!("Peers  {}", helpers::peers_summary(&tunnel.details.peers))
-    };
-    // Two headings and a blank line; the rest is shared so Peers always shows.
-    let budget = usize::from(inner.height).saturating_sub(3);
-    let routes_room = routes
-        .len()
-        .min(budget.saturating_sub(peers.len().min(budget / 2)));
-    let peers_room = budget.saturating_sub(routes_room);
-    let mut lines = vec![heading("Routes".into())];
-    lines.extend(section(routes, routes_room, dim));
-    lines.push(Line::from(""));
-    lines.push(heading(peers_title));
-    lines.extend(section(peers, peers_room, dim));
+    // Peers first: there are few of them, and a long route list scrolls below.
+    let mut all = vec![heading("Peers".into())];
+    all.extend(or_none(peers, dim));
+    all.push(Line::from(""));
+    all.push(heading(format!("Routes  {}", routes.len())));
+    all.extend(or_none(routes, dim));
+    let lines = scrolled(all, app.routes_scroll, usize::from(inner.height), dim);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -817,34 +814,17 @@ fn route_lines(tunnel: &crate::control::TunnelView, width: usize) -> Vec<Line<'s
             .map(|route| mark_line(true, &route.to_string(), "", width))
             .collect();
     }
-    if width < FULL_COLUMNS {
-        let names = column(
-            networks.iter().map(|network| network.name.as_str()),
-            width,
-            5,
-        );
-        return networks
+    let compact = width < FULL_COLUMNS;
+    // Room after the name: " exit" compact; else the range plus "  exit node".
+    let after = if compact {
+        5
+    } else {
+        networks
             .iter()
-            .map(|network| {
-                let exit = if network.is_exit_node() { " exit" } else { "" };
-                mark_line(
-                    network.selected,
-                    &format!(
-                        "{:<names$}{exit}",
-                        helpers::truncate_to_width(&network.name, names)
-                    ),
-                    "",
-                    width,
-                )
-            })
-            .collect();
-    }
-    // Every column after the name keeps its room: range plus "  exit node".
-    let after = networks
-        .iter()
-        .map(|network| network.range.len() + 11)
-        .max()
-        .unwrap_or(0);
+            .map(|network| network.range.len() + 11)
+            .max()
+            .unwrap_or(0)
+    };
     let names = column(
         networks.iter().map(|network| network.name.as_str()),
         width,
@@ -853,18 +833,17 @@ fn route_lines(tunnel: &crate::control::TunnelView, width: usize) -> Vec<Line<'s
     networks
         .iter()
         .map(|network| {
-            let exit = if network.is_exit_node() {
-                "  exit node"
-            } else {
-                ""
+            let name = helpers::truncate_to_width(&network.name, names);
+            let exit = network.is_exit_node();
+            let rest = match (compact, exit) {
+                (true, true) => " exit".to_string(),
+                (true, false) => String::new(),
+                (false, true) => format!(" {}  exit node", network.range),
+                (false, false) => format!(" {}", network.range),
             };
             mark_line(
                 network.selected,
-                &format!(
-                    "{:<names$} {}{exit}",
-                    helpers::truncate_to_width(&network.name, names),
-                    network.range
-                ),
+                &format!("{name:<names$}{rest}"),
                 "",
                 width,
             )
@@ -882,20 +861,36 @@ fn column<'a>(names: impl Iterator<Item = &'a str>, width: usize, after: usize) 
         .min(width.saturating_sub(after + 3).max(8))
 }
 
-/// A section's lines in `room` rows: `none` when empty, else as many as fit
-/// and `… N more (z)` for the rest.
-fn section(lines: Vec<Line<'static>>, room: usize, dim: Style) -> Vec<Line<'static>> {
+/// The lines, or a dimmed `none`.
+fn or_none(lines: Vec<Line<'static>>, dim: Style) -> Vec<Line<'static>> {
     if lines.is_empty() {
-        return vec![Line::styled("none", dim)];
+        vec![Line::styled("none", dim)]
+    } else {
+        lines
     }
-    if lines.len() <= room.max(1) {
-        return lines;
+}
+
+/// `height` rows of `lines` from `offset`, the first saying how many are above
+/// and the last how many are below when some are.
+fn scrolled(
+    lines: Vec<Line<'static>>,
+    offset: usize,
+    height: usize,
+    dim: Style,
+) -> Vec<Line<'static>> {
+    let offset = offset.min(lines.len().saturating_sub(height));
+    let total = lines.len();
+    let mut shown: Vec<_> = lines.into_iter().skip(offset).take(height).collect();
+    if offset > 0 && !shown.is_empty() {
+        shown[0] = Line::styled(format!("↑ {offset} above (j/k)"), dim);
     }
-    let shown = room.saturating_sub(1).max(1);
-    let more = lines.len() - shown;
-    let mut kept: Vec<_> = lines.into_iter().take(shown).collect();
-    kept.push(Line::styled(format!("… {more} more (z)"), dim));
-    kept
+    let below = total.saturating_sub(offset + height);
+    if below > 0 {
+        if let Some(last) = shown.last_mut() {
+            *last = Line::styled(format!("… {} more (j/k)", below + 1), dim);
+        }
+    }
+    shown
 }
 
 /// `● text  detail`, green when in use, grey otherwise, fitted to the panel.
@@ -1108,11 +1103,12 @@ mod tests {
         assert!(stale.contains("Your IP : unavailable"), "{stale}");
     }
 
-    /// The back of Details at `width` columns (29 is the panel at 80×24, more is zoomed).
-    fn back_at(app: &mut App, width: u16) -> String {
+    /// The back of Details at `width`×`height` (26×10 is the panel at 80×24,
+    /// larger is zoomed).
+    fn back_at(app: &mut App, width: u16, height: u16) -> String {
         app.flip_state_mut(crate::app::FocusedPanel::ConnectionDetails)
             .set_showing_back(true);
-        render_to_string(app, width, 16)
+        render_to_string(app, width, height)
     }
 
     fn mesh_app() -> App {
@@ -1156,16 +1152,14 @@ mod tests {
     #[test]
     fn the_back_lists_routes_and_peers_compactly_in_the_panel() {
         let mut app = mesh_app();
-        let screen = back_at(&mut app, 29);
+        let screen = back_at(&mut app, 26, 10);
         for shown in [
             "Routes & peers",
-            "euc1-stag",
-            "Exit Node",
-            "exit",
             "Peers",
             "relayed",
             "41 ms",
             "offline",
+            "Routes  2",
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
@@ -1175,11 +1169,43 @@ mod tests {
         );
     }
 
+    /// A long route list scrolls with j/k, zoomed or not: the last line says
+    /// how many are below, the first how many are above.
+    #[test]
+    fn a_long_route_list_scrolls() {
+        let mut app = mesh_app();
+        let mut tunnels = app.tunnels().into_iter().cloned().collect::<Vec<_>>();
+        tunnels[0].details.networks = (0..650)
+            .map(|n| crate::tunnel::RoutedNetwork {
+                name: format!("net-{n:03}"),
+                range: format!("10.{}.{}.0/24", n / 250, n % 250),
+                selected: true,
+            })
+            .collect();
+        app.set_tunnels_for_test(tunnels, None);
+        app.focused_panel = crate::app::FocusedPanel::ConnectionDetails;
+        let top = back_at(&mut app, 100, 16);
+        assert!(
+            top.contains("Routes  650") && top.contains("more (j/k)"),
+            "{top}"
+        );
+        for _ in 0..20 {
+            app.handle_message(crate::message::Message::Scroll(
+                crate::message::ScrollMove::Down,
+            ));
+        }
+        let scrolled = back_at(&mut app, 100, 16);
+        assert!(
+            scrolled.contains("↑ 20 above (j/k)") && scrolled.contains("net-0"),
+            "{scrolled}"
+        );
+    }
+
     /// Zoomed, every column shows: whole names, ranges, addresses.
     #[test]
     fn zoomed_the_back_shows_every_column() {
         let mut app = mesh_app();
-        let screen = back_at(&mut app, 100);
+        let screen = back_at(&mut app, 100, 16);
         for shown in [
             "euc1-stag-001-public-nic-v1.bsstag.com",
             "10.20.0.0/16",
@@ -1200,12 +1226,12 @@ mod tests {
             .profiles
             .push(make_profile("home", PathBuf::from("/tmp/h.conf")));
         app.profile_list_state.select(Some(0));
-        assert!(back_at(&mut app, 29).contains("Not connected"));
+        assert!(back_at(&mut app, 26, 10).contains("Not connected"));
         let mut wg = crate::app::connection::test_view("home", Phase::Up);
         wg.routes = vec![v4("10.8.0.0/24")];
         wg.details.endpoint = "203.0.113.7:51820".into();
         app.set_tunnels_for_test(vec![wg], None);
-        let screen = back_at(&mut app, 40);
+        let screen = back_at(&mut app, 40, 12);
         for shown in ["10.8.0.0/24", "203.0.113.7:51820"] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
