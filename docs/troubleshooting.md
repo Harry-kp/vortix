@@ -95,8 +95,9 @@ dashboard's Logs panel (`f` until the title names the profile).
 
 Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root only).
 
-- `timed out` after a login link: the sign-in was not finished within 5 minutes; connect
-  again for a new link, or add an `auth_key` (a setup key) to the `.netbird` file.
+- `the sign-in was not finished within 5 min`: connect again for a new link, or add an
+  `auth_key` (a setup key) to the `.netbird` file. A link that returns to `localhost` works only
+  in a browser on the computer running Vortix.
 - `timed out` with no link: the management server did not answer within the connect timeout
   (`connect_timeout`); check `server_url` and the network.
 - `another NetBird network is connected`: only one NetBird runs on a computer; disconnect the

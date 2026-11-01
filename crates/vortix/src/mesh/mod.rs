@@ -588,16 +588,10 @@ impl MeshTunnel {
         let outcome = std::thread::scope(|scope| {
             scope.spawn(|| {
                 for line in printed {
-                    if let Some(link) = login_link(&line) {
+                    if let Some(text) = sign_in(&line, profile) {
                         signing_in.store(true, Ordering::Release);
-                        let opened = open_in_browser(link, &profile.config_path);
                         if let Some(progress) = progress {
-                            let _ = progress.send(login_notice(
-                                link,
-                                &profile.display_name,
-                                LOGIN_WAIT,
-                                opened,
-                            ));
+                            let _ = progress.send(text);
                         }
                     }
                 }
@@ -637,6 +631,14 @@ impl MeshTunnel {
                 "the {} server {server} timed out after {}s: check its address and the network",
                 driver.name(),
                 budget.as_secs()
+            )));
+        }
+        if signing_in.load(Ordering::Acquire)
+            && matches!(outcome, Err(crate::process::ProcessError::Timeout { .. }))
+        {
+            return Err(TunnelError::Other(format!(
+                "the sign-in was not finished within {} min: connect again for a new link",
+                LOGIN_WAIT.as_secs().div_ceil(60)
             )));
         }
         let outcome = outcome.map_err(|error| TunnelError::Subprocess(error.to_string()))?;
@@ -840,20 +842,41 @@ fn status(driver: MeshDriver, cli: &Path, socket: &Path) -> Result<MeshStatus, T
         .map_err(|error| TunnelError::MalformedStatus(format!("{} status: {error}", driver.slug())))
 }
 
-/// The sign-in link in a line the client prints, if it is one.
-fn login_link(line: &str) -> Option<&str> {
-    line.split_whitespace()
-        .next()
-        .filter(|word| word.starts_with("https://"))
+/// The sign-in link in a line the client prints, and the rest of that line
+/// (a code to enter, when the link does not carry it).
+fn login_link(printed: &str) -> Option<(&str, &str)> {
+    let trimmed = printed.trim();
+    let (url, rest) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+    url.starts_with("https://").then_some((url, rest.trim()))
+}
+
+/// For a line with the sign-in link: open it in the user's browser, and say
+/// what to do.
+fn sign_in(printed: &str, profile: &Profile) -> Option<String> {
+    let (link, rest) = login_link(printed)?;
+    let opened = open_in_browser(link, &profile.config_path);
+    Some(login_notice(
+        link,
+        rest,
+        &profile.display_name,
+        LOGIN_WAIT,
+        opened,
+    ))
 }
 
 /// What to tell the user once the client prints its sign-in link.
-fn login_notice(link: &str, name: &str, timeout: Duration, opened: bool) -> String {
+fn login_notice(link: &str, rest: &str, name: &str, timeout: Duration, opened: bool) -> String {
     let minutes = timeout.as_secs().div_ceil(60);
+    let link = [link, rest].join(" ").trim().to_string();
     if opened {
         format!(
-            "Sign in to '{name}' in the browser that just opened; Vortix connects when you \
-             are done (within {minutes} min).\n\nBrowser didn't open? Use this link:\n{link}"
+            "Sign in to '{name}' in your browser, which should have opened; Vortix connects \
+             when you are done (within {minutes} min).\n\nNo browser? Use this link:\n{link}"
+        )
+    } else if link.contains("localhost") {
+        format!(
+            "Sign in to '{name}': open this link in a browser on this computer \
+             (within {minutes} min).\n\n{link}"
         )
     } else {
         format!(
@@ -864,20 +887,24 @@ fn login_notice(link: &str, name: &str, timeout: Duration, opened: bool) -> Stri
 }
 
 /// Open the sign-in link in the browser of the user who ran Vortix, never as
-/// root; false when there is no such user or no desktop here.
+/// root; false when there is no such user or no desktop answered in time.
 fn open_in_browser(link: &str, profile_path: &Path) -> bool {
-    if std::env::var_os("SSH_CONNECTION").is_some() {
-        return false;
-    }
     let Ok(owner) = crate::hooks::VerifiedHookOwner::for_standard_mode(profile_path) else {
         return false;
     };
-    let spec = crate::process::CommandSpec::oneshot(
+    let credentials = owner.credentials();
+    let mut spec = crate::process::CommandSpec::oneshot(
         crate::platform::BROWSER_OPENER,
         vec![link.to_string()],
     )
-    .run_as(owner.credentials())
-    .timeout(Duration::from_secs(10));
+    .redact_args(0..1)
+    .timeout(Duration::from_secs(3));
+    spec.env = crate::platform::desktop_env(credentials.uid);
+    if let Some(home) = crate::config::user_home() {
+        spec.env
+            .insert("HOME".into(), home.to_string_lossy().into());
+    }
+    let spec = spec.run_as(credentials);
     crate::process::run(spec).is_ok_and(|outcome| outcome.success())
 }
 
@@ -1117,19 +1144,27 @@ mod tests {
 
     #[test]
     fn only_the_sign_in_link_becomes_a_notice() {
+        let printed = "https://idp.example/device and enter the code AB12 to authenticate.";
+        let (link, rest) = login_link(printed).unwrap();
         assert_eq!(
-            login_link("https://idp.example/device?code=AB12 and enter the code AB12"),
-            Some("https://idp.example/device?code=AB12")
+            link, "https://idp.example/device",
+            "only the link is opened"
         );
         for other in ["Use this URL to log in:", "", "Connected", "http://plain"] {
             assert_eq!(login_link(other), None, "{other}");
         }
-        let link = "https://idp.example/device?code=AB12";
-        let opened = login_notice(link, "work", LOGIN_WAIT, true);
-        assert!(opened.starts_with("Sign in to 'work' in the browser that just opened"));
-        assert!(opened.contains("(within 5 min)") && opened.ends_with(&format!("\n{link}")));
-        let elsewhere = login_notice(link, "work", LOGIN_WAIT, false);
-        assert!(elsewhere.contains("on any device") && elsewhere.ends_with(&format!("\n{link}")));
+        let opened = login_notice(link, rest, "work", LOGIN_WAIT, true);
+        assert!(opened.starts_with("Sign in to 'work' in your browser"));
+        assert!(opened.contains("(within 5 min)"), "{opened}");
+        assert!(opened
+            .ends_with("\nhttps://idp.example/device and enter the code AB12 to authenticate."));
+        let back_here = "https://idp.example/auth?redirect_uri=http%3A%2F%2Flocalhost%3A53000%2F";
+        assert!(login_notice(back_here, "", "work", LOGIN_WAIT, false).contains("on this computer"));
+        let elsewhere = login_notice(link, "", "work", LOGIN_WAIT, false);
+        assert!(
+            elsewhere.contains("on any device")
+                && elsewhere.ends_with("\nhttps://idp.example/device")
+        );
     }
 
     #[test]

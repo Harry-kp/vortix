@@ -42,6 +42,19 @@ pub const FIREWALL_TOOL: (&str, &[&str]) = ("nft", &["--version"]);
 /// Opens a link in the user's default browser.
 pub const BROWSER_OPENER: &str = "xdg-open";
 
+/// What a command run as `uid` needs to reach that user's desktop session,
+/// which `sudo` strips from the environment.
+#[must_use]
+pub fn desktop_env(uid: u32) -> std::collections::HashMap<String, String> {
+    let runtime = format!("/run/user/{uid}");
+    let mut env = std::collections::HashMap::from([(
+        "DBUS_SESSION_BUS_ADDRESS".to_string(),
+        format!("unix:path={runtime}/bus"),
+    )]);
+    env.insert("XDG_RUNTIME_DIR".into(), runtime);
+    env
+}
+
 /// Clipboard writers to try, in order: the session's own first.
 #[must_use]
 pub fn clipboard_commands() -> Vec<&'static str> {

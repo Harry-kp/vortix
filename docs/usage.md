@@ -147,8 +147,9 @@ on Linux, NetBird's installer). Add a network from Add a VPN (`i`, or `sudo vort
 
 The profile is named after its server (`netbird` for NetBird's cloud); `R` renames it. Without
 a setup key, connecting shows a sign-in box: Vortix opens the link in your browser, as you and
-never as root, and connects once you sign in, within 5 minutes. Over SSH, or with no desktop,
-the box shows the link to open on any device; drag over it to copy. `vortix up` prints the same.
+never as root, and connects once you sign in, within 5 minutes. The box always shows the link
+too, to open on any device (for example over SSH, or when no browser opened); drag over it to
+copy. `vortix up` prints the same.
 A network you signed in to needs a new sign-in when its session ends, which NetBird's dashboard
 sets (24 hours by default): its peers go offline, and reconnecting (`r`) shows a new link.
 

@@ -40,6 +40,13 @@ pub const FIREWALL_TOOL: (&str, &[&str]) = ("pfctl", &[]);
 /// Opens a link in the user's default browser.
 pub const BROWSER_OPENER: &str = "open";
 
+/// What a command run as `uid` needs to reach that user's desktop: nothing
+/// on macOS, where `open` finds the user's session itself.
+#[must_use]
+pub fn desktop_env(_uid: u32) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::new()
+}
+
 /// Clipboard writers to try, in order.
 #[must_use]
 pub fn clipboard_commands() -> Vec<&'static str> {

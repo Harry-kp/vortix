@@ -4,7 +4,7 @@
 pub use crate::linux::autoconnect;
 #[cfg(target_os = "linux")]
 pub use crate::linux::{
-    clipboard_commands,
+    clipboard_commands, desktop_env,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
     os_description, BROWSER_OPENER, FIREWALL_TOOL,
 };
@@ -17,7 +17,7 @@ pub use crate::linux::{
 pub use crate::macos::autoconnect;
 #[cfg(target_os = "macos")]
 pub use crate::macos::{
-    clipboard_commands,
+    clipboard_commands, desktop_env,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
     os_description, BROWSER_OPENER, FIREWALL_TOOL,
 };
@@ -221,6 +221,8 @@ fn syscall_result(result: libc::c_int) -> std::io::Result<()> {
 /// scalar conversion and the async-signal-safe `setgroups` syscall.
 #[cfg(target_os = "macos")]
 pub(crate) fn set_process_supplementary_groups(groups: &[u32]) -> std::io::Result<()> {
+    // macOS refuses more than 16 (NGROUPS); like its `initgroups`, keep the first 16.
+    let groups = &groups[..groups.len().min(16)];
     let count =
         i32::try_from(groups.len()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: `groups` remains valid for the duration of the syscall.
