@@ -471,49 +471,52 @@ mod whats_new_tests {
 }
 
 pub mod action {
-    use crate::ui::theme;
-    use ratatui::{
-        layout::Rect,
-        style::{Modifier, Style},
-        text::{Line, Span},
-        widgets::{Block, Borders, Paragraph, Wrap},
-        Frame,
-    };
+    use crate::ui::{helpers, theme};
+    use ratatui::{style::Style, text::Line, Frame};
 
-    /// What a connect waits for the user to do. No side borders, so a
-    /// wrapped link copies without border characters.
+    const WIDTH: u16 = 64;
+
+    /// The link in what a connect waits for: the one `c` copies.
+    #[must_use]
+    pub fn link(text: &str) -> Option<&str> {
+        text.split_whitespace()
+            .find(|word| word.starts_with("https://"))
+    }
+
+    /// What a connect waits for the user to do, in the standard dialog. A
+    /// long link shows on one shortened line; `c` copies all of it.
     pub fn render(frame: &mut Frame, text: &str) {
-        let area = frame.area();
-        // The link gets lines of its own, so it wraps only where it must.
-        let text = text.replacen(" https://", "\nhttps://", 1);
-        let width = usize::from(area.width.max(1));
-        let lines: usize = text
-            .lines()
-            .map(|line| line.chars().count().div_ceil(width).max(1))
-            .sum();
-        let height = u16::try_from(lines + 3)
-            .unwrap_or(u16::MAX)
-            .min(area.height);
-        let overlay = Rect {
-            y: area.y + (area.height - height) / 2,
-            height,
-            ..area
-        };
-        crate::ui::helpers::clear_area(frame, overlay);
-        let accent = theme::current().warning;
-        let block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(accent))
-            .title(Span::styled(
-                " Waiting for you ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ))
-            .title_bottom(Line::from(" [Esc] Hide · the connect keeps waiting ").centered());
-        frame.render_widget(
-            Paragraph::new(format!("\n{text}"))
-                .block(block)
-                .wrap(Wrap { trim: false }),
-            overlay,
+        use super::confirm_dialog::{self, ConfirmDialogConfig};
+        let inner = usize::from(WIDTH - 2);
+        let style = Style::default().fg(theme::current().text_primary);
+        let mut body = vec![Line::from("")];
+        for paragraph in text.lines() {
+            match paragraph.split_once("https://") {
+                Some((before, after)) => {
+                    let (rest, tail) = after.split_once(' ').unwrap_or((after, ""));
+                    body.extend(helpers::wrapped_lines(before.trim(), inner, 0, style));
+                    body.push(Line::styled(
+                        helpers::truncate_to_width(&format!("https://{rest}"), inner),
+                        Style::default().fg(theme::current().accent_primary),
+                    ));
+                    body.extend(helpers::wrapped_lines(tail.trim(), inner, 0, style));
+                }
+                None if paragraph.is_empty() => body.push(Line::from("")),
+                None => body.extend(helpers::wrapped_lines(paragraph, inner, 0, style)),
+            }
+        }
+        let height = u16::try_from(body.len() + 4).unwrap_or(u16::MAX);
+        confirm_dialog::render(
+            frame,
+            ConfirmDialogConfig {
+                title: " Waiting for you ",
+                body,
+                border_color: theme::current().warning,
+                confirm_selected: true,
+                choices: [("C", "Copy link"), ("Esc", "Hide")],
+                width: WIDTH,
+                height,
+            },
         );
     }
 }
@@ -901,7 +904,7 @@ pub mod config_viewer {
     }
 }
 pub mod confirm_dialog {
-    //! Reusable confirmation dialog overlay.
+    //! The one dialog every popup uses: a title, a body and two choices.
 
     use crate::ui::theme;
     use ratatui::{
@@ -918,12 +921,20 @@ pub mod confirm_dialog {
         pub body: Vec<Line<'a>>,
         pub border_color: Color,
         pub confirm_selected: bool,
-        pub confirm_label: &'a str,
+        /// The two choices as `(key, label)`: the action, then the way out,
+        /// e.g. `[("Y", "Delete"), ("N", "Cancel")]`.
+        pub choices: [(&'a str, &'a str); 2],
         pub width: u16,
         pub height: u16,
     }
 
-    /// Render a centered confirmation dialog with an action and Cancel choice.
+    /// The usual action-or-cancel pair, `[Y] <action>` and `[N] Cancel`.
+    #[must_use]
+    pub const fn yes_no(action: &str) -> [(&str, &str); 2] {
+        [("Y", action), ("N", "Cancel")]
+    }
+
+    /// Render a centered dialog with its two choices.
     pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
         let area = frame.area();
         let width = config.width.min(area.width.saturating_sub(4));
@@ -967,24 +978,10 @@ pub mod confirm_dialog {
                 .add_modifier(Modifier::BOLD)
         };
 
-        let yes_label = format!(
-            "{}[Y] {} ",
-            if config.confirm_selected {
-                "▸ "
-            } else {
-                "  "
-            },
-            config.confirm_label
-        );
-        let no_label = format!(
-            "{}[N] {} ",
-            if config.confirm_selected {
-                "  "
-            } else {
-                "▸ "
-            },
-            "Cancel"
-        );
+        let [(yes_key, yes), (no_key, no)] = config.choices;
+        let mark = |selected: bool| if selected { "▸ " } else { "  " };
+        let yes_label = format!("{}[{yes_key}] {yes} ", mark(config.confirm_selected));
+        let no_label = format!("{}[{no_key}] {no} ", mark(!config.confirm_selected));
 
         let mut lines = config.body;
         lines.push(Line::from(""));

@@ -311,7 +311,7 @@ fn render_delete_confirm(frame: &mut Frame, name: &str, confirm_selected: bool) 
             ],
             border_color: theme::current().error,
             confirm_selected,
-            confirm_label: "Delete",
+            choices: confirm_dialog::yes_no("Delete"),
             width: dialog_w,
             height: 7,
         },
@@ -344,7 +344,7 @@ fn render_takeover_confirm(
             ],
             border_color: theme::current().warning,
             confirm_selected,
-            confirm_label: "Turn off the app",
+            choices: confirm_dialog::yes_no("Turn off the app"),
             width: 56,
             height: 14,
         },
@@ -383,7 +383,7 @@ fn render_disconnect_all_confirm(frame: &mut Frame, count: usize, confirm_select
             ],
             border_color: theme::current().warning,
             confirm_selected,
-            confirm_label: "Disconnect all",
+            choices: confirm_dialog::yes_no("Disconnect all"),
             width: 50,
             height: 7,
         },
@@ -477,7 +477,7 @@ fn render_switch_confirm(
             ],
             border_color: theme::current().warning,
             confirm_selected,
-            confirm_label: "Switch",
+            choices: confirm_dialog::yes_no("Switch"),
             width: 64,
             height: 10,
         },
@@ -579,31 +579,57 @@ mod overlay_tests {
         }
     }
 
-    /// The whole link fits on screen at 80 columns, with no side border in it.
+    /// The sign-in wait is the standard dialog at 80×24: a long link shows on
+    /// one shortened line, a code after it in full, and `c` copies the link
+    /// while the dialog stays.
     #[test]
-    fn a_login_link_is_shown_whole() {
+    fn a_sign_in_wait_is_a_normal_dialog_that_copies_its_link() {
         let mut app = App::new_test();
         let link = format!(
-            "https://login.netbird.io/activate?user_code={}",
-            "X".repeat(90)
+            "https://spider.example.com/oauth2/auth?state={}",
+            "x".repeat(250)
+        );
+        let text = format!(
+            "Sign in to 'work': open this link in a browser on this computer (within 5 min).\n\n{link} and enter the code AB12"
         );
         app.input_mode = InputMode::Action {
             profile_id: crate::profile::ProfileId::new("work"),
-            text: format!("Log in to 'work' within 30s: open {link}"),
+            text: text.clone(),
         };
         let screen = render(&mut app);
-        let cells: Vec<char> = screen.chars().collect();
-        let rows: Vec<String> = cells.chunks(80).map(|row| row.iter().collect()).collect();
-        assert!(screen.contains("Waiting for you"));
-        let first = rows
-            .iter()
-            .position(|row| row.starts_with("https://login.netbird.io/activate?user_code="))
-            .expect("the link starts a line of its own");
-        assert_eq!(screen.matches('X').count(), 90);
+        for shown in [
+            "Waiting for you",
+            "https://spider.example.com/oauth2",
+            "...",
+            "enter the code AB12",
+            "[C] Copy link",
+            "[Esc] Hide",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        let rows: Vec<String> = screen
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(80)
+            .map(|row| row.iter().collect())
+            .collect();
         assert!(
-            rows[first + 2].starts_with('─'),
-            "the link ends inside the dialog"
+            rows.iter().all(|row| !row.starts_with("https://")),
+            "not full width"
         );
+        assert!(screen.matches('x').count() < 250, "the link is shortened");
+
+        app.handle_key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char('c'),
+        ));
+        assert!(
+            matches!(app.input_mode, InputMode::Action { .. }),
+            "the dialog stays"
+        );
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.message.contains("sign-in link")));
     }
 
     fn switch(current: &str, to: &str, shared: Vec<crate::cidr::Cidr>) -> InputMode {
