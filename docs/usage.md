@@ -142,7 +142,7 @@ on Linux, NetBird's installer). Add a network from Add a VPN (`i`, or `sudo vort
 | Type | Network |
 |---|---|
 | `netbird` | The server the NetBird app on this computer uses, if it is set up here; otherwise NetBird's cloud |
-| `netbird https://server.url` | That server: a company's own NetBird (a port may follow, e.g. `:33073`) |
+| `netbird https://server.url` | That server: a company's own NetBird (a port may follow, e.g. `:33073`; a bare name such as `netbird nb.example.com` means `https://`) |
 | a `.netbird` file | The server and setup key in it (below) |
 
 The profile is named after its server (`netbird` for NetBird's cloud); `R` renames it. Without

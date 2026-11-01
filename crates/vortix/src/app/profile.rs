@@ -303,7 +303,7 @@ impl App {
 
                 self.show_toast(
                     format!(
-                        "Added '{}' · c to connect · R to rename",
+                        "Added '{}'\nc to connect · R to rename",
                         crate::ui::helpers::truncate_to_width(&name, 24)
                     ),
                     ToastType::Success,

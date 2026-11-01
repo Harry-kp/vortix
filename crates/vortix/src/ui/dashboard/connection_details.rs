@@ -135,12 +135,12 @@ fn transfer_line<'a>(details: &'a DetailedConnectionInfo, mtu_str: &'a str) -> L
         ),
         Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
         Span::styled(
-            helpers::nonempty_or(&details.transfer_rx, "0"),
+            helpers::transfer_text(&details.transfer_rx),
             Style::default().fg(theme::current().text_primary),
         ),
         Span::styled(" ↑", Style::default().fg(theme::current().success)),
         Span::styled(
-            helpers::nonempty_or(&details.transfer_tx, "0"),
+            helpers::transfer_text(&details.transfer_tx),
             Style::default().fg(theme::current().text_primary),
         ),
         Span::styled(
@@ -573,8 +573,13 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
             }
         }
     } else {
+        let hint = if app.runtime.profiles.is_empty() {
+            "Press [i] to add a VPN"
+        } else {
+            "Select a profile"
+        };
         text.push(Line::from(vec![Span::styled(
-            "Select a profile from the sidebar",
+            hint,
             Style::default().fg(palette.text_secondary),
         )]));
     }
@@ -868,6 +873,14 @@ mod tests {
         std::sync::Arc::make_mut(&mut app.control_snapshot)
             .tunnels
             .push(view);
+    }
+
+    /// With nothing to select, the panel says how to add a VPN, in words
+    /// that fit the 29-column panel of an 80-column terminal.
+    #[test]
+    fn with_no_profiles_it_says_how_to_add_one() {
+        let mut app = App::new_test();
+        assert!(render_to_string(&mut app, 29, 8).contains("Press [i] to add a VPN"));
     }
 
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {

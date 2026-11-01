@@ -344,16 +344,31 @@ pub(crate) fn text_entry_spans(
 /// ```
 #[must_use]
 pub fn format_bytes_speed(bytes: u64) -> String {
+    format!("{}/s", format_bytes(bytes))
+}
+
+/// A byte count with its unit: `1.5 MB`, `512 B`.
+#[must_use]
+pub fn format_bytes(bytes: u64) -> String {
     #[allow(clippy::cast_precision_loss)]
     if bytes >= 1_000_000_000 {
-        format!("{:.1} GB/s", bytes as f64 / 1_000_000_000.0)
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
     } else if bytes >= 1_000_000 {
-        format!("{:.1} MB/s", bytes as f64 / 1_000_000.0)
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
     } else if bytes >= 1_000 {
-        format!("{:.1} KB/s", bytes as f64 / 1_000.0)
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
     } else {
-        format!("{bytes} B/s")
+        format!("{bytes} B")
     }
+}
+
+/// A tunnel's transfer counter for display: a raw byte count gets its unit;
+/// anything else (already formatted, or empty) shows as it is, or `0 B`.
+#[must_use]
+pub fn transfer_text(counter: &str) -> String {
+    counter
+        .parse()
+        .map_or_else(|_| nonempty_or(counter, "0 B").to_string(), format_bytes)
 }
 
 /// Returns the current local time formatted as HH:MM:SS.
@@ -486,6 +501,14 @@ mod tests {
             ["Connect to a", "profile to", "protect"]
         );
         assert_eq!(wrap_to_width("abcdefgh ij", 4), ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn a_transfer_counter_shows_its_unit() {
+        assert_eq!(transfer_text("2180"), "2.2 KB");
+        assert_eq!(transfer_text("92"), "92 B");
+        assert_eq!(transfer_text(""), "0 B");
+        assert_eq!(transfer_text("12.0 MiB"), "12.0 MiB", "already formatted");
     }
 
     #[test]

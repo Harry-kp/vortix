@@ -302,7 +302,9 @@ fn profile_from_words_in(words: &str, root: &Path) -> Option<(MeshDriver, Result
         .into_iter()
         .find(|driver| first.eq_ignore_ascii_case(driver.slug()))?;
     let server_url = match words.next() {
-        Some(url) => Ok(url.to_string()),
+        // A bare server name means its https address.
+        Some(url) if url.contains("://") => Ok(url.to_string()),
+        Some(host) => Ok(format!("https://{host}")),
         None => app_server(
             driver,
             &root.join(driver.app_state_dir().trim_start_matches('/')),
@@ -1084,7 +1086,11 @@ mod tests {
             profile(" netbird  https://nb.corp.example:33073 "),
             Some((MeshDriver::NetBird, "https://nb.corp.example:33073".into()))
         );
-        assert!(profile_from_words("netbird nb.corp").is_some_and(|(_, text)| text.is_err()));
+        assert_eq!(
+            profile("netbird nb.corp.example"),
+            Some((MeshDriver::NetBird, "https://nb.corp.example".into()))
+        );
+        assert!(profile_from_words("netbird ftp://nb.corp").is_some_and(|(_, text)| text.is_err()));
         assert!(profile_from_words("work.conf").is_none());
         assert!(
             profile_from_words("NetBird").is_some(),
