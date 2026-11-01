@@ -800,8 +800,7 @@ fn render_back(
     all.push(Line::from(""));
     all.push(heading(format!("Routes  {}", routes.len())));
     all.extend(or_none(routes, dim));
-    let lines = scrolled(all, app.routes_scroll, usize::from(inner.height), dim);
-    frame.render_widget(Paragraph::new(lines), inner);
+    helpers::render_scrolled(frame, area, inner, &all, Some(app.routes_scroll));
 }
 
 /// The routes section: a mesh network's routed networks (in use or not, the
@@ -868,30 +867,6 @@ fn or_none(lines: Vec<Line<'static>>, dim: Style) -> Vec<Line<'static>> {
     } else {
         lines
     }
-}
-
-/// `height` rows of `lines` from `offset`, the first saying how many are above
-/// and the last how many are below when some are.
-fn scrolled(
-    lines: Vec<Line<'static>>,
-    offset: usize,
-    height: usize,
-    dim: Style,
-) -> Vec<Line<'static>> {
-    let offset = offset.min(lines.len().saturating_sub(height));
-    let total = lines.len();
-    let mut shown: Vec<_> = lines.into_iter().skip(offset).take(height).collect();
-    if offset > 0 && !shown.is_empty() {
-        // The skipped lines and the one this marker replaces.
-        shown[0] = Line::styled(format!("↑ {} above (j/k)", offset + 1), dim);
-    }
-    let below = total.saturating_sub(offset + height);
-    if below > 0 {
-        if let Some(last) = shown.last_mut() {
-            *last = Line::styled(format!("… {} more (j/k)", below + 1), dim);
-        }
-    }
-    shown
 }
 
 /// The mark of something in use or not, from the sigil catalog.
@@ -1159,8 +1134,8 @@ mod tests {
         );
     }
 
-    /// A long route list scrolls with j/k, zoomed or not: the last line says
-    /// how many are below, the first how many are above.
+    /// A long route list scrolls with j/k, zoomed or not, with the same
+    /// scrollbar as the Logs panel.
     #[test]
     fn a_long_route_list_scrolls() {
         let mut app = mesh_app();
@@ -1176,7 +1151,7 @@ mod tests {
         app.focused_panel = crate::app::FocusedPanel::ConnectionDetails;
         let top = back_at(&mut app, 100, 16);
         assert!(
-            top.contains("Routes  650") && top.contains("more (j/k)"),
+            top.contains("Routes  650") && top.contains("↓") && !top.contains("net-020"),
             "{top}"
         );
         for _ in 0..20 {
@@ -1186,7 +1161,7 @@ mod tests {
         }
         let scrolled = back_at(&mut app, 100, 16);
         assert!(
-            scrolled.contains("↑ 21 above (j/k)") && scrolled.contains("net-0"),
+            !scrolled.contains("Peers") && scrolled.contains("net-020"),
             "{scrolled}"
         );
     }
