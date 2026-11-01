@@ -42,11 +42,35 @@ pub const FIREWALL_TOOL: (&str, &[&str]) = ("nft", &["--version"]);
 /// Opens a link in the user's default browser.
 pub const BROWSER_OPENER: &str = "xdg-open";
 
-/// Whether a graphical desktop is there to open a browser on. Without one,
+/// Whether `uid` has a graphical desktop to open a browser on. Without one,
 /// `xdg-open` falls back to a text browser in this very terminal.
 #[must_use]
-pub fn has_desktop() -> bool {
-    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+pub fn has_desktop(uid: u32) -> bool {
+    session_display(uid).is_some()
+}
+
+/// The display of `uid`'s desktop session: from the environment when `sudo`
+/// kept it, else that user's own Wayland socket or X socket.
+fn session_display(uid: u32) -> Option<(&'static str, String)> {
+    use std::os::unix::fs::MetadataExt as _;
+    for name in ["WAYLAND_DISPLAY", "DISPLAY"] {
+        if let Ok(value) = std::env::var(name) {
+            return Some((name, value));
+        }
+    }
+    let owned =
+        |path: &std::path::Path| std::fs::metadata(path).is_ok_and(|meta| meta.uid() == uid);
+    let socket = |dir: &str, prefix: &str| {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let lock = entry.path().extension().is_some_and(|ext| ext == "lock");
+            (name.starts_with(prefix) && !lock && owned(&entry.path())).then_some(name)
+        })
+    };
+    if let Some(wayland) = socket(&format!("/run/user/{uid}"), "wayland-") {
+        return Some(("WAYLAND_DISPLAY", wayland));
+    }
+    socket("/tmp/.X11-unix", "X").map(|x| ("DISPLAY", format!(":{}", &x[1..])))
 }
 
 /// What a command run as `uid` needs to reach that user's desktop session,
@@ -59,6 +83,9 @@ pub fn desktop_env(uid: u32) -> std::collections::HashMap<String, String> {
         format!("unix:path={runtime}/bus"),
     )]);
     env.insert("XDG_RUNTIME_DIR".into(), runtime);
+    if let Some((name, display)) = session_display(uid) {
+        env.insert(name.into(), display);
+    }
     env
 }
 

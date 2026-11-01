@@ -32,13 +32,13 @@ pub use crate::macos::{
 /// is a file of that user's (a profile, the config folder) that proves who it is.
 #[must_use]
 pub fn open_in_browser(link: &str, owned_by: &std::path::Path) -> bool {
-    if !has_desktop() {
-        return false;
-    }
     let Ok(owner) = crate::hooks::VerifiedHookOwner::for_standard_mode(owned_by) else {
         return false;
     };
     let credentials = owner.credentials();
+    if !has_desktop(credentials.uid) {
+        return false;
+    }
     let mut spec = crate::process::CommandSpec::oneshot(
         crate::platform::BROWSER_OPENER,
         vec![link.to_string()],

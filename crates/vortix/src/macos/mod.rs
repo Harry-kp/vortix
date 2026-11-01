@@ -42,7 +42,7 @@ pub const BROWSER_OPENER: &str = "open";
 
 /// Whether a desktop is there to open a browser on: macOS always has one.
 #[must_use]
-pub fn has_desktop() -> bool {
+pub fn has_desktop(_uid: u32) -> bool {
     true
 }
 
