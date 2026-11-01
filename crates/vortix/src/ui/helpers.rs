@@ -47,6 +47,76 @@ pub(crate) fn link_style() -> Style {
         .add_modifier(ratatui::style::Modifier::UNDERLINED)
 }
 
+/// A scrolling list of `lines` in `inner` with a scrollbar on `area`'s right
+/// border: at `position` rows down, or following the end when `None`.
+/// Returns how far it can scroll.
+pub(crate) fn render_scrolled(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    inner: ratatui::layout::Rect,
+    lines: &[Line],
+    position: Option<usize>,
+) -> usize {
+    use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+    let visible_lines = inner.height as usize;
+    let width = usize::from(inner.width.max(1));
+    // Wrapping thousands of long lines every frame made the panel crawl, so
+    // only the lines on screen are wrapped. Positions come from each line's
+    // width; the bottom, where the panel usually sits, is exact.
+    let rows = |line: &Line| line.width().div_ceil(width).max(1);
+    let total_visual_lines: usize = lines.iter().map(rows).sum();
+    let max_scroll = total_visual_lines.saturating_sub(visible_lines);
+    let scroll_pos = position.map_or(max_scroll, |position| position.min(max_scroll));
+
+    let shown = if scroll_pos == max_scroll {
+        // The last lines that fill the panel, wrapped exactly.
+        let mut start = lines.len();
+        let mut filled = 0;
+        while start > 0 && filled < visible_lines {
+            start -= 1;
+            filled += Paragraph::new(lines[start].clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width);
+        }
+        let skip = filled.saturating_sub(visible_lines);
+        Paragraph::new(lines[start..].to_vec())
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0))
+    } else {
+        let mut start = 0;
+        let mut above = 0;
+        while start < lines.len() && above + rows(&lines[start]) <= scroll_pos {
+            above += rows(&lines[start]);
+            start += 1;
+        }
+        let end = (start + visible_lines + 1).min(lines.len());
+        Paragraph::new(lines[start..end].to_vec())
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(scroll_pos - above).unwrap_or(u16::MAX), 0))
+    };
+    frame.render_widget(shown, inner);
+
+    // Scrollbar
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
+        .style(Style::default().fg(theme::current().nord_polar_night_4))
+        .thumb_style(Style::default().fg(theme::current().accent_primary));
+
+    let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll_pos);
+
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut scrollbar_state,
+    );
+    max_scroll
+}
+
 /// `text` word-wrapped to `width` columns, each line indented by `indent` spaces.
 pub(crate) fn wrapped_lines(
     text: &str,
