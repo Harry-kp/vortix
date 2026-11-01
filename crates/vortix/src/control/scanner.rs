@@ -24,6 +24,8 @@ pub struct ActiveSession {
     pub details: crate::tunnel::DetailedConnectionInfo,
     /// Typed `WireGuard` peer facts. Empty for `OpenVPN`.
     pub wireguard_peers: Vec<crate::tunnel::TunnelPeerStatus>,
+    /// A mesh network whose sign-in ended: it is running but reaches no one.
+    pub needs_sign_in: bool,
 }
 
 /// Combined result of a scanner sweep: active VPN sessions plus the

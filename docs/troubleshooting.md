@@ -108,8 +108,8 @@ Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root on
 - `the NetBird app is set up on this computer: run with sudo`: `vortix import netbird` reads the
   app's server, which only root can; run it with `sudo`, or name the server:
   `vortix import "netbird https://server.url"`.
-- Peers all offline after a day or so: the network's sign-in session ended (24 hours by default
-  in NetBird's dashboard). Reconnect (`r`) and sign in again.
+- `needs a new sign-in`: the network's sign-in session ended (24 hours by default in NetBird's
+  dashboard). Sign in from the box that appears; with auto-reconnect off, reconnect (`r`) first.
 - `NetBird refused this device`: the setup key is expired, used up or revoked, or the
   device was removed from the NetBird dashboard. Make a new key.
 - `NetBird server: …`: `server_url` is wrong or the server is unreachable.

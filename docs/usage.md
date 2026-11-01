@@ -151,7 +151,9 @@ never as root, and connects once you sign in, within 5 minutes. The box always s
 too, to open on any device (for example over SSH, or when no browser opened), or only on this
 computer when the link returns to `localhost`; drag over it to copy. `vortix up` prints the same.
 A network you signed in to needs a new sign-in when its session ends, which NetBird's dashboard
-sets (24 hours by default): its peers go offline, and reconnecting (`r`) shows a new link.
+sets (24 hours by default). Vortix notices within seconds and, with auto-reconnect on,
+reconnects to show the sign-in box again (otherwise `r` does); `block-on-drop` does not block
+traffic for it, so the sign-in page stays reachable.
 
 A `.netbird` file can carry a setup key from the NetBird dashboard, so no sign-in is needed;
 NetBird meant these for servers, not people's own computers:
@@ -244,7 +246,7 @@ vortix status                      # --brief, --watch, --interval <secs> (defaul
 | Mode | Behaviour |
 |---|---|
 | `off` | No firewall rules |
-| `block-on-drop` | Blocks traffic when a tunnel drops unexpectedly, until it reconnects |
+| `block-on-drop` | Blocks traffic when a tunnel drops unexpectedly, until it reconnects (not when a network only asks for a new sign-in) |
 | `vpn-only` | Blocks all traffic except through a tunnel, with or without one connected |
 
 ```bash
