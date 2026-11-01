@@ -8,23 +8,17 @@ All notable changes to this project will be documented in this file.
 
 ### Highlights
 
-- **NetBird networks, run by Vortix.** Press `i` (Add a VPN) and type `netbird` to join the server the NetBird app on this computer uses, or NetBird's cloud; `netbird https://your.server` for a self-hosted one; or add a `.netbird` file with a setup key for servers. `sudo vortix import netbird https://your.server` does the same from the CLI. NetBird gets the same sidebar, keys, kill switch, Security Guard, CLI and `--json` as every other tunnel. ([#405](https://github.com/Harry-kp/vortix/pull/405), [#407](https://github.com/Harry-kp/vortix/pull/407), [#413](https://github.com/Harry-kp/vortix/pull/413))
-- **Sign in from your browser.** Connecting opens NetBird's sign-in page in your browser, as you and never as root; over SSH the dialog shows the link to open on any device, and `c` copies it. When a session ends, Vortix reconnects for a new sign-in, and `block-on-drop` does not block the sign-in page. ([#413](https://github.com/Harry-kp/vortix/pull/413), [#416](https://github.com/Harry-kp/vortix/pull/416), [#419](https://github.com/Harry-kp/vortix/pull/419))
-- **A company network beside your own VPN.** Run NetBird for company addresses and a personal WireGuard or OpenVPN for the internet at once; switching or stopping the personal VPN leaves NetBird connected. A NetBird exit node shows as your internet route. ([#407](https://github.com/Harry-kp/vortix/pull/407), [#411](https://github.com/Harry-kp/vortix/pull/411), [#418](https://github.com/Harry-kp/vortix/pull/418))
-- **Routes and peers on the back of Details.** `F2`, then `f`, lists a tunnel's routes, and for NetBird its peers, direct or relayed, with latency; `z` shows full columns and `j`/`k` scroll. ([#421](https://github.com/Harry-kp/vortix/pull/421))
-- **Copy and click in the TUI.** Drag with the mouse to select text; it is copied when you release. Click a link to open it in your browser. ([#412](https://github.com/Harry-kp/vortix/pull/412), [#423](https://github.com/Harry-kp/vortix/pull/423))
-- **NetBird's own log in the Logs panel,** like OpenVPN's: `f` in the Logs panel switches the source. ([#417](https://github.com/Harry-kp/vortix/pull/417))
+- **NetBird, run by Vortix.** Press `i` and type `netbird` (or `netbird https://your.server`); sign in in your browser, or from any device over SSH. Same keys, kill switch, CLI and `--json` as every other tunnel. Run it beside your own WireGuard or OpenVPN: company addresses go through NetBird, the internet through your VPN. ([#405](https://github.com/Harry-kp/vortix/pull/405), [#413](https://github.com/Harry-kp/vortix/pull/413))
+- **Routes and peers on the back of Details** (`F2`, `f`), for every VPN. ([#421](https://github.com/Harry-kp/vortix/pull/421))
+- **Select to copy, click to open links** in the TUI. ([#412](https://github.com/Harry-kp/vortix/pull/412), [#423](https://github.com/Harry-kp/vortix/pull/423))
 
 ### Fixed
 
-- **No false "matches the pre-VPN address" warning on a split tunnel.** The unchanged-address warning, for IPv4 and IPv6, now shows only when a tunnel carries the internet. ([#409](https://github.com/Harry-kp/vortix/pull/409), [#411](https://github.com/Harry-kp/vortix/pull/411))
-- **The Logs panel stays fast with long logs.** It wraps only the lines on screen. ([#422](https://github.com/Harry-kp/vortix/pull/422))
-- **Transfer counters show their units,** and the empty dashboard says to press `i` to add a VPN. ([#414](https://github.com/Harry-kp/vortix/pull/414), [#415](https://github.com/Harry-kp/vortix/pull/415))
+- **No false "matches the pre-VPN address" warning on split tunnels.** ([#409](https://github.com/Harry-kp/vortix/pull/409))
 
 ### Changed
 
-- **`i` is now "Add a VPN".** The same box takes a file, folder, link or `netbird`, and lists the ways in. ([#413](https://github.com/Harry-kp/vortix/pull/413))
-- **Details' back shows routes and peers instead of Health.** The tunnel's state and health reason stay on the front. ([#421](https://github.com/Harry-kp/vortix/pull/421))
+- **`i` is now "Add a VPN";** Details' back shows routes and peers instead of Health. ([#413](https://github.com/Harry-kp/vortix/pull/413), [#421](https://github.com/Harry-kp/vortix/pull/421))
 
 ## [0.5.5] - 2026-10-24
 
