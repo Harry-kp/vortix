@@ -65,7 +65,7 @@ impl App {
         }
     }
 
-    /// The tunnel that owns the default route.
+    /// The tunnel internet traffic goes through (`Snapshot::primary`).
     #[must_use]
     pub fn primary_id(&self) -> Option<&ProfileId> {
         self.control_snapshot.primary.as_ref()

@@ -134,7 +134,8 @@ pub struct DnsView {
 pub struct Snapshot {
     pub version: u64,
     pub tunnels: Vec<TunnelView>,
-    /// Owner of the default route.
+    /// The tunnel internet traffic goes through: the default route's owner,
+    /// or a mesh network using an exit node.
     pub primary: Option<ProfileId>,
     pub kill_switch: KillSwitchMode,
     pub kill_switch_state: KillSwitchState,

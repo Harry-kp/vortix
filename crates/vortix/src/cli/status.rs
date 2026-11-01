@@ -184,8 +184,8 @@ fn session_status(
 ///
 /// - `connections`: all currently active tunnels. Empty when nothing is
 ///   connected. v2 readers should prefer this field.
-/// - `primary`: profile of the tunnel carrying the default route, or `null`
-///   when none does (no tunnels, or only split tunnels).
+/// - `primary`: profile of the tunnel the kernel sends internet traffic
+///   through, or `null` when none does (no tunnels, or only split tunnels).
 /// - `connection`: v1 back-compat. The focused tunnel (primary, else the
 ///   first) when it is connected, `null` otherwise.
 #[derive(Serialize)]

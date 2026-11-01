@@ -175,8 +175,13 @@ into `NetBird.app`). The app's own files are never changed.
 After that, `up`, `down`, `status`, the dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`)
 work as for any profile. Vortix runs NetBird's own client with this network's identity in
 `/var/lib/vortix/netbird/`, separate from the app's, and deleting the profile removes it.
-NetBird is a private network, not an internet exit: with it alone the header reads
-`● MESH <name> 3/7` (peers up of all), and your public address stays your own.
+NetBird is a private network: with it alone the header reads `● MESH <name> 3/7` (peers up of
+all), and your public address stays your own. When the network uses an exit node (a peer that
+carries all internet traffic, chosen in NetBird's dashboard), Vortix shows NetBird as carrying
+your internet: the header reads `● CONNECTED (<name>/NB)` with the exit's address, and the
+Security Guard checks that exit. NetBird keeps routing it; a full WireGuard or OpenVPN tunnel
+connected on top takes the internet over on Linux (on macOS this is not yet verified), and the
+Security Guard shows the exit actually in use.
 NetBird sets up its own routes and DNS on `wt0` (macOS: `utun100`). One NetBird network can be
 up at a time. Connection Details shows how many peers are up; `P` lists the networks it routes
 to (in use or not, and which is an exit node), then the peers. `status --json` adds them under
@@ -303,9 +308,10 @@ install it exits 1 and names the right way, such as `brew upgrade vortix`.
 `status --watch --json` prints one object per line. `report` and `completions` always print
 plain text.
 
-In `status --json`, `data.connections` lists every tunnel, `data.primary` names the one that owns
-the default route (or `null`), and `data.connection` is the primary (or, without one, the first tunnel) while it is connected,
-otherwise `null`.
+In `status --json`, `data.connections` lists every tunnel, `data.primary` names the one the kernel
+sends internet traffic through (a full tunnel, or a NetBird network using an exit node; `null`
+without one), and `data.connection` is the primary (or, without one, the first tunnel) while it
+is connected, otherwise `null`.
 
 | Exit code | Meaning |
 |---|---|

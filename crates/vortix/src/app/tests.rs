@@ -492,6 +492,28 @@ fn test_publicipv6_caches_real_ipv6_when_safe_to_cache() {
     );
 }
 
+/// A mesh network's daemon routes for itself; with an exit node it carries
+/// IPv6, so a reading taken while it is up is never recorded as the real one.
+#[test]
+fn an_ipv6_reading_with_a_mesh_network_up_is_not_taken_as_real() {
+    use crate::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    app.runtime.scanner_first_tick_done = true;
+    app.runtime.real_ipv6 = Some("2401:4900::1".to_string());
+    let mut mesh = crate::app::connection::test_view("work", crate::control::Phase::Up);
+    mesh.protocol = crate::profile::ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+    std::sync::Arc::make_mut(&mut app.control_snapshot)
+        .tunnels
+        .push(mesh);
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(Some(
+        "2400:6180::1".to_string(),
+    ))));
+
+    assert_eq!(app.runtime.real_ipv6.as_deref(), Some("2401:4900::1"));
+    assert_eq!(app.runtime.public_ipv6.as_deref(), Some("2400:6180::1"));
+}
+
 #[test]
 fn test_publicipv6_clears_when_probe_returns_none() {
     use crate::telemetry::TelemetryUpdate;

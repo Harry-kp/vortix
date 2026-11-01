@@ -655,12 +655,13 @@ impl App {
             }
             TelemetryUpdate::PublicIpv6(observed) => {
                 let is_connected = self.has_active_connection();
+                // A mesh daemon routes for itself (an exit node takes IPv6 too),
+                // so its routes say nothing about whether IPv6 stays real.
                 let no_tunnel_routes_v6 = is_connected
-                    && !self
-                        .control_snapshot
-                        .tunnels
-                        .iter()
-                        .any(|tunnel| crate::cidr::claims_default_route_v6(&tunnel.routes));
+                    && !self.control_snapshot.tunnels.iter().any(|tunnel| {
+                        crate::cidr::claims_default_route_v6(&tunnel.routes)
+                            || matches!(tunnel.protocol, crate::profile::ProtocolKind::Mesh(_))
+                    });
                 let safe_to_cache = self.no_tunnel_on_egress() || no_tunnel_routes_v6;
                 if safe_to_cache {
                     if let Some(ref ip) = observed {

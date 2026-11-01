@@ -26,6 +26,8 @@ pub struct ActiveSession {
     pub wireguard_peers: Vec<crate::tunnel::TunnelPeerStatus>,
     /// A mesh network whose sign-in ended: it is running but reaches no one.
     pub needs_sign_in: bool,
+    /// Its routed networks could not be read this time (not: it has none).
+    pub networks_unread: bool,
 }
 
 /// Combined result of a scanner sweep: active VPN sessions plus the
