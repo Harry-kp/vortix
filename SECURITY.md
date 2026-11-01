@@ -58,6 +58,10 @@ Reporters are credited in the release notes unless they prefer not to be.
   profile connects, every server address it names is reachable, so a profile with many
   attacker-chosen `remote` lines opens traffic to those addresses for that time. Import profiles
   only from providers you trust.
+- **`block-on-drop` does not block for a mesh network that asks for a new sign-in.** When a
+  NetBird session ends, traffic flows normally, so the sign-in page stays reachable, until the
+  network signs in again or is disconnected, including after its reconnects give up. `vpn-only`
+  blocks as usual.
 - **The kill switch starts with Vortix, not with the OS.** A reboot clears its rules, so until
   Vortix next runs as root nothing is blocked, even in `vpn-only`
   ([Kill switch](docs/usage.md#kill-switch)). `vortix autoconnect` narrows that gap.

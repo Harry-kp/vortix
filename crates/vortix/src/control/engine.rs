@@ -603,6 +603,7 @@ impl Engine {
         self.scanning = false;
         self.next_scan = Instant::now() + SCAN_EVERY;
         if result.tunnel_observation_complete {
+            // Up since before this scan: gone, or (`true`) asking for a new sign-in.
             let lost = self
                 .state
                 .tunnels()
@@ -612,24 +613,14 @@ impl Engine {
                         .get(&tunnel.spec.profile_id)
                         .is_some_and(|up| *up < started)
                 })
-                .filter(|tunnel| session(&result.sessions, &tunnel.spec.name).is_none())
-                .map(|tunnel| tunnel.spec.profile_id.clone())
-                .collect::<Vec<_>>();
-            for profile_id in lost {
-                self.lost(&profile_id, false);
-            }
-            let signed_out = self
-                .state
-                .tunnels()
-                .filter(|tunnel| tunnel.phase == Phase::Up)
-                .filter(|tunnel| {
-                    session(&result.sessions, &tunnel.spec.name)
-                        .is_some_and(|session| session.needs_sign_in)
+                .filter_map(|tunnel| {
+                    let found = session(&result.sessions, &tunnel.spec.name);
+                    let sign_in = found.is_some_and(|session| session.needs_sign_in);
+                    (found.is_none() || sign_in).then(|| (tunnel.spec.profile_id.clone(), sign_in))
                 })
-                .map(|tunnel| tunnel.spec.profile_id.clone())
                 .collect::<Vec<_>>();
-            for profile_id in signed_out {
-                self.lost(&profile_id, true);
+            for (profile_id, sign_in) in lost {
+                self.lost(&profile_id, sign_in);
             }
             self.external = result
                 .sessions
@@ -816,8 +807,8 @@ impl Engine {
                     .begin(spec, rank, None, matches!(need, Need::Prompt(_)))
                     .is_ok()
                 {
-                    if restart.as_ref().is_some_and(|old| old.recovering.is_some()) {
-                        self.state.resume_recovery(profile_id);
+                    if let Some(old) = restart.as_ref().filter(|old| old.recovering.is_some()) {
+                        self.state.resume_recovery(profile_id, old.signing_in);
                     }
                     match need {
                         Need::Ready {

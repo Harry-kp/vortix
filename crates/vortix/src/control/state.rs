@@ -341,9 +341,10 @@ impl State {
 
     /// Keep a restarted tunnel counted as dropped, so block-on-drop keeps
     /// blocking until the restart actually comes up.
-    pub fn resume_recovery(&mut self, profile_id: &ProfileId) {
+    pub fn resume_recovery(&mut self, profile_id: &ProfileId, signing_in: bool) {
         if let Some(tunnel) = self.tunnels.get_mut(profile_id) {
             tunnel.recovering = Some(0);
+            tunnel.signing_in = signing_in;
         }
     }
 
@@ -765,6 +766,28 @@ mod tests {
         assert!(state.plan_input().dropped, "a real drop still blocks");
     }
 
+    /// Reconnecting (`r`) a network that waits for a sign-in keeps it a
+    /// sign-in, so block-on-drop still leaves the sign-in page reachable.
+    #[test]
+    fn reconnecting_a_sign_in_keeps_it_a_sign_in() {
+        let mut state = State {
+            kill_switch: KillSwitchMode::Auto,
+            ..State::default()
+        };
+        state
+            .begin(spec("01", "100.64.0.0/10"), 1, None, false)
+            .unwrap();
+        state.came_up(&id("01"), "wt0".into(), [], [], None);
+        state.sign_in_again(&id("01"), None, false);
+        assert!(state.restart(&id("01")));
+        let old = state.stopped(&id("01")).expect("restart requested");
+        state
+            .begin(spec("01", "100.64.0.0/10"), 2, None, false)
+            .unwrap();
+        state.resume_recovery(&id("01"), old.signing_in);
+        assert!(!state.plan_input().dropped);
+    }
+
     /// The dropped tunnel's teardown removes that profile's interface and
     /// ownership files; a retry that starts before it finishes gets its new
     /// tunnel torn down by the old stop.
@@ -825,7 +848,7 @@ mod tests {
         state
             .begin(spec("01", "0.0.0.0/0"), 2, None, false)
             .unwrap();
-        state.resume_recovery(&id("01"));
+        state.resume_recovery(&id("01"), false);
         assert!(
             state.plan_input().dropped,
             "still blocking while it restarts"
