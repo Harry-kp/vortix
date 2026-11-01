@@ -4,6 +4,139 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use crate::process::ProcessCredentials;
+
+/// Most supplementary groups looked up for a user.
+pub(crate) const MAX_SUPPLEMENTARY_GROUPS: usize = 1_024;
+
+/// The user Vortix runs commands as (hooks, the browser): checked against
+/// the operating system, never root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOwner {
+    credentials: ProcessCredentials,
+}
+
+impl VerifiedOwner {
+    /// Prove the owner.
+    ///
+    /// A direct non-root invocation must own the selected configuration path.
+    /// A root invocation additionally needs coherent sudo uid/gid/user facts;
+    /// direct or root-targeting sudo execution is refused.
+    pub fn for_standard_mode(config_path: &Path) -> Result<Self, OwnerError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::symlink_metadata(config_path)
+            .map_err(|source| OwnerError::ConfigMetadata { source })?;
+        if metadata.file_type().is_symlink() {
+            return Err(OwnerError::SymlinkConfig);
+        }
+        let (process_user, process_group) = crate::platform::effective_user_group_ids();
+        if process_user != 0 {
+            if process_group == 0 {
+                return Err(OwnerError::RootOwner);
+            }
+            if metadata.uid() != process_user {
+                return Err(OwnerError::ConfigOwnerMismatch {
+                    expected: process_user,
+                    actual: metadata.uid(),
+                });
+            }
+            let supplementary_groups = current_groups()?;
+            if supplementary_groups.contains(&0) {
+                return Err(OwnerError::RootOwner);
+            }
+            return Ok(Self {
+                credentials: ProcessCredentials {
+                    uid: process_user,
+                    gid: process_group,
+                    supplementary_groups,
+                },
+            });
+        }
+
+        let (uid, gid) = crate::config::sudo_ids()
+            .ok()
+            .flatten()
+            .ok_or(OwnerError::AmbiguousRoot)?;
+        if uid == 0 || gid == 0 {
+            return Err(OwnerError::RootOwner);
+        }
+        let sudo_user = std::env::var("SUDO_USER").map_err(|_| OwnerError::AmbiguousRoot)?;
+        let (recorded_user, recorded_group, supplementary_groups) = lookup_user(&sudo_user)?;
+        if recorded_user != uid || recorded_group != gid {
+            return Err(OwnerError::SudoIdentityMismatch);
+        }
+        if supplementary_groups.contains(&0) {
+            return Err(OwnerError::RootOwner);
+        }
+        if metadata.uid() != uid {
+            return Err(OwnerError::ConfigOwnerMismatch {
+                expected: uid,
+                actual: metadata.uid(),
+            });
+        }
+        Ok(Self {
+            credentials: ProcessCredentials {
+                uid,
+                gid,
+                supplementary_groups,
+            },
+        })
+    }
+
+    /// The identity a command run as this owner takes.
+    #[must_use]
+    pub fn credentials(&self) -> ProcessCredentials {
+        self.credentials.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_ids(uid: u32, gid: u32) -> Self {
+        Self {
+            credentials: ProcessCredentials {
+                uid,
+                gid,
+                supplementary_groups: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum OwnerError {
+    #[error("cannot verify the invoking user: configuration metadata failed: {source}")]
+    ConfigMetadata { source: std::io::Error },
+    #[error("cannot verify the invoking user through a symlinked configuration path")]
+    SymlinkConfig,
+    #[error("configuration owner is uid {actual}, expected invoking uid {expected}")]
+    ConfigOwnerMismatch { expected: u32, actual: u32 },
+    #[error("a direct or ambiguous root invocation has no user to run commands as")]
+    AmbiguousRoot,
+    #[error("commands Vortix runs as the user never run as root")]
+    RootOwner,
+    #[error("sudo uid/gid do not match the operating-system user record")]
+    SudoIdentityMismatch,
+    #[error("cannot resolve invoking user from the operating system")]
+    UnknownUser,
+    #[error("cannot read process groups: {source}")]
+    Groups { source: std::io::Error },
+}
+
+fn current_groups() -> Result<Vec<u32>, OwnerError> {
+    crate::platform::current_groups().map_err(|source| OwnerError::Groups { source })
+}
+
+fn lookup_user(user: &str) -> Result<(u32, u32, Vec<u32>), OwnerError> {
+    let user = std::ffi::CString::new(user).map_err(|_| OwnerError::UnknownUser)?;
+    let (uid, gid, _) = crate::platform::lookup_user(&user).ok_or(OwnerError::UnknownUser)?;
+    let mut groups =
+        crate::platform::supplementary_groups_for_user(&user, gid, MAX_SUPPLEMENTARY_GROUPS)
+            .ok_or(OwnerError::UnknownUser)?;
+    groups.sort_unstable();
+    groups.dedup();
+    Ok((uid, gid, groups))
+}
+
 pub(crate) type OwnedDirectory = std::fs::File;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,6 +797,45 @@ pub fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_owner_requires_non_root_or_sudo_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = VerifiedOwner::for_standard_mode(temp.path());
+        if crate::platform::is_root() {
+            assert!(result.is_err());
+        } else {
+            let owner = result.unwrap();
+            assert_eq!(
+                owner.credentials().uid,
+                crate::platform::effective_user_group_ids().0
+            );
+        }
+    }
+
+    #[test]
+    fn standard_owner_rejects_symlinked_configuration() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("settings.toml");
+        let link = temp.path().join("settings-link.toml");
+        std::fs::write(&target, "").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(matches!(
+            VerifiedOwner::for_standard_mode(&link),
+            Err(OwnerError::SymlinkConfig)
+        ));
+    }
+
+    #[test]
+    fn operating_system_user_lookup_returns_bounded_groups() {
+        let (uid, gid, groups) = lookup_user("root").unwrap();
+        assert_eq!(uid, 0);
+        assert_eq!(gid, 0);
+        assert!(groups.contains(&0));
+        assert!(groups.len() <= MAX_SUPPLEMENTARY_GROUPS);
+    }
 
     /// A root shell with no sudo identity (a root login, `su -`, a systemd
     /// unit) must write as the user who owns the config directory, or every
