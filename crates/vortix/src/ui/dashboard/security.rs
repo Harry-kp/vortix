@@ -900,19 +900,13 @@ fn collect_state(app: &App, primary_snap: Option<&TunnelView>, inner_width: u16)
     // when no primary owns the default route does "split-route — no
     // exit" become the truthful rendering.
     let has_primary = primary_snap.is_some();
-    let (public_ip, location, ip_status) = if has_primary {
-        let ip_status = derive_ip_status(app);
-        let location = if constants::is_pending(&app.runtime.location) {
-            None
-        } else {
-            Some(app.runtime.location.clone())
-        };
-        (app.runtime.public_ip.clone(), location, ip_status)
+    // With no exit, internet traffic leaves from the real address, so its location stands too.
+    let location =
+        (!constants::is_pending(&app.runtime.location)).then(|| app.runtime.location.clone());
+    let (public_ip, ip_status) = if has_primary {
+        (app.runtime.public_ip.clone(), derive_ip_status(app))
     } else {
-        // No exit: internet traffic leaves from the real address, so its location stands.
-        let location =
-            (!constants::is_pending(&app.runtime.location)).then(|| app.runtime.location.clone());
-        (String::new(), location, IpStatus::Pending)
+        (String::new(), IpStatus::Pending)
     };
 
     let dns_server = dns_display_value(app);
