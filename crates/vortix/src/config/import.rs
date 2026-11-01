@@ -67,7 +67,7 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
             let profile = profile?;
             if let Some(existing) = joined_already(driver, &profile) {
                 return Err(format!(
-                    "'{existing}' already joins this {driver} network; connect it with: sudo vortix up {existing}"
+                    "'{existing}' already joins this {driver} network; connect that profile instead"
                 ));
             }
             return stage_mesh_profile(driver, &profile).map(ImportTarget::File);

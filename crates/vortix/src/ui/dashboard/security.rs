@@ -909,7 +909,10 @@ fn collect_state(app: &App, primary_snap: Option<&TunnelView>, inner_width: u16)
         };
         (app.runtime.public_ip.clone(), location, ip_status)
     } else {
-        (String::new(), None, IpStatus::Pending)
+        // No exit: internet traffic leaves from the real address, so its location stands.
+        let location =
+            (!constants::is_pending(&app.runtime.location)).then(|| app.runtime.location.clone());
+        (String::new(), location, IpStatus::Pending)
     };
 
     let dns_server = dns_display_value(app);
@@ -2612,6 +2615,20 @@ mod tests {
             state.is_stale(state.dns_age),
             "the resolver reading is older than the staleness window and must say so"
         );
+    }
+
+    /// With only a split tunnel or mesh network up, traffic still leaves from
+    /// the real address, so its location shows instead of waiting forever.
+    #[test]
+    fn without_an_exit_the_real_location_stands() {
+        let mut app = App::new_test();
+        app.runtime.location = "Agra, IN".into();
+        assert_eq!(
+            collect_state(&app, None, 60).location.as_deref(),
+            Some("Agra, IN")
+        );
+        app.runtime.location = constants::MSG_DETECTING.into();
+        assert_eq!(collect_state(&app, None, 60).location, None);
     }
 
     #[test]
