@@ -42,3 +42,17 @@ runs the same. No other test notices a profile regression. It also checks the ve
 
 When the budget trips, find out why before raising it: a reverted profile setting costs
 megabytes and fails nothing else. Move the ceiling only in the commit that justifies it.
+
+## Rendering
+
+A dashboard frame must stay a few milliseconds in a release build, because every key, scan and
+telemetry update redraws it. Wrap or lay out only what is on screen: wrapping a whole
+2,000-line NetBird log on every frame once cost 46 ms (226 ms in a debug build) and made keys
+lag. Measure with the two benchmarks, in release:
+
+```bash
+cargo test -p vortix --release --lib bench_ -- --ignored --nocapture
+```
+
+`bench_full_frame` renders the dashboard with a 650-network NetBird network and 2,000 events
+(about 1.5–3.5 ms); `bench_tunnel_log_frame` renders a long tunnel log (under 2 ms).

@@ -174,3 +174,84 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use crate::app::App;
+    use crate::profile::{ProfileId, ProtocolKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::time::Instant;
+
+    /// Not a check: prints the cost of one full dashboard frame with a
+    /// company-sized `NetBird` network up, per focused panel and flip.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn bench_full_frame() {
+        let mut app = App::new_test();
+        for n in 0..30 {
+            app.runtime
+                .profiles
+                .push(crate::config::profiles::VpnProfile {
+                    id: ProfileId::new(format!("p{n:02}")),
+                    name: format!("p{n:02}"),
+                    protocol: if n == 0 {
+                        ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird)
+                    } else {
+                        ProtocolKind::WireGuard
+                    },
+                    config_path: "/tmp/x".into(),
+                    location: String::new(),
+                    last_used: None,
+                    group: None,
+                });
+        }
+        app.profile_list_state.select(Some(0));
+        let mut mesh = crate::app::connection::test_view("p00", crate::control::Phase::Up);
+        mesh.protocol = ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+        mesh.details.networks = (0..650)
+            .map(|n| crate::tunnel::RoutedNetwork {
+                name: format!("k8s-stag-{n:03}.bsstag.com"),
+                range: format!("10.{}.{}.0/24", n / 250, n % 250),
+                selected: true,
+            })
+            .collect();
+        mesh.details.peers = (0..13)
+            .map(|n| crate::tunnel::MeshPeer {
+                name: format!("peer-{n}"),
+                address: format!("100.66.0.{n}"),
+                connected: true,
+                relayed: n % 2 == 0,
+                latency: Some(std::time::Duration::from_millis(40)),
+            })
+            .collect();
+        app.set_tunnels_for_test(vec![mesh], Some(ProfileId::new("p00")));
+        for n in 0..2000 {
+            app.log(&format!(
+                "INFO: event number {n} with some text about the network and the tunnel state"
+            ));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(97, 48)).unwrap();
+        let mut time = |label: &str, app: &mut App| {
+            terminal.draw(|frame| super::render(frame, app)).unwrap();
+            let start = Instant::now();
+            for _ in 0..20 {
+                terminal.draw(|frame| super::render(frame, app)).unwrap();
+            }
+            println!("{label:<34} {:?}/frame", start.elapsed() / 20);
+        };
+        time("dashboard (sidebar focused)", &mut app);
+        app.flip_state_mut(crate::app::FocusedPanel::ConnectionDetails)
+            .set_showing_back(true);
+        time("+ Details back (650 routes)", &mut app);
+        app.zoomed_panel = Some(crate::app::FocusedPanel::ConnectionDetails);
+        time("+ Details back zoomed", &mut app);
+        app.zoomed_panel = Some(crate::app::FocusedPanel::Logs);
+        time("Event Log zoomed (2000 events)", &mut app);
+        app.zoomed_panel = None;
+        let start = Instant::now();
+        for _ in 0..20 {
+            app.on_tick();
+        }
+        println!("{:<34} {:?}/tick", "on_tick", start.elapsed() / 20);
+    }
+}

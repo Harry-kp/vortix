@@ -110,16 +110,19 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    render_scrolled(frame, app, area, inner, lines);
+    render_scrolled(frame, app, area, inner, &lines);
 }
 
 /// The panel body shared by both sources: wrapped lines that follow the end
 /// unless the user scrolled up.
-fn render_scrolled(frame: &mut Frame, app: &mut App, area: Rect, inner: Rect, lines: Vec<Line>) {
+fn render_scrolled(frame: &mut Frame, app: &mut App, area: Rect, inner: Rect, lines: &[Line]) {
     let visible_lines = inner.height as usize;
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-
-    let total_visual_lines = paragraph.line_count(inner.width);
+    let width = usize::from(inner.width.max(1));
+    // Wrapping thousands of long lines every frame made the panel crawl, so
+    // only the lines on screen are wrapped. Positions come from each line's
+    // width; the bottom, where the panel usually sits, is exact.
+    let rows = |line: &Line| line.width().div_ceil(width).max(1);
+    let total_visual_lines: usize = lines.iter().map(rows).sum();
     let max_scroll = total_visual_lines.saturating_sub(visible_lines);
     app.logs_max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
 
@@ -129,10 +132,33 @@ fn render_scrolled(frame: &mut Frame, app: &mut App, area: Rect, inner: Rect, li
         (app.logs_scroll as usize).min(max_scroll)
     };
 
-    #[allow(clippy::cast_possible_truncation)]
-    let paragraph = paragraph.scroll((scroll_pos as u16, 0));
-
-    frame.render_widget(paragraph, inner);
+    let shown = if scroll_pos == max_scroll {
+        // The last lines that fill the panel, wrapped exactly.
+        let mut start = lines.len();
+        let mut filled = 0;
+        while start > 0 && filled < visible_lines {
+            start -= 1;
+            filled += Paragraph::new(lines[start].clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width);
+        }
+        let skip = filled.saturating_sub(visible_lines);
+        Paragraph::new(lines[start..].to_vec())
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0))
+    } else {
+        let mut start = 0;
+        let mut above = 0;
+        while start < lines.len() && above + rows(&lines[start]) <= scroll_pos {
+            above += rows(&lines[start]);
+            start += 1;
+        }
+        let end = (start + visible_lines + 1).min(lines.len());
+        Paragraph::new(lines[start..end].to_vec())
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(scroll_pos - above).unwrap_or(u16::MAX), 0))
+    };
+    frame.render_widget(shown, inner);
 
     // Scrollbar
     let scrollbar = Scrollbar::default()
@@ -155,7 +181,7 @@ fn render_scrolled(frame: &mut Frame, app: &mut App, area: Rect, inner: Rect, li
 }
 
 /// Lines of a tunnel's log kept in memory; the rest of a long session is on disk.
-const TUNNEL_LOG_TAIL: usize = 2000;
+const TUNNEL_LOG_TAIL: usize = 500;
 
 fn render_tunnel_log(
     frame: &mut Frame,
@@ -224,12 +250,12 @@ fn render_tunnel_log(
         return;
     };
     let style = Style::default().fg(theme::current().text_primary);
-    let lines = cached
+    let lines: Vec<Line> = cached
         .lines
         .iter()
         .map(|line| Line::styled(line.clone(), style))
         .collect();
-    render_scrolled(frame, app, area, inner, lines);
+    render_scrolled(frame, app, area, inner, &lines);
 }
 
 /// Keep `app.tunnel_log` holding the tail of the log at `path`, re-read only
@@ -266,7 +292,7 @@ fn refresh_tunnel_log(app: &mut App, path: &std::path::Path) -> bool {
 
 /// Bytes read from the end of a tunnel's log: a daemon log can grow to many
 /// megabytes, and only its last lines are shown.
-const TUNNEL_LOG_READ: u64 = 512 * 1024;
+const TUNNEL_LOG_READ: u64 = 128 * 1024;
 
 fn read_end(path: &std::path::Path, len: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read as _, Seek as _};
@@ -434,6 +460,28 @@ mod tests {
         );
     }
 
+    /// Only the visible lines are wrapped: following the log shows its last
+    /// line, scrolled to the top its first, however long the lines are.
+    #[test]
+    fn a_long_log_shows_its_end_when_following_and_its_start_at_the_top() {
+        let (mut app, _dir) = app_with(&[("corp", true, 1)]);
+        let long = "x".repeat(150);
+        let body = (0..300)
+            .flat_map(|n| [format!("line-{n:03} "), long.clone(), "\n".into()])
+            .collect::<String>();
+        write_log(&app, "corp", &body);
+        app.logs_source = LogsSource::Tunnel(Some(ProfileId::new("corp")));
+        let following = panel(&mut app);
+        assert!(following.contains("line-299"), "{following}");
+        app.logs_auto_scroll = false;
+        app.logs_scroll = 0;
+        let top = panel(&mut app);
+        assert!(
+            top.contains("line-000") && !top.contains("line-299"),
+            "{top}"
+        );
+    }
+
     #[test]
     fn the_title_says_live_then_last_session() {
         let (mut app, _dir) = app_with(&[("corp", true, 1)]);
@@ -474,5 +522,59 @@ mod tests {
         assert_eq!(title, " Event Log [Live] ");
         assert!(!title.contains("Background"));
         assert!(!title.contains("b→G"));
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use crate::app::state::LogsSource;
+    use crate::app::App;
+    use crate::profile::{ProfileId, ProtocolKind};
+    use std::time::Instant;
+
+    /// Not a check: prints how long the Logs panel takes on a NetBird-sized log.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn bench_tunnel_log_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_test();
+        app.runtime.config_dir = dir.path().to_path_buf();
+        app.runtime
+            .profiles
+            .push(crate::config::profiles::VpnProfile {
+                id: ProfileId::new("corp"),
+                name: "corp".into(),
+                protocol: ProtocolKind::OpenVpn,
+                config_path: dir.path().join("corp.ovpn"),
+                location: String::new(),
+                last_used: None,
+                group: None,
+            });
+        let run = dir.path().join(crate::constants::OPENVPN_RUN_DIR);
+        std::fs::create_dir_all(&run).unwrap();
+        let line = "2026-11-01T20:06:52.067+05:30 INFO [peer: +54CIu25LUP5xZiR+EAermOGSSmpkeK7rkLRIBxENSY=] client/internal/lazyconn/activity/listener_udp.go:48: created activity listener: 100.126.9.80:40665";
+        let body: String = (0..4000)
+            .flat_map(|n| [n.to_string(), " ".into(), line.into(), "\n".into()])
+            .collect();
+        let path = run.join(format!("{}.log", ProfileId::new("corp").as_str()));
+        std::fs::write(&path, &body).unwrap();
+        app.logs_source = LogsSource::Tunnel(Some(ProfileId::new("corp")));
+        let frame = |app: &mut App| {
+            crate::ui::dashboard::render_to_string(64, 20, |frame, area| {
+                super::render(frame, app, area);
+            })
+        };
+        frame(&mut app);
+        let start = Instant::now();
+        for _ in 0..20 {
+            frame(&mut app);
+        }
+        println!("unchanged file: {:?}/frame", start.elapsed() / 20);
+        let start = Instant::now();
+        for n in 0..20 {
+            std::fs::write(&path, format!("{body}{n} more\n")).unwrap();
+            frame(&mut app);
+        }
+        println!("growing file:   {:?}/frame", start.elapsed() / 20);
     }
 }
