@@ -99,9 +99,6 @@ pub struct TunnelView {
     pub dns: Vec<IpAddr>,
     pub details: DetailedConnectionInfo,
     pub health: crate::tunnel::ConnectionHealth,
-    /// Unexpected drops since the user connected it, and when the last one was.
-    pub drops: u32,
-    pub last_drop: Option<SystemTime>,
 }
 
 impl TunnelView {
@@ -153,8 +150,6 @@ pub struct Snapshot {
     pub net_error: Option<String>,
     /// Unexpected drops since the engine started.
     pub drops: u32,
-    /// Why each profile's last connect failed, until it comes up.
-    pub failures: BTreeMap<ProfileId, String>,
     /// What a connect in progress waits for the user to do, such as logging in.
     pub actions: BTreeMap<ProfileId, String>,
 }

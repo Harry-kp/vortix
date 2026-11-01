@@ -947,7 +947,7 @@ pub mod help {
                 ("Tab/S-Tab,l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),
-                ("f", "Flip: Details/Security why, Chart routes & peers"),
+                ("f", "Flip: Details routes & peers, Security why"),
                 ("x", "Action menu"),
                 ("b", "Bulk action menu"),
                 ("p", "Switch color theme"),
@@ -1443,7 +1443,7 @@ pub mod help {
                 .flat_map(|(_, bindings)| bindings.iter())
                 .find(|(key, _)| *key == "f")
                 .expect("f is in the help");
-            assert_eq!(flip.1, "Flip: Details/Security why, Chart routes & peers");
+            assert_eq!(flip.1, "Flip: Details routes & peers, Security why");
         }
 
         #[test]

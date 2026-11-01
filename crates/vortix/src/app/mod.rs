@@ -144,6 +144,8 @@ pub struct App {
 
     // === Logs UI State ===
     pub logs_scroll: u16,
+    /// How far the Details back (peers and routes) is scrolled.
+    pub routes_scroll: usize,
     pub logs_auto_scroll: bool,
     pub logs_max_scroll: u16,
     pub log_level_filter: Option<crate::logger::LogLevel>,
@@ -226,6 +228,7 @@ impl App {
             should_quit: false,
 
             logs_scroll: 0,
+            routes_scroll: 0,
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
@@ -380,6 +383,7 @@ impl App {
             should_quit: false,
 
             logs_scroll: 0,
+            routes_scroll: 0,
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,

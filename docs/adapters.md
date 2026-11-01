@@ -12,7 +12,7 @@ Every connection, whatever its adapter, gets the same Vortix:
 
 - a row in the sidebar, the same connect, disconnect, switch and reconnect keys, and the same
   states (connecting, up, reconnecting, waiting for credentials, failed with the reason);
-- the header, Connection Details (and its Health side), the throughput chart and the logs;
+- the header, Connection Details (and its Routes & peers side), the throughput chart and the logs;
 - the Security Guard's leak verdicts and the kill switch, which knows every running tunnel;
 - the CLI (`up`, `down`, `status`, `list`) and the versioned JSON;
 - autoconnect at boot, lifecycle hooks and the session journal.
@@ -51,7 +51,7 @@ behaviour in the engine and one UI, written once:
 |---|---|---|
 | Config file | WireGuard `.conf`, OpenVPN `.ovpn` | Profile; import, rename, delete |
 | Provider account | Mullvad, Proton, IVPN | Account, `Server` catalog (location, load, latency), keys; one server picker, favourites, recents, connect fastest |
-| Mesh network (`mesh/`, a `MeshDriver` per vendor) | NetBird, Tailscale, Headscale, Netmaker | Network, `MeshPeer` (address, connected, direct or relayed, latency), `RoutedNetwork` (range or domains, in use, exit node), login (a link or a key); its networks and peers on the chart's flip side (shared with every VPN), one login step; the daemon runs under the kill switch's transport group |
+| Mesh network (`mesh/`, a `MeshDriver` per vendor) | NetBird, Tailscale, Headscale, Netmaker | Network, `MeshPeer` (address, connected, direct or relayed, latency), `RoutedNetwork` (range or domains, in use, exit node), login (a link or a key); its networks and peers on Details' flip side (shared with every VPN), one login step; the daemon runs under the kill switch's transport group |
 
 A company is a **driver**: the code that turns its CLI output or API into that model and
 issues its commands, plus its name and wording in the UI. Nothing outside the driver names the

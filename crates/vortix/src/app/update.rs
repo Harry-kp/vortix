@@ -163,6 +163,7 @@ impl App {
                 let panel = self.focused_panel.clone();
                 if panel.flips() {
                     self.flip_state_mut(panel).flip();
+                    self.routes_scroll = 0;
                 }
             }
             Message::CloseOverlay => {

@@ -66,9 +66,6 @@ pub struct Tunnel {
     /// Down because its network asked for a new sign-in, not a failure: the
     /// kill switch does not block for it, so the sign-in page stays reachable.
     pub signing_in: bool,
-    /// Unexpected drops since the user connected it, and when the last one was.
-    pub drops: u32,
-    pub last_drop: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,8 +147,6 @@ impl State {
                 restart: false,
                 draining: false,
                 signing_in: false,
-                drops: 0,
-                last_drop: None,
             },
         );
         Ok(())
@@ -172,8 +167,6 @@ impl State {
                 restart: false,
                 draining: false,
                 signing_in: false,
-                drops: 0,
-                last_drop: None,
             },
         );
     }
@@ -256,8 +249,6 @@ impl State {
             tunnel.interface = None;
             tunnel.recovering = Some(0);
             tunnel.draining = draining;
-            tunnel.drops += 1;
-            tunnel.last_drop = Some(tunnel.since);
         }
     }
 
@@ -535,37 +526,6 @@ mod tests {
 
     fn id(value: &str) -> ProfileId {
         ProfileId::new(value)
-    }
-
-    /// Each unexpected drop adds one; only a disconnect resets the count.
-    #[test]
-    fn each_unexpected_drop_is_counted_with_its_time() {
-        let mut state = State::default();
-        state.adopt(
-            spec("01", "0.0.0.0/0"),
-            "utun4".into(),
-            1,
-            SystemTime::now(),
-        );
-        assert_eq!(state.get(&id("01")).unwrap().drops, 0);
-        state.lost(&id("01"), None, false);
-        state.retry(&id("01"));
-        state.came_up(&id("01"), "utun5".into(), [], [], None);
-        state.lost(&id("01"), None, false);
-        let tunnel = state.get(&id("01")).unwrap();
-        assert_eq!(tunnel.drops, 2);
-        assert!(tunnel.last_drop.is_some());
-
-        state.stop(&id("01"));
-        state.stopped(&id("01"));
-        state
-            .begin(spec("01", "0.0.0.0/0"), 2, None, false)
-            .unwrap();
-        assert_eq!(
-            state.get(&id("01")).unwrap().drops,
-            0,
-            "a disconnect resets the count"
-        );
     }
 
     /// The header counts Disconnecting and Reconnecting from `since`, which
