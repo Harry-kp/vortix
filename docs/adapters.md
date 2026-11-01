@@ -51,7 +51,7 @@ behaviour in the engine and one UI, written once:
 |---|---|---|
 | Config file | WireGuard `.conf`, OpenVPN `.ovpn` | Profile; import, rename, delete |
 | Provider account | Mullvad, Proton, IVPN | Account, `Server` catalog (location, load, latency), keys; one server picker, favourites, recents, connect fastest |
-| Mesh network (`mesh/`, a `MeshDriver` per vendor) | NetBird, Tailscale, Headscale, Netmaker | Network, `MeshPeer` (address, connected, direct or relayed, latency), `RoutedNetwork` (range or domains, in use, exit node), login (a link or a key); one overlay (`P`) for networks and peers, one login step; the daemon runs under the kill switch's transport group |
+| Mesh network (`mesh/`, a `MeshDriver` per vendor) | NetBird, Tailscale, Headscale, Netmaker | Network, `MeshPeer` (address, connected, direct or relayed, latency), `RoutedNetwork` (range or domains, in use, exit node), login (a link or a key); its networks and peers on the chart's flip side (shared with every VPN), one login step; the daemon runs under the kill switch's transport group |
 
 A company is a **driver**: the code that turns its CLI output or API into that model and
 issues its commands, plus its name and wording in the UI. Nothing outside the driver names the
