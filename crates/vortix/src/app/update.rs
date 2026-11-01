@@ -868,8 +868,8 @@ impl App {
     fn handle_cycle_log_filter(&mut self) {
         use crate::app::state::LogsSource;
         use crate::logger::LogLevel;
-        let steps = self.openvpn_log_steps();
-        let next_openvpn = |index: usize| steps.get(index).cloned().map(LogsSource::OpenVpn);
+        let steps = self.tunnel_log_steps();
+        let next_log = |index: usize| steps.get(index).cloned().map(LogsSource::Tunnel);
         let next = match (&self.logs_source, self.log_level_filter) {
             (LogsSource::Events, None) => (LogsSource::Events, Some(LogLevel::Error)),
             (LogsSource::Events, Some(LogLevel::Error)) => {
@@ -878,10 +878,10 @@ impl App {
             (LogsSource::Events, Some(LogLevel::Warning)) => {
                 (LogsSource::Events, Some(LogLevel::Info))
             }
-            (LogsSource::Events, Some(_)) => (next_openvpn(0).unwrap_or_default(), None),
-            (LogsSource::OpenVpn(current), _) => {
+            (LogsSource::Events, Some(_)) => (next_log(0).unwrap_or_default(), None),
+            (LogsSource::Tunnel(current), _) => {
                 let position = steps.iter().position(|step| step == current);
-                let after = position.and_then(|index| next_openvpn(index + 1));
+                let after = position.and_then(|index| next_log(index + 1));
                 (after.unwrap_or_default(), None)
             }
         };
@@ -889,26 +889,26 @@ impl App {
         self.logs_scroll = 0;
         self.logs_auto_scroll = true;
         let message = match (&self.logs_source, self.log_level_filter) {
-            (LogsSource::OpenVpn(Some(profile_id)), _) => {
-                let name = self
+            (LogsSource::Tunnel(Some(profile_id)), _) => {
+                let label = self
                     .runtime
                     .profiles
                     .iter()
                     .find(|profile| &profile.id == profile_id)
-                    .map_or("", |profile| profile.name.as_str());
+                    .map_or_else(String::new, |profile| {
+                        format!("{} log ({})", profile.protocol, profile.name)
+                    });
                 let place = steps
                     .iter()
                     .position(|step| step.as_ref() == Some(profile_id));
                 match place {
-                    Some(index) if steps.len() > 1 => format!(
-                        "Showing: OpenVPN log ({name}), {} of {}",
-                        index + 1,
-                        steps.len()
-                    ),
-                    _ => format!("Showing: OpenVPN log ({name})"),
+                    Some(index) if steps.len() > 1 => {
+                        format!("Showing: {label}, {} of {}", index + 1, steps.len())
+                    }
+                    _ => format!("Showing: {label}"),
                 }
             }
-            (LogsSource::OpenVpn(None), _) => "Showing: OpenVPN log".to_string(),
+            (LogsSource::Tunnel(None), _) => "Showing: VPN log".to_string(),
             (LogsSource::Events, Some(LogLevel::Error)) => "Log filter: Errors only".into(),
             (LogsSource::Events, Some(LogLevel::Warning)) => "Log filter: Warn+Error".into(),
             (LogsSource::Events, Some(LogLevel::Info)) => "Log filter: Info+Warn+Error".into(),
@@ -924,28 +924,28 @@ impl App {
             .is_some_and(|tunnel| tunnel.phase != crate::control::Phase::Stopping)
     }
 
-    /// The `OpenVPN` steps of the `f` cycle: every active `OpenVPN` tunnel in
-    /// sidebar order; with none active, the most recently connected `OpenVPN`
-    /// profile (or a placeholder before any has connected). Empty when there
-    /// are no `OpenVPN` profiles.
-    pub(crate) fn openvpn_log_steps(&self) -> Vec<Option<ProfileId>> {
-        let openvpn = || {
+    /// The tunnel-log steps of the `f` cycle: every active tunnel that writes
+    /// its own log (`OpenVPN`, a mesh daemon; `WireGuard` has none) in sidebar
+    /// order; with none active, the most recently connected such profile (or
+    /// a placeholder before any has connected). Empty when there are none.
+    pub(crate) fn tunnel_log_steps(&self) -> Vec<Option<ProfileId>> {
+        let logged = || {
             self.runtime
                 .profiles
                 .iter()
-                .filter(|profile| profile.protocol == ProtocolKind::OpenVpn)
+                .filter(|profile| profile.protocol != ProtocolKind::WireGuard)
         };
-        let active = openvpn()
+        let active = logged()
             .filter(|profile| self.tunnel_is_active(&profile.id))
             .map(|profile| Some(profile.id.clone()))
             .collect::<Vec<_>>();
         if !active.is_empty() {
             return active;
         }
-        if openvpn().next().is_none() {
+        if logged().next().is_none() {
             return Vec::new();
         }
-        vec![openvpn()
+        vec![logged()
             .filter(|profile| profile.last_used.is_some())
             .max_by_key(|profile| profile.last_used)
             .map(|profile| profile.id.clone())]

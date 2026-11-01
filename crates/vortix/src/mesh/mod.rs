@@ -180,6 +180,14 @@ impl MeshDriver {
         }
     }
 
+    /// Where a network's daemon writes its log (root only).
+    #[must_use]
+    pub fn log_path(self, profile_id: &ProfileId) -> PathBuf {
+        self.state_dir(profile_id).join(match self {
+            Self::NetBird => netbird::LOG_FILE,
+        })
+    }
+
     fn state_dir(self, profile_id: &ProfileId) -> PathBuf {
         Path::new(STATE_ROOT)
             .join(self.slug())

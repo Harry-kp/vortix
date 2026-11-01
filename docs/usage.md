@@ -112,9 +112,10 @@ or `EXPOSED`, Details when the tunnel is degraded or its last connect failed.
 
 ### Logs
 
-`f` cycles the level filter (Live, Err, Warn+, Info+), then the OpenVPN log of each active
-OpenVPN tunnel, titled `<profile> · OpenVPN log · LIVE`; with none active, the last session of
-the last one, `… · last session, ended HH:MM:SS`. `L` clears the view.
+`f` cycles the level filter (Live, Err, Warn+, Info+), then the own log of each active tunnel
+that writes one (OpenVPN, and NetBird's daemon; WireGuard has none), titled
+`<profile> · OpenVPN log · LIVE` or `<profile> · NetBird log · LIVE`; with none active, the last
+session of the last one, `… · last session, ended HH:MM:SS`. `L` clears the view.
 
 ## Profiles
 

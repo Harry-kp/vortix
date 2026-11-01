@@ -305,18 +305,19 @@ pub fn help_max_scroll_for_terminal_height(terminal_height: u16, total_lines: u1
 
 pub use ratatui_flip_panel::FlipState;
 
-/// What the Logs panel shows. `OpenVpn(None)` is the step shown before any
-/// `OpenVPN` profile has connected.
+/// What the Logs panel shows. `Tunnel(None)` is the step shown before any
+/// profile with its own log has connected.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum LogsSource {
     #[default]
     Events,
-    OpenVpn(Option<ProfileId>),
+    /// The own log of a tunnel that writes one (`OpenVPN`, a mesh daemon).
+    Tunnel(Option<ProfileId>),
 }
 
-/// The tail of one `OpenVPN` log, re-read only when the file changes.
+/// The tail of one tunnel's log, re-read only when the file changes.
 #[derive(Debug)]
-pub struct OpenVpnLogFile {
+pub struct TunnelLogFile {
     pub path: std::path::PathBuf,
     pub modified: Option<std::time::SystemTime>,
     pub len: u64,

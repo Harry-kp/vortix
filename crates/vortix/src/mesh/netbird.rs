@@ -20,6 +20,9 @@ pub(super) const APP: AppInstall = AppInstall {
     restore: [&["service", "install"], &["service", "start"]],
 };
 
+/// The daemon's log, in its network's state directory.
+pub(super) const LOG_FILE: &str = "netbird.log";
+
 pub(super) fn daemon(state_dir: &Path) -> Launch {
     Launch {
         program: "netbird",
@@ -27,7 +30,7 @@ pub(super) fn daemon(state_dir: &Path) -> Launch {
             "service".into(),
             "run".into(),
             "--log-file".into(),
-            state_dir.join("netbird.log").to_string_lossy().into(),
+            state_dir.join(LOG_FILE).to_string_lossy().into(),
         ],
         env: vec![("NB_STATE_DIR", state_dir.to_string_lossy().into())],
     }
