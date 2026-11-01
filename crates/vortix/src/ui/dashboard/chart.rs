@@ -72,11 +72,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let scale = crate::ui::helpers::format_bytes_speed(peak as u64);
     let peak_label = format!(" Peak: {scale} ");
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(" Network Throughput ")
-        .title_bottom(helpers::border_hint(constants::FLIP_ROUTES_HINT))
         .title(
             Line::from(Span::styled(
                 peak_label,
@@ -91,6 +90,13 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             ))
             .right_aligned(),
         );
+    // The back has something to show once the focused profile has a tunnel.
+    if app
+        .focused_profile_id()
+        .is_some_and(|id| app.tunnel(&id).is_some())
+    {
+        block = block.title_bottom(helpers::border_hint(constants::FLIP_ROUTES_HINT));
+    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -154,9 +160,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// mesh network's routed networks) and who it talks to (a mesh network's
 /// peers, else the server), the same layout for every kind of VPN.
 fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
-    let profile_id = app
-        .selected_profile_id()
-        .or_else(|| app.primary_id().cloned());
+    let profile_id = app.focused_profile_id();
     let tunnel = profile_id.as_ref().and_then(|id| app.tunnel(id));
     let title = tunnel.map_or_else(
         || constants::TITLE_FLIP_ROUTES.to_string(),
@@ -197,15 +201,51 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
             Style::default().fg(theme::current().accent_primary),
         )
     };
-    let mut lines = vec![heading("Routes")];
-    if tunnel.details.networks.is_empty() {
-        lines.extend(
-            tunnel
-                .routes
-                .iter()
-                .map(|route| mark_line(true, &route.to_string(), "", width)),
-        );
+    let routes = route_lines(tunnel, width);
+    let peers: Vec<Line<'static>> = if !tunnel.details.peers.is_empty() {
+        peer_lines(&tunnel.details.peers, width)
+    } else if tunnel.details.endpoint.is_empty() {
+        Vec::new()
     } else {
+        vec![mark_line(
+            true,
+            &tunnel.details.endpoint,
+            &tunnel.details.latest_handshake,
+            width,
+        )]
+    };
+    // Two headings and a blank line; the rest is shared so Peers always shows.
+    let budget = usize::from(inner.height).saturating_sub(3);
+    let routes_room = routes
+        .len()
+        .min(budget.saturating_sub(peers.len().min(budget / 2)));
+    let peers_room = budget.saturating_sub(routes_room);
+    let mut lines = vec![heading("Routes")];
+    lines.extend(section(routes, routes_room, dim));
+    lines.push(Line::from(""));
+    lines.push(heading("Peers"));
+    lines.extend(section(peers, peers_room, dim));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The routes section: a mesh network's routed networks (in use or not, the
+/// exit node), else the routes the tunnel carries.
+fn route_lines(tunnel: &crate::control::TunnelView, width: usize) -> Vec<Line<'static>> {
+    if tunnel.details.networks.is_empty() {
+        tunnel
+            .routes
+            .iter()
+            .map(|route| mark_line(true, &route.to_string(), "", width))
+            .collect()
+    } else {
+        // Every column after the name keeps its room: range plus "  exit node".
+        let after = tunnel
+            .details
+            .networks
+            .iter()
+            .map(|network| network.range.len() + 11)
+            .max()
+            .unwrap_or(0);
         let names = column(
             tunnel
                 .details
@@ -213,52 +253,57 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
                 .iter()
                 .map(|network| network.name.as_str()),
             width,
+            after,
         );
-        lines.extend(tunnel.details.networks.iter().map(|network| {
-            let exit = if network.is_exit_node() {
-                "  exit node"
-            } else {
-                ""
-            };
-            mark_line(
-                network.selected,
-                &format!(
-                    "{:<names$} {}{exit}",
-                    helpers::truncate_to_width(&network.name, names),
-                    network.range
-                ),
-                "",
-                width,
-            )
-        }));
+        tunnel
+            .details
+            .networks
+            .iter()
+            .map(|network| {
+                let exit = if network.is_exit_node() {
+                    "  exit node"
+                } else {
+                    ""
+                };
+                mark_line(
+                    network.selected,
+                    &format!(
+                        "{:<names$} {}{exit}",
+                        helpers::truncate_to_width(&network.name, names),
+                        network.range
+                    ),
+                    "",
+                    width,
+                )
+            })
+            .collect()
     }
-    if lines.len() == 1 {
-        lines.push(Line::styled("none", dim));
-    }
-    lines.push(Line::from(""));
-    lines.push(heading("Peers"));
-    if tunnel.details.peers.is_empty() {
-        let handshake = helpers::nonempty_or(&tunnel.details.latest_handshake, "");
-        lines.push(mark_line(
-            true,
-            helpers::nonempty_or(&tunnel.details.endpoint, "none"),
-            handshake,
-            width,
-        ));
-    } else {
-        lines.extend(peer_lines(&tunnel.details.peers, width));
-    }
-    lines.truncate(usize::from(inner.height));
-    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// A name column as wide as the longest name, but at most half the panel.
-fn column<'a>(names: impl Iterator<Item = &'a str>, width: usize) -> usize {
+/// A name column as wide as the longest name, leaving `after` columns for
+/// what follows it (and never under 8).
+fn column<'a>(names: impl Iterator<Item = &'a str>, width: usize, after: usize) -> usize {
     names
         .map(unicode_width::UnicodeWidthStr::width)
         .max()
         .unwrap_or(0)
-        .min(width / 2)
+        .min(width.saturating_sub(after + 3).max(8))
+}
+
+/// A section's lines in `room` rows: `none` when empty, else as many as fit
+/// and `… N more (z)` for the rest.
+fn section(lines: Vec<Line<'static>>, room: usize, dim: Style) -> Vec<Line<'static>> {
+    if lines.is_empty() {
+        return vec![Line::styled("none", dim)];
+    }
+    if lines.len() <= room.max(1) {
+        return lines;
+    }
+    let shown = room.saturating_sub(1).max(1);
+    let more = lines.len() - shown;
+    let mut kept: Vec<_> = lines.into_iter().take(shown).collect();
+    kept.push(Line::styled(format!("… {more} more (z)"), dim));
+    kept
 }
 
 /// `● text  detail`, green when in use, grey otherwise, fitted to the panel.
@@ -288,7 +333,8 @@ fn peer_lines(peers: &[crate::tunnel::MeshPeer], width: usize) -> Vec<Line<'stat
     let t = theme::current();
     let mut peers = peers.to_vec();
     peers.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
-    let names = column(peers.iter().map(|peer| peer.name.as_str()), width);
+    // Address, path and latency after the name.
+    let names = column(peers.iter().map(|peer| peer.name.as_str()), width, 33);
     peers
         .iter()
         .map(|peer| {
@@ -324,6 +370,17 @@ mod tests {
     use super::*;
 
     fn back_of(app: &mut App, name: &str, protocol: crate::profile::ProtocolKind) -> String {
+        back_at(app, name, protocol, 54)
+    }
+
+    /// The back at `width` columns: 54 is the chart in an 80-column terminal,
+    /// more is the zoomed panel.
+    fn back_at(
+        app: &mut App,
+        name: &str,
+        protocol: crate::profile::ProtocolKind,
+        width: u16,
+    ) -> String {
         app.runtime
             .profiles
             .push(crate::config::profiles::VpnProfile {
@@ -344,10 +401,10 @@ mod tests {
                 state.tick();
             }
         }
-        crate::ui::dashboard::render_to_string(80, 14, |frame, area| render(frame, app, area))
+        crate::ui::dashboard::render_to_string(width, 12, |frame, area| render(frame, app, area))
     }
 
-    /// The back of the chart lists a `NetBird` network's routed networks (whole
+    /// Zoomed, the back of the chart lists a `NetBird` network's routed networks (whole
     /// names, which one is the exit node) and its peers, connected first.
     #[test]
     fn the_back_shows_a_mesh_networks_routes_and_peers() {
@@ -375,10 +432,11 @@ mod tests {
         };
         mesh.details.peers = vec![peer("asleep", false, false), peer("gw", true, true)];
         app.set_tunnels_for_test(vec![mesh], None);
-        let screen = back_of(
+        let screen = back_at(
             &mut app,
             "work",
             crate::profile::ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird),
+            100,
         );
         for shown in [
             "Routes & peers · work (NetBird)",
@@ -394,6 +452,44 @@ mod tests {
             screen.find("gw").unwrap() < screen.find("asleep").unwrap(),
             "connected first"
         );
+    }
+
+    /// At the chart's real 80×24 size, long names leave room for the columns
+    /// after them, and many routes end in `… N more (z)` so Peers still shows.
+    #[test]
+    fn the_back_keeps_every_column_and_section_at_80_columns() {
+        let mut app = App::new_test();
+        let mut mesh = crate::app::connection::test_view("work", crate::control::Phase::Up);
+        mesh.protocol = crate::profile::ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+        mesh.details.networks = (0..9)
+            .map(|n| crate::tunnel::RoutedNetwork {
+                name: format!("euc1-stag-00{n}-public-nic-v1.bsstag.com"),
+                range: format!("10.{n}.0.0/16"),
+                selected: true,
+            })
+            .chain([crate::tunnel::RoutedNetwork {
+                name: "Exit Node".into(),
+                range: "0.0.0.0/0, ::/0".into(),
+                selected: true,
+            }])
+            .rev()
+            .collect();
+        mesh.details.peers = vec![crate::tunnel::MeshPeer {
+            name: "laptop.netbird.cloud".into(),
+            address: "100.90.0.1".into(),
+            connected: true,
+            relayed: true,
+            latency: Some(std::time::Duration::from_millis(41)),
+        }];
+        app.set_tunnels_for_test(vec![mesh], None);
+        let screen = back_of(
+            &mut app,
+            "work",
+            crate::profile::ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird),
+        );
+        for shown in ["exit node", "more (z)", "Peers", "relayed", "41 ms"] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
     }
 
     /// A `WireGuard` tunnel shows what it routes and its server.

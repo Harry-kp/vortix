@@ -35,6 +35,15 @@ impl FocusedPanel {
     pub fn flips(&self) -> bool {
         matches!(self, Self::ConnectionDetails | Self::Security | Self::Chart)
     }
+
+    /// What its back shows, for the footer and the action menu.
+    #[must_use]
+    pub const fn flip_label(&self) -> &'static str {
+        match self {
+            Self::Chart => "Routes",
+            _ => "Why",
+        }
+    }
 }
 
 /// Active tab in the Help overlay. `?` opens the overlay on
@@ -172,7 +181,6 @@ pub enum InputMode {
         /// Is "Yes" selected?
         confirm_selected: bool,
     },
-    /// The other devices of the focused mesh network.
     /// A mesh vendor's own app has its service running: stop it so Vortix can
     /// run that network?
     ConfirmTakeover {

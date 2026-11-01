@@ -321,6 +321,13 @@ impl App {
         }
     }
 
+    /// The profile the panels describe: the sidebar's selection, else the
+    /// tunnel internet traffic goes through.
+    pub(crate) fn focused_profile_id(&self) -> Option<ProfileId> {
+        self.selected_profile_id()
+            .or_else(|| self.primary_id().cloned())
+    }
+
     pub(crate) fn selected_profile_id(&self) -> Option<ProfileId> {
         self.profile_list_state
             .selected()
