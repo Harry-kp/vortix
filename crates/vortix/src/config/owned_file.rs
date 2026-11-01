@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::process::ProcessCredentials;
 
 /// Most supplementary groups looked up for a user.
-pub(crate) const MAX_SUPPLEMENTARY_GROUPS: usize = 1_024;
+const MAX_SUPPLEMENTARY_GROUPS: usize = 1_024;
 
 /// The user Vortix runs commands as (hooks, the browser): checked against
 /// the operating system, never root.

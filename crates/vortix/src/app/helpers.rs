@@ -220,30 +220,7 @@ impl App {
             FocusedPanel::ConnectionDetails
                 if self.is_flipped(&FocusedPanel::ConnectionDetails) =>
             {
-                // The same bound the render uses: every line (two headings,
-                // a blank, a `none` for an empty list) past the panel's rows.
-                let lines = self
-                    .focused_profile_id()
-                    .and_then(|id| self.tunnel(&id))
-                    .map_or(0, |tunnel| {
-                        3 + tunnel.details.peers.len().max(1)
-                            + tunnel
-                                .details
-                                .networks
-                                .len()
-                                .max(tunnel.routes.len())
-                                .max(1)
-                    });
-                // Zoomed, the panel takes 90% of the terminal's height.
-                let height = if self.zoomed_panel == Some(FocusedPanel::ConnectionDetails) {
-                    self.terminal_size.1 * 9 / 10
-                } else {
-                    self.panel_areas
-                        .get(&FocusedPanel::ConnectionDetails)
-                        .map_or(0, |area| area.height)
-                };
-                let rows = usize::from(height.saturating_sub(2));
-                self.routes_scroll = (self.routes_scroll + 1).min(lines.saturating_sub(rows));
+                self.routes_scroll = (self.routes_scroll + 1).min(self.routes_max_scroll.get());
             }
             _ => {}
         }
