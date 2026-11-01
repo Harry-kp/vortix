@@ -96,10 +96,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let primary_snap = app.primary_id().and_then(|id| app.tunnel(id));
     let (session_rx, session_tx) = match primary_snap {
         Some(tunnel) if tunnel.phase == crate::control::Phase::Up => (
-            helpers::nonempty_or(&tunnel.details.transfer_rx, "0B").to_string(),
-            helpers::nonempty_or(&tunnel.details.transfer_tx, "0B").to_string(),
+            helpers::transfer_text(&tunnel.details.transfer_rx),
+            helpers::transfer_text(&tunnel.details.transfer_tx),
         ),
-        _ => ("0B".to_string(), "0B".to_string()),
+        _ => ("0 B".to_string(), "0 B".to_string()),
     };
 
     frame.render_widget(
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn a_wide_chart_keeps_the_rate_labels() {
         let app = App::new_test();
-        let text = stats_line(&app, "0B", "0B", 120).to_string();
+        let text = stats_line(&app, "0 B", "0 B", 120).to_string();
         assert!(text.contains("UP:") && text.contains("DOWN:"), "{text}");
     }
 }

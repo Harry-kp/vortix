@@ -157,7 +157,7 @@ impl App {
             ToastType::Warning => "WARN",
             ToastType::Success | ToastType::Info => "APP",
         };
-        self.log(&format!("{level_prefix}: {message}"));
+        self.log(&format!("{level_prefix}: {}", message.replace('\n', " · ")));
         if self
             .toast
             .as_ref()
