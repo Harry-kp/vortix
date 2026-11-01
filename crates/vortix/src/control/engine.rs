@@ -75,7 +75,6 @@ pub(super) struct Engine {
     up_at: BTreeMap<ProfileId, Instant>,
     cancel: BTreeMap<ProfileId, TunnelCancellation>,
     errors: BTreeMap<ProfileId, String>,
-    /// The last connect failure per profile, kept until it comes up.
     actions: BTreeMap<ProfileId, String>,
     prompts: BTreeMap<u64, Prompt>,
     waits: BTreeMap<u64, Wait>,

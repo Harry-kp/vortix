@@ -882,7 +882,8 @@ fn scrolled(
     let total = lines.len();
     let mut shown: Vec<_> = lines.into_iter().skip(offset).take(height).collect();
     if offset > 0 && !shown.is_empty() {
-        shown[0] = Line::styled(format!("↑ {offset} above (j/k)"), dim);
+        // The skipped lines and the one this marker replaces.
+        shown[0] = Line::styled(format!("↑ {} above (j/k)", offset + 1), dim);
     }
     let below = total.saturating_sub(offset + height);
     if below > 0 {
@@ -1196,9 +1197,33 @@ mod tests {
         }
         let scrolled = back_at(&mut app, 100, 16);
         assert!(
-            scrolled.contains("↑ 20 above (j/k)") && scrolled.contains("net-0"),
+            scrolled.contains("↑ 21 above (j/k)") && scrolled.contains("net-0"),
             "{scrolled}"
         );
+    }
+
+    /// The front's Health row explains every degraded reason, in the CLI's words.
+    #[test]
+    fn the_front_explains_a_peer_never_seen() {
+        let mut app = App::new_test();
+        app.runtime
+            .profiles
+            .push(make_profile("home", PathBuf::from("/tmp/h.conf")));
+        app.profile_list_state.select(Some(0));
+        let mut wg = crate::app::connection::test_view("home", Phase::Up);
+        wg.health = crate::tunnel::ConnectionHealth::Degraded {
+            reason: crate::tunnel::DegradedReason::WireGuardPeerNeverObserved {
+                peer_public_key: "abcdefghijk".into(),
+                allowed_routes: vec!["10.8.0.0/24".into()],
+            },
+        };
+        let reason = match &wg.health {
+            crate::tunnel::ConnectionHealth::Degraded { reason } => reason.describe(),
+            _ => unreachable!(),
+        };
+        app.set_tunnels_for_test(vec![wg], None);
+        let screen = render_to_string(&mut app, 120, 16);
+        assert!(screen.contains(&format!("Health  : {reason}")), "{screen}");
     }
 
     /// Zoomed, every column shows: whole names, ranges, addresses.
