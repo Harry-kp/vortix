@@ -280,6 +280,9 @@ impl App {
             // System
             Message::Quit => self.handle_quit(),
             Message::Toast(msg, t_type) => self.show_toast(msg, t_type),
+            Message::CopyLink(link) => {
+                self.copy_text(&link, "No browser here: copied the link".into());
+            }
             Message::CopyIp => self.copy_ip_to_clipboard(),
             Message::ClearLogs => {
                 logger::clear_logs();

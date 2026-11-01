@@ -448,7 +448,7 @@ impl App {
                     .selection
                     .is_some_and(|selection| selection.from == selection.to)
                 {
-                    self.open_link_at(at);
+                    self.click = Some(at);
                 }
                 self.selection = self
                     .selection

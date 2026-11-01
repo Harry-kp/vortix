@@ -184,8 +184,11 @@ pub(super) fn parse_networks(text: &str) -> Vec<RoutedNetwork> {
 
 /// The settings of `NetBird`'s own client a user would recognise, from its
 /// config in `state_dir`, as `(name, value)` rows; `None` before the first
-/// connect writes it. The private key comes back whole, for the viewer to mask.
-pub(super) fn client_config(state_dir: &Path) -> Option<Vec<(&'static str, String)>> {
+/// connect writes it, and an error when it is there but cannot be read. The
+/// private key comes back whole, for the viewer to mask.
+pub(super) fn client_config(
+    state_dir: &Path,
+) -> Result<Option<Vec<(&'static str, String)>>, String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Url {
@@ -207,8 +210,14 @@ pub(super) fn client_config(state_dir: &Path) -> Option<Vec<(&'static str, Strin
         disable_dns: bool,
         private_key: String,
     }
-    let bytes = std::fs::read(state_dir.join(APP.identity)).ok()?;
-    let config: Config = serde_json::from_slice(&bytes).ok()?;
+    let path = state_dir.join(APP.identity);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let config: Config = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let url = |url: &Url| format!("{}://{}", url.scheme, url.host);
     let mut rows = vec![("Management", url(&config.management_url))];
     if let Some(admin) = &config.admin_url {
@@ -229,7 +238,7 @@ pub(super) fn client_config(state_dir: &Path) -> Option<Vec<(&'static str, Strin
         .into(),
     ));
     rows.push(("PrivateKey", config.private_key));
-    Some(rows)
+    Ok(Some(rows))
 }
 
 /// The app's active network: `active_profile.json` names it, `default.json`
@@ -290,12 +299,19 @@ pub(super) fn profile_from_app(dir: &Path) -> Result<MeshProfile, String> {
 
 #[cfg(test)]
 mod tests {
+
+    use super::*;
+
     /// `v` shows the client settings a user recognises, and the viewer masks
     /// the private key; before the first connect there are none.
     #[test]
     fn the_client_config_shows_recognisable_settings() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(client_config(dir.path()), None);
+        assert_eq!(client_config(dir.path()), Ok(None));
+        std::fs::write(dir.path().join("default.json"), "{").unwrap();
+        assert!(client_config(dir.path())
+            .unwrap_err()
+            .contains("cannot read"));
         std::fs::write(
             dir.path().join("default.json"),
             r#"{"ManagementURL": {"Scheme": "https", "Host": "api.netbird.io:443"},
@@ -304,7 +320,7 @@ mod tests {
                 "PrivateKey": "not-a-real-key-only-a-test", "RosenpassEnabled": false}"#,
         )
         .unwrap();
-        let rows = client_config(dir.path()).unwrap();
+        let rows = client_config(dir.path()).unwrap().unwrap();
         assert_eq!(rows[0], ("Management", "https://api.netbird.io:443".into()));
         assert!(rows.contains(&("Interface", "wt0".into())));
         assert!(rows.contains(&("DNS", "managed by NetBird".into())));
@@ -318,8 +334,6 @@ mod tests {
             "{line}"
         );
     }
-
-    use super::*;
 
     const CONNECTED: &str = r#"{
         "peers": {"total": 2, "connected": 1, "details": [

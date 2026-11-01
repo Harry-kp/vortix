@@ -337,15 +337,39 @@ impl App {
         self.copy_text(&ip_str, format!("Copied IPv4: {ip_str}"));
     }
 
-    /// Keep the frame just drawn, for [`App::open_link_at`].
-    pub fn remember_frame(&mut self, buffer: &ratatui::buffer::Buffer) {
-        self.last_frame = Some(buffer.clone());
+    /// Open the link under the last click in the frame just drawn, off the
+    /// UI thread; where no browser opens (over SSH), copy it instead.
+    pub fn open_clicked_link(&mut self, buffer: &ratatui::buffer::Buffer) {
+        let Some(at) = self.click.take() else {
+            return;
+        };
+        let Some(link) = self.link_at(buffer, at) else {
+            return;
+        };
+        let owner = self.runtime.config_dir.clone();
+        let tx = self.runtime.cmd_tx.clone();
+        std::thread::spawn(move || {
+            let message = if crate::platform::open_in_browser(&link, &owner) {
+                crate::message::Message::Toast(
+                    "Opened the link in your browser".into(),
+                    ToastType::Info,
+                )
+            } else {
+                crate::message::Message::CopyLink(link)
+            };
+            let _ = tx.send(message);
+        });
     }
 
-    /// The link under a click on the last frame. A link shown shortened
-    /// (ending in `...`) is the full link it stands for.
-    pub(crate) fn link_at(&self, at: ratatui::layout::Position) -> Option<String> {
-        let buffer = self.last_frame.as_ref()?;
+    /// The link under `at` in a drawn frame: an `https://` run of characters,
+    /// without trailing punctuation. A link shown shortened (`...`) is the
+    /// whole link it stands for; one that runs into the panel's edge may wrap,
+    /// so it is not guessed at.
+    pub(crate) fn link_at(
+        &self,
+        buffer: &ratatui::buffer::Buffer,
+        at: ratatui::layout::Position,
+    ) -> Option<String> {
         let area = buffer.area;
         if !area.contains(at) {
             return None;
@@ -359,35 +383,29 @@ impl App {
         let start = (0..=column.min(row.len().saturating_sub(1)))
             .rev()
             .find(|&from| row[from..].starts_with(&scheme))?;
-        let link: String = row[start..]
+        let run: String = row[start..]
             .iter()
             .take_while(|c| !c.is_whitespace() && **c != '│')
             .collect();
-        if column >= start + link.chars().count() {
+        let end = start + run.chars().count();
+        if column >= end {
             return None;
         }
-        let Some(shown) = link.strip_suffix("...") else {
-            return Some(link);
-        };
-        match &self.input_mode {
-            InputMode::Action { text, .. } => crate::ui::overlays::action::link(text)
-                .filter(|full| full.starts_with(shown))
-                .map(str::to_string),
-            _ => None,
+        if let Some(shown) = run.strip_suffix("...") {
+            return match &self.input_mode {
+                InputMode::Action { text, .. } => crate::ui::overlays::action::link(text)
+                    .filter(|full| full.starts_with(shown))
+                    .map(str::to_string),
+                _ => None,
+            };
         }
-    }
-
-    /// Open the link under a click in the user's browser, or copy it where
-    /// no browser opens (over SSH).
-    pub(crate) fn open_link_at(&mut self, at: ratatui::layout::Position) {
-        let Some(link) = self.link_at(at) else {
-            return;
-        };
-        if crate::platform::open_in_browser(&link, &self.runtime.config_dir) {
-            self.show_toast("Opened the link in your browser".into(), ToastType::Info);
-        } else {
-            self.copy_text(&link, "No browser here: copied the link".into());
+        if row.get(end).is_none_or(|next| !next.is_whitespace()) {
+            return None;
         }
+        Some(
+            run.trim_end_matches(['.', ',', ';', ':', ')', ']', '>', '"', '\''])
+                .to_string(),
+        )
     }
 
     /// Copy text through the terminal (OSC 52), which also works over SSH.

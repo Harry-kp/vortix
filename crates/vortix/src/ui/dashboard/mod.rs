@@ -547,18 +547,43 @@ mod overlay_tests {
         let frame = terminal
             .draw(|frame| render_overlays(frame, &mut app))
             .unwrap();
-        app.remember_frame(frame.buffer);
-        let buffer = app.last_frame.clone().unwrap();
+        let buffer = frame.buffer.clone();
         let (x, y) = (0..24u16)
             .flat_map(|y| (0..80u16).map(move |x| (x, y)))
             .find(|&(x, y)| buffer[(x, y)].symbol() == "h" && buffer[(x + 1, y)].symbol() == "t")
             .expect("the link is on screen");
         let on_link = ratatui::layout::Position::new(x + 10, y);
-        assert_eq!(app.link_at(on_link), Some(link));
+        assert_eq!(app.link_at(&buffer, on_link), Some(link));
         assert!(buffer[(x + 10, y)]
             .modifier
             .contains(ratatui::style::Modifier::UNDERLINED));
-        assert_eq!(app.link_at(ratatui::layout::Position::new(x, y + 2)), None);
+        assert_eq!(
+            app.link_at(&buffer, ratatui::layout::Position::new(x, y + 2)),
+            None
+        );
+    }
+
+    /// A link in text loses trailing punctuation; one that runs into a
+    /// panel's edge may wrap, so a click on it opens nothing.
+    #[test]
+    fn a_clicked_link_is_trimmed_and_never_guessed() {
+        let app = App::new_test();
+        let row = |text: &str| {
+            let mut buffer =
+                ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 40, 1));
+            buffer.set_string(0, 0, text, ratatui::style::Style::default());
+            buffer
+        };
+        let at = ratatui::layout::Position::new(10, 0);
+        assert_eq!(
+            app.link_at(&row("see (https://x.io/a). ok"), at),
+            Some("https://x.io/a".into())
+        );
+        assert_eq!(app.link_at(&row("go https://x.io/a/b/c│"), at), None);
+        assert_eq!(
+            app.link_at(&row("go https://x.io/abcdefghijklmnopqrstuvwxyz0"), at),
+            None
+        );
     }
 
     /// The sign-in wait is the standard dialog at 80×24: a long link shows on

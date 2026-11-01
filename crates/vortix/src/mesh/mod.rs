@@ -378,7 +378,8 @@ pub fn client_config(driver: MeshDriver, profile_id: &ProfileId) -> String {
     };
     let name = driver.name();
     match rows {
-        Some(rows) => {
+        Err(error) => format!("# {name} client: {error}\n"),
+        Ok(Some(rows)) => {
             use std::fmt::Write as _;
             let mut text = format!("# {name} client (set by the server at connect)\n");
             for (key, value) in rows {
@@ -387,7 +388,7 @@ pub fn client_config(driver: MeshDriver, profile_id: &ProfileId) -> String {
             let _ = writeln!(text, "StateFolder = {}", state_dir.display());
             text
         }
-        None => format!(
+        Ok(None) => format!(
             "# {name} client: not connected yet; the server sets the rest at first connect.\n"
         ),
     }

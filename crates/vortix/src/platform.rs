@@ -4,7 +4,7 @@
 pub use crate::linux::autoconnect;
 #[cfg(target_os = "linux")]
 pub use crate::linux::{
-    clipboard_commands, desktop_env,
+    clipboard_commands, desktop_env, has_desktop,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
     os_description, BROWSER_OPENER, FIREWALL_TOOL,
 };
@@ -17,7 +17,7 @@ pub use crate::linux::{
 pub use crate::macos::autoconnect;
 #[cfg(target_os = "macos")]
 pub use crate::macos::{
-    clipboard_commands, desktop_env,
+    clipboard_commands, desktop_env, has_desktop,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
     os_description, BROWSER_OPENER, FIREWALL_TOOL,
 };
@@ -32,6 +32,9 @@ pub use crate::macos::{
 /// is a file of that user's (a profile, the config folder) that proves who it is.
 #[must_use]
 pub fn open_in_browser(link: &str, owned_by: &std::path::Path) -> bool {
+    if !has_desktop() {
+        return false;
+    }
     let Ok(owner) = crate::hooks::VerifiedHookOwner::for_standard_mode(owned_by) else {
         return false;
     };

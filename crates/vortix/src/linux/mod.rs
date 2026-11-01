@@ -42,6 +42,13 @@ pub const FIREWALL_TOOL: (&str, &[&str]) = ("nft", &["--version"]);
 /// Opens a link in the user's default browser.
 pub const BROWSER_OPENER: &str = "xdg-open";
 
+/// Whether a graphical desktop is there to open a browser on. Without one,
+/// `xdg-open` falls back to a text browser in this very terminal.
+#[must_use]
+pub fn has_desktop() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 /// What a command run as `uid` needs to reach that user's desktop session,
 /// which `sudo` strips from the environment.
 #[must_use]
