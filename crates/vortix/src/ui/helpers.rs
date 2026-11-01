@@ -39,6 +39,14 @@ pub(crate) fn detail_row<'a>(
     ])
 }
 
+/// How a link looks everywhere: the accent colour, underlined. A click opens it.
+#[must_use]
+pub(crate) fn link_style() -> Style {
+    Style::default()
+        .fg(theme::current().accent_primary)
+        .add_modifier(ratatui::style::Modifier::UNDERLINED)
+}
+
 /// `text` word-wrapped to `width` columns, each line indented by `indent` spaces.
 pub(crate) fn wrapped_lines(
     text: &str,

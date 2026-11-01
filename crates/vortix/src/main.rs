@@ -630,6 +630,7 @@ fn run_tui(
         }
         app.process_external();
         let frame = terminal.draw(|frame| ui::render(frame, &mut app))?;
+        app.remember_frame(frame.buffer);
         if let Some(text) = ui::take_selected_text(&mut app, frame.buffer) {
             app.copy_text(&text, format!("Copied {} characters", text.chars().count()));
         }

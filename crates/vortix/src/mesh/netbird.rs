@@ -182,6 +182,56 @@ pub(super) fn parse_networks(text: &str) -> Vec<RoutedNetwork> {
     networks
 }
 
+/// The settings of `NetBird`'s own client a user would recognise, from its
+/// config in `state_dir`, as `(name, value)` rows; `None` before the first
+/// connect writes it. The private key comes back whole, for the viewer to mask.
+pub(super) fn client_config(state_dir: &Path) -> Option<Vec<(&'static str, String)>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Url {
+        scheme: String,
+        host: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Config {
+        #[serde(rename = "ManagementURL")]
+        management_url: Url,
+        #[serde(rename = "AdminURL")]
+        admin_url: Option<Url>,
+        wg_iface: String,
+        wg_port: u16,
+        #[serde(rename = "MTU", default)]
+        mtu: u16,
+        #[serde(rename = "DisableDNS", default)]
+        disable_dns: bool,
+        private_key: String,
+    }
+    let bytes = std::fs::read(state_dir.join(APP.identity)).ok()?;
+    let config: Config = serde_json::from_slice(&bytes).ok()?;
+    let url = |url: &Url| format!("{}://{}", url.scheme, url.host);
+    let mut rows = vec![("Management", url(&config.management_url))];
+    if let Some(admin) = &config.admin_url {
+        rows.push(("Dashboard", url(admin)));
+    }
+    rows.push(("Interface", config.wg_iface));
+    rows.push(("Port", config.wg_port.to_string()));
+    if config.mtu > 0 {
+        rows.push(("MTU", config.mtu.to_string()));
+    }
+    rows.push((
+        "DNS",
+        if config.disable_dns {
+            "off"
+        } else {
+            "managed by NetBird"
+        }
+        .into(),
+    ));
+    rows.push(("PrivateKey", config.private_key));
+    Some(rows)
+}
+
 /// The app's active network: `active_profile.json` names it, `default.json`
 /// or `<user>/<id>.json` holds its identity and management server.
 pub(super) fn profile_from_app(dir: &Path) -> Result<MeshProfile, String> {
@@ -240,6 +290,35 @@ pub(super) fn profile_from_app(dir: &Path) -> Result<MeshProfile, String> {
 
 #[cfg(test)]
 mod tests {
+    /// `v` shows the client settings a user recognises, and the viewer masks
+    /// the private key; before the first connect there are none.
+    #[test]
+    fn the_client_config_shows_recognisable_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(client_config(dir.path()), None);
+        std::fs::write(
+            dir.path().join("default.json"),
+            r#"{"ManagementURL": {"Scheme": "https", "Host": "api.netbird.io:443"},
+                "AdminURL": {"Scheme": "https", "Host": "app.netbird.io:443"},
+                "WgIface": "wt0", "WgPort": 51820, "MTU": 1280, "DisableDNS": false,
+                "PrivateKey": "not-a-real-key-only-a-test", "RosenpassEnabled": false}"#,
+        )
+        .unwrap();
+        let rows = client_config(dir.path()).unwrap();
+        assert_eq!(rows[0], ("Management", "https://api.netbird.io:443".into()));
+        assert!(rows.contains(&("Interface", "wt0".into())));
+        assert!(rows.contains(&("DNS", "managed by NetBird".into())));
+        assert!(!rows.iter().any(|(name, _)| name.contains("Rosenpass")));
+        let line = crate::ui::overlays::config_viewer::highlight_config_line(
+            "PrivateKey = not-a-real-key-only-a-test",
+        )
+        .to_string();
+        assert!(
+            line.contains("(masked)") && !line.contains("real-key"),
+            "{line}"
+        );
+    }
+
     use super::*;
 
     const CONNECTED: &str = r#"{

@@ -62,8 +62,13 @@ impl App {
             Message::OpenConfig => {
                 if let Some(idx) = self.profile_list_state.selected() {
                     if let Some(profile) = self.runtime.profiles.get(idx) {
-                        let content = std::fs::read_to_string(&profile.config_path)
+                        let mut content = std::fs::read_to_string(&profile.config_path)
                             .unwrap_or_else(|e| format!("Error reading config: {e}"));
+                        // A mesh profile only names its server; its client has the rest.
+                        if let crate::profile::ProtocolKind::Mesh(driver) = profile.protocol {
+                            content.push('\n');
+                            content.push_str(&crate::mesh::client_config(driver, &profile.id));
+                        }
                         // Build the highlighted-lines + total-lines cache
                         // once here; aggressive scrolling later reads from
                         // this cache instead of re-parsing the file every

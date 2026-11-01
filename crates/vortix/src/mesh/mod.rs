@@ -367,6 +367,32 @@ pub fn network_name(driver: MeshDriver, profile: &str) -> String {
         .unwrap_or_else(|| driver.slug().to_string())
 }
 
+/// What `v` adds after a mesh profile: the settings its network's own client
+/// got from the server, as `name = value` lines (the private key for the
+/// viewer to mask), or why there are none yet.
+#[must_use]
+pub fn client_config(driver: MeshDriver, profile_id: &ProfileId) -> String {
+    let state_dir = driver.state_dir(profile_id);
+    let rows = match driver {
+        MeshDriver::NetBird => netbird::client_config(&state_dir),
+    };
+    let name = driver.name();
+    match rows {
+        Some(rows) => {
+            use std::fmt::Write as _;
+            let mut text = format!("# {name} client (set by the server at connect)\n");
+            for (key, value) in rows {
+                let _ = writeln!(text, "{key} = {value}");
+            }
+            let _ = writeln!(text, "StateFolder = {}", state_dir.display());
+            text
+        }
+        None => format!(
+            "# {name} client: not connected yet; the server sets the rest at first connect.\n"
+        ),
+    }
+}
+
 /// The profile file that moves the vendor app's active network here.
 pub fn profile_from_app(driver: MeshDriver, dir: &Path) -> Result<String, String> {
     let profile = driver.profile_from_app(dir)?;
@@ -866,7 +892,7 @@ fn login_link(printed: &str) -> Option<(&str, &str)> {
 /// what to do.
 fn sign_in(printed: &str, profile: &Profile) -> Option<String> {
     let (link, rest) = login_link(printed)?;
-    let opened = open_in_browser(link, &profile.config_path);
+    let opened = crate::platform::open_in_browser(link, &profile.config_path);
     Some(login_notice(
         link,
         rest,
@@ -897,28 +923,6 @@ fn login_notice(link: &str, rest: &str, name: &str, timeout: Duration, opened: b
              (within {minutes} min).\n\n{link}"
         )
     }
-}
-
-/// Open the sign-in link in the browser of the user who ran Vortix, never as
-/// root; false when there is no such user or no desktop answered in time.
-fn open_in_browser(link: &str, profile_path: &Path) -> bool {
-    let Ok(owner) = crate::hooks::VerifiedHookOwner::for_standard_mode(profile_path) else {
-        return false;
-    };
-    let credentials = owner.credentials();
-    let mut spec = crate::process::CommandSpec::oneshot(
-        crate::platform::BROWSER_OPENER,
-        vec![link.to_string()],
-    )
-    .redact_args(0..1)
-    .timeout(Duration::from_secs(3));
-    spec.env = crate::platform::desktop_env(credentials.uid);
-    if let Some(home) = crate::config::user_home() {
-        spec.env
-            .insert("HOME".into(), home.to_string_lossy().into());
-    }
-    let spec = spec.run_as(credentials);
-    crate::process::run(spec).is_ok_and(|outcome| outcome.success())
 }
 
 fn up_failure(

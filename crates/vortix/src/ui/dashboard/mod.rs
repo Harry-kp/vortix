@@ -530,6 +530,37 @@ mod overlay_tests {
         }
     }
 
+    /// A click on the shortened link in the sign-in dialog finds the whole
+    /// link; a click beside it finds none.
+    #[test]
+    fn a_click_on_a_shortened_link_finds_the_whole_link() {
+        let mut app = App::new_test();
+        let link = format!(
+            "https://spider.example.com/oauth2/auth?state={}",
+            "x".repeat(250)
+        );
+        app.input_mode = InputMode::Action {
+            profile_id: crate::profile::ProfileId::new("work"),
+            text: format!("Sign in to 'work' (within 5 min).\n\n{link}"),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let frame = terminal
+            .draw(|frame| render_overlays(frame, &mut app))
+            .unwrap();
+        app.remember_frame(frame.buffer);
+        let buffer = app.last_frame.clone().unwrap();
+        let (x, y) = (0..24u16)
+            .flat_map(|y| (0..80u16).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].symbol() == "h" && buffer[(x + 1, y)].symbol() == "t")
+            .expect("the link is on screen");
+        let on_link = ratatui::layout::Position::new(x + 10, y);
+        assert_eq!(app.link_at(on_link), Some(link));
+        assert!(buffer[(x + 10, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::UNDERLINED));
+        assert_eq!(app.link_at(ratatui::layout::Position::new(x, y + 2)), None);
+    }
+
     /// The sign-in wait is the standard dialog at 80×24: a long link shows on
     /// one shortened line, a code after it in full, and `c` copies the link
     /// while the dialog stays.

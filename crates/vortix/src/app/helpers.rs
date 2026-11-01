@@ -337,6 +337,59 @@ impl App {
         self.copy_text(&ip_str, format!("Copied IPv4: {ip_str}"));
     }
 
+    /// Keep the frame just drawn, for [`App::open_link_at`].
+    pub fn remember_frame(&mut self, buffer: &ratatui::buffer::Buffer) {
+        self.last_frame = Some(buffer.clone());
+    }
+
+    /// The link under a click on the last frame. A link shown shortened
+    /// (ending in `...`) is the full link it stands for.
+    pub(crate) fn link_at(&self, at: ratatui::layout::Position) -> Option<String> {
+        let buffer = self.last_frame.as_ref()?;
+        let area = buffer.area;
+        if !area.contains(at) {
+            return None;
+        }
+        // One character per screen column, so positions are columns.
+        let row: Vec<char> = (area.left()..area.right())
+            .map(|x| buffer[(x, at.y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        let column = usize::from(at.x - area.left());
+        let scheme: Vec<char> = "https://".chars().collect();
+        let start = (0..=column.min(row.len().saturating_sub(1)))
+            .rev()
+            .find(|&from| row[from..].starts_with(&scheme))?;
+        let link: String = row[start..]
+            .iter()
+            .take_while(|c| !c.is_whitespace() && **c != '│')
+            .collect();
+        if column >= start + link.chars().count() {
+            return None;
+        }
+        let Some(shown) = link.strip_suffix("...") else {
+            return Some(link);
+        };
+        match &self.input_mode {
+            InputMode::Action { text, .. } => crate::ui::overlays::action::link(text)
+                .filter(|full| full.starts_with(shown))
+                .map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// Open the link under a click in the user's browser, or copy it where
+    /// no browser opens (over SSH).
+    pub(crate) fn open_link_at(&mut self, at: ratatui::layout::Position) {
+        let Some(link) = self.link_at(at) else {
+            return;
+        };
+        if crate::platform::open_in_browser(&link, &self.runtime.config_dir) {
+            self.show_toast("Opened the link in your browser".into(), ToastType::Info);
+        } else {
+            self.copy_text(&link, "No browser here: copied the link".into());
+        }
+    }
+
     /// Copy text through the terminal (OSC 52), which also works over SSH.
     pub fn copy_text(&mut self, text: &str, done: String) {
         let result = {

@@ -443,6 +443,13 @@ impl App {
                 true
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // A click, not a drag: open the link under it, if any.
+                if self
+                    .selection
+                    .is_some_and(|selection| selection.from == selection.to)
+                {
+                    self.open_link_at(at);
+                }
                 self.selection = self
                     .selection
                     .filter(|selection| selection.from != selection.to)
