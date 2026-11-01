@@ -32,7 +32,7 @@ fn cli_import_single_file() {
     let config = vortix::config::AppConfig::default();
     let exit = handle_command(
         &Commands::Import {
-            file: conf.to_string_lossy().to_string(),
+            file: vec![conf.to_string_lossy().to_string()],
         },
         config_dir.path(),
         "test",

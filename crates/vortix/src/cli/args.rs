@@ -243,8 +243,8 @@ pub enum Commands {
     #[command(verbatim_doc_comment)]
     Import {
         /// Path to a `.conf`/`.ovpn`/`.netbird` file, directory or URL, or `netbird`
-        #[arg(value_hint = ValueHint::AnyPath)]
-        file: String,
+        #[arg(value_hint = ValueHint::AnyPath, required = true, num_args = 1..=2)]
+        file: Vec<String>,
     },
 
     /// Display the configuration of a VPN profile
@@ -415,6 +415,18 @@ pub enum Commands {
     },
 }
 
+/// What `vortix import` was given: one path, or `netbird` and its server.
+#[must_use]
+pub fn import_input(words: &[String]) -> Option<String> {
+    match words {
+        [path] => Some(path.clone()),
+        [first, server] if first.eq_ignore_ascii_case("netbird") => {
+            Some(format!("{first} {server}"))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! CLI grammar additions for the
@@ -450,6 +462,23 @@ mod tests {
             }
             other => panic!("expected Down, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_import_takes_netbird_and_a_server_as_typed() {
+        let args = parse(&["vortix", "import", "netbird", "https://nb.example.com"]);
+        let Some(Commands::Import { file }) = args.command else {
+            panic!("expected Import");
+        };
+        assert_eq!(
+            super::import_input(&file).as_deref(),
+            Some("netbird https://nb.example.com")
+        );
+        let two_files = parse(&["vortix", "import", "a.conf", "b.conf"]);
+        let Some(Commands::Import { file }) = two_files.command else {
+            panic!("expected Import");
+        };
+        assert_eq!(super::import_input(&file), None);
     }
 
     #[test]

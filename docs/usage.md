@@ -126,6 +126,7 @@ session of the last one, `… · last session, ended HH:MM:SS`. `L` clears the v
 vortix import ./work.conf          # WireGuard .conf, OpenVPN .ovpn or .conf, NetBird .netbird
 vortix import ./profiles/          # every supported file in a directory
 vortix import https://example.com/work.ovpn
+vortix import netbird https://nb.example.com   # a NetBird network (see NetBird networks)
 vortix list                        # --sort, --reverse, --protocol, --names-only
 vortix show work                   # parsed, secrets masked; --raw for the file
 vortix rename work work-eu
