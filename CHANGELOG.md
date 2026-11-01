@@ -4,6 +4,64 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-11-01
+
+### Bug Fixes
+
+- NetBird keeps secrets out of errors, runs once, and stays inside the kill switch
+- NetBird reads right where a user meets it
+- Deleting a mesh profile removes its identity
+- WireGuard and OpenVPN users see no NetBird noise
+- NetBird from the command line: help, import and status
+- NetBird connects from the CLI end in time, with the right exit code
+- Warn about an unchanged public address only when a tunnel carries the internet
+- The header shows a connected mesh network as connected
+- NetBird names an overridden server; smoke set covers NetBird beside a personal VPN ([#410](https://github.com/Harry-kp/vortix/pull/410))
+- The shown DNS server skips a link that answers only its own domains
+- Warn about an unchanged public IPv6 only when a tunnel carries the internet
+- Onboarding findings: Add VPN in the footer, location without an exit, plainer duplicate ([#414](https://github.com/Harry-kp/vortix/pull/414))
+- Onboarding polish: units on transfer counters, a fitting empty hint, bare server names ([#415](https://github.com/Harry-kp/vortix/pull/415))
+- A NetBird network whose sign-in ended reconnects for a new link ([#416](https://github.com/Harry-kp/vortix/pull/416))
+- The sign-in wait is a normal dialog; c copies its link ([#419](https://github.com/Harry-kp/vortix/pull/419))
+- Shared-UI review: one scroll bound, original mark colour, j/k hint
+- Vortix import netbird <server> works without quotes
+
+### Documentation
+
+- NetBird live workflows, the lab's test network, install hints
+
+### Features
+
+- Run NetBird networks from a .netbird profile
+- The kill switch lets a NetBird daemon reach its peers
+- Move from the NetBird app with `vortix import /var/lib/netbird`
+- Log in to a NetBird network from the link it prints
+- See a mesh network's peers
+- See the networks a mesh network routes to
+- Onboard to NetBird from the dashboard, and keep WireGuard working beside it
+- Select text with a mouse drag in the TUI and copy it on release ([#412](https://github.com/Harry-kp/vortix/pull/412))
+- Add a VPN onboarding: plain NetBird ways in, sign-in opens the browser ([#413](https://github.com/Harry-kp/vortix/pull/413))
+- The Logs panel shows NetBird's daemon log, like OpenVPN's ([#417](https://github.com/Harry-kp/vortix/pull/417))
+- A NetBird network using an exit node shows as carrying the internet ([#418](https://github.com/Harry-kp/vortix/pull/418))
+- Routes and peers on the back of the chart, for every VPN; P goes ([#420](https://github.com/Harry-kp/vortix/pull/420))
+- Routes and peers move to the back of Details, replacing Health ([#421](https://github.com/Harry-kp/vortix/pull/421))
+- Clickable links, and v shows a NetBird network's client settings ([#423](https://github.com/Harry-kp/vortix/pull/423))
+
+### Performance
+
+- The Logs panel wraps only what is on screen ([#422](https://github.com/Harry-kp/vortix/pull/422))
+
+### Refactor
+
+- Drop the transport status call nothing makes
+- Mesh networks are a kind, NetBird is a driver
+- Ponytail pass over everything since 0.5.5 ([#424](https://github.com/Harry-kp/vortix/pull/424))
+- Details' back takes its marks from the sigil catalog
+- One scrolling list for Logs and Details' back
+- The invoking-user check lives with file ownership, as VerifiedOwner
+
+
+
 ## [0.5.5] - 2026-10-24
 
 ### Security
