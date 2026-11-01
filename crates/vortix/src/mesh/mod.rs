@@ -99,13 +99,6 @@ impl MeshDriver {
         }
     }
 
-    /// Where its own app keeps its identity: importing this folder moves the
-    /// app's network to Vortix.
-    #[must_use]
-    pub const fn app_state_dir(self) -> &'static str {
-        self.app().state_dir
-    }
-
     /// Every driver's name, for counts: `NetBird`.
     #[must_use]
     pub fn names() -> String {
@@ -262,28 +255,32 @@ impl MeshProfile {
 
     /// Host and port of the control server.
     pub fn server(&self) -> Result<(String, u16), String> {
-        let url = &self.server_url;
-        let (rest, default_port) = url
-            .strip_prefix("https://")
-            .map(|rest| (rest, 443))
-            .or_else(|| url.strip_prefix("http://").map(|rest| (rest, 80)))
-            .ok_or("the server URL must start with https:// or http://")?;
-        let authority = rest.split('/').next().unwrap_or_default();
-        let (host, port) = match authority.strip_prefix('[') {
-            Some(v6) => v6.split_once(']').unwrap_or((v6, "")),
-            None => authority.split_once(':').unwrap_or((authority, "")),
-        };
-        let port = match port.trim_start_matches(':') {
-            "" => default_port,
-            port => port
-                .parse()
-                .map_err(|_| format!("the server URL has a bad port: {port}"))?,
-        };
-        if host.is_empty() {
-            return Err("the server URL has no host".into());
-        }
-        Ok((host.to_string(), port))
+        server(&self.server_url)
     }
+}
+
+/// A server URL's host and port (443 for https, 80 for http by default).
+fn server(url: &str) -> Result<(String, u16), String> {
+    let (rest, default_port) = url
+        .strip_prefix("https://")
+        .map(|rest| (rest, 443))
+        .or_else(|| url.strip_prefix("http://").map(|rest| (rest, 80)))
+        .ok_or("the server URL must start with https:// or http://")?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').unwrap_or((v6, "")),
+        None => authority.split_once(':').unwrap_or((authority, "")),
+    };
+    let port = match port.trim_start_matches(':') {
+        "" => default_port,
+        port => port
+            .parse()
+            .map_err(|_| format!("the server URL has a bad port: {port}"))?,
+    };
+    if host.is_empty() {
+        return Err("the server URL has no host".into());
+    }
+    Ok((host.to_string(), port))
 }
 
 /// The vendor app's state directory, if `dir` is one: its active network
@@ -315,7 +312,7 @@ fn profile_from_words_in(words: &str, root: &Path) -> Option<(MeshDriver, Result
         Some(host) => Ok(format!("https://{host}")),
         None => app_server(
             driver,
-            &root.join(driver.app_state_dir().trim_start_matches('/')),
+            &root.join(driver.app().state_dir.trim_start_matches('/')),
         )
         .map(|server| server.unwrap_or_else(|| driver.default_server().to_string())),
     };
@@ -350,16 +347,7 @@ fn app_server(driver: MeshDriver, dir: &Path) -> Result<Option<String>, String> 
 /// service.
 #[must_use]
 pub fn network_name(driver: MeshDriver, profile: &str) -> String {
-    let host = |server_url: &str| {
-        MeshProfile {
-            server_url: server_url.into(),
-            auth_key: None,
-            identity: None,
-        }
-        .server()
-        .ok()
-        .map(|(host, _)| host)
-    };
+    let host = |url: &str| server(url).ok().map(|(host, _)| host);
     MeshProfile::parse(profile)
         .ok()
         .and_then(|profile| host(&profile.server_url))
@@ -894,18 +882,12 @@ fn login_link(printed: &str) -> Option<(&str, &str)> {
 fn sign_in(printed: &str, profile: &Profile) -> Option<String> {
     let (link, rest) = login_link(printed)?;
     let opened = crate::platform::open_in_browser(link, &profile.config_path);
-    Some(login_notice(
-        link,
-        rest,
-        &profile.display_name,
-        LOGIN_WAIT,
-        opened,
-    ))
+    Some(login_notice(link, rest, &profile.display_name, opened))
 }
 
 /// What to tell the user once the client prints its sign-in link.
-fn login_notice(link: &str, rest: &str, name: &str, timeout: Duration, opened: bool) -> String {
-    let minutes = timeout.as_secs().div_ceil(60);
+fn login_notice(link: &str, rest: &str, name: &str, opened: bool) -> String {
+    let minutes = LOGIN_WAIT.as_secs().div_ceil(60);
     let link = [link, rest].join(" ").trim().to_string();
     // A link that returns to localhost works only in a browser on this computer.
     let place = if link.contains("localhost") {
@@ -1175,17 +1157,17 @@ mod tests {
         for other in ["Use this URL to log in:", "", "Connected", "http://plain"] {
             assert_eq!(login_link(other), None, "{other}");
         }
-        let opened = login_notice(link, rest, "work", LOGIN_WAIT, true);
+        let opened = login_notice(link, rest, "work", true);
         assert!(opened.starts_with("Sign in to 'work' in your browser"));
         assert!(opened.contains("(within 5 min)"), "{opened}");
         assert!(opened
             .ends_with("\nhttps://idp.example/device and enter the code AB12 to authenticate."));
         let back_here = "https://idp.example/auth?redirect_uri=http%3A%2F%2Flocalhost%3A53000%2F";
         for opened in [true, false] {
-            let notice = login_notice(back_here, "", "work", LOGIN_WAIT, opened);
+            let notice = login_notice(back_here, "", "work", opened);
             assert!(notice.contains("on this computer"), "{notice}");
         }
-        let elsewhere = login_notice(link, "", "work", LOGIN_WAIT, false);
+        let elsewhere = login_notice(link, "", "work", false);
         assert!(
             elsewhere.contains("on any device")
                 && elsewhere.ends_with("\nhttps://idp.example/device")

@@ -37,20 +37,17 @@ pub fn os_description() -> String {
 /// The kill-switch firewall tool and its version flag (none for `pfctl`).
 pub const FIREWALL_TOOL: (&str, &[&str]) = ("pfctl", &[]);
 
+/// The interface each `NetBird` daemon Vortix runs is told to create.
+pub const NETBIRD_INTERFACE: &str = "utun100";
+
 /// Opens a link in the user's default browser.
 pub const BROWSER_OPENER: &str = "open";
-
-/// Whether a desktop is there to open a browser on: macOS always has one.
-#[must_use]
-pub fn has_desktop(_uid: u32) -> bool {
-    true
-}
 
 /// What a command run as `uid` needs to reach that user's desktop: nothing
 /// on macOS, where `open` finds the user's session itself.
 #[must_use]
-pub fn desktop_env(_uid: u32) -> std::collections::HashMap<String, String> {
-    std::collections::HashMap::new()
+pub fn desktop_env(_uid: u32) -> Option<std::collections::HashMap<String, String>> {
+    Some(std::collections::HashMap::new())
 }
 
 /// Clipboard writers to try, in order.

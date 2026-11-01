@@ -182,6 +182,20 @@ pub(super) fn parse_networks(text: &str) -> Vec<RoutedNetwork> {
     networks
 }
 
+/// A URL as `NetBird` stores it in its config.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Url {
+    scheme: String,
+    host: String,
+}
+
+impl Url {
+    fn text(&self) -> String {
+        format!("{}://{}", self.scheme, self.host)
+    }
+}
+
 /// The settings of `NetBird`'s own client a user would recognise, from its
 /// config in `state_dir`, as `(name, value)` rows; `None` before the first
 /// connect writes it, and an error when it is there but cannot be read. The
@@ -189,12 +203,6 @@ pub(super) fn parse_networks(text: &str) -> Vec<RoutedNetwork> {
 pub(super) fn client_config(
     state_dir: &Path,
 ) -> Result<Option<Vec<(&'static str, String)>>, String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Url {
-        scheme: String,
-        host: String,
-    }
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Config {
@@ -218,10 +226,9 @@ pub(super) fn client_config(
     };
     let config: Config = serde_json::from_slice(&bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let url = |url: &Url| format!("{}://{}", url.scheme, url.host);
-    let mut rows = vec![("Management", url(&config.management_url))];
+    let mut rows = vec![("Management", config.management_url.text())];
     if let Some(admin) = &config.admin_url {
-        rows.push(("Dashboard", url(admin)));
+        rows.push(("Dashboard", admin.text()));
     }
     rows.push(("Interface", config.wg_iface));
     rows.push(("Port", config.wg_port.to_string()));
@@ -249,12 +256,6 @@ pub(super) fn profile_from_app(dir: &Path) -> Result<MeshProfile, String> {
         name: String,
         #[serde(default)]
         username: String,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Url {
-        scheme: String,
-        host: String,
     }
     #[derive(Deserialize)]
     struct Config {
@@ -288,10 +289,7 @@ pub(super) fn profile_from_app(dir: &Path) -> Result<MeshProfile, String> {
     let config: Config = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{} is not a NetBird profile: {error}", identity.display()))?;
     Ok(MeshProfile {
-        server_url: format!(
-            "{}://{}",
-            config.management_url.scheme, config.management_url.host
-        ),
+        server_url: config.management_url.text(),
         auth_key: None,
         identity: Some(identity),
     })

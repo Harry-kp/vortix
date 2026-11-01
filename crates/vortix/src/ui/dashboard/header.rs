@@ -149,30 +149,23 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
         tunnel.phase == Phase::Up
             && matches!(tunnel.protocol, crate::profile::ProtocolKind::Mesh(_))
     });
-    let title = mesh.map_or_else(
-        || {
-            Span::styled(
-                "\u{25cb} NO EXIT",
-                Style::default()
-                    .fg(theme::current().warning)
-                    .add_modifier(Modifier::BOLD),
-            )
-        },
-        |tunnel| {
+    let (text, color) = match mesh {
+        None => ("\u{25cb} NO EXIT".to_string(), theme::current().warning),
+        Some(tunnel) => {
             let peers = &tunnel.details.peers;
             let up = peers.iter().filter(|peer| peer.connected).count();
             let name = crate::ui::helpers::truncate_to_width(&tunnel.name, 16);
-            Span::styled(
-                if peers.is_empty() {
-                    format!("\u{25cf} MESH {name}")
-                } else {
-                    format!("\u{25cf} MESH {name} {up}/{}", peers.len())
-                },
-                Style::default()
-                    .fg(theme::current().success)
-                    .add_modifier(Modifier::BOLD),
-            )
-        },
+            let text = if peers.is_empty() {
+                format!("\u{25cf} MESH {name}")
+            } else {
+                format!("\u{25cf} MESH {name} {up}/{}", peers.len())
+            };
+            (text, theme::current().success)
+        }
+    };
+    let title = Span::styled(
+        text,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
     );
     Line::from(vec![
         title,

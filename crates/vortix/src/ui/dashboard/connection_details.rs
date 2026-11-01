@@ -786,12 +786,12 @@ fn render_back(
     } else if tunnel.details.endpoint.is_empty() {
         Vec::new()
     } else {
-        vec![mark_line(
-            true,
-            &tunnel.details.endpoint,
+        let server = [
+            tunnel.details.endpoint.as_str(),
             &tunnel.details.latest_handshake,
-            width,
-        )]
+        ]
+        .join("  ");
+        vec![mark_line(in_use(true), server.trim_end().into(), width)]
     };
     // Peers first: there are few of them, and a long route list scrolls below.
     let mut all = vec![heading("Peers".into())];
@@ -811,7 +811,7 @@ fn route_lines(tunnel: &crate::control::TunnelView, width: usize) -> Vec<Line<'s
         return tunnel
             .routes
             .iter()
-            .map(|route| mark_line(true, &route.to_string(), "", width))
+            .map(|route| mark_line(in_use(true), route.to_string(), width))
             .collect();
     }
     let compact = width < FULL_COLUMNS;
@@ -842,9 +842,8 @@ fn route_lines(tunnel: &crate::control::TunnelView, width: usize) -> Vec<Line<'s
                 (false, false) => format!(" {}", network.range),
             };
             mark_line(
-                network.selected,
-                &format!("{name:<names$}{rest}"),
-                "",
+                in_use(network.selected),
+                format!("{name:<names$}{rest}"),
                 width,
             )
         })
@@ -894,23 +893,26 @@ fn scrolled(
     shown
 }
 
-/// `● text  detail`, green when in use, grey otherwise, fitted to the panel.
-fn mark_line(active: bool, text: &str, detail: &str, width: usize) -> Line<'static> {
+/// The mark of something in use (green ●) or not (grey ○).
+fn in_use(active: bool) -> (&'static str, ratatui::style::Color) {
     let t = theme::current();
-    let (mark, color) = if active {
+    if active {
         ("●", t.success)
     } else {
         ("○", t.text_secondary)
-    };
-    let text = if detail.is_empty() {
-        text.to_string()
-    } else {
-        format!("{text}  {detail}")
-    };
+    }
+}
+
+/// `● text`, the mark in its colour, fitted to the panel.
+fn mark_line(
+    (mark, color): (&str, ratatui::style::Color),
+    text: String,
+    width: usize,
+) -> Line<'static> {
     helpers::fit_line(
         Line::from(vec![
             Span::styled(format!("{mark} "), Style::default().fg(color)),
-            Span::styled(text, Style::default().fg(t.text_primary)),
+            Span::styled(text, Style::default().fg(theme::current().text_primary)),
         ]),
         width,
     )
@@ -951,16 +953,7 @@ fn peer_lines(peers: &[crate::tunnel::MeshPeer], width: usize) -> Vec<Line<'stat
             } else {
                 format!("{:<16} {path:<8} {latency}", peer.address)
             };
-            helpers::fit_line(
-                Line::from(vec![
-                    Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::styled(
-                        format!("{name:<names$} {rest}"),
-                        Style::default().fg(t.text_primary),
-                    ),
-                ]),
-                width,
-            )
+            mark_line((mark, color), format!("{name:<names$} {rest}"), width)
         })
         .collect()
 }
@@ -1211,19 +1204,15 @@ mod tests {
             .push(make_profile("home", PathBuf::from("/tmp/h.conf")));
         app.profile_list_state.select(Some(0));
         let mut wg = crate::app::connection::test_view("home", Phase::Up);
-        wg.health = crate::tunnel::ConnectionHealth::Degraded {
-            reason: crate::tunnel::DegradedReason::WireGuardPeerNeverObserved {
-                peer_public_key: "abcdefghijk".into(),
-                allowed_routes: vec!["10.8.0.0/24".into()],
-            },
+        let reason = crate::tunnel::DegradedReason::WireGuardPeerNeverObserved {
+            peer_public_key: "abcdefghijk".into(),
+            allowed_routes: vec!["10.8.0.0/24".into()],
         };
-        let reason = match &wg.health {
-            crate::tunnel::ConnectionHealth::Degraded { reason } => reason.describe(),
-            _ => unreachable!(),
-        };
+        let shown = reason.describe();
+        wg.health = crate::tunnel::ConnectionHealth::Degraded { reason };
         app.set_tunnels_for_test(vec![wg], None);
         let screen = render_to_string(&mut app, 120, 16);
-        assert!(screen.contains(&format!("Health  : {reason}")), "{screen}");
+        assert!(screen.contains(&format!("Health  : {shown}")), "{screen}");
     }
 
     /// Zoomed, every column shows: whole names, ranges, addresses.

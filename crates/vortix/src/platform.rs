@@ -4,9 +4,9 @@
 pub use crate::linux::autoconnect;
 #[cfg(target_os = "linux")]
 pub use crate::linux::{
-    clipboard_commands, desktop_env, has_desktop,
+    clipboard_commands, desktop_env,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
-    os_description, BROWSER_OPENER, FIREWALL_TOOL,
+    os_description, BROWSER_OPENER, FIREWALL_TOOL, NETBIRD_INTERFACE,
 };
 #[cfg(target_os = "linux")]
 pub use crate::linux::{
@@ -17,9 +17,9 @@ pub use crate::linux::{
 pub use crate::macos::autoconnect;
 #[cfg(target_os = "macos")]
 pub use crate::macos::{
-    clipboard_commands, desktop_env, has_desktop,
+    clipboard_commands, desktop_env,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
-    os_description, BROWSER_OPENER, FIREWALL_TOOL,
+    os_description, BROWSER_OPENER, FIREWALL_TOOL, NETBIRD_INTERFACE,
 };
 #[cfg(target_os = "macos")]
 pub use crate::macos::{
@@ -36,16 +36,16 @@ pub fn open_in_browser(link: &str, owned_by: &std::path::Path) -> bool {
         return false;
     };
     let credentials = owner.credentials();
-    if !has_desktop(credentials.uid) {
+    let Some(desktop) = desktop_env(credentials.uid) else {
         return false;
-    }
+    };
     let mut spec = crate::process::CommandSpec::oneshot(
         crate::platform::BROWSER_OPENER,
         vec![link.to_string()],
     )
     .redact_args(0..1)
     .timeout(std::time::Duration::from_secs(3));
-    spec.env = crate::platform::desktop_env(credentials.uid);
+    spec.env = desktop;
     if let Some(home) = crate::config::user_home() {
         spec.env
             .insert("HOME".into(), home.to_string_lossy().into());
@@ -740,12 +740,6 @@ mod ipv6_gate_tests {
         );
     }
 }
-
-/// The interface each `NetBird` daemon Vortix runs is told to create.
-#[cfg(target_os = "macos")]
-pub const NETBIRD_INTERFACE: &str = "utun100";
-#[cfg(target_os = "linux")]
-pub const NETBIRD_INTERFACE: &str = "wt0";
 
 /// The address whose route stands for "the internet" when probing the default route.
 pub(crate) const INTERNET_ROUTE_PROBE: std::net::IpAddr =
