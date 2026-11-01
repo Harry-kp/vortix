@@ -32,7 +32,7 @@ pub use crate::macos::{
 /// is a file of that user's (a profile, the config folder) that proves who it is.
 #[must_use]
 pub fn open_in_browser(link: &str, owned_by: &std::path::Path) -> bool {
-    let Ok(owner) = crate::hooks::VerifiedHookOwner::for_standard_mode(owned_by) else {
+    let Ok(owner) = crate::config::owned_file::VerifiedOwner::for_standard_mode(owned_by) else {
         return false;
     };
     let credentials = owner.credentials();

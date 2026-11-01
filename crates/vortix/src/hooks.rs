@@ -6,7 +6,7 @@ use std::path::Path;
 
 pub use runner::{
     HookAttemptId, HookDiagnostic, HookDiagnosticKind, HookDiagnostics, HookDispatcher,
-    HookFailure, HookOwnerError, HookRunner, VerifiedHookOwner,
+    HookFailure, HookRunner,
 };
 
 /// Lifecycle transitions available to global hook specifications.
@@ -103,159 +103,25 @@ mod event_tests {
 mod runner {
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::future::Future;
-    use std::os::unix::fs::MetadataExt as _;
-    use std::path::Path;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
 
-    use thiserror::Error;
     use tokio::sync::{broadcast, mpsc};
     use tokio::task::{JoinHandle, JoinSet};
 
+    use crate::config::owned_file::VerifiedOwner;
     use crate::config::settings::{validate_hooks, HookConfigError, HookSpec};
     use crate::hooks::{HookEvent, HookEventId, LifecycleFact};
+    use crate::process::ProcessError;
     use crate::process::{CommandRunner, CommandSpec};
-    use crate::process::{ProcessCredentials, ProcessError};
 
     const HOOK_QUEUE_CAPACITY: usize = 64;
     const HOOK_DIAGNOSTIC_CAPACITY: usize = 128;
     const HOOK_MAX_CONCURRENCY: usize = 4;
     const HOOK_STREAM_LIMIT_BYTES: usize = 16 * 1024;
     const HOOK_RECENT_ATTEMPTS: usize = 64;
-    const HOOK_MAX_SUPPLEMENTARY_GROUPS: usize = 1_024;
-
-    /// OS-checked identity used for every hook spawn.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct VerifiedHookOwner {
-        credentials: ProcessCredentials,
-    }
-
-    impl VerifiedHookOwner {
-        /// Prove the owner.
-        ///
-        /// A direct non-root invocation must own the selected configuration path.
-        /// A root invocation additionally needs coherent sudo uid/gid/user facts;
-        /// direct or root-targeting sudo execution is refused.
-        pub fn for_standard_mode(config_path: &Path) -> Result<Self, HookOwnerError> {
-            let metadata = std::fs::symlink_metadata(config_path)
-                .map_err(|source| HookOwnerError::ConfigMetadata { source })?;
-            if metadata.file_type().is_symlink() {
-                return Err(HookOwnerError::SymlinkConfig);
-            }
-            let (process_user, process_group) = crate::platform::effective_user_group_ids();
-            if process_user != 0 {
-                if process_group == 0 {
-                    return Err(HookOwnerError::RootOwner);
-                }
-                if metadata.uid() != process_user {
-                    return Err(HookOwnerError::ConfigOwnerMismatch {
-                        expected: process_user,
-                        actual: metadata.uid(),
-                    });
-                }
-                let supplementary_groups = current_groups()?;
-                if supplementary_groups.contains(&0) {
-                    return Err(HookOwnerError::RootOwner);
-                }
-                return Ok(Self {
-                    credentials: ProcessCredentials {
-                        uid: process_user,
-                        gid: process_group,
-                        supplementary_groups,
-                    },
-                });
-            }
-
-            let (uid, gid) = crate::config::sudo_ids()
-                .ok()
-                .flatten()
-                .ok_or(HookOwnerError::AmbiguousRoot)?;
-            if uid == 0 || gid == 0 {
-                return Err(HookOwnerError::RootOwner);
-            }
-            let sudo_user =
-                std::env::var("SUDO_USER").map_err(|_| HookOwnerError::AmbiguousRoot)?;
-            let (recorded_user, recorded_group, supplementary_groups) = lookup_user(&sudo_user)?;
-            if recorded_user != uid || recorded_group != gid {
-                return Err(HookOwnerError::SudoIdentityMismatch);
-            }
-            if supplementary_groups.contains(&0) {
-                return Err(HookOwnerError::RootOwner);
-            }
-            if metadata.uid() != uid {
-                return Err(HookOwnerError::ConfigOwnerMismatch {
-                    expected: uid,
-                    actual: metadata.uid(),
-                });
-            }
-            Ok(Self {
-                credentials: ProcessCredentials {
-                    uid,
-                    gid,
-                    supplementary_groups,
-                },
-            })
-        }
-
-        /// The identity a command run as this owner takes.
-        #[must_use]
-        pub fn credentials(&self) -> ProcessCredentials {
-            self.credentials.clone()
-        }
-
-        #[cfg(test)]
-        fn from_ids(uid: u32, gid: u32) -> Self {
-            Self {
-                credentials: ProcessCredentials {
-                    uid,
-                    gid,
-                    supplementary_groups: Vec::new(),
-                },
-            }
-        }
-    }
-
-    #[derive(Debug, Error)]
-    #[non_exhaustive]
-    pub enum HookOwnerError {
-        #[error("cannot verify hook owner: configuration metadata failed: {source}")]
-        ConfigMetadata { source: std::io::Error },
-        #[error("cannot verify hook owner through a symlinked configuration path")]
-        SymlinkConfig,
-        #[error("configuration owner is uid {actual}, expected invoking uid {expected}")]
-        ConfigOwnerMismatch { expected: u32, actual: u32 },
-        #[error("direct or ambiguous root invocation cannot execute lifecycle hooks")]
-        AmbiguousRoot,
-        #[error("lifecycle hooks are never executed as root")]
-        RootOwner,
-        #[error("sudo uid/gid do not match the operating-system user record")]
-        SudoIdentityMismatch,
-        #[error("cannot resolve invoking user from the operating system")]
-        UnknownUser,
-        #[error("cannot read process groups: {source}")]
-        Groups { source: std::io::Error },
-    }
-
-    fn current_groups() -> Result<Vec<u32>, HookOwnerError> {
-        crate::platform::current_groups().map_err(|source| HookOwnerError::Groups { source })
-    }
-
-    fn lookup_user(user: &str) -> Result<(u32, u32, Vec<u32>), HookOwnerError> {
-        let user = std::ffi::CString::new(user).map_err(|_| HookOwnerError::UnknownUser)?;
-        let (uid, gid, _) =
-            crate::platform::lookup_user(&user).ok_or(HookOwnerError::UnknownUser)?;
-        let mut groups = crate::platform::supplementary_groups_for_user(
-            &user,
-            gid,
-            HOOK_MAX_SUPPLEMENTARY_GROUPS,
-        )
-        .ok_or(HookOwnerError::UnknownUser)?;
-        groups.sort_unstable();
-        groups.dedup();
-        Ok((uid, gid, groups))
-    }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     pub struct HookAttemptId {
@@ -369,7 +235,7 @@ mod runner {
         /// Validate and start only when at least one hook exists.
         pub fn start(
             specs: Vec<HookSpec>,
-            owner: VerifiedHookOwner,
+            owner: VerifiedOwner,
             runner: CommandRunner,
         ) -> Result<Option<(Self, HookDiagnostics)>, HookConfigError> {
             validate_hooks(&specs)?;
@@ -442,7 +308,7 @@ mod runner {
     async fn run_jobs(
         mut receiver: mpsc::Receiver<HookJob>,
         diagnostics: broadcast::Sender<HookDiagnostic>,
-        owner: VerifiedHookOwner,
+        owner: VerifiedOwner,
         runner: CommandRunner,
     ) {
         let mut active = JoinSet::new();
@@ -507,7 +373,7 @@ mod runner {
     async fn run_one(
         job: HookJob,
         diagnostics: broadcast::Sender<HookDiagnostic>,
-        owner: VerifiedHookOwner,
+        owner: VerifiedOwner,
         runner: CommandRunner,
     ) {
         let _ = diagnostics.send(HookDiagnostic {
@@ -541,7 +407,7 @@ mod runner {
         .timeout(timeout)
         .output_limit(HOOK_STREAM_LIMIT_BYTES)
         .redact_args(0..argument_count)
-        .run_as(owner.credentials)
+        .run_as(owner.credentials())
         .contain_process_group();
         command.env_clear = true;
         command.env = env;
@@ -585,50 +451,11 @@ mod runner {
         fn empty_configuration_starts_no_runner() {
             assert!(HookRunner::start(
                 Vec::new(),
-                VerifiedHookOwner::from_ids(501, 20),
+                VerifiedOwner::from_ids(501, 20),
                 CommandRunner::mock_default_success(),
             )
             .unwrap()
             .is_none());
-        }
-
-        #[test]
-        fn standard_owner_requires_non_root_or_sudo_provenance() {
-            let temp = tempfile::tempdir().unwrap();
-            let result = VerifiedHookOwner::for_standard_mode(temp.path());
-            if crate::platform::is_root() {
-                assert!(result.is_err());
-            } else {
-                let owner = result.unwrap();
-                assert_eq!(
-                    owner.credentials.uid,
-                    crate::platform::effective_user_group_ids().0
-                );
-            }
-        }
-
-        #[test]
-        fn standard_owner_rejects_symlinked_configuration() {
-            use std::os::unix::fs::symlink;
-
-            let temp = tempfile::tempdir().unwrap();
-            let target = temp.path().join("settings.toml");
-            let link = temp.path().join("settings-link.toml");
-            std::fs::write(&target, "").unwrap();
-            symlink(&target, &link).unwrap();
-            assert!(matches!(
-                VerifiedHookOwner::for_standard_mode(&link),
-                Err(HookOwnerError::SymlinkConfig)
-            ));
-        }
-
-        #[test]
-        fn operating_system_user_lookup_returns_bounded_groups() {
-            let (uid, gid, groups) = lookup_user("root").unwrap();
-            assert_eq!(uid, 0);
-            assert_eq!(gid, 0);
-            assert!(groups.contains(&0));
-            assert!(groups.len() <= HOOK_MAX_SUPPLEMENTARY_GROUPS);
         }
 
         #[tokio::test]
@@ -641,7 +468,7 @@ mod runner {
                     args: vec!["safe".into()],
                     timeout_secs: 5,
                 }],
-                VerifiedHookOwner::from_ids(501, 20),
+                VerifiedOwner::from_ids(501, 20),
                 CommandRunner::Mock(mock.clone()),
             )
             .unwrap()
@@ -695,7 +522,7 @@ mod runner {
                     args: Vec::new(),
                     timeout_secs: 5,
                 }],
-                VerifiedHookOwner::from_ids(501, 20),
+                VerifiedOwner::from_ids(501, 20),
                 CommandRunner::Mock(mock.clone()),
             )
             .unwrap()
@@ -723,7 +550,7 @@ mod runner {
                     args: Vec::new(),
                     timeout_secs: 5,
                 }],
-                VerifiedHookOwner::from_ids(501, 20),
+                VerifiedOwner::from_ids(501, 20),
                 CommandRunner::mock_default_success(),
             )
             .unwrap()
@@ -757,7 +584,7 @@ mod runner {
                     args: Vec::new(),
                     timeout_secs: 5,
                 }],
-                VerifiedHookOwner::from_ids(501, 20),
+                VerifiedOwner::from_ids(501, 20),
                 CommandRunner::Mock(crate::process::MockRunner::new()),
             )
             .unwrap()
@@ -810,7 +637,7 @@ mod runner {
                         args: Vec::new(),
                         timeout_secs: 5,
                     }],
-                    VerifiedHookOwner::from_ids(501, 20),
+                    VerifiedOwner::from_ids(501, 20),
                     CommandRunner::Mock(mock),
                 )
                 .unwrap()
@@ -848,8 +675,8 @@ pub(crate) fn start(config_dir: &Path) -> Option<HookRunner> {
         if settings.hooks.is_empty() {
             return Ok(None);
         }
-        let owner =
-            VerifiedHookOwner::for_standard_mode(config_dir).map_err(|error| error.to_string())?;
+        let owner = crate::config::owned_file::VerifiedOwner::for_standard_mode(config_dir)
+            .map_err(|error| error.to_string())?;
         HookRunner::start(
             settings.hooks,
             owner,
