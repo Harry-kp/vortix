@@ -629,7 +629,10 @@ fn run_tui(
             }
         }
         app.process_external();
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        let frame = terminal.draw(|frame| ui::render(frame, &mut app))?;
+        if let Some(text) = ui::take_selected_text(&mut app, frame.buffer) {
+            app.copy_text(&text, format!("Copied {} characters", text.chars().count()));
+        }
 
         if app.has_active_animation() {
             std::thread::sleep(std::time::Duration::from_millis(

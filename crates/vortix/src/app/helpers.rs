@@ -301,15 +301,20 @@ impl App {
             self.show_toast("No valid IPv4 available yet".to_string(), ToastType::Error);
             return;
         }
+        self.copy_text(&ip_str, format!("Copied IPv4: {ip_str}"));
+    }
+
+    /// Copy text through the terminal (OSC 52), which also works over SSH.
+    pub fn copy_text(&mut self, text: &str, done: String) {
         let result = {
             use std::io::Write as _;
             let mut stdout = std::io::stdout();
             stdout
-                .write_all(osc52_clipboard(&ip_str).as_bytes())
+                .write_all(osc52_clipboard(text).as_bytes())
                 .and_then(|()| stdout.flush())
         };
         match result {
-            Ok(()) => self.show_toast(format!("Copied IPv4: {ip_str}"), ToastType::Success),
+            Ok(()) => self.show_toast(done, ToastType::Success),
             Err(error) => self.show_toast(
                 format!("Failed to copy to clipboard: {error}"),
                 ToastType::Error,
