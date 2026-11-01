@@ -449,10 +449,12 @@ pub struct RoutedNetwork {
 }
 
 impl RoutedNetwork {
-    /// Routes all traffic: an exit node.
+    /// Routes all traffic: an exit node. `NetBird` lists one as `0.0.0.0/0, ::/0`.
     #[must_use]
     pub fn is_exit_node(&self) -> bool {
-        matches!(self.range.as_str(), "0.0.0.0/0" | "::/0")
+        self.range
+            .split(',')
+            .any(|range| matches!(range.trim(), "0.0.0.0/0" | "::/0"))
     }
 }
 
@@ -563,4 +565,19 @@ pub struct AuthorityEpoch(pub u64);
 pub struct TunnelRevision {
     pub authority_epoch: AuthorityEpoch,
     pub generation: u64,
+}
+
+#[cfg(test)]
+mod exit_node_tests {
+    #[test]
+    fn netbird_lists_its_exit_node_as_both_families() {
+        let network = |range: &str| super::RoutedNetwork {
+            name: String::new(),
+            range: range.into(),
+            selected: true,
+        };
+        assert!(network("0.0.0.0/0, ::/0").is_exit_node());
+        assert!(network("0.0.0.0/0").is_exit_node());
+        assert!(!network("10.0.0.0/8, 192.168.0.0/16").is_exit_node());
+    }
 }

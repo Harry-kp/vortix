@@ -111,6 +111,24 @@ pub(super) struct Engine {
     >,
 }
 
+/// The tunnel internet traffic leaves through: the one owning the default
+/// route, else a mesh network whose own daemon routes it through a selected
+/// exit node (Vortix shows that, but leaves its routes to the daemon).
+fn carries_internet(planned: Option<&ProfileId>, tunnels: &[TunnelView]) -> Option<ProfileId> {
+    planned.cloned().or_else(|| {
+        tunnels
+            .iter()
+            .find(|tunnel| {
+                tunnel.phase == Phase::Up
+                    && tunnel
+                        .details
+                        .networks
+                        .iter()
+                        .any(|network| network.selected && network.is_exit_node())
+            })
+            .map(|tunnel| tunnel.profile_id.clone())
+    })
+}
 impl Engine {
     pub(super) fn start(
         config: Config,
@@ -1113,10 +1131,11 @@ impl Engine {
         for tunnel in &tunnels {
             routes.insert(tunnel.profile_id.clone(), tunnel.routes.clone());
         }
+        let primary = carries_internet(target.primary.as_ref(), &tunnels);
         let next = Snapshot {
             version: self.published.version,
             tunnels,
-            primary: target.primary.clone(),
+            primary,
             kill_switch: self.state.kill_switch,
             kill_switch_state,
             dns,
@@ -1371,4 +1390,36 @@ fn start_hooks(
         crate::hooks::start(config_dir)?
     };
     Some((runtime, runner))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tunnel::RoutedNetwork;
+
+    fn network(range: &str, selected: bool) -> RoutedNetwork {
+        RoutedNetwork {
+            name: "Exit Node".into(),
+            range: range.into(),
+            selected,
+        }
+    }
+
+    /// A `NetBird` network whose selected exit node carries the internet is
+    /// shown as doing so; one that only offers an exit node is not, and a
+    /// tunnel owning the default route always wins.
+    #[test]
+    fn a_selected_mesh_exit_node_carries_the_internet() {
+        let mut mesh = crate::app::connection::test_view("work", Phase::Up);
+        mesh.details.networks = vec![network("0.0.0.0/0, ::/0", false)];
+        assert_eq!(carries_internet(None, std::slice::from_ref(&mesh)), None);
+
+        mesh.details.networks[0].selected = true;
+        assert_eq!(
+            carries_internet(None, std::slice::from_ref(&mesh)),
+            Some(ProfileId::new("work"))
+        );
+        let full = ProfileId::new("wg08");
+        assert_eq!(carries_internet(Some(&full), &[mesh]), Some(full));
+    }
 }
