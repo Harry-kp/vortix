@@ -46,11 +46,11 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         crate::app::FocusedPanel::Sidebar => {
             let connection_action = focused_profile_action(focused_state);
             context_hints.extend_from_slice(&[
-                ("j/k", "Navigate"),
                 ("c", connection_action),
+                ("i", "Add VPN"),
+                ("j/k", "Navigate"),
                 ("v", "View Config"),
                 ("R", "Rename"),
-                ("i", "Add VPN"),
                 ("DEL", "Delete"),
             ]);
         }
@@ -275,6 +275,25 @@ fn render_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Adding a VPN outranks navigation hints, so a common terminal width shows it.
+    #[test]
+    fn the_sidebar_footer_offers_add_a_vpn_at_97_columns() {
+        let app = App::new_test();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(97, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_dashboard(frame, &app, frame.area()))
+            .expect("footer");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("i Add VPN"), "{text}");
+    }
 
     #[test]
     fn hint_width_ascii_no_sep() {

@@ -868,19 +868,20 @@ fn sign_in(printed: &str, profile: &Profile) -> Option<String> {
 fn login_notice(link: &str, rest: &str, name: &str, timeout: Duration, opened: bool) -> String {
     let minutes = timeout.as_secs().div_ceil(60);
     let link = [link, rest].join(" ").trim().to_string();
+    // A link that returns to localhost works only in a browser on this computer.
+    let place = if link.contains("localhost") {
+        "on this computer"
+    } else {
+        "on any device"
+    };
     if opened {
         format!(
             "Sign in to '{name}' in your browser, which should have opened; Vortix connects \
-             when you are done (within {minutes} min).\n\nNo browser? Use this link:\n{link}"
-        )
-    } else if link.contains("localhost") {
-        format!(
-            "Sign in to '{name}': open this link in a browser on this computer \
-             (within {minutes} min).\n\n{link}"
+             when you are done (within {minutes} min).\n\nNo browser? Open this link {place}:\n{link}"
         )
     } else {
         format!(
-            "Sign in to '{name}': open this link in a browser on any device \
+            "Sign in to '{name}': open this link in a browser {place} \
              (within {minutes} min).\n\n{link}"
         )
     }
@@ -1159,7 +1160,10 @@ mod tests {
         assert!(opened
             .ends_with("\nhttps://idp.example/device and enter the code AB12 to authenticate."));
         let back_here = "https://idp.example/auth?redirect_uri=http%3A%2F%2Flocalhost%3A53000%2F";
-        assert!(login_notice(back_here, "", "work", LOGIN_WAIT, false).contains("on this computer"));
+        for opened in [true, false] {
+            let notice = login_notice(back_here, "", "work", LOGIN_WAIT, opened);
+            assert!(notice.contains("on this computer"), "{notice}");
+        }
         let elsewhere = login_notice(link, "", "work", LOGIN_WAIT, false);
         assert!(
             elsewhere.contains("on any device")

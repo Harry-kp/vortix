@@ -221,7 +221,7 @@ fn syscall_result(result: libc::c_int) -> std::io::Result<()> {
 /// scalar conversion and the async-signal-safe `setgroups` syscall.
 #[cfg(target_os = "macos")]
 pub(crate) fn set_process_supplementary_groups(groups: &[u32]) -> std::io::Result<()> {
-    // macOS refuses more than 16 (NGROUPS); like its `initgroups`, keep the first 16.
+    // macOS refuses more than 16 (NGROUPS); keep the first 16 of the sorted list.
     let groups = &groups[..groups.len().min(16)];
     let count =
         i32::try_from(groups.len()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
