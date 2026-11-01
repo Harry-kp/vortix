@@ -79,7 +79,8 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
     if path.is_file() {
         Ok(ImportTarget::File(path))
     } else if let Some(driver) = crate::mesh::app_driver(&path) {
-        mesh_app_profile(driver, &path).map(ImportTarget::File)
+        stage_mesh_profile(driver, &crate::mesh::profile_from_app(driver, &path)?)
+            .map(ImportTarget::File)
     } else if path.is_dir() {
         Ok(ImportTarget::Directory(path))
     } else {
@@ -110,14 +111,6 @@ fn joined_already(driver: crate::mesh::MeshDriver, profile: &str) -> Option<Stri
                 == Some(&wanted)
         })
         .map(|existing| existing.name)
-}
-
-/// Stage the profile that takes over a mesh vendor app's network.
-fn mesh_app_profile(
-    driver: crate::mesh::MeshDriver,
-    state_dir: &std::path::Path,
-) -> Result<PathBuf, String> {
-    stage_mesh_profile(driver, &crate::mesh::profile_from_app(driver, state_dir)?)
 }
 
 /// Write a generated mesh profile where downloads are staged, so both

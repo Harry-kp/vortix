@@ -370,7 +370,8 @@ impl State {
                 })
             })
             .collect();
-        let pending_endpoints = self
+        // Tunnels still starting: their transport must get out before they are up.
+        let pending: Vec<_> = self
             .tunnels
             .values()
             .filter(|tunnel| {
@@ -379,39 +380,18 @@ impl State {
                     Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
                 )
             })
+            .collect();
+        let pending_endpoints = pending
+            .iter()
             .flat_map(|tunnel| tunnel.spec.server_ips.iter().copied())
             .collect();
-        let pending_full_endpoints = self
-            .tunnels
-            .values()
-            .filter(|tunnel| {
-                matches!(
-                    tunnel.phase,
-                    Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
-                ) && crate::cidr::is_full(&tunnel.spec.routes)
-            })
+        let pending_full_endpoints = pending
+            .iter()
+            .filter(|tunnel| crate::cidr::is_full(&tunnel.spec.routes))
             .flat_map(|tunnel| tunnel.spec.server_ips.iter().copied())
             .collect();
-        let pending_group = self
-            .tunnels
-            .values()
-            .filter(|tunnel| {
-                matches!(
-                    tunnel.phase,
-                    Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
-                )
-            })
-            .find_map(|tunnel| tunnel.spec.group);
-        let pending_mark = self
-            .tunnels
-            .values()
-            .filter(|tunnel| {
-                matches!(
-                    tunnel.phase,
-                    Phase::Starting | Phase::AwaitingCredentials | Phase::Waiting { .. }
-                )
-            })
-            .find_map(|tunnel| tunnel.spec.mark);
+        let pending_group = pending.iter().find_map(|tunnel| tunnel.spec.group);
+        let pending_mark = pending.iter().find_map(|tunnel| tunnel.spec.mark);
         let dropped = self.tunnels.values().any(|tunnel| {
             tunnel.recovering.is_some() && !tunnel.signing_in && tunnel.phase != Phase::Stopping
         });
