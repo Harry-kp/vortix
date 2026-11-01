@@ -155,7 +155,9 @@ code instead.
 ## TUI density
 
 Density via signalling, not duplication. Never add a panel per tunnel; one-line
-summaries and overflow ladders fit the existing layout at 80×24 (P0-18b and P0-32 in
+summaries and overflow ladders fit the existing layout at 80×24. Status glyphs come from
+`ui/sigils.rs`, dialogs from `overlays::confirm_dialog`, scrolling lists from
+`helpers::render_scrolled`: reuse them rather than drawing your own (P0-18b and P0-32 in
 [`docs/manual-testing/P0.md`](docs/manual-testing/P0.md)).
 
 ## Tests
