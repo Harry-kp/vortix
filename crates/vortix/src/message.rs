@@ -282,7 +282,7 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
     if focused_panel.flips() {
         actions.push(ActionMenuItem {
             key: "f",
-            label: if focused_panel.flip_label() == "Routes" {
+            label: if *focused_panel == FocusedPanel::Chart {
                 "Flip: routes and peers"
             } else {
                 "Flip: why the front says that"
