@@ -6,6 +6,7 @@ use crate::control::{Phase, TunnelView};
 use crate::profile::{ProfileId, ProtocolKind};
 use crate::tunnel::DetailedConnectionInfo;
 use crate::ui::helpers;
+use crate::ui::sigils::SigilId;
 use crate::{constants, ui::theme};
 use ratatui::{
     layout::Rect,
@@ -893,25 +894,21 @@ fn scrolled(
     shown
 }
 
-/// The mark of something in use (green ●) or not (grey ○).
-fn in_use(active: bool) -> (&'static str, ratatui::style::Color) {
-    let t = theme::current();
+/// The mark of something in use or not, from the sigil catalog.
+fn in_use(active: bool) -> SigilId {
     if active {
-        ("●", t.success)
+        SigilId::InUse
     } else {
-        ("○", t.text_secondary)
+        SigilId::Unused
     }
 }
 
-/// `● text`, the mark in its colour, fitted to the panel.
-fn mark_line(
-    (mark, color): (&str, ratatui::style::Color),
-    text: String,
-    width: usize,
-) -> Line<'static> {
+/// `● text`, the sigil's mark and colour, fitted to the panel.
+fn mark_line(mark: SigilId, text: String, width: usize) -> Line<'static> {
+    let mark = crate::ui::sigils::sigil(mark);
     helpers::fit_line(
         Line::from(vec![
-            Span::styled(format!("{mark} "), Style::default().fg(color)),
+            Span::styled(format!("{} ", mark.glyph), mark.style()),
             Span::styled(text, Style::default().fg(theme::current().text_primary)),
         ]),
         width,
@@ -921,7 +918,6 @@ fn mark_line(
 /// One line per mesh peer, connected first. Zoomed: name, address, direct or
 /// relayed, latency. Narrower: the name and the one status that matters.
 fn peer_lines(peers: &[crate::tunnel::MeshPeer], width: usize) -> Vec<Line<'static>> {
-    let t = theme::current();
     let mut peers = peers.to_vec();
     peers.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
     let compact = width < FULL_COLUMNS;
@@ -934,10 +930,10 @@ fn peer_lines(peers: &[crate::tunnel::MeshPeer], width: usize) -> Vec<Line<'stat
     peers
         .iter()
         .map(|peer| {
-            let (mark, color, path) = match (peer.connected, peer.relayed) {
-                (false, _) => ("○", t.text_secondary, "offline"),
-                (true, true) => ("●", t.warning, "relayed"),
-                (true, false) => ("●", t.success, "direct"),
+            let (mark, path) = match (peer.connected, peer.relayed) {
+                (false, _) => (SigilId::Unused, "offline"),
+                (true, true) => (SigilId::Relayed, "relayed"),
+                (true, false) => (SigilId::InUse, "direct"),
             };
             let latency = peer
                 .latency
@@ -953,7 +949,7 @@ fn peer_lines(peers: &[crate::tunnel::MeshPeer], width: usize) -> Vec<Line<'stat
             } else {
                 format!("{:<16} {path:<8} {latency}", peer.address)
             };
-            mark_line((mark, color), format!("{name:<names$} {rest}"), width)
+            mark_line(mark, format!("{name:<names$} {rest}"), width)
         })
         .collect()
 }
