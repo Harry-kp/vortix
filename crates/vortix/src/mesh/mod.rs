@@ -702,12 +702,13 @@ pub fn observe(
         .and_then(|cli| status(driver, cli, &socket).ok())
         .map(MeshStatus::session)
         .unwrap_or_default();
-    if let Some(listed) = cli
+    match cli
         .as_ref()
         .and_then(|cli| run(driver, cli, &socket, driver.networks()).ok())
         .filter(crate::process::CommandOutcome::success)
     {
-        session.details.networks = driver.parse_networks(&listed.stdout_lossy());
+        Some(listed) => session.details.networks = driver.parse_networks(&listed.stdout_lossy()),
+        None => session.networks_unread = true,
     }
     session.details.interface = driver.interface().into();
     session.details.interface_authoritative = true;

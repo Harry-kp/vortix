@@ -111,6 +111,19 @@ pub(super) struct Engine {
     >,
 }
 
+/// A session whose networks could not be read keeps the last list read, so
+/// one failed read does not drop its exit node; a list read empty is kept empty.
+fn keep_unread_networks(previous: &[ActiveSession], sessions: &mut [ActiveSession]) {
+    for current in sessions
+        .iter_mut()
+        .filter(|current| current.networks_unread)
+    {
+        if let Some(before) = session(previous, &current.name) {
+            current.details.networks = before.details.networks.clone();
+        }
+    }
+}
+
 /// The tunnel internet traffic leaves through: the one owning the default
 /// route, else a mesh network whose own daemon routes it through a selected
 /// exit node (Vortix shows that, but leaves its routes to the daemon).
@@ -655,15 +668,7 @@ impl Engine {
         }
         let mut result = result;
         if let Some(previous) = &self.scan {
-            for current in &mut result.sessions {
-                if current.details.networks.is_empty() {
-                    // ponytail: one failed `networks list` reads as none; keep the last list
-                    // so the exit node does not flicker. A network losing every route waits a scan.
-                    if let Some(before) = session(&previous.sessions, &current.name) {
-                        current.details.networks = before.details.networks.clone();
-                    }
-                }
-            }
+            keep_unread_networks(&previous.sessions, &mut result.sessions);
         }
         self.scan = Some(result);
     }
@@ -1414,6 +1419,30 @@ mod tests {
             range: range.into(),
             selected,
         }
+    }
+
+    /// A failed read keeps the last networks; a list read empty (the admin
+    /// removed the exit node) clears them.
+    #[test]
+    fn only_a_failed_networks_read_keeps_the_last_list() {
+        let named = |networks: Vec<RoutedNetwork>, unread: bool| {
+            let mut session = ActiveSession {
+                name: "work".into(),
+                networks_unread: unread,
+                ..Default::default()
+            };
+            session.details.networks = networks;
+            session
+        };
+        let before = [named(vec![network("0.0.0.0/0, ::/0", true)], false)];
+
+        let mut failed = [named(Vec::new(), true)];
+        keep_unread_networks(&before, &mut failed);
+        assert_eq!(failed[0].details.networks, before[0].details.networks);
+
+        let mut removed = [named(Vec::new(), false)];
+        keep_unread_networks(&before, &mut removed);
+        assert!(removed[0].details.networks.is_empty());
     }
 
     /// A `NetBird` network whose selected exit node carries the internet is
