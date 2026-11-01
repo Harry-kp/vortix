@@ -487,7 +487,11 @@ pub mod action {
     /// long link shows on one shortened line; `c` copies all of it.
     pub fn render(frame: &mut Frame, text: &str) {
         use super::confirm_dialog::{self, ConfirmDialogConfig};
-        let inner = usize::from(WIDTH - 2);
+        let inner = usize::from(
+            WIDTH
+                .min(frame.area().width.saturating_sub(4))
+                .saturating_sub(2),
+        );
         let style = Style::default().fg(theme::current().text_primary);
         let mut body = vec![Line::from("")];
         for paragraph in text.lines() {
@@ -505,6 +509,13 @@ pub mod action {
                 None => body.extend(helpers::wrapped_lines(paragraph, inner, 0, style)),
             }
         }
+        body.push(Line::from(""));
+        body.extend(helpers::wrapped_lines(
+            "Hiding this does not stop the connect; it keeps waiting.",
+            inner,
+            0,
+            Style::default().fg(theme::current().text_secondary),
+        ));
         let height = u16::try_from(body.len() + 4).unwrap_or(u16::MAX);
         confirm_dialog::render(
             frame,
@@ -512,7 +523,8 @@ pub mod action {
                 title: " Waiting for you ",
                 body,
                 border_color: theme::current().warning,
-                confirm_selected: true,
+                // Enter hides, so Hide is the highlighted choice.
+                confirm_selected: false,
                 choices: [("C", "Copy link"), ("Esc", "Hide")],
                 width: WIDTH,
                 height,

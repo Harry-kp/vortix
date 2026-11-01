@@ -604,6 +604,7 @@ mod overlay_tests {
             "enter the code AB12",
             "[C] Copy link",
             "[Esc] Hide",
+            "keeps waiting",
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
@@ -618,6 +619,14 @@ mod overlay_tests {
             "not full width"
         );
         assert!(screen.matches('x').count() < 250, "the link is shortened");
+
+        let narrow = crate::ui::dashboard::render_to_string(60, 24, |frame, _| {
+            crate::ui::overlays::action::render(frame, &text);
+        });
+        assert!(
+            narrow.contains("enter the code AB12"),
+            "wraps to a narrow terminal: {narrow}"
+        );
 
         app.handle_key(crossterm::event::KeyEvent::from(
             crossterm::event::KeyCode::Char('c'),
