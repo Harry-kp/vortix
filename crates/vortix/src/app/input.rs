@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{App, AuthField, FocusedPanel, InputMode, ToastType};
+use super::{App, AuthField, FocusedPanel, InputMode, Selection, ToastType};
 use crate::app::state::help_max_scroll_for_terminal_height;
 use crate::constants;
 use crate::control::Phase;
@@ -432,8 +432,46 @@ impl App {
         self.handle_message(Message::CloseOverlay);
     }
 
+    /// Drag selects text, as in a terminal; returns whether the event is used up.
+    fn select_with_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let at = ratatui::layout::Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = Some(Selection {
+                    from: at,
+                    to: at,
+                    released: false,
+                });
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = &mut self.selection {
+                    selection.to = at;
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.selection = self
+                    .selection
+                    .filter(|selection| selection.from != selection.to)
+                    .map(|selection| Selection {
+                        released: true,
+                        ..selection
+                    });
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+
+        if self.select_with_mouse(mouse) {
+            return;
+        }
 
         // When an overlay is active, only route scroll to the overlay — don't
         // let mouse events pass through to panels behind it.

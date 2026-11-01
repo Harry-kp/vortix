@@ -178,6 +178,15 @@ pub struct App {
     pub panel_areas: HashMap<FocusedPanel, Rect>,
     pub toast: Option<Toast>,
     pub terminal_size: (u16, u16),
+    /// Text being selected with the mouse; copied when the button is released.
+    pub selection: Option<Selection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub from: ratatui::layout::Position,
+    pub to: ratatui::layout::Position,
+    pub released: bool,
 }
 
 impl App {
@@ -240,6 +249,7 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (0, 0),
+            selection: None,
         };
 
         // Select first profile if available
@@ -393,6 +403,7 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (80, 24),
+            selection: None,
         }
     }
 }

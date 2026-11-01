@@ -1050,6 +1050,7 @@ pub mod help {
                 ("i", "Import profile (file, dir, URL)"),
                 ("K", "Cycle kill switch mode"),
                 ("y", "Copy VPN IP to clipboard"),
+                ("Mouse drag", "Select text; release copies it"),
                 ("P", "Networks and peers of a mesh network"),
                 ("Tab/S-Tab,l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),

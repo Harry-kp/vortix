@@ -30,6 +30,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `D` | Sidebar focused: disconnect every tunnel (asks `y`/`n` when two or more are up). Elsewhere: disconnect |
 | `r` | Sidebar focused: reconnect the focused profile, or connect it if it is down. Elsewhere: reconnect |
 | `y` | Copy the VPN IP through the terminal (works over SSH) |
+| Mouse drag | Select any text on screen; releasing the button copies it through the terminal (works over SSH; needs a terminal with OSC 52 clipboard support, such as Ghostty, iTerm2, kitty or WezTerm) |
 | `P` | Networks and peers of the focused mesh network (NetBird) |
 | `i` | Import a file, directory or URL |
 | `K` | Cycle the kill-switch mode |
