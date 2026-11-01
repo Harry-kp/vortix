@@ -40,6 +40,12 @@ pub const FIREWALL_TOOL: (&str, &[&str]) = ("pfctl", &[]);
 /// Opens a link in the user's default browser.
 pub const BROWSER_OPENER: &str = "open";
 
+/// Whether a desktop is there to open a browser on: macOS always has one.
+#[must_use]
+pub fn has_desktop(_uid: u32) -> bool {
+    true
+}
+
 /// What a command run as `uid` needs to reach that user's desktop: nothing
 /// on macOS, where `open` finds the user's session itself.
 #[must_use]

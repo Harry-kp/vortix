@@ -182,6 +182,9 @@ pub struct App {
     pub terminal_size: (u16, u16),
     /// Text being selected with the mouse; copied when the button is released.
     pub selection: Option<Selection>,
+    /// Where the mouse was clicked (not dragged), for the link under it once
+    /// the frame is drawn.
+    pub(crate) click: Option<ratatui::layout::Position>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +256,7 @@ impl App {
             toast: None,
             terminal_size: (0, 0),
             selection: None,
+            click: None,
         };
 
         // Select first profile if available
@@ -408,6 +412,7 @@ impl App {
             toast: None,
             terminal_size: (80, 24),
             selection: None,
+            click: None,
         }
     }
 }

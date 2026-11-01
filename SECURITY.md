@@ -46,7 +46,9 @@ Reporters are credited in the release notes unless they prefer not to be.
   packet mark `0x1BD00`, reach any address, so under `vpn-only` anything running as group 51820
   or marking its packets so (which needs root) is let out too. The sign-in link a NetBird server
   sends (only an `https://` link) is opened in your browser as you, never as root, and kept out
-  of the log.
+  of the log. A click on an `https://` link shown in the dashboard opens it the same way, as
+  you and without a shell; with no desktop (over SSH, or Linux with no display) it is copied
+  instead.
 - **Network calls.** Vortix has no server and sends no analytics. It looks up your public
   address and its location with third-party services (by default ipinfo.io, ipwho.is,
   api.ipify.org, icanhazip.com, ifconfig.me and ident.me; see

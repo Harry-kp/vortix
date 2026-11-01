@@ -70,6 +70,8 @@ pub enum Message {
     CloseOverlay,
     /// Show toast notification
     Toast(String, ToastType),
+    /// A clicked link no browser opened: copy it instead.
+    CopyLink(String),
     /// View config for selected profile
     OpenConfig,
     /// Request delete for profile at index

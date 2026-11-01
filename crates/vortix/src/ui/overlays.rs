@@ -384,10 +384,10 @@ pub mod whats_new {
                     )));
                 }
             }
-            out.push(Line::from(Span::styled(
-                format!("Details: {}", upgrade_url()),
-                Style::default().fg(t.text_secondary),
-            )));
+            out.push(Line::from(vec![
+                Span::styled("Details: ", Style::default().fg(t.text_secondary)),
+                Span::styled(upgrade_url(), crate::ui::helpers::link_style()),
+            ]));
             out.push(Line::from(""));
         }
         out.push(Line::from(Span::styled(
@@ -400,10 +400,10 @@ pub mod whats_new {
             }
         }
         out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            format!("Full changelog: {CHANGELOG_URL}"),
-            Style::default().fg(t.text_secondary),
-        )));
+        out.push(Line::from(vec![
+            Span::styled("Full changelog: ", Style::default().fg(t.text_secondary)),
+            Span::styled(CHANGELOG_URL, crate::ui::helpers::link_style()),
+        ]));
         out
     }
 
@@ -501,7 +501,7 @@ pub mod action {
                     body.extend(helpers::wrapped_lines(before.trim(), inner, 0, style));
                     body.push(Line::styled(
                         helpers::truncate_to_width(&format!("https://{rest}"), inner),
-                        Style::default().fg(theme::current().accent_primary),
+                        helpers::link_style(),
                     ));
                     body.extend(helpers::wrapped_lines(tail.trim(), inner, 0, style));
                 }
@@ -944,6 +944,7 @@ pub mod help {
                 ("K", "Cycle kill switch mode"),
                 ("y", "Copy VPN IP to clipboard"),
                 ("Mouse drag", "Select text; release copies it"),
+                ("Click link", "Open it in your browser"),
                 ("Tab/S-Tab,l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),

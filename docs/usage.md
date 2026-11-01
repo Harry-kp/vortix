@@ -31,6 +31,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `r` | Sidebar focused: reconnect the focused profile, or connect it if it is down. Elsewhere: reconnect |
 | `y` | Copy the VPN IP through the terminal (works over SSH) |
 | Mouse drag | Select any text on screen; releasing the button copies it through the terminal (works over SSH; needs a terminal with OSC 52 clipboard support, such as Ghostty, iTerm2, kitty or WezTerm) |
+| Click a link | Links are underlined; a click opens one in your browser (as you, never as root), or copies it where no browser opens, such as over SSH |
 | `i` | Add a VPN: a file, folder, link, or `netbird` ([NetBird networks](#netbird-networks)) |
 | `K` | Cycle the kill-switch mode |
 | `j` `k` / `↓` `↑`, `g` `G`, `PgUp` `PgDn` | Move through the list |
@@ -38,7 +39,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `z` | Zoom the focused panel |
 | `f` | Flip Details to the focused tunnel's routes and peers, or Security to why its verdict says that ([Flip side](#flip-side)); in the Logs panel, cycle the source |
 | `x` / `b` | Action menu / bulk actions |
-| `R` / `v` / `Del` | Rename / view config / delete the focused profile |
+| `R` / `v` / `Del` | Rename / view config (a NetBird profile adds its client's settings from the server, private key masked) / delete the focused profile |
 | `a` / `A` | Save / clear OpenVPN credentials |
 | `s` / `/` / `p` | Sort / search / switch theme |
 | `q` | Quit |

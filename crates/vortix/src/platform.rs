@@ -4,7 +4,7 @@
 pub use crate::linux::autoconnect;
 #[cfg(target_os = "linux")]
 pub use crate::linux::{
-    clipboard_commands, desktop_env,
+    clipboard_commands, desktop_env, has_desktop,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
     os_description, BROWSER_OPENER, FIREWALL_TOOL,
 };
@@ -17,7 +17,7 @@ pub use crate::linux::{
 pub use crate::macos::autoconnect;
 #[cfg(target_os = "macos")]
 pub use crate::macos::{
-    clipboard_commands, desktop_env,
+    clipboard_commands, desktop_env, has_desktop,
     interface::{process_tun_device, tun_addresses, wireguard_started_at},
     os_description, BROWSER_OPENER, FIREWALL_TOOL,
 };
@@ -26,6 +26,33 @@ pub use crate::macos::{
     LsofSocketAudit as SocketAudit, MacDns as Dns, MacInterface as Interface,
     MacNetworkStats as NetworkStats, MacRouteTable as Routes, PfFirewall as Firewall,
 };
+
+/// Open a link in the browser of the user who ran Vortix, never as root;
+/// false when there is no such user or no desktop answered in time. `owned_by`
+/// is a file of that user's (a profile, the config folder) that proves who it is.
+#[must_use]
+pub fn open_in_browser(link: &str, owned_by: &std::path::Path) -> bool {
+    let Ok(owner) = crate::hooks::VerifiedHookOwner::for_standard_mode(owned_by) else {
+        return false;
+    };
+    let credentials = owner.credentials();
+    if !has_desktop(credentials.uid) {
+        return false;
+    }
+    let mut spec = crate::process::CommandSpec::oneshot(
+        crate::platform::BROWSER_OPENER,
+        vec![link.to_string()],
+    )
+    .redact_args(0..1)
+    .timeout(std::time::Duration::from_secs(3));
+    spec.env = crate::platform::desktop_env(credentials.uid);
+    if let Some(home) = crate::config::user_home() {
+        spec.env
+            .insert("HOME".into(), home.to_string_lossy().into());
+    }
+    let spec = spec.run_as(credentials);
+    crate::process::run(spec).is_ok_and(|outcome| outcome.success())
+}
 
 /// Whether a network interface exists; `if_nametoindex` is POSIX.
 #[must_use]
