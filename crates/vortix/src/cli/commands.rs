@@ -60,7 +60,18 @@ pub fn handle_command(
             *names_only,
             mode,
         ),
-        Commands::Import { file } => handle_import(file, config, config_dir, mode),
+        Commands::Import { file } => {
+            let Some(input) = crate::cli::args::import_input(file) else {
+                use clap::CommandFactory;
+                crate::cli::args::Args::command()
+                    .error(
+                        clap::error::ErrorKind::TooManyValues,
+                        "import takes one path (a folder adds every profile in it), or netbird and a server",
+                    )
+                    .exit()
+            };
+            handle_import(&input, config, config_dir, mode)
+        }
         Commands::Show { profile, raw } => handle_show(profile, *raw, mode),
         Commands::Delete { profile, yes } => handle_delete(profile, *yes, config_dir, mode),
         Commands::Rename { old, new } => handle_rename(old, new, config_dir, mode),
