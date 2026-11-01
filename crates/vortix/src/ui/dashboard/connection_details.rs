@@ -34,12 +34,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // Focused profile = sidebar selection, falling back to the primary if
     // nothing is selected (so the panel still has useful content when the
     // user is browsing other panels).
-    let focused_profile_id = app
-        .profile_list_state
-        .selected()
-        .and_then(|idx| app.runtime.profiles.get(idx))
-        .map(|p| p.id.clone())
-        .or_else(|| app.primary_id().cloned());
+    let focused_profile_id = app.focused_profile_id();
 
     if app.effective_flipped(&crate::app::FocusedPanel::ConnectionDetails) {
         render_back(frame, app, focused_profile_id.as_ref(), area, border_style);

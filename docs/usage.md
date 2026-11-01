@@ -31,13 +31,12 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `r` | Sidebar focused: reconnect the focused profile, or connect it if it is down. Elsewhere: reconnect |
 | `y` | Copy the VPN IP through the terminal (works over SSH) |
 | Mouse drag | Select any text on screen; releasing the button copies it through the terminal (works over SSH; needs a terminal with OSC 52 clipboard support, such as Ghostty, iTerm2, kitty or WezTerm) |
-| `P` | Networks and peers of the focused mesh network (NetBird) |
 | `i` | Add a VPN: a file, folder, link, or `netbird` ([NetBird networks](#netbird-networks)) |
 | `K` | Cycle the kill-switch mode |
 | `j` `k` / `↓` `↑`, `g` `G`, `PgUp` `PgDn` | Move through the list |
 | `Tab` / `Shift-Tab`, `l` / `h`, `F1`–`F5` | Move between panels (Profiles, Details, Chart, Security, Logs) |
 | `z` | Zoom the focused panel |
-| `f` | Flip Details or Security to the side that explains it ([Flip side](#flip-side)); in the Logs panel, cycle the source |
+| `f` | Flip Details or Security to the side that explains it, or the chart to the focused tunnel's routes and peers ([Flip side](#flip-side)); in the Logs panel, cycle the source |
 | `x` / `b` | Action menu / bulk actions |
 | `R` / `v` / `Del` | Rename / view config / delete the focused profile |
 | `a` / `A` | Save / clear OpenVPN credentials |
@@ -96,9 +95,11 @@ The footer gives the age of the readings (`Updated 12s ago`); a reading too old 
 
 ### Flip side
 
-`f` turns Details or Security over to show why its front says what it does. A panel with
+`f` turns Details or Security over to show why its front says what it does, and the chart over
+to show where the traffic goes. A panel with
 something to explain has `[f] why` in its bottom border: Security when the verdict is `PARTIAL`
-or `EXPOSED`, Details when the tunnel is degraded or its last connect failed.
+or `EXPOSED`, Details when the tunnel is degraded or its last connect failed, and the chart
+`[f] routes & peers` once the focused profile is connected.
 
 - **Evidence** (Security): each reading behind the verdict with its age: exit and real
   addresses, the resolvers the tunnel asked for against the ones in use, the kill switch
@@ -109,6 +110,11 @@ or `EXPOSED`, Details when the tunnel is degraded or its last connect failed.
   `handshake stale for 90s`), and the routes and DNS it carries. Why the last connect or
   reconnect failed stays on it until the profile comes up; a profile that never tried shows
   `No connection yet this session.`
+- **Routes & peers** (Network Throughput): the focused profile's tunnel, the same layout for
+  every VPN. Routes: what it routes (WireGuard's allowed IPs, OpenVPN's pushed routes), or a
+  mesh network's routed networks, in use or not and which is an exit node. Peers: a mesh
+  network's peers (direct or relayed, latency), connected first, else the server it talks to
+  and the last handshake. Names take the space they need, up to half the panel; `z` shows more.
 
 ### Logs
 
@@ -184,8 +190,8 @@ Security Guard checks that exit. NetBird keeps routing it; a full WireGuard or O
 connected on top takes the internet over on Linux (on macOS this is not yet verified), and the
 Security Guard shows the exit actually in use.
 NetBird sets up its own routes and DNS on `wt0` (macOS: `utun100`). One NetBird network can be
-up at a time. Connection Details shows how many peers are up; `P` lists the networks it routes
-to (in use or not, and which is an exit node), then the peers. `status --json` adds them under
+up at a time. Connection Details shows how many peers are up; the chart's back (focus the chart with `F3`,
+press `f`) lists the networks it routes to (in use or not, and which is an exit node), then the peers. `status --json` adds them under
 `network.networks` (`name`, `range`, `selected`) and `network.peers` (`name`, `address`,
 `connected`, `relayed`, `latency_ms`). Choosing networks and the exit node stays in NetBird's
 dashboard or `netbird networks select`.

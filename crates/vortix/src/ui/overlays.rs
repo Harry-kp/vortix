@@ -533,122 +533,6 @@ pub mod action {
     }
 }
 
-pub mod peers {
-    use crate::tunnel::{MeshPeer, RoutedNetwork};
-    use crate::ui::{helpers::centered_rect, theme};
-    use ratatui::{
-        style::{Modifier, Style},
-        text::{Line, Span},
-        widgets::{Block, Borders, Paragraph},
-        Frame,
-    };
-
-    /// One line per peer, connected first: name, address, direct or relayed, latency.
-    pub fn lines(peers: &[MeshPeer]) -> Vec<Line<'static>> {
-        let t = theme::current();
-        let mut peers = peers.to_vec();
-        peers.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
-        peers
-            .iter()
-            .map(|peer| {
-                let (mark, color, path) = match (peer.connected, peer.relayed) {
-                    (false, _) => ("○", t.text_secondary, "offline"),
-                    (true, true) => ("●", t.warning, "relayed"),
-                    (true, false) => ("●", t.success, "direct"),
-                };
-                let latency = peer
-                    .latency
-                    .map(|latency| format!("{} ms", latency.as_millis()))
-                    .unwrap_or_default();
-                Line::from(vec![
-                    Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::styled(
-                        format!(
-                            "{:<20} {:<16} {path:<8} {latency}",
-                            crate::ui::helpers::truncate_to_width(&peer.name, 20),
-                            peer.address
-                        ),
-                        Style::default().fg(t.text_primary),
-                    ),
-                ])
-            })
-            .collect()
-    }
-
-    /// Routed networks first: ● in use, ○ not, and which one is an exit node.
-    pub fn network_lines(networks: &[RoutedNetwork]) -> Vec<Line<'static>> {
-        let t = theme::current();
-        networks
-            .iter()
-            .map(|network| {
-                let (mark, color) = if network.selected {
-                    ("●", t.success)
-                } else {
-                    ("○", t.text_secondary)
-                };
-                let exit = if network.is_exit_node() {
-                    "  exit node"
-                } else {
-                    ""
-                };
-                Line::from(vec![
-                    Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::styled(
-                        format!(
-                            "{:<20} {}{exit}",
-                            crate::ui::helpers::truncate_to_width(&network.name, 20),
-                            network.range
-                        ),
-                        Style::default().fg(t.text_primary),
-                    ),
-                ])
-            })
-            .collect()
-    }
-
-    pub fn render(
-        frame: &mut Frame,
-        name: &str,
-        networks: &[RoutedNetwork],
-        peers: &[MeshPeer],
-        scroll: u16,
-    ) {
-        let area = centered_rect(85, 80, frame.area());
-        crate::ui::helpers::clear_area(frame, area);
-        let t = theme::current();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(t.border_focused))
-            .title(Span::styled(
-                format!(
-                    " Peers of {name} · {} ",
-                    crate::ui::helpers::peers_summary(peers)
-                ),
-                Style::default()
-                    .fg(t.border_focused)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .title_bottom(Line::from(" [Esc] Close  [↑/↓] Scroll ").centered());
-        let heading = |text: &'static str| {
-            Line::from(Span::styled(
-                text,
-                Style::default()
-                    .fg(t.text_secondary)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        };
-        let mut text = Vec::new();
-        if !networks.is_empty() {
-            text.push(heading("Networks"));
-            text.extend(network_lines(networks));
-            text.push(Line::from(""));
-            text.push(heading("Peers"));
-        }
-        text.extend(lines(peers));
-        frame.render_widget(Paragraph::new(text).block(block).scroll((scroll, 0)), area);
-    }
-}
-
 pub mod config_viewer {
     //! Config file viewer overlay
 
@@ -1060,11 +944,10 @@ pub mod help {
                 ("K", "Cycle kill switch mode"),
                 ("y", "Copy VPN IP to clipboard"),
                 ("Mouse drag", "Select text; release copies it"),
-                ("P", "Networks and peers of a mesh network"),
                 ("Tab/S-Tab,l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),
-                ("f", "Flip Details / Security: why the front says that"),
+                ("f", "Flip: Details/Security why, Chart routes & peers"),
                 ("x", "Action menu"),
                 ("b", "Bulk action menu"),
                 ("p", "Switch color theme"),
@@ -1560,7 +1443,7 @@ pub mod help {
                 .flat_map(|(_, bindings)| bindings.iter())
                 .find(|(key, _)| *key == "f")
                 .expect("f is in the help");
-            assert_eq!(flip.1, "Flip Details / Security: why the front says that");
+            assert_eq!(flip.1, "Flip: Details/Security why, Chart routes & peers");
         }
 
         #[test]

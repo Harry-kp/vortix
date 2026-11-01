@@ -2667,14 +2667,13 @@ fn declining_a_late_takeover_disconnects_the_new_tunnel() {
     assert!(declined());
 }
 
-/// The Chart has no second face: `f` there changes nothing.
+/// The Chart's back shows routes and peers: `f` flips it like Details and Security.
 #[test]
-fn f_leaves_the_chart_unflipped() {
+fn f_flips_the_chart_to_routes_and_peers() {
     let mut app = test_app();
     app.focused_panel = FocusedPanel::Chart;
     app.handle_message(Message::ToggleFlip);
-    assert!(!app.has_active_animation());
-    assert!(!app.is_flipped(&FocusedPanel::Chart));
+    assert!(app.has_active_animation());
 }
 
 fn with_action(app: &mut App, name: &str, text: Option<&str>) {

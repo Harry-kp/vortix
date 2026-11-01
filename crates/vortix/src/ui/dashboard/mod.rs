@@ -249,17 +249,6 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             driver,
             confirm_selected,
         } => render_takeover_confirm(frame, *driver, *confirm_selected),
-        InputMode::Peers { profile_id, scroll } => {
-            if let Some(tunnel) = app.tunnel(profile_id) {
-                super::overlays::peers::render(
-                    frame,
-                    &tunnel.name,
-                    &tunnel.details.networks,
-                    &tunnel.details.peers,
-                    *scroll,
-                );
-            }
-        }
         InputMode::WhatsNew { from, scroll } => {
             super::overlays::whats_new::render(frame, from, *scroll);
         }
@@ -518,44 +507,6 @@ mod overlay_tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
-    }
-
-    /// Connected peers first, each with its path; the title sums them up.
-    #[test]
-    fn peers_list_connected_first_with_their_path() {
-        let peer = |name: &str, connected, relayed| crate::tunnel::MeshPeer {
-            name: name.into(),
-            address: format!("100.90.0.{}", name.len()),
-            connected,
-            relayed,
-            latency: connected.then(|| std::time::Duration::from_millis(7)),
-        };
-        let peers = vec![
-            peer("asleep", false, false),
-            peer("db", true, true),
-            peer("ci", true, false),
-        ];
-        let lines: Vec<String> = crate::ui::overlays::peers::lines(&peers)
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert!(
-            lines[0].starts_with("● ci ")
-                && lines[0].contains("direct")
-                && lines[0].ends_with("7 ms")
-        );
-        assert!(lines[1].starts_with("● db ") && lines[1].contains("relayed"));
-        assert!(lines[2].starts_with("○ asleep ") && lines[2].contains("offline"));
-        let networks = vec![crate::tunnel::RoutedNetwork {
-            name: "exit".into(),
-            range: "0.0.0.0/0".into(),
-            selected: true,
-        }];
-        let lines: Vec<String> = crate::ui::overlays::peers::network_lines(&networks)
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert!(lines[0].starts_with("● exit ") && lines[0].ends_with("0.0.0.0/0  exit node"));
     }
 
     /// The offer to turn off the vendor's app names it, says how to bring it

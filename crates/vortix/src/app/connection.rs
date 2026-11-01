@@ -231,36 +231,6 @@ impl App {
         }
     }
 
-    /// List the peers of the focused mesh network.
-    pub(crate) fn open_peers(&mut self) {
-        let Some(profile_id) = self.selected_profile_id() else {
-            return;
-        };
-        if self.tunnel(&profile_id).is_some_and(|tunnel| {
-            !tunnel.details.peers.is_empty() || !tunnel.details.networks.is_empty()
-        }) {
-            self.input_mode = InputMode::Peers {
-                profile_id,
-                scroll: 0,
-            };
-        } else {
-            let mesh = self
-                .runtime
-                .profiles
-                .iter()
-                .find(|profile| profile.id == profile_id)
-                .filter(|profile| {
-                    matches!(profile.protocol, crate::profile::ProtocolKind::Mesh(_))
-                });
-            let text = match (mesh, self.tunnel(&profile_id)) {
-                (Some(profile), None) => format!("'{}' is not connected", profile.name),
-                (Some(profile), Some(_)) => format!("'{}' has no peers yet", profile.name),
-                (None, _) => "No peers: only a mesh network such as NetBird has them".into(),
-            };
-            self.show_toast(text, ToastType::Info);
-        }
-    }
-
     /// Open what a connect waits for the user to do, and close it once the
     /// connect no longer waits.
     fn show_action(&mut self, snapshot: &Snapshot) {
@@ -351,7 +321,14 @@ impl App {
         }
     }
 
-    fn selected_profile_id(&self) -> Option<ProfileId> {
+    /// The profile the panels describe: the sidebar's selection, else the
+    /// tunnel internet traffic goes through.
+    pub(crate) fn focused_profile_id(&self) -> Option<ProfileId> {
+        self.selected_profile_id()
+            .or_else(|| self.primary_id().cloned())
+    }
+
+    pub(crate) fn selected_profile_id(&self) -> Option<ProfileId> {
         self.profile_list_state
             .selected()
             .and_then(|index| self.runtime.profiles.get(index))

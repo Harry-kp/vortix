@@ -66,7 +66,7 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         | crate::app::FocusedPanel::Security
         | crate::app::FocusedPanel::ConnectionDetails) => {
             if panel.flips() {
-                context_hints.push(("f", "Why"));
+                context_hints.push(("f", panel.flip_label()));
             }
             context_hints.push(("z", "Zoom"));
         }

@@ -282,7 +282,11 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
     if focused_panel.flips() {
         actions.push(ActionMenuItem {
             key: "f",
-            label: "Flip: why the front says that",
+            label: if *focused_panel == FocusedPanel::Chart {
+                "Flip: routes and peers"
+            } else {
+                "Flip: why the front says that"
+            },
             message: Message::ToggleFlip,
         });
     }
@@ -346,9 +350,12 @@ mod tests {
     }
 
     #[test]
-    fn test_chart_actions_zoom_only() {
+    fn test_chart_actions_flip_and_zoom() {
         let actions = get_single_actions(&FocusedPanel::Chart);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
+        assert!(actions
+            .iter()
+            .any(|a| a.key == "f" && a.label == "Flip: routes and peers"));
         assert!(actions.iter().any(|a| a.key == "z")); // zoom
     }
 
