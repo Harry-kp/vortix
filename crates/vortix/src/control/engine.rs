@@ -603,6 +603,7 @@ impl Engine {
         self.scanning = false;
         self.next_scan = Instant::now() + SCAN_EVERY;
         if result.tunnel_observation_complete {
+            // Up since before this scan: gone, or (`true`) asking for a new sign-in.
             let lost = self
                 .state
                 .tunnels()
@@ -612,11 +613,14 @@ impl Engine {
                         .get(&tunnel.spec.profile_id)
                         .is_some_and(|up| *up < started)
                 })
-                .filter(|tunnel| session(&result.sessions, &tunnel.spec.name).is_none())
-                .map(|tunnel| tunnel.spec.profile_id.clone())
+                .filter_map(|tunnel| {
+                    let found = session(&result.sessions, &tunnel.spec.name);
+                    let sign_in = found.is_some_and(|session| session.needs_sign_in);
+                    (found.is_none() || sign_in).then(|| (tunnel.spec.profile_id.clone(), sign_in))
+                })
                 .collect::<Vec<_>>();
-            for profile_id in lost {
-                self.lost(&profile_id);
+            for (profile_id, sign_in) in lost {
+                self.lost(&profile_id, sign_in);
             }
             self.external = result
                 .sessions
@@ -681,7 +685,9 @@ impl Engine {
         }
     }
 
-    fn lost(&mut self, profile_id: &ProfileId) {
+    /// An up tunnel went down on its own, or (`sign_in`) its network asked
+    /// for a new sign-in, which reconnecting shows.
+    fn lost(&mut self, profile_id: &ProfileId, sign_in: bool) {
         self.drops = self.drops.saturating_add(1);
         let name = self.name(profile_id);
         let draining = if let Some(live) = self.live.remove(profile_id) {
@@ -703,15 +709,18 @@ impl Engine {
         self.up_at.remove(profile_id);
         let retry_at = (self.config.auto_reconnect && self.config.max_retries > 0)
             .then(|| Instant::now() + self.config.reconnect_delay);
-        self.state.lost(profile_id, retry_at, draining);
-        self.notice(
-            Level::Warning,
-            if retry_at.is_some() {
-                format!("'{name}' dropped; reconnecting")
-            } else {
-                format!("'{name}' dropped. Reconnect or disconnect it.")
-            },
-        );
+        if sign_in {
+            self.state.sign_in_again(profile_id, retry_at, draining);
+        } else {
+            self.state.lost(profile_id, retry_at, draining);
+        }
+        let text = match (sign_in, retry_at.is_some()) {
+            (true, true) => format!("'{name}' needs a new sign-in; reconnecting for a link"),
+            (true, false) => format!("'{name}' needs a new sign-in. Reconnect for a link."),
+            (false, true) => format!("'{name}' dropped; reconnecting"),
+            (false, false) => format!("'{name}' dropped. Reconnect or disconnect it."),
+        };
+        self.notice(Level::Warning, text);
         self.hook(HookEvent::Reconnecting, profile_id);
     }
 
@@ -798,8 +807,8 @@ impl Engine {
                     .begin(spec, rank, None, matches!(need, Need::Prompt(_)))
                     .is_ok()
                 {
-                    if restart.as_ref().is_some_and(|old| old.recovering.is_some()) {
-                        self.state.resume_recovery(profile_id);
+                    if let Some(old) = restart.as_ref().filter(|old| old.recovering.is_some()) {
+                        self.state.resume_recovery(profile_id, old.signing_in);
                     }
                     match need {
                         Need::Ready {

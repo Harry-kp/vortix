@@ -407,6 +407,7 @@ impl MeshStatus {
                 peers: self.peers,
                 ..Default::default()
             },
+            needs_sign_in: matches!(self.state, MeshState::NeedsLogin(_)),
             ..Default::default()
         }
     }

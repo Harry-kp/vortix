@@ -63,6 +63,9 @@ pub struct Tunnel {
     pub restart: bool,
     /// A dropped tunnel's teardown is still running; no retry until it ends.
     pub draining: bool,
+    /// Down because its network asked for a new sign-in, not a failure: the
+    /// kill switch does not block for it, so the sign-in page stays reachable.
+    pub signing_in: bool,
     /// Unexpected drops since the user connected it, and when the last one was.
     pub drops: u32,
     pub last_drop: Option<SystemTime>,
@@ -146,6 +149,7 @@ impl State {
                 recovering: None,
                 restart: false,
                 draining: false,
+                signing_in: false,
                 drops: 0,
                 last_drop: None,
             },
@@ -167,6 +171,7 @@ impl State {
                 recovering: None,
                 restart: false,
                 draining: false,
+                signing_in: false,
                 drops: 0,
                 last_drop: None,
             },
@@ -202,6 +207,7 @@ impl State {
         }
         tunnel.since = SystemTime::now();
         tunnel.recovering = None;
+        tunnel.signing_in = false;
         let Some(mut replaces) = tunnel.replaces.take() else {
             return BTreeSet::new();
         };
@@ -252,6 +258,20 @@ impl State {
             tunnel.draining = draining;
             tunnel.drops += 1;
             tunnel.last_drop = Some(tunnel.since);
+        }
+    }
+
+    /// An up tunnel whose network asks for a new sign-in: it reconnects like
+    /// a drop, but the kill switch does not count it as one.
+    pub fn sign_in_again(
+        &mut self,
+        profile_id: &ProfileId,
+        retry_at: Option<Instant>,
+        draining: bool,
+    ) {
+        self.lost(profile_id, retry_at, draining);
+        if let Some(tunnel) = self.tunnels.get_mut(profile_id) {
+            tunnel.signing_in = matches!(tunnel.phase, Phase::Waiting { .. });
         }
     }
 
@@ -321,9 +341,10 @@ impl State {
 
     /// Keep a restarted tunnel counted as dropped, so block-on-drop keeps
     /// blocking until the restart actually comes up.
-    pub fn resume_recovery(&mut self, profile_id: &ProfileId) {
+    pub fn resume_recovery(&mut self, profile_id: &ProfileId, signing_in: bool) {
         if let Some(tunnel) = self.tunnels.get_mut(profile_id) {
             tunnel.recovering = Some(0);
+            tunnel.signing_in = signing_in;
         }
     }
 
@@ -400,10 +421,9 @@ impl State {
                 )
             })
             .find_map(|tunnel| tunnel.spec.mark);
-        let dropped = self
-            .tunnels
-            .values()
-            .any(|tunnel| tunnel.recovering.is_some() && tunnel.phase != Phase::Stopping);
+        let dropped = self.tunnels.values().any(|tunnel| {
+            tunnel.recovering.is_some() && !tunnel.signing_in && tunnel.phase != Phase::Stopping
+        });
         let releasing = self
             .tunnels
             .values()
@@ -720,6 +740,54 @@ mod tests {
         assert!(!state.plan_input().dropped);
     }
 
+    /// A network asking for a new sign-in reconnects for a link, but block-on-drop
+    /// does not block: the sign-in page must stay reachable.
+    #[test]
+    fn a_new_sign_in_reconnects_without_blocking() {
+        let mut state = State {
+            kill_switch: KillSwitchMode::Auto,
+            ..State::default()
+        };
+        state
+            .begin(spec("01", "100.64.0.0/10"), 1, None, false)
+            .unwrap();
+        state.came_up(&id("01"), "wt0".into(), [], [], None);
+        state.sign_in_again(&id("01"), Some(Instant::now()), false);
+        assert!(matches!(
+            state.get(&id("01")).unwrap().phase,
+            Phase::Waiting { .. }
+        ));
+        assert!(!state.plan_input().dropped);
+        assert_eq!(state.retry(&id("01")), Some(1));
+        assert!(!state.plan_input().dropped, "nor while the reconnect runs");
+        state.came_up(&id("01"), "wt0".into(), [], [], None);
+        assert!(!state.get(&id("01")).unwrap().signing_in);
+        state.lost(&id("01"), Some(Instant::now()), false);
+        assert!(state.plan_input().dropped, "a real drop still blocks");
+    }
+
+    /// Reconnecting (`r`) a network that waits for a sign-in keeps it a
+    /// sign-in, so block-on-drop still leaves the sign-in page reachable.
+    #[test]
+    fn reconnecting_a_sign_in_keeps_it_a_sign_in() {
+        let mut state = State {
+            kill_switch: KillSwitchMode::Auto,
+            ..State::default()
+        };
+        state
+            .begin(spec("01", "100.64.0.0/10"), 1, None, false)
+            .unwrap();
+        state.came_up(&id("01"), "wt0".into(), [], [], None);
+        state.sign_in_again(&id("01"), None, false);
+        assert!(state.restart(&id("01")));
+        let old = state.stopped(&id("01")).expect("restart requested");
+        state
+            .begin(spec("01", "100.64.0.0/10"), 2, None, false)
+            .unwrap();
+        state.resume_recovery(&id("01"), old.signing_in);
+        assert!(!state.plan_input().dropped);
+    }
+
     /// The dropped tunnel's teardown removes that profile's interface and
     /// ownership files; a retry that starts before it finishes gets its new
     /// tunnel torn down by the old stop.
@@ -780,7 +848,7 @@ mod tests {
         state
             .begin(spec("01", "0.0.0.0/0"), 2, None, false)
             .unwrap();
-        state.resume_recovery(&id("01"));
+        state.resume_recovery(&id("01"), false);
         assert!(
             state.plan_input().dropped,
             "still blocking while it restarts"
