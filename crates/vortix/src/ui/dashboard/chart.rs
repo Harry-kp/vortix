@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn a_wide_chart_keeps_the_rate_labels() {
         let app = App::new_test();
-        let text = stats_line(&app, "0B", "0B", 120).to_string();
+        let text = stats_line(&app, "0 B", "0 B", 120).to_string();
         assert!(text.contains("UP:") && text.contains("DOWN:"), "{text}");
     }
 }
