@@ -385,10 +385,17 @@ impl App {
                 self.input_mode = InputMode::Peers { profile_id, scroll };
             }
             InputMode::Action { text, .. } => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
-                    self.hidden_action = Some(text);
-                } else {
-                    return;
+                match key.code {
+                    KeyCode::Char('c' | 'C') => {
+                        if let Some(link) = crate::ui::overlays::action::link(&text) {
+                            self.copy_text(link, "Copied the sign-in link".into());
+                        }
+                        return;
+                    }
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        self.hidden_action = Some(text);
+                    }
+                    _ => return,
                 }
                 self.input_mode = InputMode::Normal;
             }

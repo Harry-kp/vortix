@@ -150,7 +150,8 @@ The profile is named after its server (`netbird` for NetBird's cloud); `R` renam
 a setup key, connecting shows a sign-in box: Vortix opens the link in your browser, as you and
 never as root, and connects once you sign in, within 5 minutes. The box always shows the link
 too, to open on any device (for example over SSH, or when no browser opened), or only on this
-computer when the link returns to `localhost`; drag over it to copy. `vortix up` prints the same.
+computer when the link returns to `localhost`; `c` copies the whole link (a long one shows
+shortened). `vortix up` prints the same.
 A network you signed in to needs a new sign-in when its session ends, which NetBird's dashboard
 sets (24 hours by default). Vortix notices within seconds and, with auto-reconnect on,
 reconnects to show the sign-in box again (otherwise `r` does); `block-on-drop` does not block
