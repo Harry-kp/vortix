@@ -131,7 +131,11 @@ fn stage_mesh_profile(driver: crate::mesh::MeshDriver, profile: &str) -> Result<
         .map_err(|error| format!("cannot create the download directory: {error}"))?;
     let path = crate::config::profiles::get_unique_path(
         &dir,
-        &format!("{}.{}", driver.slug(), driver.slug()),
+        &format!(
+            "{}.{}",
+            crate::mesh::network_name(driver, profile),
+            driver.slug()
+        ),
     );
     crate::config::owned_file::open_user_file(&path, false)
         .and_then(|mut file| file.write_all(profile.as_bytes()))

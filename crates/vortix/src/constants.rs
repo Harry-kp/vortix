@@ -240,9 +240,9 @@ pub const DEFAULT_IMPORTED_FILENAME: &str = "imported_profile.conf";
 
 // === UI Labels & Titles ===
 
-pub const TITLE_IMPORT_PROFILE: &str = " Import VPN Profile ";
-pub const TITLE_IMPORT_FOOTER: &str = " [Enter] Import  [Esc] Cancel ";
-pub const PROMPT_IMPORT_PATH: &str = "Enter path to file, directory, or URL:";
+pub const TITLE_IMPORT_PROFILE: &str = " Add a VPN ";
+pub const TITLE_IMPORT_FOOTER: &str = " [Enter] Add  [Esc] Cancel ";
+pub const PROMPT_IMPORT_PATH: &str = "Paste a path, link or name:";
 
 // === Flip Panel (Back-View) Titles ===
 
@@ -256,7 +256,6 @@ pub const FLIP_BACK_HINT: &str = " [f] flip back ";
 pub const FLIP_WHY_HINT: &str = " [f] why ";
 /// Minimum panel width (columns) to render content during flip animation.
 pub const FLIP_ANIMATION_MIN_WIDTH: u16 = 3;
-pub const LABEL_SUPPORTED_FORMATS: &str = "Supported formats:";
 pub const EXT_CONF: &str = ".conf";
 pub const EXT_OVPN: &str = ".ovpn";
 
@@ -264,11 +263,8 @@ pub const EXT_OVPN: &str = ".ovpn";
 
 pub const MSG_DOWNLOADING: &str = "Downloading profile...";
 pub const MSG_DOWNLOAD_FAILED: &str = "Download failed: ";
-pub const MSG_IMPORT_SUCCESS: &str = "Imported: ";
 pub const MSG_IMPORT_ERROR: &str = "Error: ";
 pub const MSG_NO_FILES_FOUND: &str = "No .conf or .ovpn files found";
-pub const MSG_BATCH_IMPORTED: &str = "Imported ";
-pub const MSG_BATCH_IMPORTED_SUFFIX: &str = " profile(s)";
 
 // === Messages: CLI Output ===
 

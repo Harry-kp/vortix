@@ -326,22 +326,27 @@ fn render_takeover_confirm(
 ) {
     use super::overlays::confirm_dialog::{self, ConfirmDialogConfig};
     let text = |line: String| Line::from(Span::raw(line));
+    let [install, start] = crate::mesh::restore_commands(driver);
+    let title = format!(" The {driver} app is running ");
     confirm_dialog::render(
         frame,
         ConfirmDialogConfig {
-            title: " Take over from the app ",
+            title: &title,
             body: vec![
                 Line::from(""),
-                text(format!("{driver}'s own app is running, and only one")),
-                text(format!("{driver} can run at a time. Stop its service so")),
-                text("Vortix runs it from now on? Its files stay, so".into()),
-                text("reinstalling its service brings it back.".into()),
+                text(format!("Only one {driver} can run at a time.")),
+                text(format!("Vortix will turn off the app's {driver} and run")),
+                text("your network itself.".into()),
+                Line::from(""),
+                text("To use the app again later: disconnect here, then".into()),
+                text(format!("{install} &&")),
+                text(start),
             ],
             border_color: theme::current().warning,
             confirm_selected,
-            confirm_label: "Stop it",
+            confirm_label: "Turn off the app",
             width: 56,
-            height: 10,
+            height: 14,
         },
     );
 }
@@ -553,7 +558,8 @@ mod overlay_tests {
         assert!(lines[0].starts_with("● exit ") && lines[0].ends_with("0.0.0.0/0  exit node"));
     }
 
-    /// The offer to take over names the vendor and fits at 80×24.
+    /// The offer to turn off the vendor's app names it, says how to bring it
+    /// back, and fits at 80×24.
     #[test]
     fn the_take_over_offer_is_whole() {
         let mut app = App::new_test();
@@ -563,10 +569,11 @@ mod overlay_tests {
         };
         let screen = render(&mut app);
         for text in [
-            "Take over from the app",
-            "NetBird's own app is running",
-            "brings it back",
-            "Stop it",
+            "The NetBird app is running",
+            "Only one NetBird can run at a time.",
+            "sudo netbird service install &&",
+            "sudo netbird service start",
+            "Turn off the app",
         ] {
             assert!(screen.contains(text), "{text}: {screen}");
         }

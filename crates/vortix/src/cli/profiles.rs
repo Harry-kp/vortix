@@ -435,9 +435,9 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
                 if crate::mesh::app_running(driver) {
                     let [stop, uninstall] = crate::mesh::stop_commands(driver);
                     println!(
-                        "\n{driver}'s own app is running, and only one {driver} can run at a time."
+                        "\nThe {driver} app is running, and only one {driver} can run at a time."
                     );
-                    println!("Stop it so Vortix runs it: {stop} && {uninstall}");
+                    println!("Turn it off so Vortix runs your network: {stop} && {uninstall}");
                 }
                 let signs_in = std::fs::read_to_string(&profile.config_path)
                     .ok()

@@ -1047,7 +1047,7 @@ pub mod help {
                 ("d", "Disconnect focused tunnel / Cancel"),
                 ("D", "Sidebar: disconnect all (asks if 2+); else: focused"),
                 ("r", "Reconnect"),
-                ("i", "Import profile (file, dir, URL)"),
+                ("i", "Add a VPN (file, folder, link, netbird)"),
                 ("K", "Cycle kill switch mode"),
                 ("y", "Copy VPN IP to clipboard"),
                 ("Mouse drag", "Select text; release copies it"),
@@ -1799,12 +1799,8 @@ pub mod import {
             ),
             Line::from(""),
             Line::from(Span::styled(
-                "Directory paths import every supported profile.",
+                "A folder adds every profile in it.",
                 Style::default().fg(theme::current().accent_secondary),
-            )),
-            Line::from(Span::styled(
-                constants::LABEL_SUPPORTED_FORMATS,
-                Style::default().fg(theme::current().text_secondary),
             )),
             Line::from(vec![
                 Span::styled(
@@ -1812,13 +1808,11 @@ pub mod import {
                     Style::default().fg(theme::current().nord_purple),
                 ),
                 Span::styled(
-                    format!(" → {}", crate::profile::ProtocolKind::WireGuard),
+                    format!(" → {}   ", crate::profile::ProtocolKind::WireGuard),
                     Style::default().fg(theme::current().text_secondary),
                 ),
-            ]),
-            Line::from(vec![
                 Span::styled(
-                    format!("  {}", constants::EXT_OVPN),
+                    constants::EXT_OVPN,
                     Style::default().fg(theme::current().warning),
                 ),
                 Span::styled(
@@ -1828,16 +1822,21 @@ pub mod import {
             ]),
         ];
         for driver in crate::mesh::MeshDriver::ALL {
-            text.push(Line::from(vec![
-                Span::styled(
-                    format!("  {} or {}", driver.slug(), driver.app_state_dir()),
-                    Style::default().fg(theme::current().success),
-                ),
-                Span::styled(
-                    format!(" → {driver}"),
-                    Style::default().fg(theme::current().text_secondary),
-                ),
-            ]));
+            for way in [
+                format!(".{}", driver.slug()),
+                format!("{} https://server.url", driver.slug()),
+            ] {
+                text.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {way}"),
+                        Style::default().fg(theme::current().success),
+                    ),
+                    Span::styled(
+                        format!(" → {driver}"),
+                        Style::default().fg(theme::current().text_secondary),
+                    ),
+                ]));
+            }
         }
 
         frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
@@ -1865,7 +1864,8 @@ pub mod import {
             assert!(output.contains(".ovpn"), "{output}");
             assert!(output.contains("OpenVPN"), "{output}");
             assert!(
-                output.contains("netbird or /var/lib/netbird → NetBird"),
+                output.contains(".netbird → NetBird")
+                    && output.contains("netbird https://server.url → NetBird"),
                 "{output}"
             );
         }

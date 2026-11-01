@@ -205,7 +205,7 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
         FocusedPanel::Sidebar => {
             actions.push(ActionMenuItem {
                 key: "i",
-                label: "Import Profiles",
+                label: "Add a VPN",
                 message: Message::OpenImport,
             });
             actions.push(ActionMenuItem {
@@ -301,7 +301,7 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
     vec![
         ActionMenuItem {
             key: "i",
-            label: "Import Profiles",
+            label: "Add a VPN",
             message: Message::OpenImport,
         },
         ActionMenuItem {

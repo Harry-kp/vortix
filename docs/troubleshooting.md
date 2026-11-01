@@ -95,12 +95,21 @@ dashboard's Logs panel (`f` until the title names the profile).
 
 Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root only).
 
-- `timed out` after a login link: the sign-in was not finished within 5 minutes; connect
-  again for a new link, or add an `auth_key` (a setup key) to the `.netbird` file.
+- `the sign-in was not finished within 5 min`: connect again for a new link, or add an
+  `auth_key` (a setup key) to the `.netbird` file. A link that returns to `localhost` works only
+  in a browser on the computer running Vortix.
 - `timed out` with no link: the management server did not answer within the connect timeout
   (`connect_timeout`); check `server_url` and the network.
 - `another NetBird network is connected`: only one NetBird runs on a computer; disconnect the
   other network first.
+- `this NetBird server has no sign-in page`: the server has no sign-in set up, so a device joins
+  only with a setup key. Ask its admin for one and add it to the `.netbird` file as `auth_key`
+  ([NetBird networks](usage.md#netbird-networks)).
+- `the NetBird app is set up on this computer: run with sudo`: `vortix import netbird` reads the
+  app's server, which only root can; run it with `sudo`, or name the server:
+  `vortix import "netbird https://server.url"`.
+- Peers all offline after a day or so: the network's sign-in session ended (24 hours by default
+  in NetBird's dashboard). Reconnect (`r`) and sign in again.
 - `NetBird refused this device`: the setup key is expired, used up or revoked, or the
   device was removed from the NetBird dashboard. Make a new key.
 - `NetBird server: …`: `server_url` is wrong or the server is unreachable.
