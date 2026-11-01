@@ -289,7 +289,7 @@ fn render_empty_state(frame: &mut Frame, inner: Rect) {
     let empty_msg = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "No profiles yet",
+            "No VPNs yet",
             Style::default().fg(theme::current().text_secondary),
         )),
         Line::from(""),
@@ -305,7 +305,7 @@ fn render_empty_state(frame: &mut Frame, inner: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " to import",
+                " to add a VPN",
                 Style::default().fg(theme::current().key_hint_desc),
             ),
         ]),
@@ -459,7 +459,7 @@ mod tests {
 
         let out = render_to_string(&mut app, 40, 10);
         assert!(
-            out.contains("No profiles yet"),
+            out.contains("No VPNs yet"),
             "expected empty-state copy, got:\n{out}"
         );
     }
@@ -499,7 +499,7 @@ mod tests {
         ];
 
         let out = render_to_string(&mut app, 60, 10);
-        assert!(!out.contains("No profiles yet"), "got:\n{out}");
+        assert!(!out.contains("No VPNs yet"), "got:\n{out}");
         assert!(out.contains("alpha"), "alpha row missing:\n{out}");
         assert!(out.contains("bravo"), "bravo row missing:\n{out}");
         assert!(out.contains("charlie"), "charlie row missing:\n{out}");

@@ -39,6 +39,9 @@ pub fn os_description() -> String {
 /// The kill-switch firewall tool and its version flag.
 pub const FIREWALL_TOOL: (&str, &[&str]) = ("nft", &["--version"]);
 
+/// Opens a link in the user's default browser.
+pub const BROWSER_OPENER: &str = "xdg-open";
+
 /// Clipboard writers to try, in order: the session's own first.
 #[must_use]
 pub fn clipboard_commands() -> Vec<&'static str> {

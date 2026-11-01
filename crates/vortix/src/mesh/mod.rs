@@ -213,6 +213,8 @@ struct AppInstall {
     /// Its CLI's arguments that stop its service, then keep it stopped after
     /// a reboot.
     stop: [&'static [&'static str]; 2],
+    /// Its CLI's arguments that bring its service back.
+    restore: [&'static [&'static str]; 2],
 }
 
 /// The daemon's program, arguments and environment.
@@ -286,23 +288,73 @@ pub fn app_driver(dir: &Path) -> Option<MeshDriver> {
 }
 
 /// `netbird` or `netbird https://nb.example.com`, typed where a file would go:
-/// a profile for that network that signs in on first connect.
+/// a profile for that network that signs in on first connect. With no server,
+/// the one the vendor's app on this computer uses, else its hosted service.
 #[must_use]
 pub fn profile_from_words(words: &str) -> Option<(MeshDriver, Result<String, String>)> {
+    profile_from_words_in(words, Path::new("/"))
+}
+
+fn profile_from_words_in(words: &str, root: &Path) -> Option<(MeshDriver, Result<String, String>)> {
     let mut words = words.split_whitespace();
     let first = words.next()?;
     let driver = MeshDriver::ALL
         .into_iter()
         .find(|driver| first.eq_ignore_ascii_case(driver.slug()))?;
-    let profile = MeshProfile {
-        server_url: words.next().unwrap_or(driver.default_server()).to_string(),
-        auth_key: None,
-        identity: None,
+    let server_url = match words.next() {
+        Some(url) => Ok(url.to_string()),
+        None => app_server(
+            driver,
+            &root.join(driver.app_state_dir().trim_start_matches('/')),
+        )
+        .map(|server| server.unwrap_or_else(|| driver.default_server().to_string())),
     };
-    let text = profile
-        .server()
-        .and_then(|_| toml::to_string(&profile).map_err(|error| error.to_string()));
+    let text = server_url.and_then(|server_url| {
+        let profile = MeshProfile {
+            server_url,
+            auth_key: None,
+            identity: None,
+        };
+        profile.server()?;
+        toml::to_string(&profile).map_err(|error| error.to_string())
+    });
     Some((driver, text))
+}
+
+/// The server the vendor's app uses, when the app is set up on this computer.
+fn app_server(driver: MeshDriver, dir: &Path) -> Result<Option<String>, String> {
+    if let Err(error) = std::fs::read_dir(dir) {
+        return match error.kind() {
+            std::io::ErrorKind::PermissionDenied => Err(format!(
+                "the {driver} app is set up on this computer: run with sudo to use its \
+                 server, or name one: {} https://server.url",
+                driver.slug()
+            )),
+            _ => Ok(None),
+        };
+    }
+    Ok(driver.profile_from_app(dir).ok().map(|app| app.server_url))
+}
+
+/// A new network's name: its server's host, or the vendor's for its hosted
+/// service.
+#[must_use]
+pub fn network_name(driver: MeshDriver, profile: &str) -> String {
+    let host = |server_url: &str| {
+        MeshProfile {
+            server_url: server_url.into(),
+            auth_key: None,
+            identity: None,
+        }
+        .server()
+        .ok()
+        .map(|(host, _)| host)
+    };
+    MeshProfile::parse(profile)
+        .ok()
+        .and_then(|profile| host(&profile.server_url))
+        .filter(|server| Some(server) != host(driver.default_server()).as_ref())
+        .unwrap_or_else(|| driver.slug().to_string())
 }
 
 /// The profile file that moves the vendor app's active network here.
@@ -536,10 +588,16 @@ impl MeshTunnel {
         let outcome = std::thread::scope(|scope| {
             scope.spawn(|| {
                 for line in printed {
-                    if let Some(text) = login_notice(&line, &profile.display_name, LOGIN_WAIT) {
+                    if let Some(link) = login_link(&line) {
                         signing_in.store(true, Ordering::Release);
+                        let opened = open_in_browser(link, &profile.config_path);
                         if let Some(progress) = progress {
-                            let _ = progress.send(text);
+                            let _ = progress.send(login_notice(
+                                link,
+                                &profile.display_name,
+                                LOGIN_WAIT,
+                                opened,
+                            ));
                         }
                     }
                 }
@@ -653,10 +711,17 @@ pub fn app_running(driver: MeshDriver) -> bool {
 /// What a user types to stop the vendor app's service and keep it stopped.
 #[must_use]
 pub fn stop_commands(driver: MeshDriver) -> [String; 2] {
-    driver
-        .app()
-        .stop
-        .map(|args| format!("sudo {} {}", driver.slug(), args.join(" ")))
+    typed(driver, driver.app().stop)
+}
+
+/// What a user types to bring the vendor app's service back.
+#[must_use]
+pub fn restore_commands(driver: MeshDriver) -> [String; 2] {
+    typed(driver, driver.app().restore)
+}
+
+fn typed(driver: MeshDriver, commands: [&[&str]; 2]) -> [String; 2] {
+    commands.map(|args| format!("sudo {} {}", driver.slug(), args.join(" ")))
 }
 
 /// Stop the vendor app's service and keep it stopped after a reboot. Its
@@ -775,15 +840,45 @@ fn status(driver: MeshDriver, cli: &Path, socket: &Path) -> Result<MeshStatus, T
         .map_err(|error| TunnelError::MalformedStatus(format!("{} status: {error}", driver.slug())))
 }
 
-/// What to tell the user when the client prints its login link.
-fn login_notice(line: &str, name: &str, timeout: Duration) -> Option<String> {
-    let line = line.trim();
-    line.starts_with("https://").then(|| {
+/// The sign-in link in a line the client prints, if it is one.
+fn login_link(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .next()
+        .filter(|word| word.starts_with("https://"))
+}
+
+/// What to tell the user once the client prints its sign-in link.
+fn login_notice(link: &str, name: &str, timeout: Duration, opened: bool) -> String {
+    let minutes = timeout.as_secs().div_ceil(60);
+    if opened {
         format!(
-            "Log in to '{name}' within {}s: open {line}",
-            timeout.as_secs()
+            "Sign in to '{name}' in the browser that just opened; Vortix connects when you \
+             are done (within {minutes} min).\n\nBrowser didn't open? Use this link:\n{link}"
         )
-    })
+    } else {
+        format!(
+            "Sign in to '{name}': open this link in a browser on any device \
+             (within {minutes} min).\n\n{link}"
+        )
+    }
+}
+
+/// Open the sign-in link in the browser of the user who ran Vortix, never as
+/// root; false when there is no such user or no desktop here.
+fn open_in_browser(link: &str, profile_path: &Path) -> bool {
+    if std::env::var_os("SSH_CONNECTION").is_some() {
+        return false;
+    }
+    let Ok(owner) = crate::hooks::VerifiedHookOwner::for_standard_mode(profile_path) else {
+        return false;
+    };
+    let spec = crate::process::CommandSpec::oneshot(
+        crate::platform::BROWSER_OPENER,
+        vec![link.to_string()],
+    )
+    .run_as(owner.credentials())
+    .timeout(Duration::from_secs(10));
+    crate::process::run(spec).is_ok_and(|outcome| outcome.success())
 }
 
 fn up_failure(
@@ -811,6 +906,12 @@ fn up_failure(
         return TunnelError::Other(format!(
             "the {name} server {} cannot be reached: check its address and the network",
             status.server
+        ));
+    }
+    if stderr.contains("no peer auth method provided") {
+        return TunnelError::AuthFailed(format!(
+            "this {name} server has no sign-in page: ask its admin for a setup key and add it \
+             to the profile as auth_key"
         ));
     }
     if let MeshState::NeedsLogin(why) = &status.state {
@@ -942,8 +1043,9 @@ mod tests {
     /// self-hosted one. Anything else is not a mesh network.
     #[test]
     fn a_network_is_added_by_name() {
+        let nothing_installed = tempfile::tempdir().unwrap();
         let profile = |words: &str| {
-            let (driver, text) = profile_from_words(words)?;
+            let (driver, text) = profile_from_words_in(words, nothing_installed.path())?;
             Some((driver, MeshProfile::parse(&text.ok()?).ok()?.server_url))
         };
         assert_eq!(
@@ -963,20 +1065,71 @@ mod tests {
         assert!(profile_from_words("").is_none());
     }
 
+    /// A bare name joins the server the vendor's app here uses; a server
+    /// named after it always wins.
     #[test]
-    fn only_the_login_link_becomes_a_notice() {
-        let notice = |line| login_notice(line, "work", Duration::from_secs(60));
+    fn a_bare_name_uses_the_apps_server_when_the_app_is_set_up() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("var/lib/netbird");
+        std::fs::create_dir_all(&app).unwrap();
+        let server = |words: &str| {
+            let (_, text) = profile_from_words_in(words, root.path()).unwrap();
+            text.map(|text| MeshProfile::parse(&text).unwrap().server_url)
+        };
         assert_eq!(
-            notice("https://idp.example/device?code=AB12 and enter the code AB12 to authenticate."),
-            Some(
-                "Log in to 'work' within 60s: open https://idp.example/device?code=AB12 \
-                 and enter the code AB12 to authenticate."
-                    .into()
-            )
+            server("netbird").unwrap(),
+            "https://api.netbird.io",
+            "not set up"
+        );
+        std::fs::write(
+            app.join("default.json"),
+            r#"{"ManagementURL": {"Scheme": "https", "Host": "nb.corp.example:443"}}"#,
+        )
+        .unwrap();
+        assert_eq!(server("netbird").unwrap(), "https://nb.corp.example:443");
+        assert_eq!(
+            server("netbird https://other.example").unwrap(),
+            "https://other.example"
+        );
+
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = server("netbird");
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !crate::platform::is_root() {
+            assert!(unreadable.unwrap_err().contains("run with sudo"));
+        }
+    }
+
+    #[test]
+    fn a_network_is_named_after_its_server() {
+        let name =
+            |url: &str| network_name(MeshDriver::NetBird, &format!("server_url = \"{url}\"\n"));
+        assert_eq!(name("https://spider.example.com"), "spider.example.com");
+        assert_eq!(name("https://nb.corp.example:33073"), "nb.corp.example");
+        assert_eq!(
+            name("https://api.netbird.io"),
+            "netbird",
+            "the hosted service"
+        );
+        assert_eq!(network_name(MeshDriver::NetBird, "not toml"), "netbird");
+    }
+
+    #[test]
+    fn only_the_sign_in_link_becomes_a_notice() {
+        assert_eq!(
+            login_link("https://idp.example/device?code=AB12 and enter the code AB12"),
+            Some("https://idp.example/device?code=AB12")
         );
         for other in ["Use this URL to log in:", "", "Connected", "http://plain"] {
-            assert_eq!(notice(other), None, "{other}");
+            assert_eq!(login_link(other), None, "{other}");
         }
+        let link = "https://idp.example/device?code=AB12";
+        let opened = login_notice(link, "work", LOGIN_WAIT, true);
+        assert!(opened.starts_with("Sign in to 'work' in the browser that just opened"));
+        assert!(opened.contains("(within 5 min)") && opened.ends_with(&format!("\n{link}")));
+        let elsewhere = login_notice(link, "work", LOGIN_WAIT, false);
+        assert!(elsewhere.contains("on any device") && elsewhere.ends_with(&format!("\n{link}")));
     }
 
     #[test]
@@ -1026,6 +1179,17 @@ mod tests {
         assert!(
             unreachable.to_string().contains("cannot be reached"),
             "{unreachable}"
+        );
+        let no_sign_in = failure(
+            MeshState::NeedsLogin("NeedsLogin".into()),
+            "",
+            "Error: login failed: rpc error: code = Unknown desc = no peer auth method provided, please use a setup key or interactive SSO login",
+        );
+        assert!(
+            no_sign_in
+                .to_string()
+                .contains("has no sign-in page: ask its admin for a setup key"),
+            "{no_sign_in}"
         );
     }
 

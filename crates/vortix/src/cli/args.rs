@@ -230,8 +230,9 @@ pub enum Commands {
     ///
     /// Supports `.conf` (`WireGuard`), `.ovpn` (`OpenVPN`), `.netbird` (`NetBird`), directories
     /// for bulk import, and http/https URLs for remote config download. For `NetBird`, `netbird`
-    /// adds a network that signs in on first connect, and `/var/lib/netbird` moves the `NetBird`
-    /// app's network here.
+    /// adds the network of the `NetBird` app on this computer (else `NetBird`'s cloud) and
+    /// `netbird <server URL>` a company's own, each signing in on first connect;
+    /// `/var/lib/netbird` moves the app's network here with its device and login.
     ///
     /// EXAMPLES:
     ///     vortix import ./work.conf             Import a `WireGuard` profile

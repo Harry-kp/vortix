@@ -349,28 +349,26 @@ impl App {
             InputMode::ConfirmTakeover {
                 driver,
                 mut confirm_selected,
-            } => {
-                match handle_confirm_keys(key, &mut confirm_selected) {
-                    ConfirmAction::Confirmed => {
-                        self.input_mode = InputMode::Normal;
-                        self.take_over_app(driver);
-                    }
-                    ConfirmAction::Cancelled => {
-                        self.input_mode = InputMode::Normal;
-                        let [stop, uninstall] = crate::mesh::stop_commands(driver);
-                        self.show_toast(
-                        format!("{driver} can't connect beside its app. Later: {stop} && {uninstall}"),
+            } => match handle_confirm_keys(key, &mut confirm_selected) {
+                ConfirmAction::Confirmed => {
+                    self.input_mode = InputMode::Normal;
+                    self.take_over_app(driver);
+                }
+                ConfirmAction::Cancelled => {
+                    self.input_mode = InputMode::Normal;
+                    let [stop, uninstall] = crate::mesh::stop_commands(driver);
+                    self.show_toast(
+                        format!("{driver} can't connect while its app runs. To turn the app off: {stop} && {uninstall}"),
                         ToastType::Info,
                     );
-                    }
-                    ConfirmAction::None => {
-                        self.input_mode = InputMode::ConfirmTakeover {
-                            driver,
-                            confirm_selected,
-                        };
-                    }
                 }
-            }
+                ConfirmAction::None => {
+                    self.input_mode = InputMode::ConfirmTakeover {
+                        driver,
+                        confirm_selected,
+                    };
+                }
+            },
             InputMode::Peers {
                 profile_id,
                 mut scroll,

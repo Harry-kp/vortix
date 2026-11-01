@@ -32,7 +32,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `y` | Copy the VPN IP through the terminal (works over SSH) |
 | Mouse drag | Select any text on screen; releasing the button copies it through the terminal (works over SSH; needs a terminal with OSC 52 clipboard support, such as Ghostty, iTerm2, kitty or WezTerm) |
 | `P` | Networks and peers of the focused mesh network (NetBird) |
-| `i` | Import a file, directory or URL |
+| `i` | Add a VPN: a file, folder, link, or `netbird` ([NetBird networks](#netbird-networks)) |
 | `K` | Cycle the kill-switch mode |
 | `j` `k` / `↓` `↑`, `g` `G`, `PgUp` `PgDn` | Move through the list |
 | `Tab` / `Shift-Tab`, `l` / `h`, `F1`–`F5` | Move between panels (Profiles, Details, Chart, Security, Logs) |
@@ -137,29 +137,36 @@ use [hooks](configuration.md#hooks) instead.
 ### NetBird networks
 
 NetBird's `netbird` command must be installed (`brew install netbirdio/tap/netbird` on macOS;
-on Linux, NetBird's installer). There are two ways in, both from Import (`i`, or
-`sudo vortix import`):
+on Linux, NetBird's installer). Add a network from Add a VPN (`i`, or `sudo vortix import`):
 
-- **Moving from the NetBird app:** import `/var/lib/netbird`. Its active network becomes the
-  profile `netbird`, and the first connect keeps the same device, address and login. Only one
-  NetBird runs at a time, so the dashboard then offers to stop the app's own service (the CLI
-  prints the two commands: `sudo netbird service stop && sudo netbird service uninstall`).
-  Quit and remove the NetBird desktop app too; on macOS install the `netbird` command first,
-  because the app carries it (`/usr/local/bin/netbird` points into `NetBird.app`). To go back,
-  disconnect in Vortix and run `sudo netbird service install && sudo netbird service start`;
-  the app's own files are never changed.
-- **A new network:** import `netbird` (NetBird's hosted service) or
-  `netbird https://netbird.example.com` (your own). The first connect shows a sign-in link:
-  `vortix up` prints it and the dashboard shows it until you finish, and you have 5 minutes
-  (from a terminal; a script's `--timeout` holds).
+| Type | Network |
+|---|---|
+| `netbird` | The server the NetBird app on this computer uses, if it is set up here; otherwise NetBird's cloud |
+| `netbird https://server.url` | That server: a company's own NetBird (a port may follow, e.g. `:33073`) |
+| a `.netbird` file | The server and setup key in it (below) |
 
-A profile is a `.netbird` file, so it can also be written by hand, for example with a setup key
-from the NetBird dashboard so no sign-in is needed:
+The profile is named after its server (`netbird` for NetBird's cloud); `R` renames it. Without
+a setup key, connecting shows a sign-in box: Vortix opens the link in your browser, as you and
+never as root, and connects once you sign in, within 5 minutes. Over SSH, or with no desktop,
+the box shows the link to open on any device; drag over it to copy. `vortix up` prints the same.
+A network you signed in to needs a new sign-in when its session ends, which NetBird's dashboard
+sets (24 hours by default): its peers go offline, and reconnecting (`r`) shows a new link.
+
+A `.netbird` file can carry a setup key from the NetBird dashboard, so no sign-in is needed;
+NetBird meant these for servers, not people's own computers:
 
 ```toml
 server_url = "https://api.netbird.io"   # its management server, or your own
 auth_key = "…"                         # optional: a setup key
 ```
+
+Only one NetBird runs at a time. If the NetBird app's service is running, the dashboard offers
+to turn it off (the CLI prints the two commands: `sudo netbird service stop && sudo netbird
+service uninstall`); `sudo netbird service install && sudo netbird service start` brings it
+back. To keep the app's device and login instead of signing in again, add the app's folder:
+`sudo vortix import /var/lib/netbird`. Quit and remove the NetBird desktop app too; on macOS
+install the `netbird` command first, because the app carries it (`/usr/local/bin/netbird` points
+into `NetBird.app`). The app's own files are never changed.
 
 After that, `up`, `down`, `status`, the dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`)
 work as for any profile. Vortix runs NetBird's own client with this network's identity in

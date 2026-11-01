@@ -37,6 +37,9 @@ pub fn os_description() -> String {
 /// The kill-switch firewall tool and its version flag (none for `pfctl`).
 pub const FIREWALL_TOOL: (&str, &[&str]) = ("pfctl", &[]);
 
+/// Opens a link in the user's default browser.
+pub const BROWSER_OPENER: &str = "open";
+
 /// Clipboard writers to try, in order.
 #[must_use]
 pub fn clipboard_commands() -> Vec<&'static str> {

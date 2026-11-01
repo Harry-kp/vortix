@@ -50,7 +50,7 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
                 ("c", connection_action),
                 ("v", "View Config"),
                 ("R", "Rename"),
-                ("i", "Import"),
+                ("i", "Add VPN"),
                 ("DEL", "Delete"),
             ]);
         }

@@ -277,15 +277,15 @@ impl App {
     /// Stop a mesh vendor app's service, off the UI thread.
     pub(crate) fn take_over_app(&mut self, driver: crate::mesh::MeshDriver) {
         let tx = self.runtime.cmd_tx.clone();
-        self.show_toast(format!("Stopping {driver}'s own service…"), ToastType::Info);
+        self.show_toast(format!("Turning off the {driver} app…"), ToastType::Info);
         std::thread::spawn(move || {
             let toast = match crate::mesh::stop_app(driver) {
                 Ok(()) => (
-                    format!("{driver}'s own service is stopped. Connect to go on."),
+                    format!("The {driver} app is off. Press c to connect."),
                     ToastType::Success,
                 ),
                 Err(error) => (
-                    format!("Could not stop {driver}: {error}"),
+                    format!("Could not turn off the {driver} app: {error}"),
                     ToastType::Error,
                 ),
             };
@@ -302,7 +302,10 @@ impl App {
                 self.sync_profiles();
 
                 self.show_toast(
-                    format!("{}{}", constants::MSG_IMPORT_SUCCESS, name),
+                    format!(
+                        "Added '{}' · c to connect · R to rename",
+                        crate::ui::helpers::truncate_to_width(&name, 24)
+                    ),
                     ToastType::Success,
                 );
                 Some(name)
@@ -339,14 +342,9 @@ impl App {
                 // Show summary feedback
                 if imported > 0 {
                     let msg = if failed > 0 {
-                        format!("Imported {imported} profile(s), {failed} failed")
+                        format!("Added {imported} profile(s), {failed} failed")
                     } else {
-                        format!(
-                            "{}{}{}",
-                            constants::MSG_BATCH_IMPORTED,
-                            imported,
-                            constants::MSG_BATCH_IMPORTED_SUFFIX
-                        )
+                        format!("Added {imported} profile(s) · c to connect")
                     };
                     let t_type = if failed > imported {
                         ToastType::Warning

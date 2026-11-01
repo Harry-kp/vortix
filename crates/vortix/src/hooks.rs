@@ -199,6 +199,12 @@ mod runner {
             })
         }
 
+        /// The identity a command run as this owner takes.
+        #[must_use]
+        pub fn credentials(&self) -> ProcessCredentials {
+            self.credentials.clone()
+        }
+
         #[cfg(test)]
         fn from_ids(uid: u32, gid: u32) -> Self {
             Self {
