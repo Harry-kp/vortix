@@ -1359,7 +1359,11 @@ pub mod help {
     fn build_sigils_lines() -> Vec<Line<'static>> {
         let mut lines: Vec<Line> = Vec::with_capacity(CATALOG.len() * 2 + 6);
 
-        for category in [SigilCategory::Sidebar, SigilCategory::SecurityGuard] {
+        for category in [
+            SigilCategory::Sidebar,
+            SigilCategory::SecurityGuard,
+            SigilCategory::RoutesAndPeers,
+        ] {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("  {}", category_title(category)),
@@ -1380,6 +1384,7 @@ pub mod help {
         match c {
             SigilCategory::Sidebar => "Sidebar (per-tunnel badges + suffixes)",
             SigilCategory::SecurityGuard => "Security Guard (per-row sigils)",
+            SigilCategory::RoutesAndPeers => "Routes & peers (Details' back)",
         }
     }
 

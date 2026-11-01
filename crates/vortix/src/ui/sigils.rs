@@ -50,6 +50,14 @@ pub enum SigilId {
     SgAlarmWarn,
     /// `✗` red bold — SG row alarm, real problem (leak, etc.).
     SgAlarmError,
+
+    // ── Routes & peers (Details' back) ────────────────────────────────
+    /// `●` green — a route in use, a peer reached directly.
+    InUse,
+    /// `●` yellow — a peer reached through a relay.
+    Relayed,
+    /// `○` dim — a route not in use, a peer offline.
+    Unused,
 }
 
 /// A single sigil's visual + textual identity. Theme colors are resolved when
@@ -84,6 +92,8 @@ pub enum SigilCategory {
     Sidebar,
     /// Security Guard panel row sigils.
     SecurityGuard,
+    /// Routes and peers on Details' back.
+    RoutesAndPeers,
 }
 
 impl Sigil {
@@ -271,6 +281,36 @@ pub const CATALOG: &[Sigil] = &[
         dim: false,
         category: SigilCategory::SecurityGuard,
     },
+    Sigil {
+        id: SigilId::InUse,
+        glyph: "\u{25cf}",
+        label: "In use",
+        description: "A route the network uses, or a peer reached directly.",
+        color: success_color,
+        bold: false,
+        dim: false,
+        category: SigilCategory::RoutesAndPeers,
+    },
+    Sigil {
+        id: SigilId::Relayed,
+        glyph: "\u{25cf}",
+        label: "Relayed",
+        description: "A peer reached through a relay server, not directly: slower.",
+        color: warning_color,
+        bold: false,
+        dim: false,
+        category: SigilCategory::RoutesAndPeers,
+    },
+    Sigil {
+        id: SigilId::Unused,
+        glyph: "\u{25cb}",
+        label: "Not in use",
+        description: "A route the network offers but does not use, or a peer that is offline.",
+        color: inactive_color,
+        bold: false,
+        dim: false,
+        category: SigilCategory::RoutesAndPeers,
+    },
 ];
 
 #[cfg(test)]
@@ -301,6 +341,9 @@ mod tests {
             SigilId::SgNotApplicable,
             SigilId::SgAlarmWarn,
             SigilId::SgAlarmError,
+            SigilId::InUse,
+            SigilId::Relayed,
+            SigilId::Unused,
         ];
         // Exhaustive-match guard: if you add a SigilId variant and
         // forget to add it to `all_ids`, this match arm forces you
@@ -323,6 +366,9 @@ mod tests {
                 SigilId::SgNotApplicable => (),
                 SigilId::SgAlarmWarn => (),
                 SigilId::SgAlarmError => (),
+                SigilId::InUse => (),
+                SigilId::Relayed => (),
+                SigilId::Unused => (),
             }
         }
 
