@@ -446,12 +446,11 @@ sudo dnf install {pkg}  # Fedora"
 
 /// The package a protocol's own tool comes in: what `check_dependencies`
 /// reports when it is missing.
-fn vpn_tool(protocol: crate::profile::ProtocolKind) -> &'static str {
+fn vpn_tool(protocol: crate::profile::ProtocolKind) -> (&'static str, Vec<&'static str>) {
     match protocol {
-        // `wg` and `wg-quick` ship together in wireguard-tools.
-        crate::profile::ProtocolKind::WireGuard => "wireguard-tools",
-        crate::profile::ProtocolKind::OpenVpn => "openvpn",
-        crate::profile::ProtocolKind::Mesh(driver) => driver.slug(),
+        crate::profile::ProtocolKind::WireGuard => ("wireguard-tools", vec!["wg-quick", "wg"]),
+        crate::profile::ProtocolKind::OpenVpn => ("openvpn", vec!["openvpn"]),
+        crate::profile::ProtocolKind::Mesh(driver) => (driver.slug(), vec![driver.slug()]),
     }
 }
 
@@ -459,12 +458,8 @@ fn vpn_tool(protocol: crate::profile::ProtocolKind) -> &'static str {
 /// `PATH` lookup only.
 #[must_use]
 pub fn vpn_tool_missing(protocol: crate::profile::ProtocolKind) -> Option<&'static str> {
-    let installed = match protocol {
-        crate::profile::ProtocolKind::WireGuard => binary_exists("wg-quick") && binary_exists("wg"),
-        crate::profile::ProtocolKind::OpenVpn => binary_exists("openvpn"),
-        crate::profile::ProtocolKind::Mesh(driver) => binary_exists(driver.slug()),
-    };
-    (!installed).then(|| vpn_tool(protocol))
+    let (package, binaries) = vpn_tool(protocol);
+    (!binaries.into_iter().all(binary_exists)).then_some(package)
 }
 
 /// What to tell a user whose profile needs `missing`: the VPN is not
@@ -481,7 +476,7 @@ pub fn missing_tools_message(
         .join("\n");
     match missing {
         [] => None,
-        [tool] if tool == vpn_tool(protocol) => {
+        [tool] if tool == vpn_tool(protocol).0 => {
             Some(format!("{protocol} isn't installed. Install it: {hints}"))
         }
         _ => Some(format!(
@@ -502,10 +497,12 @@ pub fn check_dependencies(
     protocol: crate::profile::ProtocolKind,
     config_path: &std::path::Path,
 ) -> Vec<String> {
-    let mut missing = Vec::new();
+    let mut missing: Vec<String> = vpn_tool_missing(protocol)
+        .map(str::to_string)
+        .into_iter()
+        .collect();
     match protocol {
         crate::profile::ProtocolKind::WireGuard => {
-            missing.extend(vpn_tool_missing(protocol).map(str::to_string));
             // `DNS =` is stripped before wg-quick runs; Vortix applies it
             // through `resolvectl`, else `resolvconf` (the same choice as
             // `linux::dns`). A DNS profile with neither cannot be honoured.
@@ -539,9 +536,7 @@ pub fn check_dependencies(
             #[cfg(not(target_os = "linux"))]
             let _ = config_path; // suppress unused warning on non-Linux
         }
-        crate::profile::ProtocolKind::Mesh(_) => {
-            missing.extend(vpn_tool_missing(protocol).map(str::to_string));
-        }
+        crate::profile::ProtocolKind::Mesh(_) => {}
         crate::profile::ProtocolKind::OpenVpn => {
             if crate::platform::binary_exists("openvpn") {
                 // Assert OpenVPN ≥ 2.4 so `--pull-filter` (multi-tunnel
@@ -568,8 +563,6 @@ pub fn check_dependencies(
                         );
                     }
                 }
-            } else {
-                missing.push(vpn_tool(protocol).to_string());
             }
         }
     }
