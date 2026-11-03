@@ -240,6 +240,10 @@ pub(super) fn run_on(
 fn failure_code(message: &str) -> (&'static str, ExitCode) {
     if message.contains("timed out") || message.contains("did not come up in time") {
         ("timeout", ExitCode::Timeout)
+    } else if message.contains("isn't installed. Install it:")
+        || message.contains("Missing dependencies:")
+    {
+        ("dependency_missing", ExitCode::DependencyMissing)
     } else if message.contains("can run at a time") {
         // Another network of the same kind, or its vendor's own app, holds it.
         ("state_conflict", ExitCode::StateConflict)
@@ -837,6 +841,18 @@ mod tests {
         assert_eq!(
             (code, exit as i32),
             ("state_conflict", ExitCode::StateConflict as i32)
+        );
+    }
+
+    /// A VPN whose tool is missing exits 5, as the CLI's own check does.
+    #[test]
+    fn a_missing_tool_from_the_engine_exits_with_the_dependency_code() {
+        let (code, exit) = failure_code(
+            "Could not connect 'nb': NetBird isn't installed. Install it: brew install netbirdio/tap/netbird",
+        );
+        assert_eq!(
+            (code, exit as i32),
+            ("dependency_missing", ExitCode::DependencyMissing as i32)
         );
     }
 

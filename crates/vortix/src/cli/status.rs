@@ -205,6 +205,7 @@ struct PeerEntry {
     name: String,
     address: String,
     connected: bool,
+    idle: bool,
     relayed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     latency_ms: Option<u128>,
@@ -366,6 +367,7 @@ fn status_data(snap: &StatusSnapshot) -> StatusData {
                     name: peer.name.clone(),
                     address: peer.address.clone(),
                     connected: peer.connected,
+                    idle: peer.idle,
                     relayed: peer.relayed,
                     latency_ms: peer.latency.map(|latency| latency.as_millis()),
                 })
@@ -629,12 +631,13 @@ mod handshake_status_tests {
             connected: true,
             relayed: true,
             latency: Some(std::time::Duration::from_micros(12_400)),
+            ..Default::default()
         }];
         let value = serde_json::to_value(status_data(&tunnels(vec![mesh], None))).unwrap();
         assert_eq!(
             value["network"]["peers"],
             serde_json::json!([{"name": "db", "address": "100.90.1.2", "connected": true,
-                "relayed": true, "latency_ms": 12}])
+                "idle": false, "relayed": true, "latency_ms": 12}])
         );
         let plain = tunnels(vec![session("split", "utun5")], None);
         let value = serde_json::to_value(status_data(&plain)).unwrap();

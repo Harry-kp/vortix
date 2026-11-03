@@ -95,6 +95,9 @@ dashboard's Logs panel (`f` until the title names the profile).
 
 Each network's daemon log is `/var/lib/vortix/netbird/<id>/netbird.log` (root only); the dashboard shows it in the Logs panel (`f`).
 
+- `NetBird isn't installed. Install it: …`: Vortix runs NetBird's own `netbird` command; run the
+  command shown (on macOS `brew install netbirdio/tap/netbird`), then connect again. The same
+  sentence names WireGuard or OpenVPN when their tools are missing; `vortix up` exits 5.
 - `the sign-in was not finished within 5 min`: connect again for a new link, or add an
   `auth_key` (a setup key) to the `.netbird` file. A link that returns to `localhost` works only
   in a browser on the computer running Vortix.

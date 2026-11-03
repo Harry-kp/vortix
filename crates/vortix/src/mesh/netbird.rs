@@ -151,6 +151,7 @@ pub(super) fn parse_status(json: &[u8]) -> Result<MeshStatus, String> {
                     .to_string(),
                 address: peer.netbird_ip.clone(),
                 connected: peer.status == "Connected",
+                idle: peer.status == "Idle",
                 relayed: peer.connection_type == "Relayed",
                 latency: (peer.latency > 0).then(|| Duration::from_nanos(peer.latency)),
             })
@@ -358,7 +359,7 @@ mod tests {
         assert!(status.peers[0].connected && !status.peers[0].relayed);
         assert_eq!(status.peers[0].latency, Some(Duration::from_millis(3)));
         assert_eq!(status.peers[1].name, "100.90.1.3");
-        assert!(!status.peers[1].connected);
+        assert!(!status.peers[1].connected && status.peers[1].idle);
     }
 
     #[test]

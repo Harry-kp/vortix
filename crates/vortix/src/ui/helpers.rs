@@ -249,14 +249,14 @@ pub(crate) fn clear_area(frame: &mut Frame, area: Rect) {
 
 /// `9/13 up, 2 relayed`: a mesh network's peers in one line.
 pub(crate) fn peers_summary(peers: &[crate::tunnel::MeshPeer]) -> String {
-    let connected = peers.iter().filter(|peer| peer.connected).count();
+    let reachable = peers.iter().filter(|peer| peer.reachable()).count();
     let relayed = peers
         .iter()
         .filter(|peer| peer.connected && peer.relayed)
         .count();
     match relayed {
-        0 => format!("{connected}/{} up", peers.len()),
-        _ => format!("{connected}/{} up, {relayed} relayed", peers.len()),
+        0 => format!("{reachable}/{} up", peers.len()),
+        _ => format!("{reachable}/{} up, {relayed} relayed", peers.len()),
     }
 }
 

@@ -615,23 +615,15 @@ fn exit_if_missing_dependencies(
     profile: &crate::config::profiles::VpnProfile,
 ) {
     let missing = crate::platform::check_dependencies(profile.protocol, &profile.config_path);
-    if missing.is_empty() {
+    let Some(message) = crate::platform::missing_tools_message(profile.protocol, &missing) else {
         return;
-    }
-    let hint = missing
-        .iter()
-        .map(|tool| crate::platform::install_hint(tool))
-        .collect::<Vec<_>>()
-        .join("\n");
+    };
     print_error_and_exit(
         mode,
         command,
         CliError {
             code: "dependency_missing",
-            message: format!(
-                "Missing dependencies: {}. Install with: {hint}",
-                missing.join(", ")
-            ),
+            message,
             hint: None,
         },
         ExitCode::DependencyMissing,

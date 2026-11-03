@@ -119,9 +119,9 @@ pub mod version {
             .clone()
     }
 
-    /// Upper bound on the version-probe subprocess. The probe runs on the UI
-    /// thread (via `check_dependencies` on every connect attempt), so a slow or
-    /// hung `openvpn --version` would freeze the TUI. 10 seconds is generous
+    /// Upper bound on the version-probe subprocess. The probe runs before
+    /// every connect (via `check_dependencies`), so a slow or hung
+    /// `openvpn --version` would stall the connect. 10 seconds is generous
     /// for a first-run launch (Gatekeeper / antivirus / Spotlight on macOS;
     /// cold cache on Linux) and short enough that the user notices a UX bug
     /// rather than concluding vortix is broken. On timeout we fall through to

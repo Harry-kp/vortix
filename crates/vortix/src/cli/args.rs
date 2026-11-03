@@ -68,7 +68,7 @@ EXIT CODES:
     2  Permission denied (needs sudo)
     3  Not found (profile doesn't exist)
     4  State conflict (already connected/disconnected)
-    5  Missing dependency (wg-quick, openvpn)
+    5  Missing dependency (wg-quick, openvpn, netbird)
     6  Timeout";
 
 /// Available CLI commands.

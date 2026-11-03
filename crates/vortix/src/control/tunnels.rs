@@ -114,6 +114,10 @@ pub fn start(
     credentials: Option<OpenVpnStaticChallengeCredentials>,
     context: TunnelExecutionContext,
 ) -> Result<Live, StartError> {
+    let missing = crate::platform::check_dependencies(profile.protocol, &profile.config_path);
+    if let Some(message) = crate::platform::missing_tools_message(profile.protocol, &missing) {
+        return Err(StartError::Failed(message));
+    }
     let mut kind =
         TunnelKind::new(profile.protocol, settings).for_start(generation, context, credentials);
     let Ok(result) = panic::catch_unwind(AssertUnwindSafe(|| kind.up(profile))) else {
