@@ -901,7 +901,11 @@ fn mark_line(mark: SigilId, text: String, width: usize) -> Line<'static> {
 /// relayed, latency. Narrower: the name and the one status that matters.
 fn peer_lines(peers: &[crate::tunnel::MeshPeer], width: usize) -> Vec<Line<'static>> {
     let mut peers = peers.to_vec();
-    peers.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
+    peers.sort_by(|a, b| {
+        (b.connected, b.idle)
+            .cmp(&(a.connected, a.idle))
+            .then(a.name.cmp(&b.name))
+    });
     let compact = width < FULL_COLUMNS;
     // Address, path and latency after the name; compact, one status.
     let names = column(
@@ -913,6 +917,7 @@ fn peer_lines(peers: &[crate::tunnel::MeshPeer], width: usize) -> Vec<Line<'stat
         .iter()
         .map(|peer| {
             let (mark, path) = match (peer.connected, peer.relayed) {
+                (false, _) if peer.idle => (SigilId::Idle, "idle"),
                 (false, _) => (SigilId::Unused, "offline"),
                 (true, true) => (SigilId::Relayed, "relayed"),
                 (true, false) => (SigilId::InUse, "direct"),
@@ -1109,11 +1114,17 @@ mod tests {
             connected,
             relayed,
             latency: connected.then(|| Duration::from_millis(41)),
+            ..Default::default()
         };
         mesh.details.peers = vec![
             peer("asleep", false, false),
             peer("gw", true, true),
             peer("laptop", true, false),
+            crate::tunnel::MeshPeer {
+                name: "nas".into(),
+                idle: true,
+                ..Default::default()
+            },
         ];
         app.set_tunnels_for_test(vec![mesh], None);
         app
@@ -1131,13 +1142,15 @@ mod tests {
             "relayed",
             "41 ms",
             "offline",
+            "idle",
             "Routes  2",
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
         assert!(
-            screen.find("gw").unwrap() < screen.find("asleep").unwrap(),
-            "connected first"
+            screen.find("gw").unwrap() < screen.find("nas").unwrap()
+                && screen.find("nas").unwrap() < screen.find("asleep").unwrap(),
+            "connected, then idle, then offline"
         );
     }
 

@@ -402,15 +402,16 @@ impl App {
         };
     }
 
-    /// Check for system-wide dependencies at startup and warn the user.
+    /// Warn at startup about the VPN tools the user's profiles need; the full
+    /// per-profile check runs when one connects.
     pub(crate) fn check_system_dependencies(&mut self) {
         let mut missing: Vec<&str> = Vec::new();
-        if !crate::platform::binary_exists("openvpn") {
-            missing.push("openvpn");
-        }
-        // wg / wg-quick both ship in wireguard-tools.
-        if !crate::platform::binary_exists("wg-quick") || !crate::platform::binary_exists("wg") {
-            missing.push("wireguard-tools");
+        for profile in &self.runtime.profiles {
+            if let Some(tool) = crate::platform::vpn_tool_missing(profile.protocol) {
+                if !missing.contains(&tool) {
+                    missing.push(tool);
+                }
+            }
         }
         if missing.is_empty() {
             return;

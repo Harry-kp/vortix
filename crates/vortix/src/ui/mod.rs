@@ -222,6 +222,7 @@ mod bench {
                 connected: true,
                 relayed: n % 2 == 0,
                 latency: Some(std::time::Duration::from_millis(40)),
+                ..Default::default()
             })
             .collect();
         app.set_tunnels_for_test(vec![mesh], Some(ProfileId::new("p00")));

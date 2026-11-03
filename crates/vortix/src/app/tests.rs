@@ -2786,3 +2786,30 @@ fn only_an_internet_tunnel_is_expected_to_change_the_public_ipv6() {
     probe(&mut full, "2001:db8::78");
     assert!(warned("2001:db8::78"));
 }
+
+/// The startup check covers the kinds of VPN the user has: nothing to say
+/// without profiles, and `netbird` once a profile needs it.
+#[test]
+fn the_startup_tool_check_covers_the_vpns_the_user_has() {
+    let mut app = App::new_test();
+    app.toast = None;
+    app.check_system_dependencies();
+    assert!(app.toast.is_none(), "no profiles, nothing to check");
+
+    app.runtime.profiles.push(VpnProfile {
+        id: crate::profile::ProfileId::new("nb"),
+        name: "nb".to_string(),
+        protocol: ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird),
+        config_path: std::path::PathBuf::from("/nonexistent/nb.netbird"),
+        location: "Test".to_string(),
+        last_used: None,
+        group: None,
+    });
+    app.check_system_dependencies();
+    let toast = app.toast.as_ref().map(|toast| toast.message.clone());
+    if crate::platform::binary_exists("netbird") {
+        assert!(toast.is_none(), "{toast:?}");
+    } else {
+        assert!(toast.is_some_and(|text| text.contains("netbird")));
+    }
+}

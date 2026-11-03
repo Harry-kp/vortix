@@ -464,9 +464,18 @@ pub struct MeshPeer {
     pub name: String,
     pub address: String,
     pub connected: bool,
+    /// Online, but not connected to yet: the client connects when traffic needs it.
+    pub idle: bool,
     /// Through a relay rather than direct.
     pub relayed: bool,
     pub latency: Option<Duration>,
+}
+
+impl MeshPeer {
+    #[must_use]
+    pub fn reachable(&self) -> bool {
+        self.connected || self.idle
+    }
 }
 
 fn default_interface_authoritative() -> bool {

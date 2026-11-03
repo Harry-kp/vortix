@@ -58,6 +58,8 @@ pub enum SigilId {
     Relayed,
     /// `○` dim — a route not in use, a peer offline.
     Unused,
+    /// `◌` — a peer online but not connected to yet.
+    Idle,
 }
 
 /// A single sigil's visual + textual identity. Theme colors are resolved when
@@ -315,6 +317,16 @@ pub const CATALOG: &[Sigil] = &[
         dim: false,
         category: SigilCategory::RoutesAndPeers,
     },
+    Sigil {
+        id: SigilId::Idle,
+        glyph: "\u{25cc}",
+        label: "Idle",
+        description: "A peer that is online but not connected to yet; it connects when traffic needs it.",
+        color: success_color,
+        bold: false,
+        dim: true,
+        category: SigilCategory::RoutesAndPeers,
+    },
 ];
 
 #[cfg(test)]
@@ -348,6 +360,7 @@ mod tests {
             SigilId::InUse,
             SigilId::Relayed,
             SigilId::Unused,
+            SigilId::Idle,
         ];
         // Exhaustive-match guard: if you add a SigilId variant and
         // forget to add it to `all_ids`, this match arm forces you
@@ -373,6 +386,7 @@ mod tests {
                 SigilId::InUse => (),
                 SigilId::Relayed => (),
                 SigilId::Unused => (),
+                SigilId::Idle => (),
             }
         }
 

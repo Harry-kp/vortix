@@ -102,10 +102,11 @@ the focused profile is connected; Security has `[f] why` when the verdict is `PA
 `EXPOSED`.
 
 - **Routes & peers** (Details): the focused profile's tunnel, the same layout for every VPN,
-  peers first. Peers: a mesh network's peers, connected first, else the server it talks to and
+  peers first. Peers: a mesh network's peers, connected first, then idle (online, connected to when
+  traffic needs it), then offline, else the server it talks to and
   the last handshake. Routes, with their count: what it routes (WireGuard's allowed IPs,
   OpenVPN's pushed routes), or a mesh network's routed networks, in use or not and which is the
-  exit node. In the panel each line keeps one status (exit, relayed, offline or latency); zoomed
+  exit node. In the panel each line keeps one status (exit, relayed, idle, offline or latency); zoomed
   (`z`), every column shows: whole names, ranges, addresses. A list longer than the panel
   scrolls with `j`/`k`, with the same scrollbar as the Logs panel.
 - **Evidence** (Security): each reading behind the verdict with its age: exit and real
@@ -180,18 +181,18 @@ into `NetBird.app`). The app's own files are never changed.
 After that, `up`, `down`, `status`, the dashboard keys and hooks (`VORTIX_PROTOCOL=netbird`)
 work as for any profile. Vortix runs NetBird's own client with this network's identity in
 `/var/lib/vortix/netbird/`, separate from the app's, and deleting the profile removes it.
-NetBird is a private network: with it alone the header reads `● MESH <name> 3/7` (peers up of
-all), and your public address stays your own. When the network uses an exit node (a peer that
+NetBird is a private network: with it alone the header reads `● MESH <name> 3/7` (peers up
+or idle, of all), and your public address stays your own. When the network uses an exit node (a peer that
 carries all internet traffic, chosen in NetBird's dashboard), Vortix shows NetBird as carrying
 your internet: the header reads `● CONNECTED (<name>/NB)` with the exit's address, and the
 Security Guard checks that exit. NetBird keeps routing it; a full WireGuard or OpenVPN tunnel
 connected on top takes the internet over on Linux (on macOS this is not yet verified), and the
 Security Guard shows the exit actually in use.
 NetBird sets up its own routes and DNS on `wt0` (macOS: `utun100`). One NetBird network can be
-up at a time. Connection Details shows how many peers are up; its back (focus Details with `F2`, press
+up at a time. Connection Details shows how many peers are up (connected or idle); its back (focus Details with `F2`, press
 `f`) lists the networks it routes to (in use or not, and which is an exit node), then the peers. `status --json` adds them under
 `network.networks` (`name`, `range`, `selected`) and `network.peers` (`name`, `address`,
-`connected`, `relayed`, `latency_ms`). Choosing networks and the exit node stays in NetBird's
+`connected`, `idle`, `relayed`, `latency_ms`). Choosing networks and the exit node stays in NetBird's
 dashboard or `netbird networks select`.
 
 ## Connecting
@@ -325,7 +326,7 @@ is connected, otherwise `null`.
 | 2 | Needs root |
 | 3 | Profile not found |
 | 4 | State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start, a second NetBird network or the NetBird app's own service) |
-| 5 | Missing dependency (WireGuard tools, `openvpn`, or on Linux `resolvconf`/`systemd-resolved`) |
+| 5 | Missing dependency (WireGuard tools, `openvpn`, `netbird`, or on Linux `resolvconf`/`systemd-resolved`) |
 | 6 | Timeout |
 
 See [Configuration](configuration.md) for files and settings, and

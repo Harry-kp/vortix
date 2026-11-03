@@ -444,6 +444,53 @@ sudo dnf install {pkg}  # Fedora"
     }
 }
 
+/// The package a protocol's own tool comes in: what `check_dependencies`
+/// reports when it is missing.
+fn vpn_tool(protocol: crate::profile::ProtocolKind) -> &'static str {
+    match protocol {
+        // `wg` and `wg-quick` ship together in wireguard-tools.
+        crate::profile::ProtocolKind::WireGuard => "wireguard-tools",
+        crate::profile::ProtocolKind::OpenVpn => "openvpn",
+        crate::profile::ProtocolKind::Mesh(driver) => driver.slug(),
+    }
+}
+
+/// The protocol's own tool when it is not installed: the cheap check, by
+/// `PATH` lookup only.
+#[must_use]
+pub fn vpn_tool_missing(protocol: crate::profile::ProtocolKind) -> Option<&'static str> {
+    let installed = match protocol {
+        crate::profile::ProtocolKind::WireGuard => binary_exists("wg-quick") && binary_exists("wg"),
+        crate::profile::ProtocolKind::OpenVpn => binary_exists("openvpn"),
+        crate::profile::ProtocolKind::Mesh(driver) => binary_exists(driver.slug()),
+    };
+    (!installed).then(|| vpn_tool(protocol))
+}
+
+/// What to tell a user whose profile needs `missing`: the VPN is not
+/// installed and how to install it, or the list of what else is missing.
+#[must_use]
+pub fn missing_tools_message(
+    protocol: crate::profile::ProtocolKind,
+    missing: &[String],
+) -> Option<String> {
+    let hints = missing
+        .iter()
+        .map(|tool| install_hint(tool))
+        .collect::<Vec<_>>()
+        .join("\n");
+    match missing {
+        [] => None,
+        [tool] if tool == vpn_tool(protocol) => {
+            Some(format!("{protocol} isn't installed. Install it: {hints}"))
+        }
+        _ => Some(format!(
+            "Missing dependencies: {}. Install with: {hints}",
+            missing.join(", ")
+        )),
+    }
+}
+
 /// Check if required binaries are available for a given protocol.
 ///
 /// Shared between TUI and CLI so both surfaces refuse the same
@@ -458,13 +505,7 @@ pub fn check_dependencies(
     let mut missing = Vec::new();
     match protocol {
         crate::profile::ProtocolKind::WireGuard => {
-            // Both `wg` and `wg-quick` ship in the wireguard-tools
-            // package on every supported distro — report them under
-            // a single label so the install hint isn't duplicated.
-            if !crate::platform::binary_exists("wg-quick") || !crate::platform::binary_exists("wg")
-            {
-                missing.push("wireguard-tools".to_string());
-            }
+            missing.extend(vpn_tool_missing(protocol).map(str::to_string));
             // `DNS =` is stripped before wg-quick runs; Vortix applies it
             // through `resolvectl`, else `resolvconf` (the same choice as
             // `linux::dns`). A DNS profile with neither cannot be honoured.
@@ -498,10 +539,8 @@ pub fn check_dependencies(
             #[cfg(not(target_os = "linux"))]
             let _ = config_path; // suppress unused warning on non-Linux
         }
-        crate::profile::ProtocolKind::Mesh(driver) => {
-            if !crate::platform::binary_exists(driver.slug()) {
-                missing.push(driver.slug().to_string());
-            }
+        crate::profile::ProtocolKind::Mesh(_) => {
+            missing.extend(vpn_tool_missing(protocol).map(str::to_string));
         }
         crate::profile::ProtocolKind::OpenVpn => {
             if crate::platform::binary_exists("openvpn") {
@@ -530,7 +569,7 @@ pub fn check_dependencies(
                     }
                 }
             } else {
-                missing.push("openvpn".to_string());
+                missing.push(vpn_tool(protocol).to_string());
             }
         }
     }
@@ -1017,6 +1056,33 @@ pub(crate) fn binary_exists(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VPN's own tool missing reads as the VPN not being installed; anything
+    /// else keeps the list.
+    #[test]
+    fn a_missing_vpn_tool_says_the_vpn_is_not_installed() {
+        use crate::profile::ProtocolKind;
+        let netbird = ProtocolKind::Mesh(crate::mesh::MeshDriver::NetBird);
+        assert_eq!(missing_tools_message(netbird, &[]), None);
+        let message = missing_tools_message(netbird, &["netbird".to_string()]).unwrap();
+        assert!(
+            message.starts_with("NetBird isn't installed. Install it: "),
+            "{message}"
+        );
+        assert!(message.contains(&install_hint("netbird")), "{message}");
+        let wireguard =
+            missing_tools_message(ProtocolKind::WireGuard, &["wireguard-tools".to_string()]);
+        assert!(wireguard.unwrap().starts_with("WireGuard isn't installed."));
+        let other = missing_tools_message(
+            ProtocolKind::OpenVpn,
+            &["openvpn 2.4+ required (found 2.3.10)".to_string()],
+        )
+        .unwrap();
+        assert!(
+            other.starts_with("Missing dependencies: openvpn 2.4+"),
+            "{other}"
+        );
+    }
 
     #[test]
     fn socket_protocol_round_trips_through_json() {

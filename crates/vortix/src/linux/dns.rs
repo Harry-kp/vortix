@@ -1165,10 +1165,9 @@ pub(crate) fn resolvconf_works() -> bool {
     // `resolvconf -l` (list) is not supported by systemd-resolvconf's shim.
     //
     // The 10s cap mirrors the OpenVPN version probe: this probe is called from
-    // `check_dependencies` on the UI thread during a connect press,
-    // so a hung subprocess (broken DNS plumbing, locked /etc/resolv.conf,
-    // an openresolv shim stuck on a syscall) would freeze the TUI until
-    // the user kills it. 10s is generous for any healthy probe; on
+    // `check_dependencies` before every connect, so a hung subprocess
+    // (broken DNS plumbing, locked /etc/resolv.conf, an openresolv shim
+    // stuck on a syscall) would stall the connect. 10s is generous for any healthy probe; on
     // timeout we return `false`, which routes the user to the existing
     // "resolvconf not available" error path — strictly better than a
     // wedged panel.

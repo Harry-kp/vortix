@@ -153,7 +153,7 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
         None => ("\u{25cb} NO EXIT".to_string(), theme::current().warning),
         Some(tunnel) => {
             let peers = &tunnel.details.peers;
-            let up = peers.iter().filter(|peer| peer.connected).count();
+            let up = peers.iter().filter(|peer| peer.reachable()).count();
             let name = crate::ui::helpers::truncate_to_width(&tunnel.name, 16);
             let text = if peers.is_empty() {
                 format!("\u{25cf} MESH {name}")
@@ -1031,11 +1031,15 @@ mod tests {
                 ..Default::default()
             },
             crate::tunnel::MeshPeer::default(),
+            crate::tunnel::MeshPeer {
+                idle: true,
+                ..Default::default()
+            },
         ];
         app.set_tunnels_for_test(vec![mesh], None);
         let line = render_no_exit_line(&app, Span::raw(" KS:Off"));
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.starts_with("\u{25cf} MESH office 1/2"), "{text}");
+        assert!(text.starts_with("\u{25cf} MESH office 2/3"), "{text}");
         assert!(!text.contains("NO EXIT"), "{text}");
         assert_eq!(line.spans[0].style.fg, Some(theme::current().success));
 
