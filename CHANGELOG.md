@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-03
+
+### Bug Fixes
+
+- NetBird polish: plain missing-tool message, idle peers shown as idle
+
+### Refactor
+
+- One table of VPN tools, one missing check in check_dependencies
+
+
+
 ## [0.6.0] - 2026-11-02
 
 ### Highlights
