@@ -146,6 +146,10 @@ curl -4 --max-time 15 --resolve cloudflare.com:443:104.16.132.229 https://cloudf
 Device-management software or another VPN client that owns DNS can stop Vortix from applying
 its resolvers.
 
+On macOS, `cannot read macOS dynamic-store key` or `cannot list macOS dynamic-store keys`
+means the DNS baseline could not be read reliably. Vortix refuses to replace it. Retry
+after the network service has settled; leave manual DNS settings in place while diagnosing.
+
 ## Connecting at boot
 
 **The profile doesn't connect after a reboot.** Check the unit's log: `journalctl -u

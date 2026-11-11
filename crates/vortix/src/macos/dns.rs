@@ -101,7 +101,14 @@ pub struct MacDnsPolicy {
 enum MacDynamicStore {
     System,
     #[cfg(test)]
-    Memory(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>),
+    Memory(std::sync::Arc<std::sync::Mutex<MemoryDynamicStore>>),
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct MemoryDynamicStore {
+    values: std::collections::BTreeMap<String, Vec<u8>>,
+    failed_get: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -131,6 +138,15 @@ struct PlannedResolver {
     original: Option<Vec<u8>>,
 }
 
+fn confirm_dynamic_key_absent(key: &str, keys: Option<CFArray<CFString>>) -> Result<(), String> {
+    let keys = keys.ok_or_else(|| "cannot list macOS dynamic-store keys".to_string())?;
+    if keys.iter().any(|candidate| candidate.to_string() == key) {
+        Err(format!("cannot read macOS dynamic-store key {key}"))
+    } else {
+        Ok(())
+    }
+}
+
 impl MacDynamicStore {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         match self {
@@ -138,13 +154,26 @@ impl MacDynamicStore {
                 let store = SCDynamicStoreBuilder::new(SC_STORE_NAME)
                     .build()
                     .ok_or_else(|| "cannot open the macOS dynamic store".to_string())?;
-                store.get(key).map(|value| encode_plist(&value)).transpose()
+                if let Some(value) = store.get(key) {
+                    return encode_plist(&value).map(Some);
+                }
+                // CopyValue returns NULL for both a missing key and a read error.
+                confirm_dynamic_key_absent(key, store.get_keys(".*"))?;
+                Ok(None)
             }
             #[cfg(test)]
-            Self::Memory(values) => values
-                .lock()
-                .map_err(|_| "test dynamic store lock poisoned".to_string())
-                .map(|values| values.get(key).cloned()),
+            Self::Memory(values) => {
+                let mut values = values
+                    .lock()
+                    .map_err(|_| "test dynamic store lock poisoned".to_string())?;
+                if values.failed_get.as_deref() == Some(key) {
+                    values.failed_get = None;
+                    let keys: Vec<_> = values.values.keys().map(|key| CFString::new(key)).collect();
+                    confirm_dynamic_key_absent(key, Some(CFArray::from_CFTypes(&keys)))?;
+                    return Ok(None);
+                }
+                Ok(values.values.get(key).cloned())
+            }
         }
     }
 
@@ -169,7 +198,7 @@ impl MacDynamicStore {
                 .lock()
                 .map_err(|_| "test dynamic store lock poisoned".to_string())
                 .map(|mut values| {
-                    values.insert(key.to_string(), value.to_vec());
+                    values.values.insert(key.to_string(), value.to_vec());
                 }),
         }
     }
@@ -177,10 +206,13 @@ impl MacDynamicStore {
     fn remove(&self, key: &str) -> Result<(), String> {
         match self {
             Self::System => {
+                if self.get(key)?.is_none() {
+                    return Ok(());
+                }
                 let store = SCDynamicStoreBuilder::new(SC_STORE_NAME)
                     .build()
                     .ok_or_else(|| "cannot open the macOS dynamic store".to_string())?;
-                if store.get(key).is_none() || store.remove(key) {
+                if store.remove(key) {
                     Ok(())
                 } else {
                     Err(format!("cannot remove macOS dynamic-store key {key}"))
@@ -191,7 +223,7 @@ impl MacDynamicStore {
                 .lock()
                 .map_err(|_| "test dynamic store lock poisoned".to_string())
                 .map(|mut values| {
-                    values.remove(key);
+                    values.values.remove(key);
                 }),
         }
     }
@@ -230,7 +262,12 @@ impl MacDynamicStore {
                     .expect("test DNS value is valid"),
             ),
         ]);
-        Self::Memory(std::sync::Arc::new(std::sync::Mutex::new(values)))
+        Self::Memory(std::sync::Arc::new(std::sync::Mutex::new(
+            MemoryDynamicStore {
+                values,
+                failed_get: None,
+            },
+        )))
     }
 }
 
@@ -1608,6 +1645,53 @@ mod policy_tests {
     use super::*;
     use crate::control::dns::{DnsRequest, DnsTunnelIntent, DnsTunnelRole};
     use crate::profile::ProfileId;
+
+    #[test]
+    fn absent_keys_require_a_successful_key_list() {
+        let key = "Setup:/Network/Service/test/DNS";
+        assert!(confirm_dynamic_key_absent(key, None).is_err());
+        let present = CFArray::from_CFTypes(&[CFString::new(key)]);
+        assert!(confirm_dynamic_key_absent(key, Some(present)).is_err());
+        assert!(
+            confirm_dynamic_key_absent(key, Some(CFArray::<CFString>::from_CFTypes(&[]))).is_ok()
+        );
+    }
+
+    #[test]
+    fn failed_primary_read_preserves_dns_and_does_not_publish_a_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = MacDnsPolicy::at(temp.path().join("resolver"));
+        let original = adapter.test_primary_dns_servers();
+        let MacDynamicStore::Memory(values) = &adapter.dynamic_store else {
+            unreachable!();
+        };
+        let key = adapter.primary_service_key().unwrap();
+        values.lock().unwrap().failed_get = Some(key);
+        let applied = adapter.apply(&policy(1, "10.80.0.1"), None, &DnsEffectiveState::default());
+        assert_eq!(applied.status, DnsEffectiveStatus::Degraded);
+        assert_eq!(adapter.test_primary_dns_servers(), original);
+        assert!(adapter.primary_backup_state().unwrap().is_none());
+        assert!(adapter.primary_owner_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_release_read_keeps_the_owner_and_baseline_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = MacDnsPolicy::at(temp.path().join("resolver"));
+        let original = adapter.test_primary_dns_servers();
+        let applied = adapter.apply(&policy(1, "10.80.0.1"), None, &DnsEffectiveState::default());
+        let MacDynamicStore::Memory(values) = &adapter.dynamic_store else {
+            unreachable!();
+        };
+        let key = adapter.primary_service_key().unwrap();
+        values.lock().unwrap().failed_get = Some(key);
+        assert!(adapter.release(&applied.owned[0]).is_err());
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["10.80.0.1"]);
+        assert!(adapter.primary_backup_state().unwrap().is_some());
+        assert!(adapter.primary_owner_state().unwrap().is_some());
+        adapter.release(&applied.owned[0]).unwrap();
+        assert_eq!(adapter.test_primary_dns_servers(), original);
+    }
 
     fn policy(generation: u64, server: &str) -> DnsPolicy {
         DnsPolicy::compute(
