@@ -7,7 +7,7 @@
 [![Arch Linux](https://img.shields.io/badge/Arch_Linux-extra-1793D1?logo=archlinux&logoColor=white)](https://archlinux.org/packages/extra/x86_64/vortix/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
 
-Terminal UI for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and leak guarding.
+VPN terminal UI (TUI) for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and leak guarding.
 
 ![Vortix Demo](https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/demo.gif)
 
@@ -43,7 +43,7 @@ Terminal UI for WireGuard and OpenVPN with multi-tunnel control, real-time telem
 
 ## Why Vortix?
 
-Vortix gives WireGuard and OpenVPN users one keyboard-driven view of their tunnels and the network around them. It is useful when plain `wg-quick` or `openvpn` provides too little visibility, while a full desktop VPN client is too heavy or tied to one provider.
+Vortix is a VPN TUI: it gives WireGuard and OpenVPN users one keyboard-driven view of their tunnels and the network around them. It is useful when plain `wg-quick` or `openvpn` provides too little visibility, while a full desktop VPN client is too heavy or tied to one provider.
 
 - Connect multiple profiles and distinguish the default-route tunnel from split-route tunnels.
 - See throughput, latency, jitter, packet loss, exit identity, DNS policy, and encryption state.
