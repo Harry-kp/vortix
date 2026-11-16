@@ -1,6 +1,6 @@
 //! # Vortix VPN Manager
 //!
-//! VPN terminal UI (TUI) for `WireGuard` and `OpenVPN` with multi-tunnel control, real-time telemetry, and leak guarding.
+//! VPN terminal UI (TUI) for `WireGuard` and `OpenVPN` with multi-tunnel control, real-time telemetry, and a kill switch.
 //! It provides profile management and an intuitive dashboard interface.
 #![allow(clippy::missing_errors_doc, clippy::implicit_hasher)]
 

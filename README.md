@@ -7,7 +7,7 @@
 [![Arch Linux](https://img.shields.io/badge/Arch_Linux-extra-1793D1?logo=archlinux&logoColor=white)](https://archlinux.org/packages/extra/x86_64/vortix/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
 
-VPN terminal UI (TUI) for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and leak guarding.
+VPN terminal UI (TUI) for WireGuard and OpenVPN with multi-tunnel control, real-time telemetry, and a kill switch.
 
 ![Vortix Demo](https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/demo.gif)
 
