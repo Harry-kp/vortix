@@ -57,7 +57,8 @@ jobs:
           - label: fedora-41
             dockerfile: Dockerfile.fedora
             image_tag: vortix-integration-fedora
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 hosts deny root in the container reading the mounted fixtures.
+    runs-on: ubuntu-24.04
     # Hard-gated: a failed integration test fails the PR check.
     # Killswitch is Vortix's core product promise — regressions here
     # are silent betrayals of users who think they're protected.
