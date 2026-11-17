@@ -380,6 +380,8 @@ impl Control {
                 _ => {}
             }
             if Instant::now() >= deadline {
+                // Rolling back can clear the error that made the connect fail.
+                let net_error = snapshot.net_error.clone();
                 // Exiting mid-start left half a tunnel on the host.
                 let (done, settled) = mpsc::channel();
                 if self.tx.send(Msg::Settle(done)).is_ok() {
@@ -389,7 +391,7 @@ impl Control {
                 if snapshot.outcomes.get(&ticket) == Some(&Outcome::Done) {
                     return Ok(());
                 }
-                return Err(snapshot.net_error.as_ref().map_or_else(
+                return Err(net_error.as_ref().map_or_else(
                     || "timed out waiting for the VPN".into(),
                     |error| format!("network settings not applied: {error}"),
                 ));

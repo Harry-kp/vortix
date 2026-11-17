@@ -35,6 +35,10 @@ sudo chown -R "$(id -un):$(id -gn)" ~/.config/vortix
 **`up` times out.** The connect is rolled back and nothing is left running. A slow server or a
 large profile may need longer: `sudo vortix up <profile> --timeout 60`.
 
+**`up` or `reconnect` fails with "network settings not applied".** The tunnel came up, but
+Vortix could not set its routes, DNS or firewall, so the connect is rolled back and nothing is
+left running. The rest of the message names what failed.
+
 **"This profile needs saved credentials".** The CLI cannot type an OpenVPN username and
 password. Save them once in the dashboard (`a` on the profile).
 

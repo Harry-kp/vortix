@@ -205,8 +205,8 @@ sudo vortix reconnect work         # no profile: every tunnel; nothing up: the l
 ```
 
 `up` waits 22 s for WireGuard and 37 s for OpenVPN. `--timeout <seconds>` sets both the wait
-and the time the connect may take. A connect that runs out of time is rolled back: nothing is
-left running. `down` on a tunnel Vortix did not start exits 4 and leaves it alone.
+and the time the connect may take. A connect or reconnect that runs out of time is rolled
+back: nothing is left running. `down` on a tunnel Vortix did not start exits 4 and leaves it alone.
 
 OpenVPN profiles that need a username and password connect from the CLI only with saved
 credentials: save them once in the dashboard (`a`). A one-time code (static challenge) is
