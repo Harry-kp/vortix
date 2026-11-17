@@ -98,11 +98,15 @@ impl Net {
         if tightening {
             self.apply_firewall(target, mode)?;
         }
-        self.apply_routes(target)?;
-        self.apply_dns(target)?;
-        if !tightening {
-            self.apply_firewall(target, mode)?;
-        }
+        let route_result = self.apply_routes(target);
+        let dns_result = self.apply_dns(target);
+        // A failed route or DNS step must not keep an older, stricter firewall.
+        let loosened = if tightening {
+            Ok(())
+        } else {
+            self.apply_firewall(target, mode)
+        };
+        route_result.and(dns_result).and(loosened)?;
         let routes = std::mem::take(&mut self.applied.routes);
         self.applied = target.clone();
         self.applied.routes = routes;
