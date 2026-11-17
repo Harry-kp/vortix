@@ -20,6 +20,8 @@ pub(crate) enum ManagementAuthError {
     Closed,
     #[error("OpenVPN rejected authentication")]
     AuthenticationRejected,
+    #[error("the OpenVPN server refused the connection for now; connect again later")]
+    TemporarilyRefused,
     #[error("OpenVPN requested an unsupported interactive challenge")]
     UnsupportedChallenge,
     #[error("OpenVPN exited during authentication")]
@@ -70,6 +72,8 @@ pub(crate) fn authenticate(
                 return Err(ManagementAuthError::UnsupportedChallenge);
             }
             send_credentials(&mut writer, username, password, None, deadline)?;
+        } else if event.starts_with(">PASSWORD:Verification Failed") && event.contains("['TEMP") {
+            return Err(ManagementAuthError::TemporarilyRefused);
         } else if event.starts_with(">PASSWORD:Verification Failed") && event.contains("['CRV1:") {
             // A dynamic challenge, not a rejection.
             return Err(ManagementAuthError::UnsupportedChallenge);
@@ -360,5 +364,16 @@ mod tests {
             .unwrap_err();
             assert_eq!(error, ManagementAuthError::UnsupportedChallenge);
         }
+    }
+
+    #[test]
+    fn a_temporary_refusal_is_not_a_rejection() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .write_all(b">PASSWORD:Verification Failed: 'Auth' ['TEMP[backoff 30]:server busy']\n")
+            .unwrap();
+        let error =
+            authenticate(client, "alice", "pw", &[], None, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error, ManagementAuthError::TemporarilyRefused);
     }
 }

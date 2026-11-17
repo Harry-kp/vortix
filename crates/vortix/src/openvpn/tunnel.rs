@@ -20,6 +20,7 @@ use crate::tunnel::OperationId;
 use crate::tunnel::{TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
 use tracing::{debug, info, warn};
 
+use crate::openvpn::management::ManagementAuthError;
 use crate::openvpn::parser::{
     dns_setting, forbidden_effective_directive, parse_ovpn_conf, DnsSetting,
 };
@@ -214,8 +215,7 @@ fn drive_mgmt_auth(
 }
 
 /// Only a server rejection is `AuthFailed`: it is what clears saved credentials.
-fn management_error(error: crate::openvpn::management::ManagementAuthError) -> TunnelError {
-    use crate::openvpn::management::ManagementAuthError;
+fn management_error(error: ManagementAuthError) -> TunnelError {
     match error {
         ManagementAuthError::AuthenticationRejected => TunnelError::AuthFailed(String::new()),
         ManagementAuthError::DaemonExited => TunnelError::DaemonExited(error.to_string()),
@@ -662,11 +662,16 @@ fn poll_log_until_ready(
                         let reason = error_line
                             .split_once("AUTH_FAILED")
                             .map_or("", |(_, reason)| reason.trim_start_matches(',').trim());
-                        if reason.starts_with("CRV1:") {
-                            return Err(TunnelError::Subprocess(
-                                crate::openvpn::management::ManagementAuthError::UnsupportedChallenge
-                                    .to_string(),
-                            ));
+                        // OpenVPN retries a TEMP refusal; neither is a verdict on the password.
+                        let not_rejected = if reason.starts_with("TEMP") {
+                            Some(ManagementAuthError::TemporarilyRefused)
+                        } else if reason.starts_with("CRV1:") {
+                            Some(ManagementAuthError::UnsupportedChallenge)
+                        } else {
+                            None
+                        };
+                        if let Some(error) = not_rejected {
+                            return Err(TunnelError::Subprocess(error.to_string()));
                         }
                         return Err(TunnelError::AuthFailed(reason.to_string()));
                     }
@@ -1823,5 +1828,24 @@ mod tests {
             pushed_dns_evidence(&parsed, log),
             OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
         );
+    }
+
+    #[test]
+    fn a_temporary_refusal_in_the_log_is_not_a_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("corp.log");
+        std::fs::write(
+            &log,
+            "AUTH: Received control message: AUTH_FAILED,TEMP[backoff 30]:server busy\n",
+        )
+        .unwrap();
+        let error = poll_log_until_ready(
+            &log,
+            &temp.path().join("corp.pid"),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap_err();
+        assert!(!matches!(error, TunnelError::AuthFailed(_)), "{error}");
     }
 }
