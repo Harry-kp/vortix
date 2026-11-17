@@ -21,7 +21,7 @@ use crate::tunnel::{TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKin
 use tracing::{debug, info, warn};
 
 use crate::openvpn::parser::{forbidden_effective_directive, parse_ovpn_conf};
-use crate::openvpn::push::{latest_completed_push_reply, PushReplySelectionError};
+use crate::openvpn::push::{latest_completed_push_options, PushReplySelectionError};
 
 /// Quality of the DNS intent recovered from an `OpenVPN` session log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,7 +799,7 @@ fn process_exists(pid: u32) -> bool {
 /// as an authoritative empty request. The corresponding options are filtered
 /// from `OpenVPN` itself, so this is intent capture only.
 fn pushed_dns_evidence(mut request: crate::control::dns::DnsRequest, log: &str) -> OvpnDnsEvidence {
-    let push_reply = match latest_completed_push_reply(log) {
+    let push_reply = match latest_completed_push_options(log) {
         Ok(Some(push_reply)) => push_reply,
         Ok(None) => return OvpnDnsEvidence::ExplicitlyEmpty(request),
         Err(PushReplySelectionError::NoCompletedNegotiation) => {
@@ -816,8 +816,7 @@ fn pushed_dns_evidence(mut request: crate::control::dns::DnsRequest, log: &str) 
         }
     };
     let mut observed = false;
-    for option in push_reply.split(',') {
-        let option = option.trim().trim_matches('\'');
+    for option in push_reply {
         let mut tokens = option.split_whitespace();
         if !matches!(tokens.next(), Some(prefix) if prefix.eq_ignore_ascii_case("dhcp-option")) {
             continue;
