@@ -126,17 +126,6 @@ impl App {
             .is_some_and(|id| self.tunnel(&id).is_some())
     }
 
-    /// Whether the profile at `idx` is currently Connecting (in-flight).
-    /// Used by the `c` cancel keybinding.
-    #[must_use]
-    pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
-        let Some(profile) = self.runtime.profiles.get(idx) else {
-            return false;
-        };
-        self.tunnel(&profile.id)
-            .is_some_and(|tunnel| tunnel.phase == crate::control::Phase::Starting)
-    }
-
     /// Resolve the profile index that the Connection Details panel is
     /// currently focused on. Always mirrors the sidebar selection —
     /// the user picks which tunnel's details to view by navigating
@@ -299,8 +288,11 @@ impl App {
         let Some(cached) = self.cached_config.as_ref() else {
             return 0;
         };
-        let viewport_height = (self.terminal_size.1 * constants::CONFIG_VIEWER_HEIGHT_PCT / 100)
-            .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
+        let viewport_height = u16::try_from(
+            u32::from(self.terminal_size.1) * u32::from(constants::CONFIG_VIEWER_HEIGHT_PCT) / 100,
+        )
+        .unwrap_or(u16::MAX)
+        .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
         cached.total_lines.saturating_sub(viewport_height)
     }
 

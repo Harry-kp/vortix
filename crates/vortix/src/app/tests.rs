@@ -2895,3 +2895,91 @@ mod zoom {
         assert_eq!(app.zoomed_panel, Some(app.focused_panel.clone()));
     }
 }
+
+mod overlay_keys {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn q_closes_the_action_menu_and_config_viewer_without_quitting() {
+        for open in ['x', 'v'] {
+            let mut app = test_app();
+            add_profiles(&mut app, &["alpha"]);
+            app.profile_list_state.select(Some(0));
+            app.handle_key(key(KeyCode::Char(open)));
+            app.handle_key(key(KeyCode::Char('q')));
+            assert!(!app.should_quit, "q after {open} quit the app");
+        }
+    }
+
+    #[test]
+    fn editing_saved_credentials_backspaces_the_last_character() {
+        let mut app = test_app();
+        let username = crate::app::state::SecretText::from("josé".to_string());
+        let username_cursor = username.expose().chars().count();
+        app.input_mode = InputMode::AuthPrompt {
+            profile_id: crate::profile::ProfileId::new("a"),
+            profile_name: "a".into(),
+            username,
+            username_cursor,
+            password: crate::app::state::SecretText::default(),
+            password_cursor: 0,
+            otp: crate::app::state::SecretText::default(),
+            otp_cursor: 0,
+            focused_field: AuthField::Username,
+            save_credentials: true,
+            connect_after: false,
+            static_challenge_prompt: None,
+            reveal_secrets: false,
+        };
+        app.handle_key(key(KeyCode::Backspace));
+        let InputMode::AuthPrompt { username, .. } = &app.input_mode else {
+            panic!("the prompt closed");
+        };
+        assert_eq!(username.expose(), "jos");
+    }
+
+    #[test]
+    fn details_c_cancels_a_connect_waiting_to_retry() {
+        let mut app = test_app();
+        set_phase(
+            &mut app,
+            "a",
+            crate::control::Phase::Waiting { retry_at: None },
+        );
+        app.profile_list_state.select(Some(0));
+        app.focused_panel = FocusedPanel::ConnectionDetails;
+        app.toast = None;
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn a_blank_rename_keeps_the_dialog_open_and_says_why() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["alpha"]);
+        app.profile_list_state.select(Some(0));
+        app.handle_key(key(KeyCode::Char('R')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.input_mode, InputMode::Rename { .. }));
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn config_viewer_end_on_a_very_tall_terminal_does_not_overflow() {
+        let mut app = test_app();
+        app.terminal_size = (200, 800);
+        app.show_config = true;
+        app.cached_config = Some(crate::app::CachedConfigView::from_content(
+            "x\n".repeat(10),
+            app.runtime.config.theme,
+        ));
+        app.handle_key(key(KeyCode::Char('G')));
+    }
+}

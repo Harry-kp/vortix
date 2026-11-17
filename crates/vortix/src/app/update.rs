@@ -461,8 +461,8 @@ impl App {
                             Default::default()
                         }
                     };
-                    let username_cursor = username.len();
-                    let password_cursor = password.len();
+                    let username_cursor = username.expose().chars().count();
+                    let password_cursor = password.expose().chars().count();
                     self.input_mode = InputMode::AuthPrompt {
                         profile_id,
                         profile_name,

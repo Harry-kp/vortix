@@ -66,6 +66,16 @@ fn handle_confirm_keys(key: KeyEvent, confirm_selected: &mut bool) -> ConfirmAct
 }
 
 impl App {
+    /// What a lifecycle shortcut does to the profile at `idx`.
+    fn tunnel_action_at(&self, idx: usize) -> FocusedTunnelAction {
+        focused_tunnel_action(
+            self.runtime
+                .profiles
+                .get(idx)
+                .and_then(|profile| self.tunnel(&profile.id).map(|tunnel| tunnel.phase)),
+        )
+    }
+
     /// Apply the sidebar disconnect shortcut to the focused profile only.
     ///
     /// An inactive row is deliberately a no-op: falling back to the engine snapshot
@@ -75,12 +85,7 @@ impl App {
         let Some(idx) = self.profile_list_state.selected() else {
             return;
         };
-        let phase = self
-            .runtime
-            .profiles
-            .get(idx)
-            .and_then(|profile| self.tunnel(&profile.id).map(|tunnel| tunnel.phase));
-        match focused_tunnel_action(phase) {
+        match self.tunnel_action_at(idx) {
             FocusedTunnelAction::Disconnect => {
                 self.handle_message(Message::DisconnectProfile { idx });
             }
@@ -98,7 +103,12 @@ impl App {
             return;
         }
         // 'q' in normal mode: exit immediately. Active VPN sessions persist.
-        if key.code == KeyCode::Char('q') && self.input_mode == InputMode::Normal {
+        if key.code == KeyCode::Char('q')
+            && self.input_mode == InputMode::Normal
+            && !self.show_config
+            && !self.show_action_menu
+            && !self.show_bulk_menu
+        {
             self.handle_message(Message::Quit);
             return;
         }
@@ -771,7 +781,7 @@ impl crate::app::App {
         // the top of handle_key) and the panel-specific keys.
         if key.code == KeyCode::Char('c') && self.focused_panel == FocusedPanel::ConnectionDetails {
             if let Some(idx) = self.connection_details_focused_idx() {
-                if self.is_profile_connecting(idx) {
+                if self.tunnel_action_at(idx) == FocusedTunnelAction::Cancel {
                     self.handle_message(Message::CancelConnect { idx });
                     return;
                 }
@@ -901,11 +911,7 @@ impl crate::app::App {
                     let Some(idx) = self.profile_list_state.selected() else {
                         return;
                     };
-                    let phase =
-                        self.runtime.profiles.get(idx).and_then(|profile| {
-                            self.tunnel(&profile.id).map(|tunnel| tunnel.phase)
-                        });
-                    match focused_tunnel_action(phase) {
+                    match self.tunnel_action_at(idx) {
                         FocusedTunnelAction::Connect => {
                             self.handle_message(Message::ToggleConnect(Some(idx)));
                         }
@@ -1050,9 +1056,11 @@ impl crate::app::App {
             }
             KeyCode::Enter => {
                 let trimmed = new_name.trim().to_string();
-                if !trimmed.is_empty() {
-                    self.rename_profile_by_id(profile_id, &trimmed);
+                if trimmed.is_empty() {
+                    self.show_toast("Type a name first.".to_string(), ToastType::Warning);
+                    return;
                 }
+                self.rename_profile_by_id(profile_id, &trimmed);
                 self.input_mode = InputMode::Normal;
             }
             _ => Self::handle_text_field_input(key, new_name, cursor),
