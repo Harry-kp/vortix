@@ -70,9 +70,15 @@ pub(crate) fn authenticate(
                 return Err(ManagementAuthError::UnsupportedChallenge);
             }
             send_credentials(&mut writer, username, password, None, deadline)?;
+        } else if event.starts_with(">PASSWORD:Verification Failed") && event.contains("['CRV1:") {
+            // A dynamic challenge, not a rejection.
+            return Err(ManagementAuthError::UnsupportedChallenge);
         } else if event.starts_with(">PASSWORD:Verification Failed") {
             return Err(ManagementAuthError::AuthenticationRejected);
-        } else if event.starts_with(">PASSWORD:Need '") || event.starts_with(">NEED-STR:") {
+        } else if event.starts_with(">PASSWORD:Need '")
+            || event.starts_with(">NEED-STR:")
+            || event.starts_with(">INFOMSG:CR_TEXT:")
+        {
             return Err(ManagementAuthError::UnsupportedChallenge);
         } else if event.starts_with(">FATAL:") {
             return Err(ManagementAuthError::DaemonExited);
@@ -333,5 +339,26 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, ManagementAuthError::Timeout);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dynamic_and_pending_challenges_are_unsupported_not_rejected() {
+        for event in [
+            &b">PASSWORD:Verification Failed: 'Auth' ['CRV1:R,E:c3RhdGU=:YWxpY2U=:Enter OTP']\n"[..],
+            b">INFOMSG:CR_TEXT:R,E:Enter push code\n",
+        ] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            server.write_all(event).unwrap();
+            let error = authenticate(
+                client,
+                "alice",
+                "pw",
+                b"1",
+                Some(OpenVpnChallengeKind::Static),
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert_eq!(error, ManagementAuthError::UnsupportedChallenge);
+        }
     }
 }
