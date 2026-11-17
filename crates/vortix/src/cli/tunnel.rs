@@ -179,6 +179,13 @@ pub(super) fn handle_up(
         }
     };
 
+    let target = profiles
+        .iter()
+        .find(|profile| profile.name == profile_name)
+        .cloned()
+        .unwrap_or_else(|| {
+            print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
+        });
     if !crate::platform::is_root() {
         print_error_and_exit(
             mode,
@@ -187,18 +194,7 @@ pub(super) fn handle_up(
             ExitCode::PermissionDenied,
         );
     }
-
-    if let Some(profile) = profiles.iter().find(|p| p.name == profile_name) {
-        exit_if_missing_dependencies(mode, "up", profile);
-    }
-
-    let target = profiles
-        .iter()
-        .find(|profile| profile.name == profile_name)
-        .cloned()
-        .unwrap_or_else(|| {
-            print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
-        });
+    exit_if_missing_dependencies(mode, "up", &target);
     let engine_config = timeout_secs.map(|secs| config.with_connect_budget(target.protocol, secs));
     let timeout_secs = connect_operation_timeout_secs(timeout_secs, target.protocol, config);
     let protocol = target.protocol.to_string();
