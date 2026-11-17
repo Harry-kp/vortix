@@ -195,16 +195,11 @@ impl Drop for ScopedThemeGuard<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     // --- Backgrounds ---
-    pub warm_bg: Color,
     pub panel_bg: Color,
-    pub panel_bg_dark: Color,
-    pub panel_header_bg: Color,
 
     // --- Accents ---
     pub accent_primary: Color,
     pub accent_secondary: Color,
-    pub accent_dark: Color,
-    pub teal_accent: Color,
 
     // --- Status ---
     pub success: Color,
@@ -215,7 +210,6 @@ pub struct Theme {
     // --- Text ---
     pub text_primary: Color,
     pub text_secondary: Color,
-    pub text_light: Color,
     pub text_dark: Color,
 
     // --- Borders ---
@@ -225,11 +219,6 @@ pub struct Theme {
     // --- Rows / Selection ---
     pub row_selected_bg: Color,
     pub row_selected_fg: Color,
-
-    // --- Buttons ---
-    pub btn_connect_bg: Color,
-    pub btn_terminate_bg: Color,
-    pub btn_default_bg: Color,
 
     // --- Footer / Hints ---
     pub key_hint: Color,
@@ -244,7 +233,6 @@ pub struct Theme {
 
     // --- Palette-specific colors (used for protocol badges, charts, etc.) ---
     pub yellow: Color,
-    pub nord_polar_night_3: Color,
     pub nord_polar_night_4: Color,
     pub nord_frost_3: Color,
     pub nord_purple: Color,
@@ -252,31 +240,22 @@ pub struct Theme {
 
 impl Theme {
     #[cfg(test)]
-    const fn colors(self) -> [Color; 35] {
+    const fn colors(self) -> [Color; 25] {
         [
-            self.warm_bg,
             self.panel_bg,
-            self.panel_bg_dark,
-            self.panel_header_bg,
             self.accent_primary,
             self.accent_secondary,
-            self.accent_dark,
-            self.teal_accent,
             self.success,
             self.warning,
             self.error,
             self.inactive,
             self.text_primary,
             self.text_secondary,
-            self.text_light,
             self.text_dark,
             self.border_default,
             self.border_focused,
             self.row_selected_bg,
             self.row_selected_fg,
-            self.btn_connect_bg,
-            self.btn_terminate_bg,
-            self.btn_default_bg,
             self.key_hint,
             self.key_hint_desc,
             self.separator,
@@ -285,7 +264,6 @@ impl Theme {
             self.toast_warning,
             self.toast_error,
             self.yellow,
-            self.nord_polar_night_3,
             self.nord_polar_night_4,
             self.nord_frost_3,
             self.nord_purple,
@@ -297,18 +275,13 @@ impl Theme {
 
 /// Default Synthwave / Cyberpunk theme — warm backgrounds, cyan accents.
 pub const SYNTHWAVE: Theme = Theme {
-    warm_bg: Color::Rgb(180, 160, 140),
     // Match the legacy rendered surface captured before palette switching.
     // The old constant was blue-slate but the old renderer inherited this
     // neutral-purple terminal surface instead.
     panel_bg: Color::Rgb(28, 28, 40),
-    panel_bg_dark: Color::Rgb(22, 22, 32),
-    panel_header_bg: Color::Rgb(40, 55, 75),
 
     accent_primary: Color::Rgb(6, 182, 212),
     accent_secondary: Color::Rgb(34, 211, 238),
-    accent_dark: Color::Rgb(8, 145, 178),
-    teal_accent: Color::Rgb(20, 184, 166),
 
     success: Color::Rgb(16, 185, 129),
     warning: Color::Rgb(245, 158, 11),
@@ -317,7 +290,6 @@ pub const SYNTHWAVE: Theme = Theme {
 
     text_primary: Color::Rgb(248, 250, 252),
     text_secondary: Color::Rgb(148, 163, 184),
-    text_light: Color::Rgb(203, 213, 225),
     text_dark: Color::Rgb(30, 41, 59),
 
     border_default: Color::Rgb(71, 85, 105),
@@ -325,10 +297,6 @@ pub const SYNTHWAVE: Theme = Theme {
 
     row_selected_bg: Color::Rgb(40, 55, 75),
     row_selected_fg: Color::Rgb(34, 211, 238),
-
-    btn_connect_bg: Color::Rgb(6, 182, 212),
-    btn_terminate_bg: Color::Rgb(239, 68, 68),
-    btn_default_bg: Color::Rgb(71, 85, 105),
 
     key_hint: Color::Rgb(6, 182, 212),
     key_hint_desc: Color::DarkGray,
@@ -340,7 +308,6 @@ pub const SYNTHWAVE: Theme = Theme {
     toast_error: Color::Rgb(191, 97, 106),
 
     yellow: Color::Rgb(234, 179, 8),
-    nord_polar_night_3: Color::Rgb(67, 76, 94),
     nord_polar_night_4: Color::Rgb(76, 86, 106),
     nord_frost_3: Color::Rgb(129, 161, 193),
     nord_purple: Color::Rgb(180, 142, 173),
@@ -349,15 +316,10 @@ pub const SYNTHWAVE: Theme = Theme {
 /// Terminal-adaptive theme. Ordinary surfaces and text inherit the user's
 /// terminal palette; semantic signals use only the named ANSI colors.
 pub const TERMINAL: Theme = Theme {
-    warm_bg: Color::Reset,
     panel_bg: Color::Reset,
-    panel_bg_dark: Color::Reset,
-    panel_header_bg: Color::Reset,
 
     accent_primary: Color::Cyan,
     accent_secondary: Color::LightCyan,
-    accent_dark: Color::Blue,
-    teal_accent: Color::Cyan,
 
     success: Color::Green,
     warning: Color::Yellow,
@@ -366,7 +328,6 @@ pub const TERMINAL: Theme = Theme {
 
     text_primary: Color::Reset,
     text_secondary: Color::Reset,
-    text_light: Color::Reset,
     text_dark: Color::Black,
 
     border_default: Color::DarkGray,
@@ -374,10 +335,6 @@ pub const TERMINAL: Theme = Theme {
 
     row_selected_bg: Color::Blue,
     row_selected_fg: Color::White,
-
-    btn_connect_bg: Color::Cyan,
-    btn_terminate_bg: Color::Red,
-    btn_default_bg: Color::Blue,
 
     key_hint: Color::Cyan,
     key_hint_desc: Color::DarkGray,
@@ -389,7 +346,6 @@ pub const TERMINAL: Theme = Theme {
     toast_error: Color::Red,
 
     yellow: Color::Yellow,
-    nord_polar_night_3: Color::DarkGray,
     nord_polar_night_4: Color::DarkGray,
     nord_frost_3: Color::Blue,
     nord_purple: Color::Magenta,
@@ -397,15 +353,10 @@ pub const TERMINAL: Theme = Theme {
 
 /// Catppuccin Mocha — soft pastels over a deep blue-black base.
 pub const CATPPUCCIN_MOCHA: Theme = Theme {
-    warm_bg: Color::Rgb(17, 17, 27),
     panel_bg: Color::Rgb(30, 30, 46),
-    panel_bg_dark: Color::Rgb(24, 24, 37),
-    panel_header_bg: Color::Rgb(49, 50, 68),
 
     accent_primary: Color::Rgb(203, 166, 247),
     accent_secondary: Color::Rgb(137, 180, 250),
-    accent_dark: Color::Rgb(116, 199, 236),
-    teal_accent: Color::Rgb(148, 226, 213),
 
     success: Color::Rgb(166, 227, 161),
     warning: Color::Rgb(249, 226, 175),
@@ -414,7 +365,6 @@ pub const CATPPUCCIN_MOCHA: Theme = Theme {
 
     text_primary: Color::Rgb(205, 214, 244),
     text_secondary: Color::Rgb(166, 173, 200),
-    text_light: Color::Rgb(186, 194, 222),
     text_dark: Color::Rgb(17, 17, 27),
 
     border_default: Color::Rgb(108, 112, 134),
@@ -422,10 +372,6 @@ pub const CATPPUCCIN_MOCHA: Theme = Theme {
 
     row_selected_bg: Color::Rgb(69, 71, 90),
     row_selected_fg: Color::Rgb(180, 190, 254),
-
-    btn_connect_bg: Color::Rgb(137, 180, 250),
-    btn_terminate_bg: Color::Rgb(243, 139, 168),
-    btn_default_bg: Color::Rgb(88, 91, 112),
 
     key_hint: Color::Rgb(203, 166, 247),
     key_hint_desc: Color::Rgb(166, 173, 200),
@@ -437,7 +383,6 @@ pub const CATPPUCCIN_MOCHA: Theme = Theme {
     toast_error: Color::Rgb(243, 139, 168),
 
     yellow: Color::Rgb(249, 226, 175),
-    nord_polar_night_3: Color::Rgb(49, 50, 68),
     nord_polar_night_4: Color::Rgb(69, 71, 90),
     nord_frost_3: Color::Rgb(137, 180, 250),
     nord_purple: Color::Rgb(203, 166, 247),
@@ -445,15 +390,10 @@ pub const CATPPUCCIN_MOCHA: Theme = Theme {
 
 /// Dracula — vivid status colors over its canonical charcoal background.
 pub const DRACULA: Theme = Theme {
-    warm_bg: Color::Rgb(33, 34, 44),
     panel_bg: Color::Rgb(40, 42, 54),
-    panel_bg_dark: Color::Rgb(33, 34, 44),
-    panel_header_bg: Color::Rgb(68, 71, 90),
 
     accent_primary: Color::Rgb(189, 147, 249),
     accent_secondary: Color::Rgb(139, 233, 253),
-    accent_dark: Color::Rgb(98, 114, 164),
-    teal_accent: Color::Rgb(139, 233, 253),
 
     success: Color::Rgb(80, 250, 123),
     warning: Color::Rgb(241, 250, 140),
@@ -462,7 +402,6 @@ pub const DRACULA: Theme = Theme {
 
     text_primary: Color::Rgb(248, 248, 242),
     text_secondary: Color::Rgb(164, 166, 183),
-    text_light: Color::Rgb(248, 248, 242),
     text_dark: Color::Rgb(40, 42, 54),
 
     border_default: Color::Rgb(98, 114, 164),
@@ -470,10 +409,6 @@ pub const DRACULA: Theme = Theme {
 
     row_selected_bg: Color::Rgb(68, 71, 90),
     row_selected_fg: Color::Rgb(248, 248, 242),
-
-    btn_connect_bg: Color::Rgb(139, 233, 253),
-    btn_terminate_bg: Color::Rgb(255, 85, 85),
-    btn_default_bg: Color::Rgb(98, 114, 164),
 
     key_hint: Color::Rgb(255, 121, 198),
     key_hint_desc: Color::Rgb(164, 166, 183),
@@ -485,7 +420,6 @@ pub const DRACULA: Theme = Theme {
     toast_error: Color::Rgb(255, 85, 85),
 
     yellow: Color::Rgb(241, 250, 140),
-    nord_polar_night_3: Color::Rgb(40, 42, 54),
     nord_polar_night_4: Color::Rgb(68, 71, 90),
     nord_frost_3: Color::Rgb(139, 233, 253),
     nord_purple: Color::Rgb(189, 147, 249),
@@ -493,15 +427,10 @@ pub const DRACULA: Theme = Theme {
 
 /// Nord — the original Polar Night, Snow Storm, Frost, and Aurora colors.
 pub const NORD: Theme = Theme {
-    warm_bg: Color::Rgb(46, 52, 64),
     panel_bg: Color::Rgb(46, 52, 64),
-    panel_bg_dark: Color::Rgb(46, 52, 64),
-    panel_header_bg: Color::Rgb(59, 66, 82),
 
     accent_primary: Color::Rgb(136, 192, 208),
     accent_secondary: Color::Rgb(143, 188, 187),
-    accent_dark: Color::Rgb(94, 129, 172),
-    teal_accent: Color::Rgb(143, 188, 187),
 
     success: Color::Rgb(163, 190, 140),
     warning: Color::Rgb(235, 203, 139),
@@ -510,7 +439,6 @@ pub const NORD: Theme = Theme {
 
     text_primary: Color::Rgb(236, 239, 244),
     text_secondary: Color::Rgb(216, 222, 233),
-    text_light: Color::Rgb(229, 233, 240),
     text_dark: Color::Rgb(16, 18, 22),
 
     border_default: Color::Rgb(123, 136, 161),
@@ -518,10 +446,6 @@ pub const NORD: Theme = Theme {
 
     row_selected_bg: Color::Rgb(67, 76, 94),
     row_selected_fg: Color::Rgb(236, 239, 244),
-
-    btn_connect_bg: Color::Rgb(136, 192, 208),
-    btn_terminate_bg: Color::Rgb(191, 97, 106),
-    btn_default_bg: Color::Rgb(76, 86, 106),
 
     key_hint: Color::Rgb(136, 192, 208),
     key_hint_desc: Color::Rgb(129, 161, 193),
@@ -533,7 +457,6 @@ pub const NORD: Theme = Theme {
     toast_error: Color::Rgb(220, 130, 139),
 
     yellow: Color::Rgb(235, 203, 139),
-    nord_polar_night_3: Color::Rgb(67, 76, 94),
     nord_polar_night_4: Color::Rgb(76, 86, 106),
     nord_frost_3: Color::Rgb(129, 161, 193),
     nord_purple: Color::Rgb(180, 142, 173),
@@ -541,15 +464,10 @@ pub const NORD: Theme = Theme {
 
 /// Gruvbox Dark — warm, high-separation retro colors.
 pub const GRUVBOX_DARK: Theme = Theme {
-    warm_bg: Color::Rgb(29, 32, 33),
     panel_bg: Color::Rgb(29, 32, 33),
-    panel_bg_dark: Color::Rgb(29, 32, 33),
-    panel_header_bg: Color::Rgb(60, 56, 54),
 
     accent_primary: Color::Rgb(131, 165, 152),
     accent_secondary: Color::Rgb(142, 192, 124),
-    accent_dark: Color::Rgb(69, 133, 136),
-    teal_accent: Color::Rgb(142, 192, 124),
 
     success: Color::Rgb(184, 187, 38),
     warning: Color::Rgb(250, 189, 47),
@@ -558,7 +476,6 @@ pub const GRUVBOX_DARK: Theme = Theme {
 
     text_primary: Color::Rgb(235, 219, 178),
     text_secondary: Color::Rgb(189, 174, 147),
-    text_light: Color::Rgb(213, 196, 161),
     text_dark: Color::Rgb(29, 32, 33),
 
     border_default: Color::Rgb(146, 131, 116),
@@ -566,10 +483,6 @@ pub const GRUVBOX_DARK: Theme = Theme {
 
     row_selected_bg: Color::Rgb(80, 73, 69),
     row_selected_fg: Color::Rgb(251, 241, 199),
-
-    btn_connect_bg: Color::Rgb(131, 165, 152),
-    btn_terminate_bg: Color::Rgb(251, 73, 52),
-    btn_default_bg: Color::Rgb(102, 92, 84),
 
     key_hint: Color::Rgb(142, 192, 124),
     key_hint_desc: Color::Rgb(168, 153, 132),
@@ -581,7 +494,6 @@ pub const GRUVBOX_DARK: Theme = Theme {
     toast_error: Color::Rgb(251, 73, 52),
 
     yellow: Color::Rgb(250, 189, 47),
-    nord_polar_night_3: Color::Rgb(60, 56, 54),
     nord_polar_night_4: Color::Rgb(80, 73, 69),
     nord_frost_3: Color::Rgb(131, 165, 152),
     nord_purple: Color::Rgb(211, 134, 155),
@@ -589,15 +501,10 @@ pub const GRUVBOX_DARK: Theme = Theme {
 
 /// Tokyo Night Storm — saturated cool accents on a midnight-blue surface.
 pub const TOKYO_NIGHT: Theme = Theme {
-    warm_bg: Color::Rgb(22, 22, 30),
     panel_bg: Color::Rgb(26, 27, 38),
-    panel_bg_dark: Color::Rgb(22, 22, 30),
-    panel_header_bg: Color::Rgb(41, 46, 66),
 
     accent_primary: Color::Rgb(122, 162, 247),
     accent_secondary: Color::Rgb(125, 207, 255),
-    accent_dark: Color::Rgb(61, 89, 161),
-    teal_accent: Color::Rgb(180, 249, 248),
 
     success: Color::Rgb(158, 206, 106),
     warning: Color::Rgb(224, 175, 104),
@@ -606,7 +513,6 @@ pub const TOKYO_NIGHT: Theme = Theme {
 
     text_primary: Color::Rgb(192, 202, 245),
     text_secondary: Color::Rgb(169, 177, 214),
-    text_light: Color::Rgb(180, 249, 248),
     text_dark: Color::Rgb(22, 22, 30),
 
     border_default: Color::Rgb(115, 122, 162),
@@ -614,10 +520,6 @@ pub const TOKYO_NIGHT: Theme = Theme {
 
     row_selected_bg: Color::Rgb(41, 46, 66),
     row_selected_fg: Color::Rgb(192, 202, 245),
-
-    btn_connect_bg: Color::Rgb(122, 162, 247),
-    btn_terminate_bg: Color::Rgb(247, 118, 142),
-    btn_default_bg: Color::Rgb(59, 66, 97),
 
     key_hint: Color::Rgb(187, 154, 247),
     key_hint_desc: Color::Rgb(169, 177, 214),
@@ -629,7 +531,6 @@ pub const TOKYO_NIGHT: Theme = Theme {
     toast_error: Color::Rgb(247, 118, 142),
 
     yellow: Color::Rgb(224, 175, 104),
-    nord_polar_night_3: Color::Rgb(41, 46, 66),
     nord_polar_night_4: Color::Rgb(59, 66, 97),
     nord_frost_3: Color::Rgb(122, 162, 247),
     nord_purple: Color::Rgb(187, 154, 247),
@@ -696,29 +597,20 @@ const fn indexed_color(color: Color) -> Color {
 
 const fn indexed_theme(theme: Theme) -> Theme {
     Theme {
-        warm_bg: indexed_color(theme.warm_bg),
         panel_bg: indexed_color(theme.panel_bg),
-        panel_bg_dark: indexed_color(theme.panel_bg_dark),
-        panel_header_bg: indexed_color(theme.panel_header_bg),
         accent_primary: indexed_color(theme.accent_primary),
         accent_secondary: indexed_color(theme.accent_secondary),
-        accent_dark: indexed_color(theme.accent_dark),
-        teal_accent: indexed_color(theme.teal_accent),
         success: indexed_color(theme.success),
         warning: indexed_color(theme.warning),
         error: indexed_color(theme.error),
         inactive: indexed_color(theme.inactive),
         text_primary: indexed_color(theme.text_primary),
         text_secondary: indexed_color(theme.text_secondary),
-        text_light: indexed_color(theme.text_light),
         text_dark: indexed_color(theme.text_dark),
         border_default: indexed_color(theme.border_default),
         border_focused: indexed_color(theme.border_focused),
         row_selected_bg: indexed_color(theme.row_selected_bg),
         row_selected_fg: indexed_color(theme.row_selected_fg),
-        btn_connect_bg: indexed_color(theme.btn_connect_bg),
-        btn_terminate_bg: indexed_color(theme.btn_terminate_bg),
-        btn_default_bg: indexed_color(theme.btn_default_bg),
         key_hint: indexed_color(theme.key_hint),
         key_hint_desc: indexed_color(theme.key_hint_desc),
         separator: indexed_color(theme.separator),
@@ -727,7 +619,6 @@ const fn indexed_theme(theme: Theme) -> Theme {
         toast_warning: indexed_color(theme.toast_warning),
         toast_error: indexed_color(theme.toast_error),
         yellow: indexed_color(theme.yellow),
-        nord_polar_night_3: indexed_color(theme.nord_polar_night_3),
         nord_polar_night_4: indexed_color(theme.nord_polar_night_4),
         nord_frost_3: indexed_color(theme.nord_frost_3),
         nord_purple: indexed_color(theme.nord_purple),
@@ -778,29 +669,20 @@ mod tests {
         assert_eq!(
             SYNTHWAVE,
             Theme {
-                warm_bg: Color::Rgb(180, 160, 140),
                 panel_bg: Color::Rgb(28, 28, 40),
-                panel_bg_dark: Color::Rgb(22, 22, 32),
-                panel_header_bg: Color::Rgb(40, 55, 75),
                 accent_primary: Color::Rgb(6, 182, 212),
                 accent_secondary: Color::Rgb(34, 211, 238),
-                accent_dark: Color::Rgb(8, 145, 178),
-                teal_accent: Color::Rgb(20, 184, 166),
                 success: Color::Rgb(16, 185, 129),
                 warning: Color::Rgb(245, 158, 11),
                 error: Color::Rgb(239, 68, 68),
                 inactive: Color::Gray,
                 text_primary: Color::Rgb(248, 250, 252),
                 text_secondary: Color::Rgb(148, 163, 184),
-                text_light: Color::Rgb(203, 213, 225),
                 text_dark: Color::Rgb(30, 41, 59),
                 border_default: Color::Rgb(71, 85, 105),
                 border_focused: Color::Rgb(6, 182, 212),
                 row_selected_bg: Color::Rgb(40, 55, 75),
                 row_selected_fg: Color::Rgb(34, 211, 238),
-                btn_connect_bg: Color::Rgb(6, 182, 212),
-                btn_terminate_bg: Color::Rgb(239, 68, 68),
-                btn_default_bg: Color::Rgb(71, 85, 105),
                 key_hint: Color::Rgb(6, 182, 212),
                 key_hint_desc: Color::DarkGray,
                 separator: Color::Rgb(76, 86, 106),
@@ -809,7 +691,6 @@ mod tests {
                 toast_warning: Color::Rgb(235, 203, 139),
                 toast_error: Color::Rgb(191, 97, 106),
                 yellow: Color::Rgb(234, 179, 8),
-                nord_polar_night_3: Color::Rgb(67, 76, 94),
                 nord_polar_night_4: Color::Rgb(76, 86, 106),
                 nord_frost_3: Color::Rgb(129, 161, 193),
                 nord_purple: Color::Rgb(180, 142, 173),
@@ -957,8 +838,6 @@ mod tests {
         let theme = ThemeChoice::Terminal.palette();
 
         assert_eq!(theme.panel_bg, Color::Reset);
-        assert_eq!(theme.panel_bg_dark, Color::Reset);
-        assert_eq!(theme.panel_header_bg, Color::Reset);
         assert_eq!(theme.text_primary, Color::Reset);
         assert_eq!(theme.text_secondary, Color::Reset);
         for color in [
