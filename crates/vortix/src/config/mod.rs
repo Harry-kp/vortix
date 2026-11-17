@@ -254,7 +254,12 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
     if !path.exists() {
         // Track which ancestors already exist so we only chown dirs we create.
         let first_existing_ancestor = path.ancestors().find(|a| a.exists());
-        std::fs::create_dir_all(&path)?;
+        std::fs::create_dir_all(&path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot create config directory {}: {error}", path.display()),
+            )
+        })?;
         // `create_dir_all` applies the caller's umask. Ubuntu defaults to 002,
         // which yields a group-writable 0775 — and Vortix's own durable-state
         // checks reject any group- or world-writable directory, so a first run
@@ -282,6 +287,13 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
                 dir = d.parent();
             }
         }
+    }
+
+    if !path.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "config directory {} is not a directory",
+            path.display()
+        )));
     }
 
     // An install created before Vortix set 0700 keeps the umask's mode
@@ -1277,6 +1289,15 @@ ip_api_fallbacks = ["https://fallback1.example.com"]
         assert_eq!(result, expected);
         // resolve_config_dir must create the directory
         assert!(custom.is_dir());
+    }
+
+    #[test]
+    fn a_config_dir_that_is_a_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let error = resolve_config_dir(Some(&file)).unwrap_err();
+        assert!(error.to_string().ends_with("is not a directory"), "{error}");
     }
 
     #[test]

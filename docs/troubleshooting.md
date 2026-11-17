@@ -24,6 +24,9 @@ profiles it manages and refuses to act while `profiles/` holds a file it did not
 the named file out of `~/.config/vortix/profiles/` and import it with `vortix import`; never
 copy files into that directory by hand.
 
+**"config directory … is not a directory".** `-C`/`--config-dir` or `VORTIX_CONFIG_DIR` names a
+file. Point it at a directory, or at a path that does not exist yet for Vortix to create.
+
 **Files in `~/.config/vortix` owned by root, or "must be a file owned by you that no other user
 can open".** Every file there must be yours and private. Give them back:
 

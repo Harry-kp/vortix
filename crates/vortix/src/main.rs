@@ -72,8 +72,10 @@ fn main() -> Result<()> {
 
     // Resolve config directory (CLI flag > SUDO_USER > XDG > default)
     let explicit_override = args.config_dir.is_some();
-    let mut config_dir = config::resolve_config_dir(args.config_dir.as_ref())
-        .map_err(|e| eyre::eyre!("Failed to resolve config directory: {e}"))?;
+    let mut config_dir = config::resolve_config_dir(args.config_dir.as_ref()).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(cli::output::ExitCode::GeneralError.code());
+    });
 
     // Emergency release must remain available when settings, journals,
     // profile migrations, or the normal control service cannot start. The
