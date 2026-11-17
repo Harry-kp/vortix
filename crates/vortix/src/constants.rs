@@ -235,8 +235,8 @@ pub const TITLE_AUTH_MANAGE_FOOTER: &str = " [Tab] Switch  [^R] Show  [Enter] Sa
 /// Maximum config file size (1 MB). Anything larger is almost certainly not a VPN config.
 pub const MAX_CONFIG_SIZE_BYTES: u64 = 1_024 * 1_024;
 
-/// Default filename for downloaded profiles if none can be determined.
-pub const DEFAULT_IMPORTED_FILENAME: &str = "imported_profile.conf";
+/// Default file stem for a downloaded profile whose URL names no file.
+pub const DEFAULT_IMPORTED_FILENAME: &str = "imported";
 
 // === UI Labels & Titles ===
 
