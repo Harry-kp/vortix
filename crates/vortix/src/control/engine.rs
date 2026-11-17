@@ -565,7 +565,7 @@ impl Engine {
             }
             Ok(live) => self.spawn_stop(profile_id, live),
             Err(error) => {
-                if error == StartError::AuthFailed && used_saved {
+                if matches!(error, StartError::AuthFailed(_)) && used_saved {
                     let cleared = self
                         .credentials
                         .lock()
@@ -1791,7 +1791,7 @@ mod tests {
 
         engine.started(
             &ProfileId::new("a"),
-            Err(StartError::AuthFailed),
+            Err(StartError::AuthFailed(String::new())),
             None,
             true,
         );

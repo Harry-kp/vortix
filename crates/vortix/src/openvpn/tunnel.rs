@@ -239,17 +239,17 @@ fn drive_mgmt_auth(
     let challenge =
         (!answer.is_empty()).then_some(crate::openvpn::routes::OpenVpnChallengeKind::Static);
     crate::openvpn::management::authenticate(stream, user, pass, answer, challenge, timeout)
-        .map_err(|error| match error {
-            crate::openvpn::management::ManagementAuthError::AuthenticationRejected
-            | crate::openvpn::management::ManagementAuthError::UnsupportedChallenge
-            | crate::openvpn::management::ManagementAuthError::InvalidCredentials => {
-                TunnelError::AuthFailed(error.to_string())
-            }
-            crate::openvpn::management::ManagementAuthError::DaemonExited => {
-                TunnelError::DaemonExited(error.to_string())
-            }
-            _ => TunnelError::Subprocess(error.to_string()),
-        })
+        .map_err(management_error)
+}
+
+/// Only a server rejection is `AuthFailed`: it is what clears saved credentials.
+fn management_error(error: crate::openvpn::management::ManagementAuthError) -> TunnelError {
+    use crate::openvpn::management::ManagementAuthError;
+    match error {
+        ManagementAuthError::AuthenticationRejected => TunnelError::AuthFailed(String::new()),
+        ManagementAuthError::DaemonExited => TunnelError::DaemonExited(error.to_string()),
+        _ => TunnelError::Subprocess(error.to_string()),
+    }
 }
 
 /// Wait for openvpn to create the management unix socket. Returns
@@ -702,7 +702,10 @@ fn poll_log_until_ready(
                         .find(|l| l.contains(pattern))
                         .unwrap_or(pattern);
                     if pattern == &"AUTH_FAILED" {
-                        return Err(TunnelError::AuthFailed(error_line.to_string()));
+                        let reason = error_line
+                            .split_once("AUTH_FAILED")
+                            .map_or("", |(_, reason)| reason.trim_start_matches(',').trim());
+                        return Err(TunnelError::AuthFailed(reason.to_string()));
                     }
                     return Err(TunnelError::DaemonExited(format!("OpenVPN: {error_line}")));
                 }
@@ -1837,5 +1840,22 @@ mod tests {
             sanitize_managed_config(profile).unwrap(),
             "client\nverb 3\n"
         );
+    }
+    #[test]
+    fn only_a_server_rejection_is_an_auth_failure() {
+        use crate::openvpn::management::ManagementAuthError;
+        assert!(matches!(
+            management_error(ManagementAuthError::AuthenticationRejected),
+            TunnelError::AuthFailed(_)
+        ));
+        for error in [
+            ManagementAuthError::UnsupportedChallenge,
+            ManagementAuthError::InvalidCredentials,
+        ] {
+            assert!(!matches!(
+                management_error(error),
+                TunnelError::AuthFailed(_)
+            ));
+        }
     }
 }
