@@ -20,7 +20,9 @@ use crate::tunnel::OperationId;
 use crate::tunnel::{TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
 use tracing::{debug, info, warn};
 
-use crate::openvpn::parser::{forbidden_effective_directive, parse_ovpn_conf};
+use crate::openvpn::parser::{
+    dns_setting, forbidden_effective_directive, parse_ovpn_conf, DnsSetting,
+};
 use crate::openvpn::push::{latest_completed_push_options, PushReplySelectionError};
 
 /// Quality of the DNS intent recovered from an `OpenVPN` session log.
@@ -68,11 +70,9 @@ fn sanitize_managed_config(text: &str) -> Result<String, TunnelError> {
         validate_managed_line(line).map_err(|error| TunnelError::Subprocess(error.to_string()))?;
         let directive = line.split(['#', ';']).next().unwrap_or_default();
         let mut tokens = directive.split_whitespace();
-        let first = tokens.next().map(|value| value.trim_start_matches('-'));
-        let is_dns = matches!(first, Some(value) if value.eq_ignore_ascii_case("dhcp-option"))
-            && matches!(tokens.next(), Some(value) if value.eq_ignore_ascii_case("DNS")
-                || value.eq_ignore_ascii_case("DOMAIN")
-                || value.eq_ignore_ascii_case("DOMAIN-SEARCH"));
+        let first = tokens.next().unwrap_or_default();
+        let is_dns = first.trim_start_matches('-').eq_ignore_ascii_case("dns")
+            || !matches!(dns_setting(first, tokens), Ok(None));
         if !is_dns {
             output.push_str(line);
         }
@@ -723,7 +723,20 @@ fn build_ovpn_args(
     log_path: &std::path::Path,
     verbosity: &str,
 ) -> Vec<String> {
-    let mut args = vec![
+    // Before `--config`: the first matching filter wins, so a profile's
+    // `pull-filter accept` cannot hand DNS back to OpenVPN.
+    let mut args = Vec::new();
+    for option in [
+        "dhcp-option DNS",
+        "dhcp-option DOMAIN",
+        "dhcp-option DOMAIN-SEARCH",
+        "dns",
+    ] {
+        args.push("--pull-filter".to_string());
+        args.push("ignore".to_string());
+        args.push(option.to_string());
+    }
+    args.extend([
         "--config".to_string(),
         config_path.to_string_lossy().into_owned(),
         "--writepid".to_string(),
@@ -736,18 +749,7 @@ fn build_ovpn_args(
         // harmless: the topology transaction installs the authenticated
         // route evidence after conflict admission succeeds.
         "--route-noexec".to_string(),
-    ];
-
-    for option in [
-        "dhcp-option DNS",
-        "dhcp-option DOMAIN",
-        "dhcp-option DOMAIN-SEARCH",
-    ] {
-        args.push("--pull-filter".to_string());
-        args.push("ignore".to_string());
-        args.push(option.to_string());
-    }
-
+    ]);
     args
 }
 
@@ -822,41 +824,31 @@ fn pushed_dns_evidence(
     let mut observed = false;
     for option in push_reply {
         let mut tokens = option.split_whitespace();
-        if !matches!(tokens.next(), Some(prefix) if prefix.eq_ignore_ascii_case("dhcp-option")) {
-            continue;
-        }
-        match tokens.next() {
-            Some(kind) if kind.eq_ignore_ascii_case("DNS") => {
-                let Some(server) = tokens.next().and_then(|value| value.parse().ok()) else {
-                    return OvpnDnsEvidence::Unavailable {
-                        configured: request,
-                        reason: "OpenVPN PUSH_REPLY contained malformed DNS evidence".into(),
-                    };
+        let directive = tokens.next().unwrap_or_default();
+        match dns_setting(directive, tokens) {
+            Err(()) => {
+                return OvpnDnsEvidence::Unavailable {
+                    configured: request,
+                    reason: "OpenVPN PUSH_REPLY contained malformed DNS evidence".into(),
                 };
-                observed = true;
-                if !request.servers.contains(&server) {
-                    request.servers.push(server);
-                }
             }
-            Some(kind)
-                if kind.eq_ignore_ascii_case("DOMAIN")
-                    || kind.eq_ignore_ascii_case("DOMAIN-SEARCH") =>
-            {
-                let domains = tokens.collect::<Vec<_>>();
-                if domains.is_empty() {
-                    return OvpnDnsEvidence::Unavailable {
-                        configured: request,
-                        reason: "OpenVPN PUSH_REPLY contained malformed domain evidence".into(),
-                    };
-                }
+            Ok(Some(DnsSetting::Servers(servers))) => {
                 observed = true;
-                for domain in domains {
-                    if !request.search_domains.iter().any(|item| item == domain) {
-                        request.search_domains.push(domain.to_string());
+                for server in servers {
+                    if !request.servers.contains(&server) {
+                        request.servers.push(server);
                     }
                 }
             }
-            _ => {}
+            Ok(Some(DnsSetting::Domains(domains))) => {
+                observed = true;
+                for domain in domains {
+                    if !request.search_domains.contains(&domain) {
+                        request.search_domains.push(domain);
+                    }
+                }
+            }
+            Ok(None) => {}
         }
     }
     if observed {
@@ -1399,11 +1391,15 @@ mod tests {
             args.iter()
                 .filter(|arg| arg.as_str() == "--pull-filter")
                 .count(),
-            3
+            4
         );
         assert!(args
             .windows(3)
             .any(|window| { window == ["--pull-filter", "ignore", "dhcp-option DOMAIN-SEARCH"] }));
+        assert!(args
+            .windows(3)
+            .any(|window| window == ["--pull-filter", "ignore", "dns"]));
+        assert!(pf_idx < args.iter().position(|arg| arg == "--config").unwrap());
         assert!(!args.iter().any(|arg| arg == "--daemon"));
         assert!(args.iter().any(|arg| arg == "--route-noexec"));
     }
@@ -1789,5 +1785,43 @@ mod tests {
                 OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
             );
         }
+    }
+    #[test]
+    fn openvpn_2_6_dns_options_are_captured() {
+        let evidence = pushed_dns_evidence(
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
+            "PUSH_REPLY,dns server 0 address 10.8.0.1 [2001:db8::53]:53,dns search-domains corp.example\nInitialization Sequence Completed\n",
+        );
+        let OvpnDnsEvidence::Observed(request) = evidence else {
+            panic!("pushed dns options must be observed");
+        };
+        assert_eq!(
+            request.servers,
+            ["10.8.0.1", "2001:db8::53"].map(|ip| ip.parse::<std::net::IpAddr>().unwrap())
+        );
+        assert_eq!(request.search_domains, ["corp.example"]);
+        assert!(matches!(
+            pushed_dns_evidence(
+                &crate::openvpn::parser::OvpnParsedProfile::default(),
+                "PUSH_REPLY,dns server 0 address nonsense\nInitialization Sequence Completed\n",
+            ),
+            OvpnDnsEvidence::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_profile_dns_option_is_captured_and_kept_from_openvpn() {
+        let profile =
+            "client\ndns server 0 address 10.8.0.1\ndns search-domains corp.example\nverb 3\n";
+        let parsed = parse_ovpn_conf(profile).unwrap();
+        assert_eq!(
+            parsed.dns_servers,
+            ["10.8.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(parsed.dns_search_domains, ["corp.example"]);
+        assert_eq!(
+            sanitize_managed_config(profile).unwrap(),
+            "client\nverb 3\n"
+        );
     }
 }
