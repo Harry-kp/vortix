@@ -71,10 +71,7 @@ impl CachedConfigView {
     #[must_use]
     pub fn from_content(content: String, choice: crate::ui::theme::ThemeChoice) -> Self {
         let highlighted_lines = crate::ui::theme::with_choice(choice, || {
-            content
-                .lines()
-                .map(crate::ui::overlays::config_viewer::highlight_config_line)
-                .collect::<Vec<Line<'static>>>()
+            crate::ui::overlays::config_viewer::highlight_config(&content)
         });
         let total_lines = u16::try_from(highlighted_lines.len()).unwrap_or(u16::MAX);
         Self {

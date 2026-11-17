@@ -39,7 +39,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `z` | Zoom the focused panel |
 | `f` | Flip Details to the focused tunnel's routes and peers, or Security to why its verdict says that ([Flip side](#flip-side)); in the Logs panel, cycle the source |
 | `x` / `b` | Action menu / bulk actions |
-| `R` / `v` / `Del` | Rename / view config (a NetBird profile adds its client's settings from the server, private key masked) / delete the focused profile |
+| `R` / `v` / `Del` | Rename / view config (keys, passwords and inline OpenVPN secrets masked; a NetBird profile adds its client's settings from the server) / delete the focused profile |
 | `a` / `A` | Save / clear OpenVPN credentials |
 | `s` / `/` / `p` | Sort / search / switch theme |
 | `q` | Quit |

@@ -653,6 +653,45 @@ pub mod config_viewer {
         frame.render_stateful_widget(scrollbar, scroll_area, &mut scrollbar_state);
     }
 
+    /// Inline profile blocks whose body is a secret.
+    const SECRET_BLOCKS: [&str; 7] = [
+        "key",
+        "tls-auth",
+        "tls-crypt",
+        "tls-crypt-v2",
+        "secret",
+        "pkcs12",
+        "auth-user-pass",
+    ];
+
+    /// Highlight a whole config, replacing the body of each secret block with one masked line.
+    pub(crate) fn highlight_config(content: &str) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let mut secret: Option<&str> = None;
+        for line in content.lines() {
+            let tag = line
+                .trim()
+                .strip_prefix('<')
+                .and_then(|t| t.strip_suffix('>'));
+            match (secret, tag) {
+                (Some(open), Some(tag)) if tag.strip_prefix('/') == Some(open) => secret = None,
+                (Some(_), _) => continue,
+                (None, Some(tag)) if SECRET_BLOCKS.contains(&tag) => {
+                    secret = Some(tag);
+                    lines.push(highlight_config_line(line));
+                    lines.push(Line::from(Span::styled(
+                        "•••••••••••• (masked)",
+                        Style::default().fg(theme::current().inactive),
+                    )));
+                    continue;
+                }
+                (None, _) => {}
+            }
+            lines.push(highlight_config_line(line));
+        }
+        lines
+    }
+
     /// Apply syntax highlighting to config lines.
     ///
     /// Exposed `pub(crate)` so the App's open-config handler can build a
@@ -788,6 +827,25 @@ pub mod config_viewer {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn inline_openvpn_secrets_are_masked() {
+            let config = "client\n<ca>\nCA-BODY\n</ca>\n<key>\nKEYBODY\n</key>\n<tls-crypt>\nSTATICBODY\n</tls-crypt>\nverb 3";
+            let shown: Vec<String> = super::highlight_config(config)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            let text = shown.join("\n");
+            assert!(text.contains("CA-BODY"), "{text}");
+            assert!(
+                !text.contains("KEYBODY") && !text.contains("STATICBODY"),
+                "{text}"
+            );
+            assert!(
+                text.contains("<key>") && text.contains("</tls-crypt>") && text.contains("verb 3"),
+                "{text}"
+            );
+        }
+
         #[test]
         fn a_mesh_auth_key_is_masked() {
             let shown =
