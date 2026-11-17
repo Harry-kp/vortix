@@ -48,8 +48,6 @@ impl PushedRouteEvidence {
 pub(crate) enum PushReplySelectionError {
     #[error("OpenVPN log has no completed negotiation marker")]
     NoCompletedNegotiation,
-    #[error("OpenVPN PUSH_REPLY contained a route or DNS option OpenVPN itself would refuse")]
-    NonCanonicalOption,
     #[error("OpenVPN log contains a newer incomplete negotiation")]
     NewerIncompleteNegotiation,
 }
@@ -259,40 +257,6 @@ pub(crate) fn pushed_route_evidence(
     })
 }
 
-/// The pushed options Vortix reads. `OpenVPN` matches option names and the
-/// `dhcp-option` kinds case-sensitively and filters on the raw text, so any
-/// other spelling or spacing of one is refused rather than read.
-const READ_OPTIONS: [&str; 10] = [
-    "route",
-    "route-ipv6",
-    "redirect-gateway",
-    "redirect-gateway-ipv6",
-    "redirect-private",
-    "route-gateway",
-    "route-ipv6-gateway",
-    "route-metric",
-    "dhcp-option",
-    "dns",
-];
-
-fn canonical_option(option: &str) -> bool {
-    let mut words = option.split_whitespace();
-    let name = words.next().unwrap_or_default();
-    if !READ_OPTIONS
-        .iter()
-        .any(|read| name.eq_ignore_ascii_case(read))
-    {
-        return true;
-    }
-    let kinds = ["DNS", "DOMAIN", "DOMAIN-SEARCH"];
-    let kind = words.next().unwrap_or_default();
-    READ_OPTIONS.contains(&name)
-        && option.split_whitespace().collect::<Vec<_>>().join(" ") == option
-        && (name != "dhcp-option"
-            || kinds.contains(&kind)
-            || !kinds.iter().any(|known| kind.eq_ignore_ascii_case(known)))
-}
-
 /// Every option the latest completed negotiation pushed that the profile
 /// pulls. A long push arrives as several `PUSH_REPLY` messages, each but the
 /// last marked `push-continuation 2`.
@@ -315,18 +279,12 @@ pub(super) fn latest_completed_push_options<'a>(
         continued = message.contains(&"push-continuation 2");
         options.get_or_insert_default().extend(message);
     }
-    let Some(options) = options else {
-        return Ok(None);
-    };
-    if !options.iter().all(|option| canonical_option(option)) {
-        return Err(PushReplySelectionError::NonCanonicalOption);
-    }
-    Ok(Some(
+    Ok(options.map(|options| {
         options
             .into_iter()
             .filter(|option| parsed.pull.pulls(option))
-            .collect(),
-    ))
+            .collect()
+    }))
 }
 
 /// Return the transport address selected by the latest successful `OpenVPN`
@@ -700,29 +658,12 @@ mod tests {
         assert_eq!(evidence.routes()[0].destination.to_string(), "10.9.0.0/16");
     }
     #[test]
-    fn a_route_option_in_a_form_openvpn_refuses_cannot_slip_past_a_pull_filter() {
-        let parsed = crate::openvpn::parser::parse_ovpn_conf(
-            "client\npull-filter ignore \"redirect-gateway\"\npull-filter ignore \"route 10.9.0.0\"\n",
-        )
-        .unwrap();
-        for push in [
-            "Redirect-Gateway def1",
-            "redirect-gateway DEF1",
-            "redirect-gateway  def1",
-            "route\t10.9.0.0 255.255.0.0",
-            "route  10.9.0.0 255.255.0.0",
-            "ROUTE 10.9.0.0 255.255.0.0",
-        ] {
-            let log = format!("PUSH: Received control message: 'PUSH_REPLY,{push}\nInitialization Sequence Completed\n");
-            assert!(
-                pushed_route_evidence(&OvpnParsedProfile::default(), &log).is_err(),
-                "{push}"
-            );
-            if let Ok(evidence) = pushed_route_evidence(&parsed, &log) {
-                assert!(evidence.redirect_gateway().is_none(), "{push}");
-                assert!(evidence.routes().is_empty(), "{push}");
-            }
-        }
+    fn a_pushed_option_in_another_case_is_ignored_like_openvpn_does() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,Redirect-Gateway def1,ROUTE 10.9.0.0 255.255.0.0'\n\
+                   Initialization Sequence Completed\n";
+        let evidence = pushed_route_evidence(&OvpnParsedProfile::default(), log).unwrap();
+        assert!(evidence.redirect_gateway().is_none());
+        assert!(evidence.routes().is_empty());
     }
 
     #[test]

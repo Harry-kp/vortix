@@ -1721,25 +1721,14 @@ mod tests {
         }
     }
     #[test]
-    fn pushed_dns_in_a_form_openvpn_refuses_is_unavailable() {
-        for push in [
-            "dhcp-option dns 10.8.0.1",
-            "DHCP-OPTION DNS 10.8.0.1",
-            "dhcp-option  DNS 10.8.0.1",
-        ] {
-            let log = format!("PUSH: Received control message: 'PUSH_REPLY,{push}\nInitialization Sequence Completed\n");
-            assert!(
-                matches!(
-                    pushed_dns_evidence(
-                        &crate::openvpn::parser::OvpnParsedProfile::default(),
-                        &log
-                    ),
-                    OvpnDnsEvidence::Unavailable { .. }
-                ),
-                "{push}"
-            );
-        }
+    fn pushed_dns_in_another_case_is_ignored_like_openvpn_does() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,dhcp-option dns 10.8.0.1,DHCP-OPTION DNS 10.8.0.2'\nInitialization Sequence Completed\n";
+        assert_eq!(
+            pushed_dns_evidence(&crate::openvpn::parser::OvpnParsedProfile::default(), log),
+            OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
+        );
     }
+
     #[test]
     fn openvpn_2_6_dns_options_are_captured() {
         let evidence = pushed_dns_evidence(
