@@ -24,7 +24,7 @@ use clap::{Parser, Subcommand, ValueHint};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, after_long_help = GLOBAL_EXAMPLES)]
 pub struct Args {
-    /// Override config directory [env: `VORTIX_CONFIG_DIR`]
+    /// Override config directory
     #[arg(
         short = 'C',
         long,
@@ -71,6 +71,20 @@ EXIT CODES:
     5  Missing dependency (wg-quick, openvpn, netbird)
     6  Timeout";
 
+const IMPORT_HELP: &str = "\
+Supports .conf (WireGuard), .ovpn (OpenVPN), .netbird (NetBird), directories
+for bulk import, and http/https URLs for remote config download. For NetBird, netbird
+adds the network of the NetBird app on this computer (else NetBird's cloud) and
+netbird <server URL> a company's own, each signing in on first connect;
+/var/lib/netbird moves the app's network here with its device and login.
+
+EXAMPLES:
+    vortix import ./work.conf             Import a WireGuard profile
+    vortix import ./configs/              Bulk import from directory
+    vortix import https://example.com/vpn.conf
+    sudo vortix import netbird            Join NetBird (or netbird <server URL>)
+    sudo vortix import /var/lib/netbird   Move from the NetBird app";
+
 /// Available CLI commands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
@@ -82,7 +96,7 @@ pub enum Commands {
     ///
     /// A profile that conflicts with a running tunnel (both want all
     /// traffic, or both route the same networks) exits with code 4.
-    /// `--yes` switches: the new tunnel replaces the conflicting one.
+    /// --yes switches: the new tunnel replaces the conflicting one.
     ///
     /// EXAMPLES:
     ///     sudo vortix up work-vpn               Connect to 'work-vpn'
@@ -97,28 +111,26 @@ pub enum Commands {
         #[arg(value_hint = ValueHint::Other)]
         profile: Option<String>,
 
-        /// Overall connection timeout in seconds (defaults to the protocol
-        /// gate plus a bounded cleanup/control-publication grace)
+        /// Overall connection timeout in seconds (default: the protocol's
+        /// connect timeout plus a few seconds to clean up a failed attempt)
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
 
-        /// Bypass the multi-tunnel conflict gate (default-route takeover or
-        /// route overlap) and switch to this tunnel. Without this flag,
-        /// conflicting connects exit with code 4 (`StateConflict`) so
-        /// scripted callers can branch.
+        /// Switch to this tunnel even if it conflicts with a running one
+        /// (both take all traffic, or their routes overlap); it replaces
+        /// that tunnel. Without this flag a conflicting connect exits
+        /// with code 4, so scripts can branch.
         #[arg(short, long)]
         yes: bool,
     },
 
     /// Disconnect from VPN
     ///
-    /// Without arguments, disconnects every active tunnel (preserves
-    /// single-tunnel semantics — for one-tunnel users, "down" still
-    /// means "stop the one tunnel"). With a profile name, disconnects
-    /// that profile only. `--all` is the explicit script-friendly form
-    /// of the no-args behaviour. If already disconnected, exits
-    /// successfully (idempotent). A process still running 5 s after the
-    /// graceful stop is killed on every disconnect.
+    /// Without arguments, disconnects every active tunnel. With a
+    /// profile name, disconnects that profile only. --all spells out
+    /// the no-argument form for scripts. If already disconnected, exits
+    /// successfully. A process still running 5 s after the graceful
+    /// stop is killed.
     ///
     /// EXAMPLES:
     ///     sudo vortix down              Disconnect every active tunnel
@@ -146,9 +158,8 @@ pub enum Commands {
 
     /// Reconnect VPN tunnel(s)
     ///
-    /// Without arguments, cycles every currently-Connected tunnel
-    /// (disconnect then reconnect) — matches today's single-tunnel
-    /// reconnect semantics applied across all active tunnels. With a
+    /// Without arguments, disconnects and reconnects every connected
+    /// tunnel, or the last-used profile when none is connected. With a
     /// profile name, cycles that profile only.
     ///
     /// EXAMPLES:
@@ -157,8 +168,7 @@ pub enum Commands {
     ///     sudo vortix reconnect --json     Reconnect with JSON result
     #[command(verbatim_doc_comment)]
     Reconnect {
-        /// Profile to cycle. Omit to cycle every currently-Connected
-        /// tunnel.
+        /// Profile to cycle. Omit to cycle every connected tunnel.
         #[arg(value_hint = ValueHint::Other)]
         profile: Option<String>,
     },
@@ -201,9 +211,9 @@ pub enum Commands {
     ///
     /// EXAMPLES:
     ///     vortix list                           Table with all profiles
-    ///     vortix list --json                    JSON object with profiles in `.data`
+    ///     vortix list --json                    JSON with the profiles under data
     ///     vortix list --sort last-used          Most recently used first
-    ///     vortix list --protocol wireguard      Only `WireGuard` profiles
+    ///     vortix list --protocol wireguard      Only profiles of one protocol
     ///     vortix list --names-only              Profile names for scripting
     ///     vortix list --json | jq '.data[].name' Extract names via jq
     #[command(visible_alias = "ls")]
@@ -233,22 +243,9 @@ pub enum Commands {
     },
 
     /// Import VPN profile(s) from a file, directory, or URL
-    ///
-    /// Supports `.conf` (`WireGuard`), `.ovpn` (`OpenVPN`), `.netbird` (`NetBird`), directories
-    /// for bulk import, and http/https URLs for remote config download. For `NetBird`, `netbird`
-    /// adds the network of the `NetBird` app on this computer (else `NetBird`'s cloud) and
-    /// `netbird <server URL>` a company's own, each signing in on first connect;
-    /// `/var/lib/netbird` moves the app's network here with its device and login.
-    ///
-    /// EXAMPLES:
-    ///     vortix import ./work.conf             Import a `WireGuard` profile
-    ///     vortix import ./configs/              Bulk import from directory
-    ///     vortix import <https://example.com/vpn.conf>
-    ///     sudo vortix import netbird            Join `NetBird` (or `netbird <server URL>`)
-    ///     sudo vortix import /var/lib/netbird   Move from the `NetBird` app
-    #[command(verbatim_doc_comment)]
+    #[command(long_about = IMPORT_HELP)]
     Import {
-        /// Path to a `.conf`/`.ovpn`/`.netbird` file, directory or URL, or `netbird`
+        /// A .conf, .ovpn or .netbird file, a directory, an http(s) URL, or netbird
         #[arg(value_hint = ValueHint::AnyPath, required = true, num_args = 1..=2)]
         file: Vec<String>,
     },
@@ -259,7 +256,7 @@ pub enum Commands {
     ///
     /// EXAMPLES:
     ///     vortix show work-vpn                  Parsed config with masked secrets
-    ///     vortix show work-vpn --raw            Raw `.conf`/`.ovpn` file contents
+    ///     vortix show work-vpn --raw            Raw profile file contents
     ///     vortix show work-vpn --json           Parsed config as JSON
     #[command(verbatim_doc_comment)]
     Show {
@@ -346,10 +343,10 @@ pub enum Commands {
 
     /// Connect a profile when the computer starts
     ///
-    /// Installs a boot unit (systemd on Linux, launchd on macOS) that runs
-    /// `vortix up <PROFILE>` at every boot, from the next one on, retrying a
+    /// Installs a boot unit (systemd on Linux, launchd on macOS) that
+    /// connects the profile at every boot, from the next one on, retrying a
     /// failed attempt every 30 seconds. It applies the saved kill switch mode
-    /// like any connect. `off` removes the unit. Without an argument, shows
+    /// like any connect. off removes the unit. Without an argument, shows
     /// the current setting.
     ///
     /// EXAMPLES:
@@ -358,7 +355,7 @@ pub enum Commands {
     ///     sudo vortix autoconnect off          Stop connecting at boot
     #[command(verbatim_doc_comment)]
     Autoconnect {
-        /// Profile to connect at boot, or `off` (omit to show the current setting)
+        /// Profile to connect at boot, or off (omit to show the current setting)
         #[arg(value_hint = ValueHint::Other)]
         profile: Option<String>,
     },
@@ -371,7 +368,7 @@ pub enum Commands {
     #[command(verbatim_doc_comment)]
     Info,
 
-    /// Update a `cargo install` of vortix to the latest version from crates.io
+    /// Update vortix from crates.io, when it was installed with cargo install
     ///
     /// EXAMPLES:
     ///     vortix update
@@ -389,7 +386,7 @@ pub enum Commands {
     ///
     /// Per-process snapshot of open TCP/UDP sockets visible to the
     /// calling user. Useful for answering "is this traffic actually
-    /// going through the VPN tunnel?" — the `--vpn-only` flag filters
+    /// going through the VPN tunnel?" — --vpn-only filters
     /// to sockets bound to / routing via the active VPN interface.
     ///
     /// EXAMPLES:
@@ -416,7 +413,7 @@ pub enum Commands {
     ///     vortix completions fish > ~/.config/fish/completions/vortix.fish
     #[command(verbatim_doc_comment)]
     Completions {
-        /// Target shell: bash, zsh, fish, powershell
+        /// Target shell
         shell: clap_complete::Shell,
     },
 }
