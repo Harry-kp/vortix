@@ -326,7 +326,7 @@ pub(super) fn handle_import(
                     crate::config::import::cleanup_temp_download(&downloaded_path);
                     match result {
                         Ok(profile) => {
-                            print_import_success(&profile, mode);
+                            print_import_success(&profile, &downloaded_path, mode);
                             0
                         }
                         Err(e) => {
@@ -363,7 +363,7 @@ pub(super) fn handle_import(
             crate::config::import::cleanup_temp_download(&path);
             match imported {
                 Ok(profile) => {
-                    print_import_success(&profile, mode);
+                    print_import_success(&profile, &path, mode);
                     0
                 }
                 Err(e) => {
@@ -418,7 +418,11 @@ struct ImportData {
     config_path: String,
 }
 
-fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: OutputMode) {
+fn print_import_success(
+    profile: &crate::config::profiles::VpnProfile,
+    source: &Path,
+    mode: OutputMode,
+) {
     let data = ImportData {
         name: profile.name.clone(),
         protocol: format!("{}", profile.protocol),
@@ -428,6 +432,16 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
     match mode {
         OutputMode::Human => {
             println!("✓ Imported '{}'", profile.name);
+            if let Some(requested) = source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| *stem != profile.name)
+            {
+                println!(
+                    "  A profile named '{requested}' already exists, so this one is '{}'.",
+                    profile.name
+                );
+            }
             println!("  Protocol:  {}", profile.protocol);
             println!("  Location:  {}", profile.location);
             println!("  Config:    {}", profile.config_path.display());
