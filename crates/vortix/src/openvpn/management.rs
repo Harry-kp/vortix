@@ -180,7 +180,7 @@ fn remaining(deadline: Instant) -> Result<Duration, ManagementAuthError> {
         .ok_or(ManagementAuthError::Timeout)
 }
 
-fn valid_quoted_value(value: &str) -> bool {
+pub(crate) fn valid_quoted_value(value: &str) -> bool {
     !value.is_empty() && !value.as_bytes().iter().any(u8::is_ascii_control)
 }
 

@@ -152,7 +152,7 @@ impl fmt::Display for CredentialIoOperation {
 pub enum CredentialStoreError {
     #[error("remembered credential artifact was rejected: {0}")]
     UnsafeArtifact(CredentialArtifactIssue),
-    #[error("remembered credentials must contain non-empty single-line values")]
+    #[error("remembered credentials must be non-empty, without tabs, line breaks or other control characters")]
     InvalidCredentials,
     #[error("remembered credential record exceeds its fixed capacity")]
     Capacity,
@@ -626,15 +626,13 @@ fn normalize_private_directory(
     Ok(())
 }
 
+/// Saved credentials are answered over the management socket, so they
+/// follow its rule.
 fn validate_field(value: &str) -> Result<(), CredentialStoreError> {
-    if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| matches!(byte, b'\n' | b'\r' | b'\0'))
-    {
-        Err(CredentialStoreError::InvalidCredentials)
-    } else {
+    if crate::openvpn::management::valid_quoted_value(value) {
         Ok(())
+    } else {
+        Err(CredentialStoreError::InvalidCredentials)
     }
 }
 
@@ -870,6 +868,14 @@ mod tests {
         ));
         assert!(matches!(
             RememberedOpenVpnCredentials::new("user\nother", "pass"),
+            Err(CredentialStoreError::InvalidCredentials)
+        ));
+    }
+
+    #[test]
+    fn a_password_the_management_socket_cannot_carry_is_not_saved() {
+        assert!(matches!(
+            RememberedOpenVpnCredentials::new("user", "pass\tword"),
             Err(CredentialStoreError::InvalidCredentials)
         ));
     }

@@ -98,6 +98,8 @@ dashboard's Logs panel (`f` until the title names the profile).
   code; its reason follows when it gives one. A saved password that is rejected is removed. If
   the notice says it could not be removed, clear it with `A` in the dashboard; until then every
   connect tries it again. Any other failure keeps the saved password.
+- `remembered credentials must be non-empty, without tabs, line breaks or other control
+  characters`: OpenVPN cannot be handed such a username or password, so it is not saved.
 - `the OpenVPN server refused the connection for now`: the server sent a temporary refusal
   (`AUTH_FAILED,TEMP`), often while busy. Connect again later; a saved password is kept.
 - `OpenVPN requested an unsupported interactive challenge`: the server asks for a dynamic
