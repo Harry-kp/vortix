@@ -820,12 +820,15 @@ fn handle_update(mode: OutputMode) {
 
 fn handle_completions(shell: clap_complete::Shell) {
     use clap::CommandFactory;
+    let mut script = Vec::new();
     clap_complete::generate(
         shell,
         &mut crate::cli::args::Args::command(),
         "vortix",
-        &mut std::io::stdout(),
+        &mut script,
     );
+    // Printed like every other command, so `| head` exits quietly.
+    print!("{}", String::from_utf8_lossy(&script));
 }
 
 #[cfg(test)]
