@@ -19,6 +19,21 @@ fn importable_profile_paths(dir_path: &Path) -> std::io::Result<Vec<std::path::P
 }
 
 impl App {
+    /// Select row `index`, clamped to the list and none when it is empty. Another
+    /// profile's routes start at the top.
+    pub(crate) fn select_profile(&mut self, index: usize) {
+        let index = self
+            .runtime
+            .profiles
+            .len()
+            .checked_sub(1)
+            .map(|last| index.min(last));
+        if index != self.profile_list_state.selected() {
+            self.routes_scroll = 0;
+        }
+        self.profile_list_state.select(index);
+    }
+
     pub(crate) fn profile_next(&mut self) {
         let i = match self.profile_list_state.selected() {
             Some(i) => {
@@ -30,7 +45,7 @@ impl App {
             }
             None => 0,
         };
-        self.profile_list_state.select(Some(i));
+        self.select_profile(i);
     }
 
     pub(crate) fn profile_previous(&mut self) {
@@ -44,7 +59,7 @@ impl App {
             }
             None => 0,
         };
-        self.profile_list_state.select(Some(i));
+        self.select_profile(i);
     }
 
     /// Request deletion of a profile (Safety Check)
@@ -209,6 +224,7 @@ impl App {
 
         let mut last_imported_name: Option<String> = None;
         let mut should_close_overlay = false;
+        let previous = self.selected_profile_id();
 
         match resolve_target(path_str) {
             Ok(ImportTarget::Url(url)) => {
@@ -247,11 +263,13 @@ impl App {
 
         self.runtime.sort_profiles();
 
-        if let Some(name) = &last_imported_name {
-            if let Some(idx) = self.runtime.profiles.iter().position(|p| &p.name == name) {
-                self.profile_list_state.select(Some(idx));
-            }
-        }
+        // The sort moved rows: keep the selection on a profile, not an index.
+        let imported = last_imported_name
+            .as_ref()
+            .and_then(|name| self.runtime.profiles.iter().position(|p| &p.name == name));
+        let kept = previous.and_then(|id| self.profile_index(&id));
+        let first = (!self.runtime.profiles.is_empty()).then_some(0);
+        self.profile_list_state.select(imported.or(kept).or(first));
 
         if should_close_overlay {
             self.handle_message(Message::CloseOverlay);

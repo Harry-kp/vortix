@@ -131,11 +131,8 @@ impl App {
             Message::ProfileMove(mv) => match mv {
                 SelectionMove::Next => self.profile_next(),
                 SelectionMove::Prev => self.profile_previous(),
-                SelectionMove::First => self.profile_list_state.select(Some(0)),
-                SelectionMove::Last => {
-                    let last = self.runtime.profiles.len().saturating_sub(1);
-                    self.profile_list_state.select(Some(last));
-                }
+                SelectionMove::First => self.select_profile(0),
+                SelectionMove::Last => self.select_profile(usize::MAX),
             },
 
             // Connection

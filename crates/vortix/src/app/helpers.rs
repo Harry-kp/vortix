@@ -199,8 +199,7 @@ impl App {
                 let current = self.profile_list_state.selected().unwrap_or(0);
                 let last = self.runtime.profiles.len().saturating_sub(1);
                 if current < last {
-                    self.profile_list_state.select(Some(current + 1));
-                    self.routes_scroll = 0;
+                    self.select_profile(current + 1);
                 }
             }
             FocusedPanel::Logs => {
@@ -227,8 +226,7 @@ impl App {
             FocusedPanel::Sidebar => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
                 if current > 0 {
-                    self.profile_list_state.select(Some(current - 1));
-                    self.routes_scroll = 0;
+                    self.select_profile(current - 1);
                 }
             }
             FocusedPanel::Logs => {

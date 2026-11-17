@@ -2983,3 +2983,83 @@ mod overlay_keys {
         app.handle_key(key(KeyCode::Char('G')));
     }
 }
+
+mod directory_import {
+    use super::*;
+
+    fn write_profile(dir: &std::path::Path, name: &str) {
+        std::fs::write(
+            dir.join(format!("{name}.conf")),
+            "[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\nEndpoint = 192.0.2.1:51820\nAllowedIPs = 0.0.0.0/0\n",
+        )
+        .unwrap();
+    }
+
+    fn unique() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 100_000_000
+    }
+
+    #[test]
+    fn importing_a_folder_into_an_empty_list_selects_a_profile() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let id = unique();
+        write_profile(dir.path(), &format!("a{id}x"));
+        write_profile(dir.path(), &format!("a{id}y"));
+        app.handle_message(crate::message::Message::Import(
+            dir.path().display().to_string(),
+        ));
+        assert!(!app.runtime.profiles.is_empty());
+        assert!(app.profile_list_state.selected().is_some());
+    }
+
+    #[test]
+    fn importing_a_folder_keeps_the_selected_profile() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["zz-mine"]);
+        app.profile_list_state.select(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let id = unique();
+        write_profile(dir.path(), &format!("b{id}x"));
+        write_profile(dir.path(), &format!("b{id}y"));
+        app.handle_message(crate::message::Message::Import(
+            dir.path().display().to_string(),
+        ));
+        let selected = app.profile_list_state.selected().unwrap();
+        assert_eq!(app.runtime.profiles[selected].name, "zz-mine");
+    }
+}
+
+mod selection {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn moving_through_an_empty_list_selects_nothing() {
+        let mut app = test_app();
+        for code in [KeyCode::Char('j'), KeyCode::Char('G'), KeyCode::PageDown] {
+            app.handle_key(key(code));
+            assert_eq!(app.profile_list_state.selected(), None, "{code:?}");
+        }
+        app.handle_key(key(KeyCode::Char('v')));
+        assert!(!app.show_config);
+    }
+
+    #[test]
+    fn the_next_profile_starts_its_routes_at_the_top() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["a", "b"]);
+        app.profile_list_state.select(Some(0));
+        app.routes_scroll = 7;
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.routes_scroll, 0);
+    }
+}

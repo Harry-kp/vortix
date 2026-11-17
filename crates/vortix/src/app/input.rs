@@ -828,14 +828,11 @@ impl crate::app::App {
             }
             KeyCode::PageUp => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let next = current.saturating_sub(constants::PROFILE_LIST_PAGE_SIZE);
-                self.profile_list_state.select(Some(next));
+                self.select_profile(current.saturating_sub(constants::PROFILE_LIST_PAGE_SIZE));
             }
             KeyCode::PageDown => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let last = self.runtime.profiles.len().saturating_sub(1);
-                let next = (current + constants::PROFILE_LIST_PAGE_SIZE).min(last);
-                self.profile_list_state.select(Some(next));
+                self.select_profile(current + constants::PROFILE_LIST_PAGE_SIZE);
             }
 
             // Quick Actions (always available)
@@ -1083,7 +1080,7 @@ impl crate::app::App {
     pub(crate) fn apply_search_filter(&mut self, query: &str) {
         if query.is_empty() {
             self.search_match_count = self.runtime.profiles.len();
-            self.profile_list_state.select(Some(0));
+            self.select_profile(0);
             return;
         }
         let lower = query.to_lowercase();
@@ -1097,7 +1094,7 @@ impl crate::app::App {
             .collect();
         self.search_match_count = matches.len();
         if let Some(&first) = matches.first() {
-            self.profile_list_state.select(Some(first));
+            self.select_profile(first);
         }
     }
 }
