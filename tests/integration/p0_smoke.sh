@@ -58,15 +58,13 @@ if [[ -L /etc/resolv.conf ]]; then
 fi
 printf '#!/bin/sh\n[ "$1" = --version ]\n' >"$WORK/resolvconf"
 chmod 755 "$WORK/resolvconf"
-set +e
-UP_OUT=$(ip netns exec "$NS_B" env SUDO_USER="$P0_USER" PATH="$WORK:$PATH" \
-  "$VX" up p0dns --timeout 8 2>&1)
-UP_STATUS=$?
-set -e
-if [[ "$UP_STATUS" -eq 0 ]] || ! grep -q "network settings not applied" <<<"$UP_OUT"; then
-  echo "expected the p0dns connect to fail its network settings: $UP_OUT" >&2
+if UP_OUT=$(ip netns exec "$NS_B" env SUDO_USER="$P0_USER" PATH="$WORK:$PATH" \
+  "$VX" up p0dns --timeout 8 2>&1); then
+  echo "expected the p0dns connect to fail: $UP_OUT" >&2
   exit 1
 fi
+grep -q "network settings not applied" <<<"$UP_OUT" ||
+  { echo "expected a network settings failure: $UP_OUT" >&2; exit 1; }
 if ip -n "$NS_B" link show p0dns >/dev/null 2>&1; then
   echo "a connect that failed its network settings left its tunnel running" >&2
   exit 1
