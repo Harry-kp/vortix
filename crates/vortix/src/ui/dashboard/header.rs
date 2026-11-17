@@ -289,22 +289,8 @@ fn connected_line(
         QualityLevel::Excellent => ("●●●●●", theme::current().success),
     };
 
-    let proto_tag = app
-        .runtime
-        .profiles
-        .iter()
-        .find(|p| p.name == profile_name)
-        .map_or("", |p| match p.protocol {
-            crate::profile::ProtocolKind::WireGuard => "WG",
-            crate::profile::ProtocolKind::OpenVpn => "OVPN",
-            crate::profile::ProtocolKind::Mesh(driver) => driver.short(),
-        });
-
-    let proto_suffix = if proto_tag.is_empty() {
-        ")".to_string()
-    } else {
-        format!("/{proto_tag})")
-    };
+    // From the tunnel: the name may already be shortened.
+    let proto_suffix = format!("/{})", primary_snap.protocol.short());
 
     let mut header_spans = vec![
         Span::styled(

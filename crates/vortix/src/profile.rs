@@ -175,6 +175,18 @@ impl ResolvedEndpoint {
     }
 }
 
+impl ProtocolKind {
+    /// The two-letter tag the sidebar and header show.
+    #[must_use]
+    pub const fn short(self) -> &'static str {
+        match self {
+            Self::WireGuard => "WG",
+            Self::OpenVpn => "OV",
+            Self::Mesh(driver) => driver.short(),
+        }
+    }
+}
+
 impl std::fmt::Display for ProtocolKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

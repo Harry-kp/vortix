@@ -3101,3 +3101,21 @@ fn the_footer_keeps_quit_at_sixty_columns() {
         assert!(footer.contains("q Quit"), "{width}: {footer}");
     }
 }
+
+#[test]
+fn the_header_keeps_the_protocol_of_a_long_name_at_80_columns() {
+    let mut app = test_app();
+    set_connected(&mut app, "mullvad-se-sto-wg-001");
+    let mut snapshot = (*app.control_snapshot).clone();
+    snapshot.primary = Some(crate::profile::ProfileId::new("mullvad-se-sto-wg-001"));
+    snapshot.version += 1;
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let header: String = (0..80)
+        .map(|x| buffer[(x, 0)].symbol().to_string())
+        .collect();
+    let tag = app.control_snapshot.tunnels[0].protocol.short();
+    assert!(header.contains(&format!("/{tag})")), "{header}");
+}

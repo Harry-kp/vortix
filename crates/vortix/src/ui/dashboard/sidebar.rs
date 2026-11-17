@@ -236,11 +236,7 @@ fn profile_row(
     }
     let name_cell = Cell::from(Line::from(name_spans));
 
-    let proto_icon = match profile.protocol {
-        crate::profile::ProtocolKind::WireGuard => "WG",
-        crate::profile::ProtocolKind::OpenVpn => "OV",
-        crate::profile::ProtocolKind::Mesh(driver) => driver.short(),
-    };
+    let proto_icon = profile.protocol.short();
     let proto_color = if is_selected {
         theme::current().row_selected_fg
     } else if signal.is_active {
