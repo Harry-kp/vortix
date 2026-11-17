@@ -922,7 +922,7 @@ fn test_help_scroll_down_clamps_at_max() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
@@ -968,7 +968,7 @@ fn test_help_scroll_clamps_after_resize_before_key_handling() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: max_scroll.saturating_add(10),
@@ -990,7 +990,7 @@ fn test_help_end_jumps_to_max_scroll() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
@@ -1012,7 +1012,7 @@ fn test_help_mouse_scroll_down_clamps_at_max() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
@@ -1041,7 +1041,7 @@ fn test_help_mouse_scroll_up_clamps_after_resize() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: max_scroll.saturating_add(9),

@@ -223,7 +223,7 @@ impl App {
             } => {
                 let max_scroll = help_max_scroll_for_terminal_height(
                     self.terminal_size.1,
-                    crate::ui::help_total_lines(tab),
+                    crate::ui::help_total_lines(tab, self.terminal_size.0),
                 );
                 scroll = scroll.min(max_scroll);
                 match key.code {
@@ -487,7 +487,7 @@ impl App {
                 (InputMode::Help { scroll, tab }, MouseEventKind::ScrollDown) => {
                     let max_scroll = help_max_scroll_for_terminal_height(
                         self.terminal_size.1,
-                        crate::ui::help_total_lines(*tab),
+                        crate::ui::help_total_lines(*tab, self.terminal_size.0),
                     );
                     *scroll = (*scroll).min(max_scroll);
                     *scroll = scroll.saturating_add(3).min(max_scroll);
@@ -495,7 +495,7 @@ impl App {
                 (InputMode::Help { scroll, tab }, MouseEventKind::ScrollUp) => {
                     let max_scroll = help_max_scroll_for_terminal_height(
                         self.terminal_size.1,
-                        crate::ui::help_total_lines(*tab),
+                        crate::ui::help_total_lines(*tab, self.terminal_size.0),
                     );
                     *scroll = (*scroll).min(max_scroll);
                     *scroll = scroll.saturating_sub(3);

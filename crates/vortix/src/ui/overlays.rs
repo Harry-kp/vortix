@@ -978,13 +978,13 @@ pub mod help {
     //!   Guard explains the semantics.
 
     use crate::app::{state, state::HelpTab};
-    use crate::ui::sigils::{Sigil, SigilCategory, CATALOG};
+    use crate::ui::sigils::{SigilCategory, CATALOG};
     use crate::ui::theme;
     use ratatui::{
         layout::{Constraint, Direction, Layout, Rect},
         style::{Modifier, Style},
         text::{Line, Span},
-        widgets::{Block, Borders, Paragraph, Tabs, Wrap},
+        widgets::{Block, Borders, Paragraph, Tabs},
         Frame,
     };
 
@@ -1003,7 +1003,7 @@ pub mod help {
                 ("y", "Copy VPN IP to clipboard"),
                 ("Mouse drag", "Select text; release copies it"),
                 ("Click link", "Open it in your browser"),
-                ("Tab/S-Tab,l/h", "Next / Previous panel"),
+                ("Tab/S-Tab, l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),
                 ("f", "Flip: Details routes & peers, Security why"),
@@ -1122,7 +1122,7 @@ pub mod help {
     ),
     (
         "PARTIAL",
-        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (killswitch off, cipher weak, or DNS policy not verified). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
+        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (kill switch off, cipher weak, or DNS policy not verified). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
     ),
     (
         "PROTECTED",
@@ -1130,11 +1130,11 @@ pub mod help {
     ),
     (
         "Identity → Real IPv4 / Real IPv6",
-        "Your cached pre-VPN public addresses — what your ISP would expose you as if no tunnel were up. Always informational (no safety verdict on these rows): they're what you'd revert to if the VPN dropped. When your host has no IPv6 connectivity the row collapses to a single `Real IP` line; with v6 present, `Real IPv4` and `Real IPv6` render as separate rows. `Real IPv6` reads `checking…` until vortix can prove the v6 probe escaped any active tunnel (either a fully-disconnected sample or a tunnel whose AllowedIPs lack `::/0`).",
+        "Your cached pre-VPN public addresses — what your ISP would expose you as if no tunnel were up. Always informational (no safety verdict on these rows): they're what you'd revert to if the VPN dropped. When your host has no IPv6 connectivity the row collapses to a single `Real IP` line; with v6 present, `Real IPv4` and `Real IPv6` render as separate rows. `Real IPv6` reads `checking…` until Vortix can prove the v6 probe escaped any active tunnel (either a fully-disconnected sample or a tunnel whose AllowedIPs lack `::/0`).",
     ),
     (
         "Identity → Exit IPv4 / Exit IPv6",
-        "The public addresses the rest of the internet sees you as right now. With a working full-tunnel VPN these are the tunnel's exit addresses and the rows read ✓. When `Exit IPv4` matches `Real IPv4` the row goes ✗ with 'real IPv4 exposed' — IPv4 masking has failed. The `Exit IPv6` row carries the same per-family verdict: ✓ when `public_ipv6` differs from `real_ipv6`, ✗ with 'v6 exposed — matches real IPv6' when they match.",
+        "The public addresses the rest of the internet sees you as right now. With a working full-tunnel VPN these are the tunnel's exit addresses and the rows read ✓. When `Exit IPv4` matches `Real IPv4` the row goes ✗ with 'real IPv4 exposed' — IPv4 masking has failed. The `Exit IPv6` row carries the same per-family verdict: ✓ when it differs from `Real IPv6`, ✗ with 'v6 exposed — matches real IPv6' when they match.",
     ),
     (
         "Identity → Location",
@@ -1146,7 +1146,7 @@ pub mod help {
     ),
     (
         "Defense → Killswitch",
-        "Current killswitch mode and runtime state. Modes: {off} (no firewall), {block_on_drop} (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops — also reads 'VPN dropped' with 'press r to reconnect' sub-line during the drop window), {vpn_only} (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K.",
+        "Current kill switch mode and runtime state. Modes: {off} (no firewall), {block_on_drop} (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops — also reads 'VPN dropped' with 'press r to reconnect' sub-line during the drop window), {vpn_only} (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K.",
     ),
     (
         "Defense → Encryption",
@@ -1162,37 +1162,59 @@ pub mod help {
     const OVERLAY_MAX_WIDTH: u16 = 120;
     const TAB_STRIP_HEIGHT: u16 = 2;
 
+    /// The overlay's width on a terminal `terminal_width` columns wide.
+    fn overlay_width(terminal_width: u16) -> u16 {
+        terminal_width.saturating_sub(4).min(OVERLAY_MAX_WIDTH)
+    }
+
+    /// How many lines `tab` has on a terminal `terminal_width` columns wide.
     #[must_use]
-    pub fn total_lines(tab: HelpTab) -> u16 {
-        let lines = match tab {
-            HelpTab::Keys => HELP_TEXT
-                .iter()
-                .enumerate()
-                .map(|(section_idx, (_, bindings))| {
-                    bindings.len() + 2 + usize::from(section_idx > 0)
-                })
-                .sum::<usize>(),
+    pub fn total_lines(tab: HelpTab, terminal_width: u16) -> u16 {
+        let width = usize::from(overlay_width(terminal_width).saturating_sub(2));
+        u16::try_from(tab_lines(tab, width).len()).unwrap_or(u16::MAX)
+    }
+
+    /// A tab's content, already wrapped to `width`.
+    fn tab_lines(tab: HelpTab, width: usize) -> Vec<Line<'static>> {
+        match tab {
+            HelpTab::Keys => build_keys_lines(width),
             HelpTab::Roles => {
-                // ~6 lines per entry (header + ~4 wrapped + blank) + leading blank + footer
-                1 + ROLE_GLOSSARY.len() * 6 + 2
+                build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER), width)
             }
-            HelpTab::Sigils => {
-                // 1 header per category + ~2 lines per entry. Conservative upper bound.
-                let entries = CATALOG.len();
-                2 + entries * 2 + 4
-            }
-            HelpTab::Guard => {
-                // Same shape as Roles — ~6 lines per entry (header + wrapped
-                // body + blank) + leading blank + footer.
-                1 + GUARD_GLOSSARY.len() * 6 + 2
-            }
-        };
-        u16::try_from(lines).unwrap_or(u16::MAX)
+            HelpTab::Sigils => build_sigils_lines(width),
+            HelpTab::Guard => build_guard_glossary_lines(width),
+        }
+    }
+
+    /// A label padded to `label_width`, then `description` wrapped beneath itself.
+    fn labelled_rows(
+        lead: Vec<Span<'static>>,
+        label: Span<'static>,
+        label_width: usize,
+        description: &str,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let indent: usize = lead.iter().map(Span::width).sum::<usize>() + label_width;
+        let style = Style::default().fg(theme::current().text_secondary);
+        let pad = " ".repeat(label_width.saturating_sub(label.width()));
+        let mut rows =
+            crate::ui::helpers::wrap_to_width(description, width.saturating_sub(indent + 1))
+                .into_iter();
+        let mut first = lead;
+        first.extend([label, Span::raw(pad)]);
+        first.push(Span::styled(rows.next().unwrap_or_default(), style));
+        std::iter::once(Line::from(first))
+            .chain(
+                rows.map(|row| {
+                    Line::from(Span::styled(format!("{}{row}", " ".repeat(indent)), style))
+                }),
+            )
+            .collect()
     }
 
     pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {
         let area = frame.area();
-        let width = area.width.saturating_sub(4).min(OVERLAY_MAX_WIDTH);
+        let width = overlay_width(area.width);
         let height = area
             .height
             .saturating_sub(2)
@@ -1241,7 +1263,6 @@ pub mod help {
         render_tab_strip(frame, chunks[0], tab);
         render_divider(frame, chunks[1]);
 
-        let active_tab = HelpTab::ALL.iter().position(|t| *t == tab).unwrap_or(0);
         // Clamp scroll against the ACTUAL content-paragraph height
         // (chunks[2]), not the full inner area. The tab strip + divider
         // eat 3 rows from the top of inner; without accounting for that
@@ -1249,20 +1270,11 @@ pub mod help {
         // each tab would be unreachable.
         let content_height = chunks[2].height;
         let content_width = usize::from(chunks[2].width);
-        let max_scroll = total_lines(tab).saturating_sub(content_height);
-        let clamped_scroll = scroll.min(max_scroll);
-
-        let lines = match HelpTab::ALL[active_tab] {
-            HelpTab::Keys => build_keys_lines(),
-            HelpTab::Roles => {
-                build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER), content_width)
-            }
-            HelpTab::Sigils => build_sigils_lines(),
-            HelpTab::Guard => build_guard_glossary_lines(content_width),
-        };
-        let paragraph = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((clamped_scroll, 0));
+        let lines = tab_lines(tab, content_width);
+        let max_scroll = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_sub(content_height);
+        let paragraph = Paragraph::new(lines).scroll((scroll.min(max_scroll), 0));
         frame.render_widget(paragraph, chunks[2]);
     }
 
@@ -1299,7 +1311,13 @@ pub mod help {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    fn build_keys_lines() -> Vec<Line<'static>> {
+    fn build_keys_lines(width: usize) -> Vec<Line<'static>> {
+        let key_width = HELP_TEXT
+            .iter()
+            .flat_map(|(_, bindings)| bindings.iter())
+            .map(|(key, _)| key.chars().count() + 2)
+            .max()
+            .unwrap_or(0);
         let mut lines: Vec<Line> = Vec::new();
         for (section_idx, (section, bindings)) in HELP_TEXT.iter().enumerate() {
             if section_idx > 0 {
@@ -1314,15 +1332,19 @@ pub mod help {
             lines.push(Line::from(""));
 
             for (key, desc) in *bindings {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("    {key:<14}"),
-                        Style::default()
-                            .fg(theme::current().key_hint)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(*desc, Style::default().fg(theme::current().text_secondary)),
-                ]));
+                let key = Span::styled(
+                    (*key).to_string(),
+                    Style::default()
+                        .fg(theme::current().key_hint)
+                        .add_modifier(Modifier::BOLD),
+                );
+                lines.extend(labelled_rows(
+                    vec![Span::raw("    ")],
+                    key,
+                    key_width,
+                    desc,
+                    width,
+                ));
             }
         }
         lines
@@ -1366,7 +1388,7 @@ pub mod help {
                 ),
             ]));
             let description = description_for(label, desc);
-            for line in crate::ui::helpers::wrap_to_width(&description, width.saturating_sub(5)) {
+            for line in crate::ui::helpers::wrap_to_width(&description, width.saturating_sub(6)) {
                 lines.push(Line::from(Span::styled(
                     format!("     {line}"),
                     Style::default().fg(theme::current().text_secondary),
@@ -1375,12 +1397,14 @@ pub mod help {
             lines.push(Line::from(""));
         }
         if let Some(footer) = footer {
-            lines.push(Line::from(Span::styled(
-                format!("  {footer}"),
-                Style::default()
-                    .fg(theme::current().key_hint_desc)
-                    .add_modifier(Modifier::ITALIC),
-            )));
+            for line in crate::ui::helpers::wrap_to_width(footer, width.saturating_sub(3)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default()
+                        .fg(theme::current().key_hint_desc)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            }
         }
         lines
     }
@@ -1414,7 +1438,12 @@ pub mod help {
     /// 3-column grid for the Sigils tab. Each row:
     ///   <glyph in its real TUI color>  <label, bold>  <description, secondary>
     /// Grouped by [`SigilCategory`] with a category header above each group.
-    fn build_sigils_lines() -> Vec<Line<'static>> {
+    fn build_sigils_lines(width: usize) -> Vec<Line<'static>> {
+        let label_width = CATALOG
+            .iter()
+            .map(|entry| entry.label.chars().count() + 2)
+            .max()
+            .unwrap_or(0);
         let mut lines: Vec<Line> = Vec::with_capacity(CATALOG.len() * 2 + 6);
 
         for category in [
@@ -1432,7 +1461,20 @@ pub mod help {
             lines.push(Line::from(""));
 
             for entry in CATALOG.iter().filter(|s| s.category == category) {
-                lines.push(sigil_row(entry));
+                let label = Span::styled(
+                    entry.label,
+                    Style::default()
+                        .fg(theme::current().text_primary)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let glyph = Span::styled(format!("    {}   ", entry.glyph), entry.style());
+                lines.extend(labelled_rows(
+                    vec![glyph],
+                    label,
+                    label_width,
+                    entry.description,
+                    width,
+                ));
             }
         }
         lines
@@ -1444,29 +1486,6 @@ pub mod help {
             SigilCategory::SecurityGuard => "Security Guard (per-row sigils)",
             SigilCategory::RoutesAndPeers => "Routes & peers (Details' back)",
         }
-    }
-
-    /// One row of the Sigils tab. The glyph is rendered in its actual
-    /// TUI color (the one the renderer applies), so the help-overlay
-    /// swatch matches what users see on screen byte-for-byte.
-    fn sigil_row(entry: &'static Sigil) -> Line<'static> {
-        // Column widths chosen to fit comfortably at the 95-col overlay:
-        //   glyph column: 4 cells (1 glyph + 3 padding for visual gutter)
-        //   label column: 24 cells
-        //   description: rest, wraps naturally
-        Line::from(vec![
-            Span::styled(format!("    {}   ", entry.glyph), entry.style()),
-            Span::styled(
-                format!("{:<22}", entry.label),
-                Style::default()
-                    .fg(theme::current().text_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                entry.description,
-                Style::default().fg(theme::current().text_secondary),
-            ),
-        ])
     }
 
     #[cfg(test)]
@@ -1517,7 +1536,7 @@ pub mod help {
                 .find(|(section, _)| *section == "Global")
                 .map(|(_, bindings)| *bindings)
                 .expect("Global help section must exist");
-            assert!(global.contains(&("Tab/S-Tab,l/h", "Next / Previous panel")));
+            assert!(global.contains(&("Tab/S-Tab, l/h", "Next / Previous panel")));
         }
 
         #[test]
@@ -1542,7 +1561,7 @@ pub mod help {
             // EVERY entry produces a row. This is the drift-detection
             // backstop: adding a sigil to the catalog automatically makes
             // it appear in help; removing one from the catalog removes it.
-            let lines = build_sigils_lines();
+            let lines = build_sigils_lines(116);
             let blob: String = lines
                 .iter()
                 .flat_map(|l| l.spans.iter())
@@ -1579,8 +1598,17 @@ pub mod help {
 
         #[test]
         fn keys_total_lines_invariant_holds() {
-            let expected = u16::try_from(build_keys_lines().len()).expect("fits in u16");
-            assert_eq!(total_lines(HelpTab::Keys), expected);
+            for tab in HelpTab::ALL.iter().copied() {
+                for terminal_width in [80, 100, 200] {
+                    let width = usize::from(overlay_width(terminal_width) - 2);
+                    let lines = tab_lines(tab, width);
+                    assert_eq!(usize::from(total_lines(tab, terminal_width)), lines.len());
+                    assert!(
+                        lines.iter().all(|line| line.width() <= width),
+                        "{tab:?} at {terminal_width}"
+                    );
+                }
+            }
         }
 
         #[test]
