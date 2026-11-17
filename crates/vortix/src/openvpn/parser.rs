@@ -79,17 +79,10 @@ pub struct OvpnParsedProfile {
 pub struct PullPolicy {
     /// Pushed routes and DNS are not taken.
     pub route_nopull: bool,
-    /// In profile order; the first one that matches wins.
-    pub filters: Vec<(PullFilterAction, String)>,
-}
-
-/// What a `pull-filter` does with a pushed option that starts with its text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PullFilterAction {
-    Accept,
-    Ignore,
-    /// `OpenVPN` restarts the connection instead, so no completed session holds one.
-    Reject,
+    /// `pull-filter` as (accepts, text), in profile order; the first one that
+    /// matches wins. `reject` counts as not accepting: `OpenVPN` restarts the
+    /// connection instead, so no completed session holds such an option.
+    pub filters: Vec<(bool, String)>,
 }
 
 impl PullPolicy {
@@ -101,7 +94,7 @@ impl PullPolicy {
             .filters
             .iter()
             .find(|(_, text)| option.starts_with(text.as_str()))
-            .is_some_and(|(action, _)| *action != PullFilterAction::Accept);
+            .is_some_and(|(accepts, _)| !accepts);
         let directive = option.split_whitespace().next().unwrap_or_default();
         let route_or_dns = [
             "route",
@@ -286,17 +279,15 @@ pub(super) fn dns_setting<'a>(
     }
 }
 
-fn parse_pull_filter(arguments: &[String]) -> Result<(PullFilterAction, String), ParseError> {
+fn parse_pull_filter(arguments: &[String]) -> Result<(bool, String), ParseError> {
     let [action, text] = arguments else {
         return Err(pull_filter_error());
     };
-    let action = match action.as_str() {
-        "accept" => PullFilterAction::Accept,
-        "ignore" => PullFilterAction::Ignore,
-        "reject" => PullFilterAction::Reject,
-        _ => return Err(pull_filter_error()),
-    };
-    Ok((action, text.clone()))
+    match action.as_str() {
+        "accept" => Ok((true, text.clone())),
+        "ignore" | "reject" => Ok((false, text.clone())),
+        _ => Err(pull_filter_error()),
+    }
 }
 
 fn pull_filter_error() -> ParseError {
