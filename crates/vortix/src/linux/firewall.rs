@@ -526,7 +526,17 @@ mod nft_policy {
         Group(u32),
         Mark(u32),
         Dhcp,
+        NeighbourDiscovery,
     }
+
+    /// Without these the IPv6 next hop of a VPN server becomes unreachable.
+    /// ND only addresses link-local and link-scope multicast with hop limit
+    /// 255 (RFC 4861), so nothing else can leave this way.
+    const NEIGHBOUR_DISCOVERY: &str = "ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 \
+        icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept";
+    /// The same rule as `nft -n` prints it.
+    const NEIGHBOUR_DISCOVERY_NUMERIC: &str =
+        "ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 icmpv6 type { 133, 135, 136 } accept";
 
     pub(super) struct ExpectedPolicy {
         ruleset: String,
@@ -617,6 +627,7 @@ mod nft_policy {
             "    ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"
         )
         .unwrap();
+        writeln!(ruleset, "    {NEIGHBOUR_DISCOVERY}").unwrap();
         for tunnel in active {
             if !tunnel.is_endpoint_allowlist() {
                 writeln!(ruleset, "    oifname \"{}\" accept", tunnel.interface).unwrap();
@@ -651,6 +662,9 @@ mod nft_policy {
     fn parse_accept_rule(line: &str) -> Option<AcceptRule> {
         if line == "ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept" {
             return Some(AcceptRule::Dhcp);
+        }
+        if line == NEIGHBOUR_DISCOVERY || line == NEIGHBOUR_DISCOVERY_NUMERIC {
+            return Some(AcceptRule::NeighbourDiscovery);
         }
         if let Some(group) = line
             .strip_prefix("meta skgid ")
@@ -779,6 +793,27 @@ mod tests {
         assert!(rules.contains("ip daddr 192.168.0.0/16 accept"));
         assert!(rules.contains("ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"));
         assert!(!rules.contains("oifname \"wg"));
+    }
+
+    #[test]
+    fn ipv6_neighbour_discovery_is_let_out_and_reads_back_numerically() {
+        let rules = nft(&[]);
+        let nd = "    ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 \
+                  icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept\n";
+        assert!(rules.contains(nd));
+        let numeric = rules.replace(
+            nd,
+            "    ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 icmpv6 type { 133, 135, 136 } accept\n",
+        );
+        assert!(nft_policy::snapshot_matches(&[], &numeric));
+        assert!(!nft_policy::snapshot_matches(&[], &rules.replace(nd, "")));
+        // Scoped: nothing lets ICMPv6 out to an arbitrary address.
+        assert!(rules
+            .lines()
+            .filter(|line| line.contains("icmpv6"))
+            .all(|line| line.contains("ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 ")));
+        let unscoped = rules.replace("ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 ", "");
+        assert!(!nft_policy::snapshot_matches(&[], &unscoped));
     }
 
     #[test]
@@ -1002,6 +1037,7 @@ mod tests {
     ip daddr 172.16.0.0/12 accept
     ip daddr 192.168.0.0/16 accept
     ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept
+    ip6 daddr {{ fe80::/10, ff02::/16 }} ip6 hoplimit 255 icmpv6 type {{ nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert }} accept
     oifname \"wg0\" accept
     ip daddr 1.2.3.4 accept
     oifname \"wg1\" accept

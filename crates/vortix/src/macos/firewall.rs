@@ -36,6 +36,10 @@ pub(crate) const PF_ANCHOR: &str = "com.apple/vortix.killswitch";
 pub(crate) const PF_APPLY_ARGS: [&str; 6] = ["-o", "none", "-a", PF_ANCHOR, "-f", "-"];
 pub(crate) const PF_RELEASE_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-F", "rules"];
 const POLICY_LABEL_PREFIX: &str = "vortix-policy:";
+/// Without these the IPv6 next hop of a VPN server becomes unreachable. ND
+/// only addresses link-local and link-scope multicast destinations.
+const ND_TYPES: [&str; 3] = ["routersol", "neighbrsol", "neighbradv"];
+const ND_DESTINATIONS: [&str; 2] = ["fe80::/10", "ff02::/16"];
 const PF_RULE_LABEL_MAX_BYTES: usize = 63;
 
 fn pfctl(args: &[&str]) -> io::Result<crate::process::CommandOutcome> {
@@ -115,7 +119,7 @@ impl PfFirewall {
     ///   2. RFC1918 pass-out rules, with secondaries' declared CIDRs
     ///      carved out so traffic claimed by a secondary cannot escape
     ///      onto the underlay
-    ///   3. DHCP pass rules
+    ///   3. DHCP and IPv6 neighbour-discovery pass rules
     ///   4. Per-tunnel: `pass out quick on <interface>` + one
     ///      `pass out quick to <server_ip>` per server IP, so the tunnel
     ///      can reconnect after a transport drop
@@ -156,6 +160,17 @@ impl PfFirewall {
             "pass in quick proto udp from any port 67 to any port 68"
         )
         .unwrap();
+        writeln!(rules).unwrap();
+        writeln!(rules, "# Allow IPv6 neighbour discovery").unwrap();
+        for to in ND_DESTINATIONS {
+            for kind in ND_TYPES {
+                writeln!(
+                    rules,
+                    "pass out quick inet6 proto icmp6 from any to {to} icmp6-type {kind} no state"
+                )
+                .unwrap();
+            }
+        }
 
         // Per-tunnel rules. Order is preserved from the caller — typically
         // primary first, then secondaries by attach order.
@@ -333,6 +348,11 @@ fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
         return Some(
             "pass in quick proto udp from any port = 67 to any port = 68 keep state".into(),
         );
+    }
+    if let Some(rest) = rule.strip_prefix("pass out quick inet6 proto icmp6 from any to ") {
+        return Some(format!(
+            "pass out quick inet6 proto ipv6-icmp from any to {rest}"
+        ));
     }
     if let Some(group) = rule
         .strip_prefix("pass out quick proto tcp group ")
@@ -707,6 +727,12 @@ mod tests {
             "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
             "pass out quick inet proto udp from any port = 68 to 255.255.255.255 port = 67 keep state",
             "pass in quick proto udp from any port = 67 to any port = 68 keep state",
+            "pass out quick inet6 proto ipv6-icmp from any to fe80::/10 icmp6-type routersol no state",
+            "pass out quick inet6 proto ipv6-icmp from any to fe80::/10 icmp6-type neighbrsol no state",
+            "pass out quick inet6 proto ipv6-icmp from any to fe80::/10 icmp6-type neighbradv no state",
+            "pass out quick inet6 proto ipv6-icmp from any to ff02::/16 icmp6-type routersol no state",
+            "pass out quick inet6 proto ipv6-icmp from any to ff02::/16 icmp6-type neighbrsol no state",
+            "pass out quick inet6 proto ipv6-icmp from any to ff02::/16 icmp6-type neighbradv no state",
             "pass out quick on utun4 all flags any keep state",
             "pass out quick inet from any to 198.51.100.7 flags any keep state",
         ];
@@ -731,6 +757,27 @@ mod tests {
         let rules = PfFirewall::generate_pf_rules(&[]);
         assert!(!rules.contains("to any port 67"));
         assert!(rules.contains("port 68 to 255.255.255.255 port 67"));
+    }
+
+    /// Router and neighbour solicitations and adverts reach the IPv6 next
+    /// hop of a VPN server; blocking them cuts the tunnel's own transport.
+    #[test]
+    fn ipv6_neighbour_discovery_passes_before_the_block() {
+        let rules = PfFirewall::generate_pf_rules(&[]);
+        let block = rules.find("block drop out quick all").unwrap();
+        for to in ["fe80::/10", "ff02::/16"] {
+            for kind in ["routersol", "neighbrsol", "neighbradv"] {
+                let rule = format!(
+                    "pass out quick inet6 proto icmp6 from any to {to} icmp6-type {kind} no state\n"
+                );
+                assert!(rules.find(&rule).is_some_and(|at| at < block), "{rule}");
+            }
+        }
+        // Scoped: nothing lets ICMPv6 out to an arbitrary address.
+        assert!(rules
+            .lines()
+            .filter(|line| line.contains("icmp6"))
+            .all(|line| line.contains(" to fe80::/10 ") || line.contains(" to ff02::/16 ")));
     }
 
     /// Without `flags any`, pf matches only SYNs, so a localhost TCP flow
@@ -977,6 +1024,14 @@ pass out quick to 192.168.0.0/16 flags any
 pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
 
+# Allow IPv6 neighbour discovery
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbradv no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbradv no state
+
 # Default: block all remaining egress
 block drop out quick all
 ";
@@ -1010,6 +1065,14 @@ pass out quick to 192.168.0.0/16 flags any
 # Allow DHCP
 pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
+
+# Allow IPv6 neighbour discovery
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbradv no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbradv no state
 
 # Tunnel: utun3 (primary=true)
 pass out quick on utun3 all flags any
@@ -1055,6 +1118,14 @@ pass out quick to 192.168.0.0/16 flags any
 # Allow DHCP
 pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
+
+# Allow IPv6 neighbour discovery
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbradv no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbradv no state
 
 # Tunnel: utun3 (primary=true)
 pass out quick on utun3 all flags any
