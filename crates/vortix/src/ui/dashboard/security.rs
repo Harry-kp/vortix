@@ -10,6 +10,7 @@ use ratatui::{
     Frame,
 };
 use std::time::Duration;
+use unicode_width::UnicodeWidthStr;
 
 // ── Layout primitives ───────────────────────────────────────────────────────
 //
@@ -293,7 +294,7 @@ fn value_budget(inner_width: usize) -> usize {
 /// tag is the spelled-out version for the widths that can afford it.
 fn tagged_if_it_fits(value: &str, tag: &str, inner_width: usize) -> String {
     let tagged = format!("{value} · {tag}");
-    if tagged.chars().count() <= value_budget(inner_width) {
+    if tagged.width() <= value_budget(inner_width) {
         tagged
     } else {
         value.to_string()
@@ -308,9 +309,13 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
         format!("{:<5} ", short_label(label))
     };
     let value_budget = value_budget(inner_width);
-    let value_truncated = crate::ui::helpers::truncate_to_width(value, value_budget);
-    let value_chars = value_truncated.chars().count();
-    let padding = " ".repeat(value_budget.saturating_sub(value_chars));
+    // A shortened value keeps a space before the sigil so the two do not merge.
+    let value_truncated = if value.width() > value_budget {
+        crate::ui::helpers::truncate_to_width(value, value_budget.saturating_sub(1))
+    } else {
+        value.to_string()
+    };
+    let padding = " ".repeat(value_budget.saturating_sub(value_truncated.width()));
 
     let sigil_col = format!("{} ", sigil.glyph());
 
@@ -2756,5 +2761,24 @@ mod tests {
             !out.contains("Not enforced"),
             "old IPv6 explainer must be gone:\n{out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod gutter_tests {
+    #[test]
+    fn a_shortened_value_does_not_touch_its_sigil() {
+        let line = super::audit_row(
+            "Exit IPv6",
+            "2401:4900:89ab:cdef:1234:5678:9abc:def0",
+            super::Sigil::AlarmWarn,
+            23,
+        );
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains(" ⚠"), "{text:?}");
     }
 }
