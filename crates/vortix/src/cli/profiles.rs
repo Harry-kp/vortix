@@ -771,18 +771,13 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
     require_profile_inactive(&profiles, old, old, "rename", mode);
 
     let trimmed = new.trim();
-    if trimmed.is_empty()
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains("..")
-        || trimmed.starts_with('.')
-    {
+    if let Err(message) = crate::profile::validate_profile_name(trimmed) {
         print_error_and_exit(
             mode,
             "rename",
             CliError {
                 code: "invalid_name",
-                message: "Invalid name: must not contain path separators or '..'".into(),
+                message,
                 hint: None,
             },
             ExitCode::GeneralError,

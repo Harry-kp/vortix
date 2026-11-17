@@ -158,16 +158,8 @@ impl App {
         };
 
         let trimmed = new_name.trim();
-        if trimmed.is_empty()
-            || trimmed.contains('/')
-            || trimmed.contains('\\')
-            || trimmed.contains("..")
-            || trimmed.starts_with('.')
-        {
-            self.show_toast(
-                "Invalid name: must not contain path separators or '..'".to_string(),
-                ToastType::Warning,
-            );
+        if let Err(message) = crate::profile::validate_profile_name(trimmed) {
+            self.show_toast(message, ToastType::Warning);
             return;
         }
 
