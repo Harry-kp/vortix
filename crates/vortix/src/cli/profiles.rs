@@ -809,22 +809,6 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
     };
     require_profile_inactive(&fresh_profiles, &fresh_profile.name, old, "rename", mode);
 
-    if fresh_profile.protocol == crate::profile::ProtocolKind::WireGuard
-        && crate::profile::validate_wireguard_interface_name(trimmed).is_err()
-    {
-        print_error_and_exit(
-            mode,
-            "rename",
-            CliError {
-                code: "invalid_name",
-                message: format!(
-                    "'{trimmed}' is not a usable profile name. WireGuard names must be 1–15 characters using only letters, numbers, _, ., or -."
-                ),
-                hint: None,
-            },
-            ExitCode::GeneralError,
-        );
-    }
     if let Err(error) = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME))
         .rename(&profile_id, trimmed)
     {
@@ -833,6 +817,11 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
                 "already_exists",
                 format!("A profile named '{trimmed}' already exists"),
                 ExitCode::StateConflict,
+            ),
+            crate::config::profile_store::ProfileStoreError::InvalidWireGuardName(reason) => (
+                "invalid_name",
+                format!("'{trimmed}' is not a usable profile name. {reason}."),
+                ExitCode::GeneralError,
             ),
             crate::config::profile_store::ProfileStoreError::InvalidName(_) => (
                 "invalid_name",

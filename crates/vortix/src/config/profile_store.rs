@@ -116,6 +116,8 @@ pub enum ProfileStoreError {
     MissingConfig { sidecar: PathBuf, config: PathBuf },
     #[error("invalid profile name: {0}")]
     InvalidName(String),
+    #[error("{0}")]
+    InvalidWireGuardName(String),
     #[error("invalid profile ID: {0}")]
     InvalidId(String),
     #[error("profile storage is busy: timed out waiting for {path}")]
@@ -946,6 +948,10 @@ impl FsProfileStore {
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or_else(|| Self::extension(profile.protocol));
+        if profile.protocol == ProtocolKind::WireGuard {
+            crate::profile::validate_wireguard_interface_name(new_name)
+                .map_err(ProfileStoreError::InvalidWireGuardName)?;
+        }
         let new_config_file = format!("{new_name}.{extension}");
         let new_config = self.safe_profile_path(&new_config_file)?;
         let new_sidecar = self.sidecar_path(new_name);
@@ -1267,6 +1273,18 @@ mod tests {
         assert_ne!(store.auth_path(&id(1)), store.auth_path(&id(2)));
         assert_eq!(store.rename(&id(1), "a@b").unwrap().id, id(1));
         assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rename_refuses_a_wireguard_name_wg_quick_cannot_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsProfileStore::new(tmp.path().join("profiles"));
+        store.insert(&corp(), b"[Interface]\n").unwrap();
+        assert!(matches!(
+            store.rename(&id(1), "My Home VPN Server"),
+            Err(ProfileStoreError::InvalidWireGuardName(_))
+        ));
+        assert_eq!(store.list().unwrap()[0].display_name, "corp");
     }
 
     #[test]
