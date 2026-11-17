@@ -394,16 +394,17 @@ fn killswitch_offers_other_modes_with_sudo() {
 #[test]
 fn a_closed_output_pipe_exits_quietly() {
     let config = tempfile::tempdir().unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box closed stdout
+    // The reader is gone before the child starts, so its first write fails.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box closed stdout
         .arg("--config-dir")
         .arg(config.path())
         .arg("info")
-        .stdout(std::process::Stdio::piped())
+        .stdout(writer)
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .output()
         .unwrap();
-    drop(child.stdout.take());
-    let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.is_empty(), "{stderr}");
     assert_ne!(output.status.code(), Some(101));

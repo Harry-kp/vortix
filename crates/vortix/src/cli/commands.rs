@@ -271,7 +271,10 @@ pub(super) fn engine_failure_or_exit(mode: OutputMode, command: &str, message: S
             code,
             message,
             hint: (code == "timeout" && command == "up").then(|| {
-                "Nothing was left running. To wait longer: sudo vortix up <profile> --timeout 60".to_owned()
+                format!(
+                    "Nothing was left running. To wait longer: {} <profile> --timeout 60",
+                    crate::cli::output::sudo_command(&["up"])
+                )
             }),
         },
         exit,

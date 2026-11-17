@@ -1077,34 +1077,32 @@ impl crate::app::App {
         cursor: &mut usize,
         before: Option<&crate::profile::ProfileId>,
     ) {
-        let restore = |app: &mut Self| {
-            if let Some(index) = before.and_then(|id| app.profile_index(id)) {
-                app.select_profile(index);
-            }
-        };
         match key.code {
             KeyCode::Esc => {
-                restore(self);
+                self.apply_search_filter("", before);
                 self.input_mode = InputMode::Normal;
             }
             KeyCode::Enter => self.input_mode = InputMode::Normal,
             KeyCode::Backspace | KeyCode::Delete | KeyCode::Char(_) => {
                 Self::handle_text_field_input(key, query, cursor);
-                if query.is_empty() {
-                    self.search_match_count = self.runtime.profiles.len();
-                    restore(self);
-                } else {
-                    self.apply_search_filter(query);
-                }
+                self.apply_search_filter(query, before);
             }
             _ => Self::handle_text_field_input(key, query, cursor),
         }
     }
 
-    pub(crate) fn apply_search_filter(&mut self, query: &str) {
+    /// Select the first profile matching `query`; an empty query goes back to
+    /// the selection from `before` the search.
+    pub(crate) fn apply_search_filter(
+        &mut self,
+        query: &str,
+        before: Option<&crate::profile::ProfileId>,
+    ) {
         if query.is_empty() {
             self.search_match_count = self.runtime.profiles.len();
-            self.select_profile(0);
+            if let Some(index) = before.and_then(|id| self.profile_index(id)) {
+                self.select_profile(index);
+            }
             return;
         }
         let lower = query.to_lowercase();

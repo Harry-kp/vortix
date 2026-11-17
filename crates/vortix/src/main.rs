@@ -21,7 +21,8 @@ fn main() -> Result<()> {
 
     // Wrap Rust's default panic hook with terminal restoration and recovery
     // instructions. Drop glue on App will still run to release kill switch
-    // rules and VPN processes.
+    // rules and VPN processes, except on a closed output pipe: that exits
+    // at once, so CLI output must come after the engine work has settled.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // `vortix status | head`: the reader left, which is not a crash.

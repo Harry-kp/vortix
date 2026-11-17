@@ -137,7 +137,7 @@ vortix delete work-eu --yes
 Import copies the profile into the config directory; later edits to the source file do not
 apply until you import it again. A WireGuard profile name becomes the interface name, so it must be 1–15 characters of
 letters, numbers, `_`, `.` or `-`. A name already taken gets `_1`, `_2`, … (a long WireGuard
-name is shortened to fit), and import says so. WireGuard profiles may hold up to 1024 routes; OpenVPN up to 256, counting routes the server pushes. Profiles that run
+name is shortened to fit), and `vortix import <file>` says so. WireGuard profiles may hold up to 1024 routes; OpenVPN up to 256, counting routes the server pushes. Profiles that run
 commands (`PreUp`/`PostUp`/`PreDown`/`PostDown`, OpenVPN `up`/`down` and similar) are refused;
 use [hooks](configuration.md#hooks) instead.
 

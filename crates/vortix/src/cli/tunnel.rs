@@ -171,7 +171,10 @@ pub(super) fn handle_up(
                     CliError {
                         code: "no_profile",
                         message: "No profile specified and no previously used profile found".into(),
-                        hint: Some("Specify a profile: sudo vortix up <PROFILE>".into()),
+                        hint: Some(format!(
+                            "Specify a profile: {} <PROFILE>",
+                            crate::cli::output::sudo_command(&["up"])
+                        )),
                     },
                     ExitCode::GeneralError,
                 );
@@ -511,7 +514,10 @@ pub(super) fn handle_reconnect(
                     CliError {
                         code: "no_profile",
                         message: "No previously used profile found".into(),
-                        hint: Some("Connect to a profile first: sudo vortix up <PROFILE>".into()),
+                        hint: Some(format!(
+                            "Connect to a profile first: {} <PROFILE>",
+                            crate::cli::output::sudo_command(&["up"])
+                        )),
                     },
                     ExitCode::NotFound,
                 );

@@ -265,7 +265,7 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
     // --max-time: Timeout
     // -o: Output file
     // --config -: the URL comes on stdin, so its credentials stay out of `ps`
-    let mut spec = CommandSpec::oneshot(
+    let spec = CommandSpec::oneshot(
         "curl",
         vec![
             "-f".into(),
@@ -281,8 +281,8 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
             "--config".into(),
             "-".into(),
         ],
-    );
-    spec.stdin_bytes = Some(
+    )
+    .stdin(
         format!(
             "url = \"{}\"\n",
             url.replace('\\', "\\\\").replace('"', "\\\"")

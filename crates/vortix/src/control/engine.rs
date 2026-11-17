@@ -759,23 +759,9 @@ impl Engine {
         self.drops = self.drops.saturating_add(1);
         let name = self.name(profile_id);
         let draining = if let Some(live) = self.live.remove(profile_id) {
-            let settings = self.config.tunnels.clone();
-            let ownership = Arc::clone(&self.ownership);
-            let tx = self.tx.clone();
-            let profile_id = profile_id.clone();
-            std::thread::spawn(move || {
-                let backup = Live {
-                    kind: live.kind.clone(),
-                    handle: live.handle.clone(),
-                };
-                // Drained must arrive even if the stop panics, or the retry never runs.
-                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tunnels::stop(&settings, &ownership, live)
-                })) {
-                    Ok(result) => result.map_err(|error| (backup, error)),
-                    Err(_) => Err((backup, "the teardown panicked".into())),
-                };
-                let _ = tx.send(Msg::Event(Box::new(Event::Drained { profile_id, result })));
+            self.spawn_teardown(profile_id, live, |profile_id, result| Event::Drained {
+                profile_id,
+                result,
             });
             true
         } else {
@@ -976,6 +962,21 @@ impl Engine {
     }
 
     fn spawn_stop(&self, profile_id: &ProfileId, live: Live) {
+        self.spawn_teardown(profile_id, live, |profile_id, result| Event::Stopped {
+            profile_id,
+            result,
+        });
+    }
+
+    /// Tear `live` down off the engine thread and report it as `event`. The
+    /// event arrives even if the teardown panics, or the tunnel would stay
+    /// stopping (or its retry never run).
+    fn spawn_teardown(
+        &self,
+        profile_id: &ProfileId,
+        live: Live,
+        event: fn(ProfileId, Result<(), (Live, String)>) -> Event,
+    ) {
         let settings = self.config.tunnels.clone();
         let ownership = Arc::clone(&self.ownership);
         let tx = self.tx.clone();
@@ -985,9 +986,13 @@ impl Engine {
                 kind: live.kind.clone(),
                 handle: live.handle.clone(),
             };
-            let result =
-                tunnels::stop(&settings, &ownership, live).map_err(|error| (backup, error));
-            let _ = tx.send(Msg::Event(Box::new(Event::Stopped { profile_id, result })));
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tunnels::stop(&settings, &ownership, live)
+            })) {
+                Ok(result) => result.map_err(|error| (backup, error)),
+                Err(_) => Err((backup, "the teardown panicked".into())),
+            };
+            let _ = tx.send(Msg::Event(Box::new(event(profile_id, result))));
         });
     }
 

@@ -49,11 +49,6 @@ pub struct StatusSnapshot {
     pub observation_complete: bool,
 }
 
-/// Printed instead of "Disconnected" when nothing was seen but the scan was
-/// incomplete: an unprivileged `status` cannot see `WireGuard` tunnels.
-const UNKNOWN_HEADLINE: &str =
-    "? Tunnel state unknown: VPN tunnels are only visible to root. Run: sudo vortix status";
-
 impl StatusSnapshot {
     /// Nothing seen, but the scan could not see everything.
     #[must_use]
@@ -325,7 +320,10 @@ pub(super) fn handle_status(
             } else {
                 vec![
                     crate::cli::output::vortix_command(&["list", "--json"]),
-                    "sudo vortix up <PROFILE> --json".into(),
+                    format!(
+                        "{} <PROFILE> --json",
+                        crate::cli::output::sudo_command(&["up"])
+                    ),
                 ]
             };
             print_success(mode, "status", &data, next);
@@ -481,7 +479,10 @@ fn other_tunnel_lines(snap: &StatusSnapshot) -> Vec<String> {
 
 fn snapshot_headline(snap: &StatusSnapshot) -> String {
     if snap.state_unknown() {
-        UNKNOWN_HEADLINE.to_string()
+        format!(
+            "? Tunnel state unknown: VPN tunnels are only visible to root. Run: {}",
+            crate::cli::output::sudo_command(&["status"])
+        )
     } else {
         human_status_headline(snap.focus())
     }
@@ -594,7 +595,11 @@ mod handshake_status_tests {
         assert_eq!(snapshot_headline(&snap), "○ Disconnected");
         snap.observation_complete = false;
         assert!(snapshot_headline(&snap).starts_with("? Tunnel state unknown"));
-        assert!(snapshot_headline(&snap).contains("sudo vortix status"));
+        let headline = snapshot_headline(&snap);
+        assert!(
+            headline.contains("sudo vortix") && headline.ends_with(" status"),
+            "{headline}"
+        );
     }
 
     fn session(name: &str, interface: &str) -> SessionStatus {

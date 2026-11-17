@@ -67,7 +67,10 @@ pub(super) fn handle_list(
                 mode,
                 "list",
                 &Vec::<ProfileEntry>::new(),
-                vec!["vortix import <PATH> --json".into()],
+                vec![format!(
+                    "{} <PATH> --json",
+                    crate::cli::output::vortix_command(&["import"])
+                )],
             ),
             OutputMode::Quiet => {}
         }
@@ -135,8 +138,14 @@ pub(super) fn handle_list(
                 "list",
                 &entries,
                 vec![
-                    "vortix show <PROFILE> --json".into(),
-                    "sudo vortix up <PROFILE> --json".into(),
+                    format!(
+                        "{} <PROFILE> --json",
+                        crate::cli::output::vortix_command(&["show"])
+                    ),
+                    format!(
+                        "{} <PROFILE> --json",
+                        crate::cli::output::sudo_command(&["up"])
+                    ),
                 ],
             );
         }

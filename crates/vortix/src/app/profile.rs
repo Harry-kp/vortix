@@ -260,8 +260,7 @@ impl App {
             .as_ref()
             .and_then(|name| self.runtime.profiles.iter().position(|p| &p.name == name));
         let kept = previous.and_then(|id| self.profile_index(&id));
-        let first = (!self.runtime.profiles.is_empty()).then_some(0);
-        self.profile_list_state.select(imported.or(kept).or(first));
+        self.select_profile(imported.or(kept).unwrap_or(0));
 
         if should_close_overlay {
             self.handle_message(Message::CloseOverlay);

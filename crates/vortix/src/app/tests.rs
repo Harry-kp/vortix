@@ -611,7 +611,7 @@ fn test_search_filter_selects_matching_profile() {
     add_profiles(&mut app, &["amsterdam", "berlin", "chicago"]);
     app.profile_list_state.select(Some(0));
 
-    app.apply_search_filter("ber");
+    app.apply_search_filter("ber", None);
 
     assert_eq!(
         app.profile_list_state.selected(),
@@ -621,17 +621,17 @@ fn test_search_filter_selects_matching_profile() {
 }
 
 #[test]
-fn test_search_filter_empty_resets_to_first() {
+fn test_search_filter_empty_returns_to_the_selection_before_the_search() {
     let mut app = test_app();
     add_profiles(&mut app, &["amsterdam", "berlin"]);
-    app.profile_list_state.select(Some(1));
+    app.profile_list_state.select(Some(0));
 
-    app.apply_search_filter("");
+    app.apply_search_filter("", Some(&crate::profile::ProfileId::new("berlin")));
 
     assert_eq!(
         app.profile_list_state.selected(),
-        Some(0),
-        "Empty query should reset to first profile"
+        Some(1),
+        "Empty query should return to the selection before the search"
     );
 }
 
@@ -641,7 +641,7 @@ fn test_search_filter_no_match_keeps_selection() {
     add_profiles(&mut app, &["amsterdam", "berlin"]);
     app.profile_list_state.select(Some(0));
 
-    app.apply_search_filter("zzzzz");
+    app.apply_search_filter("zzzzz", None);
 
     assert_eq!(
         app.profile_list_state.selected(),
@@ -709,16 +709,16 @@ fn test_search_match_count_updated() {
     add_profiles(&mut app, &["amsterdam", "ankara", "berlin"]);
     app.profile_list_state.select(Some(0));
 
-    app.apply_search_filter("an");
+    app.apply_search_filter("an", None);
     assert_eq!(app.search_match_count, 1, "Should match ankara");
 
-    app.apply_search_filter("a");
+    app.apply_search_filter("a", None);
     assert_eq!(
         app.search_match_count, 2,
         "Should match amsterdam and ankara"
     );
 
-    app.apply_search_filter("");
+    app.apply_search_filter("", None);
     assert_eq!(app.search_match_count, 3, "Empty query should match all");
 }
 #[test]

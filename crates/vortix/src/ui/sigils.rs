@@ -34,8 +34,6 @@ pub enum SigilId {
     Disconnecting,
     /// `?` yellow — awaiting credentials.
     AwaitingInput,
-    /// `✗` red — Disconnected with a failure record.
-
     /// `*` accent — Sidebar suffix marking the current Primary tunnel.
     PrimaryMarker,
     /// `!` warning — Sidebar risk annotation (e.g., `AddressableSuppressed`).
@@ -261,7 +259,7 @@ pub const CATALOG: &[Sigil] = &[
         id: SigilId::SgAlarmWarn,
         glyph: "\u{26a0}",
         label: "Warning",
-        description: "Worth acting on, but not broken. E.g. the Block on drop kill switch is blocking traffic because the VPN dropped.",
+        description: "Worth acting on, but not broken. E.g. the kill switch is blocking traffic because the VPN dropped.",
         color: warning_color,
         bold: true,
         dim: false,
