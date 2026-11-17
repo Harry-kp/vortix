@@ -47,7 +47,13 @@ impl App {
             // Navigation
             Message::NextPanel => self.next_panel(),
             Message::PreviousPanel => self.previous_panel(),
-            Message::FocusPanel(panel) => self.focused_panel = panel,
+            Message::FocusPanel(panel) => {
+                // Focus never lands on a panel hidden behind the zoom.
+                if self.zoomed_panel.is_some() {
+                    self.zoomed_panel = Some(panel.clone());
+                }
+                self.focused_panel = panel;
+            }
 
             // Imports
             Message::Import(path) => self.import_profile_from_path(&path),

@@ -2813,3 +2813,85 @@ fn the_startup_tool_check_covers_the_vpns_the_user_has() {
         assert!(toast.is_some_and(|text| text.contains("netbird")));
     }
 }
+
+mod zoom {
+    use super::*;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn draw(app: &mut App) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn a_dialog_opened_while_zoomed_is_drawn_on_top() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["alpha"]);
+        app.profile_list_state.select(Some(0));
+        app.handle_key(key(KeyCode::Char('z')));
+        app.handle_key(key(KeyCode::Delete));
+        assert!(text(&draw(&mut app)).contains("Are you sure"));
+    }
+
+    #[test]
+    fn a_click_in_the_zoomed_sidebar_selects_the_clicked_row() {
+        let mut app = test_app();
+        let names: Vec<String> = (0..18).map(|i| format!("prof-{i:02}")).collect();
+        add_profiles(
+            &mut app,
+            &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        app.profile_list_state.select(Some(0));
+        app.handle_key(key(KeyCode::Char('z')));
+        let buffer = draw(&mut app);
+        let (column, row) = (0..24u16)
+            .find_map(|y| {
+                let line: String = (0..80u16)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect();
+                line.find("prof-14")
+                    .map(|x| (u16::try_from(line[..x].chars().count()).unwrap(), y))
+            })
+            .unwrap();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        let selected = app.profile_list_state.selected().unwrap();
+        assert_eq!(app.runtime.profiles[selected].name, "prof-14");
+        assert_eq!(app.focused_panel, FocusedPanel::Sidebar);
+    }
+
+    #[test]
+    fn a_function_key_while_zoomed_zooms_the_panel_it_focuses() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["alpha"]);
+        app.focused_panel = FocusedPanel::Logs;
+        app.handle_key(key(KeyCode::Char('z')));
+        app.handle_key(key(KeyCode::F(1)));
+        assert_eq!(app.zoomed_panel, Some(app.focused_panel.clone()));
+    }
+}
