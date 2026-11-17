@@ -54,13 +54,15 @@ pub(super) fn handle_list(
     }
 
     if let Some(proto) = protocol_filter {
-        let proto_lower = proto.to_lowercase();
-        profiles.retain(|p| format!("{}", p.protocol).to_lowercase() == proto_lower);
+        profiles.retain(|p| p.protocol.to_string().eq_ignore_ascii_case(proto));
     }
 
     if profiles.is_empty() {
         match mode {
-            OutputMode::Human => println!("No profiles found. Import one: vortix import <PATH>"),
+            OutputMode::Human => match protocol_filter.filter(|_| !all.is_empty()) {
+                Some(proto) => println!("No profiles match --protocol {proto}."),
+                None => println!("No profiles found. Import one: vortix import <PATH>"),
+            },
             OutputMode::Json => print_success(
                 mode,
                 "list",
@@ -106,18 +108,8 @@ pub(super) fn handle_list(
     match mode {
         OutputMode::Human => {
             // Calculate column widths
-            let max_name = entries
-                .iter()
-                .map(|e| e.name.len())
-                .max()
-                .unwrap_or(4)
-                .max(4);
-            let max_proto = entries
-                .iter()
-                .map(|e| e.protocol.len())
-                .max()
-                .unwrap_or(8)
-                .max(8);
+            let max_name = entries.iter().map(|e| e.name.len()).fold(4, usize::max);
+            let max_proto = entries.iter().map(|e| e.protocol.len()).fold(8, usize::max);
             println!(
                 "  {:<width_n$}  {:<width_p$}  LAST USED",
                 "NAME",
