@@ -130,7 +130,7 @@ impl PfFirewall {
         writeln!(rules, "# DO NOT EDIT - Will be overwritten").unwrap();
         writeln!(rules).unwrap();
         writeln!(rules, "# Allow loopback").unwrap();
-        writeln!(rules, "pass out quick on lo0 all").unwrap();
+        writeln!(rules, "pass out quick on lo0 all flags any").unwrap();
         writeln!(rules).unwrap();
 
         let rfc1918 = lan_allowance(active);
@@ -345,9 +345,6 @@ fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
         return Some(format!(
             "pass out quick proto udp all group = {group} keep state"
         ));
-    }
-    if rule == "pass out quick on lo0 all" {
-        return Some("pass out quick on lo0 all flags S/SA keep state".into());
     }
     if let Some(interface) = rule
         .strip_prefix("pass out quick on ")
@@ -587,7 +584,7 @@ mod tests {
             "pass out quick inet from any to 10.0.0.0/8 flags any keep state",
             "pass out quick inet from any to 172.16.0.0/12 flags any keep state",
             "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
-            "pass out quick on lo0 all flags S/SA keep state",
+            "pass out quick on lo0 all flags any keep state",
             "pass out quick proto udp from any port = 68 to any port = 67 keep state",
             "pass in quick proto udp from any port = 67 to any port = 68 keep state",
         ];
@@ -703,7 +700,7 @@ mod tests {
             is_primary: true,
         }];
         let normalized = [
-            "pass out quick on lo0 all flags S/SA keep state",
+            "pass out quick on lo0 all flags any keep state",
             "pass out quick inet from any to 10.0.0.0/8 flags any keep state",
             "pass out quick inet from any to 172.16.0.0/12 flags any keep state",
             "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
@@ -722,8 +719,18 @@ mod tests {
         );
         assert!(PfFirewall::canonical_snapshot_matches(&active, &observed));
 
-        observed[0] = "pass out quick on lo0 all flags S/SA keep state label \"foreign\"";
+        observed[0] = "pass out quick on lo0 all flags any keep state label \"foreign\"";
         assert!(!PfFirewall::canonical_snapshot_matches(&active, &observed));
+    }
+
+    /// Without `flags any`, pf matches only SYNs, so a localhost TCP flow
+    /// opened before the kill switch engaged falls through to the block.
+    #[test]
+    fn loopback_keeps_flows_opened_before_the_kill_switch() {
+        let rules = PfFirewall::generate_pf_rules(&[]);
+        assert!(rules
+            .lines()
+            .any(|line| line == "pass out quick on lo0 all flags any"));
     }
 
     #[test]
@@ -949,7 +956,7 @@ mod tests {
 # DO NOT EDIT - Will be overwritten
 
 # Allow loopback
-pass out quick on lo0 all
+pass out quick on lo0 all flags any
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
 pass out quick to 10.0.0.0/8 flags any
@@ -983,7 +990,7 @@ block drop out quick all
 # DO NOT EDIT - Will be overwritten
 
 # Allow loopback
-pass out quick on lo0 all
+pass out quick on lo0 all flags any
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
 pass out quick to 10.0.0.0/8 flags any
@@ -1029,7 +1036,7 @@ block drop out quick all
 # DO NOT EDIT - Will be overwritten
 
 # Allow loopback
-pass out quick on lo0 all
+pass out quick on lo0 all flags any
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
 pass out quick to 172.16.0.0/12 flags any
