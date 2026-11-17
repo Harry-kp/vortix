@@ -2,7 +2,7 @@
 //!
 //! Extracts what the engine actually needs today: DNS servers (for
 //! `resolvconf` dependency hinting), peer routing data (`AllowedIPs`,
-//! `Endpoint`, `FwMark`) used by the multi-tunnel engine snapshot's conflict
+//! `Endpoint`) used by the multi-tunnel engine snapshot's conflict
 //! detector and killswitch synthesis, a `has_hooks` flag derived from
 //! rejection of `PreUp`/`PostUp`/`PreDown`/`PostDown` executable directives
 //! in the `[Interface]` section, and a passthrough of the raw text. The
@@ -30,7 +30,6 @@ pub struct WgPeer {
     /// required before a firewall safety barrier is installed.
     pub endpoint_host: Option<String>,
     pub endpoint_port: Option<u16>,
-    pub fwmark: Option<u32>,
     pub persistent_keepalive: Option<u16>,
 }
 
@@ -220,25 +219,6 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                             peer.endpoint_host = Some(host);
                             peer.endpoint_port = Some(port);
                         }
-                    } else if key.eq_ignore_ascii_case("FwMark") {
-                        if value.eq_ignore_ascii_case("off") {
-                            peer.fwmark = Some(0);
-                        } else {
-                            // Accept hex (0x...) or decimal forms.
-                            let parsed = if let Some(hex) = value
-                                .strip_prefix("0x")
-                                .or_else(|| value.strip_prefix("0X"))
-                            {
-                                u32::from_str_radix(hex, 16).ok()
-                            } else {
-                                value.parse::<u32>().ok()
-                            };
-                            if let Some(mark) = parsed {
-                                peer.fwmark = Some(mark);
-                            } else {
-                                tracing::warn!(value, "ignoring malformed FwMark value in [Peer]");
-                            }
-                        }
                     } else if key.eq_ignore_ascii_case("PersistentKeepalive") {
                         peer.persistent_keepalive =
                             value.parse::<u16>().ok().filter(|seconds| *seconds > 0);
@@ -421,7 +401,6 @@ Address = 10.0.0.2/32
 PublicKey = BBBB
 AllowedIPs = 10.0.0.0/8, 192.168.0.0/16
 Endpoint = 203.0.113.5:51820
-FwMark = 51820
 ";
         let p = parse_wg_conf(text).unwrap();
         assert_eq!(p.peers.len(), 1);
@@ -445,7 +424,6 @@ FwMark = 51820
                 51820
             ))
         );
-        assert_eq!(peer.fwmark, Some(51820));
     }
 
     #[test]
@@ -527,7 +505,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
     }
 
     #[test]
-    fn peer_without_endpoint_or_fwmark() {
+    fn peer_without_endpoint() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
@@ -540,7 +518,6 @@ AllowedIPs = 10.0.0.0/8
         assert_eq!(p.peers.len(), 1);
         let peer = &p.peers[0];
         assert!(peer.endpoint.is_none());
-        assert!(peer.fwmark.is_none());
         assert_eq!(peer.allowed_ips.len(), 1);
     }
 
@@ -565,34 +542,6 @@ AllowedIPs = 10.0.0/8, 192.168.0.0/16, bogus
             IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0))
         );
         assert_eq!(peer.allowed_ips[0].prefix_len, 16);
-    }
-
-    #[test]
-    fn fwmark_off_parses_as_zero() {
-        let text = "\
-[Interface]
-PrivateKey = AAAA
-
-[Peer]
-PublicKey = BBBB
-FwMark = off
-";
-        let p = parse_wg_conf(text).unwrap();
-        assert_eq!(p.peers[0].fwmark, Some(0));
-    }
-
-    #[test]
-    fn fwmark_hex_value_parses() {
-        let text = "\
-[Interface]
-PrivateKey = AAAA
-
-[Peer]
-PublicKey = BBBB
-FwMark = 0xca6c
-";
-        let p = parse_wg_conf(text).unwrap();
-        assert_eq!(p.peers[0].fwmark, Some(0xca6c));
     }
 
     #[test]
