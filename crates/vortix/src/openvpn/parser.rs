@@ -242,7 +242,8 @@ pub(super) enum DnsSetting {
 
 /// The DNS an option sets: `dhcp-option DNS|DOMAIN|DOMAIN-SEARCH`, or
 /// `OpenVPN` 2.6's `dns server N address` and `dns search-domains`. `Ok(None)`
-/// for any other option; `Err` for one of these that is malformed.
+/// for any other option, a dashed one included; `Err` for one of these that is
+/// malformed.
 pub(super) fn dns_setting<'a>(
     directive: &str,
     mut tokens: impl Iterator<Item = &'a str>,
@@ -255,7 +256,7 @@ pub(super) fn dns_setting<'a>(
             Ok(Some(DnsSetting::Domains(domains)))
         }
     };
-    match (directive.trim_start_matches('-'), tokens.next()) {
+    match (directive, tokens.next()) {
         ("dhcp-option", Some("DNS")) => {
             let server = tokens
                 .next()

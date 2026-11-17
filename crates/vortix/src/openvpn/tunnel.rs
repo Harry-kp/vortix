@@ -70,9 +70,9 @@ fn sanitize_managed_config(text: &str) -> Result<String, TunnelError> {
         validate_managed_line(line).map_err(|error| TunnelError::Subprocess(error.to_string()))?;
         let directive = line.split(['#', ';']).next().unwrap_or_default();
         let mut tokens = directive.split_whitespace();
-        let first = tokens.next().unwrap_or_default();
-        let is_dns = first.trim_start_matches('-').eq_ignore_ascii_case("dns")
-            || !matches!(dns_setting(first, tokens), Ok(None));
+        let first = tokens.next().unwrap_or_default().trim_start_matches('-');
+        let is_dns =
+            first.eq_ignore_ascii_case("dns") || !matches!(dns_setting(first, tokens), Ok(None));
         if !is_dns {
             output.push_str(line);
         }
@@ -1813,5 +1813,15 @@ mod tests {
             poll("AUTH: Received control message: AUTH_FAILED,Account expired\n"),
             TunnelError::AuthFailed(reason) if reason == "Account expired"
         ));
+    }
+
+    #[test]
+    fn a_dashed_pushed_dns_option_is_not_read() {
+        let parsed = parse_ovpn_conf("client\nroute-nopull\n").unwrap();
+        let log = "PUSH: Received control message: 'PUSH_REPLY,--dns server 0 address 6.6.6.6,-dhcp-option DNS 6.6.6.7'\nInitialization Sequence Completed\n";
+        assert_eq!(
+            pushed_dns_evidence(&parsed, log),
+            OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
+        );
     }
 }
