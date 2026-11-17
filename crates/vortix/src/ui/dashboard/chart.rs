@@ -75,7 +75,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .title(
             Line::from(Span::styled(
                 peak_label,
-                Style::default().fg(theme::current().nord_polar_night_4),
+                Style::default().fg(theme::current().inactive),
             ))
             .right_aligned(),
         )

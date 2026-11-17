@@ -196,9 +196,11 @@ fn render_hints(
 ) {
     use ratatui::layout::{Constraint, Layout};
 
+    // The version gives way to the hints on narrow terminals.
+    let branding_width = if area.width >= 80 { 16 } else { 0 };
     let chunks = Layout::default()
         .direction(ratatui::layout::Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(16)])
+        .constraints([Constraint::Min(0), Constraint::Length(branding_width)])
         .split(area);
 
     let max_width = chunks[0].width as usize;
@@ -264,7 +266,7 @@ fn render_hints(
             crate::constants::APP_NAME,
             crate::constants::APP_VERSION
         ),
-        Style::default().fg(crate::ui::theme::current().nord_polar_night_4),
+        Style::default().fg(crate::ui::theme::current().inactive),
     )]);
     frame.render_widget(
         Paragraph::new(branding).alignment(ratatui::layout::Alignment::Right),

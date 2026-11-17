@@ -47,7 +47,7 @@ pub mod action_menu {
         let list_items: Vec<ListItem> = if items.is_empty() {
             vec![ListItem::new(Line::from(vec![Span::styled(
                 " No actions available ",
-                Style::default().fg(theme::current().nord_polar_night_4),
+                Style::default().fg(theme::current().inactive),
             )]))]
         } else {
             items
@@ -183,8 +183,8 @@ pub mod auth {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::current().accent_primary))
-            .title(format!(" {title} "))
-            .title_bottom(Line::from(format!(" {footer} ")).centered());
+            .title(title)
+            .title_bottom(Line::from(footer).centered());
 
         let inner = block.inner(popup_area);
         frame.render_widget(block, popup_area);
@@ -730,10 +730,10 @@ pub mod config_viewer {
 
             return Line::from(vec![
                 Span::styled(
-                    key.to_string(),
+                    key.trim_end().to_string(),
                     Style::default().fg(theme::current().accent_primary),
                 ),
-                Span::styled("=", Style::default().fg(theme::current().separator)),
+                Span::styled(" = ", Style::default().fg(theme::current().separator)),
                 Span::styled(
                     masked_value,
                     Style::default().fg(theme::current().text_primary),

@@ -3084,3 +3084,20 @@ fn the_first_public_address_is_not_logged_as_a_change() {
         "a placeholder was logged as an address"
     );
 }
+
+#[test]
+fn the_footer_keeps_quit_at_sixty_columns() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["alpha"]);
+    app.profile_list_state.select(Some(0));
+    for width in 60..=80 {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let footer: String = (0..width)
+            .map(|x| buffer[(x, 23)].symbol().to_string())
+            .collect();
+        assert!(footer.contains("q Quit"), "{width}: {footer}");
+    }
+}
