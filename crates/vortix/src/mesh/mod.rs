@@ -1019,8 +1019,10 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), TunnelError> {
 /// The daemon reports a server other than the profile's when something on
 /// this computer overrides it, such as an organization's device management.
 fn server_overridden(name: &str, settings: &MeshProfile, reported: &str) -> Option<String> {
-    let (host, port) = reported.rsplit_once(':')?;
-    let port: u16 = port.parse().ok()?;
+    if !reported.contains(':') {
+        return None;
+    }
+    let (host, port) = server(&format!("https://{reported}")).ok()?;
     let (ours, our_port) = settings.server().ok()?;
     (!host.eq_ignore_ascii_case(&ours) || port != our_port).then(|| {
         format!(
@@ -1056,6 +1058,13 @@ mod tests {
         let message = server_overridden("NetBird", &company, "spider.example.com:443").unwrap();
         assert!(message.contains("set to use spider.example.com, not nb.corp.example"));
         assert!(server_overridden("NetBird", &company, "nb.corp.example:33073").is_some());
+        let v6 = MeshProfile {
+            server_url: "https://[2001:db8::1]:443".into(),
+            auth_key: None,
+            identity: None,
+        };
+        assert_eq!(server_overridden("NetBird", &v6, "[2001:db8::1]:443"), None);
+        assert!(server_overridden("NetBird", &v6, "[2001:db8::2]:443").is_some());
     }
 
     #[test]
