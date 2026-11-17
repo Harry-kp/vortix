@@ -788,7 +788,8 @@ fn pushed_dns_evidence(
     };
     let mut observed = false;
     for option in push_reply {
-        let mut tokens = option.split_whitespace();
+        let words = crate::openvpn::parser::option_words(option);
+        let mut tokens = words.iter().map(String::as_str);
         let directive = tokens.next().unwrap_or_default();
         match dns_setting(directive, tokens) {
             Err(()) => {
@@ -1836,5 +1837,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(!matches!(error, TunnelError::AuthFailed(_)), "{error}");
+    }
+
+    #[test]
+    fn pushed_dns_split_only_on_openvpn_whitespace() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,dhcp-option\u{a0}DNS 6.6.6.6,dns server 0 address\u{a0}6.6.6.7'\nInitialization Sequence Completed\n";
+        assert_eq!(
+            pushed_dns_evidence(&crate::openvpn::parser::OvpnParsedProfile::default(), log),
+            OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
+        );
     }
 }

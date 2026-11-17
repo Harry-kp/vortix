@@ -95,7 +95,8 @@ impl PullPolicy {
             .iter()
             .find(|(_, text)| option.starts_with(text.as_str()))
             .is_some_and(|(accepts, _)| !accepts);
-        let directive = option.split_whitespace().next().unwrap_or_default();
+        let words = option_words(option);
+        let directive = words.first().map_or("", String::as_str);
         let route_or_dns = [
             "route",
             "route-ipv6",
@@ -105,8 +106,7 @@ impl PullPolicy {
             "dhcp-option",
             "dns",
         ]
-        .iter()
-        .any(|name| directive.eq_ignore_ascii_case(name));
+        .contains(&directive);
         !(filtered || self.route_nopull && route_or_dns)
     }
 }
@@ -470,12 +470,23 @@ fn effective_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
 
 /// Tokenize the security-relevant prefix using `OpenVPN`'s config-file quoting
 /// rules. `None` means `OpenVPN` would reject the malformed line itself.
+/// The words of one pushed option, split as `OpenVPN` splits it; none for one
+/// it cannot parse.
+pub(crate) fn option_words(option: &str) -> Vec<String> {
+    openvpn_option_tokens(option, 128).unwrap_or_default()
+}
+
+/// `OpenVPN`'s word separator: C `isspace`, never other Unicode spaces.
+pub(crate) fn openvpn_space(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
+}
+
 fn openvpn_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
     let mut chars = line.chars().peekable();
     let mut tokens = Vec::with_capacity(limit.min(8));
 
     while tokens.len() < limit {
-        while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
+        while chars.next_if(|ch| openvpn_space(*ch)).is_some() {}
         if chars.peek().is_none_or(|ch| matches!(ch, '#' | ';')) {
             break;
         }
@@ -495,7 +506,7 @@ fn openvpn_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
                 break;
             } else if ch == '\\' {
                 token.push(chars.next()?);
-            } else if quote.is_none() && ch.is_whitespace() {
+            } else if quote.is_none() && openvpn_space(ch) {
                 break;
             } else {
                 token.push(ch);
