@@ -55,7 +55,7 @@ pub mod action_menu {
                 .map(|item| {
                     let line = Line::from(vec![
                         Span::styled(
-                            format!(" {} ", item.key),
+                            format!(" {:<3} ", item.key),
                             Style::default()
                                 .fg(theme::current().accent_primary)
                                 .add_modifier(Modifier::BOLD),
@@ -1000,7 +1000,7 @@ pub mod help {
                 ("r", "Reconnect"),
                 ("i", "Add a VPN (file, folder, link, netbird)"),
                 ("K", "Cycle kill switch mode"),
-                ("y", "Copy VPN IP to clipboard"),
+                ("y", "Copy public IPv4 to clipboard"),
                 ("Mouse drag", "Select text; release copies it"),
                 ("Click link", "Open it in your browser"),
                 ("Tab/S-Tab, l/h", "Next / Previous panel"),

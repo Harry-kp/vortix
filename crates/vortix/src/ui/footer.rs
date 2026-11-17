@@ -51,7 +51,7 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
                 ("j/k", "Navigate"),
                 ("v", "View Config"),
                 ("R", "Rename"),
-                ("DEL", "Delete"),
+                ("Del", "Delete"),
             ]);
         }
         crate::app::FocusedPanel::Logs => {

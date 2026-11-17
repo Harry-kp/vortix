@@ -297,7 +297,8 @@ impl App {
     /// Copy the current public IPv4 address to clipboard.
     pub(crate) fn copy_ip_to_clipboard(&mut self) {
         let ip_str = self.runtime.public_ip.clone();
-        if ip_str.is_empty() || ip_str == constants::MSG_FETCHING || ip_str.starts_with("Error") {
+        // Only an address: never a placeholder such as "Detecting...".
+        if ip_str.parse::<std::net::IpAddr>().is_err() {
             self.show_toast("No valid IPv4 available yet".to_string(), ToastType::Error);
             return;
         }

@@ -212,7 +212,7 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
             });
             actions.push(ActionMenuItem {
                 key: "c",
-                label: "Connect / Disconnect",
+                label: "Connect / disconnect",
                 message: Message::ToggleConnect(None),
             });
             actions.push(ActionMenuItem {
@@ -222,58 +222,58 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
             });
             actions.push(ActionMenuItem {
                 key: "v",
-                label: "View Configuration",
+                label: "View config",
                 message: Message::OpenConfig,
             });
             actions.push(ActionMenuItem {
                 key: "a",
-                label: "Edit Auth Credentials",
+                label: "Manage auth",
                 message: Message::ManageAuth,
             });
             actions.push(ActionMenuItem {
                 key: "A",
-                label: "Clear Auth Credentials",
+                label: "Clear saved auth",
                 message: Message::ClearAuth,
             });
             actions.push(ActionMenuItem {
-                key: "DEL",
-                label: "Delete Profile",
+                key: "Del",
+                label: "Delete profile",
                 message: Message::OpenDelete(None),
             });
             actions.push(ActionMenuItem {
                 key: "s",
-                label: "Sort Profiles",
+                label: "Cycle sort order",
                 message: Message::CycleSortOrder,
             });
             actions.push(ActionMenuItem {
                 key: "R",
-                label: "Rename Profile",
+                label: "Rename profile",
                 message: Message::OpenRename,
             });
         }
         FocusedPanel::Logs => {
             actions.push(ActionMenuItem {
                 key: "L",
-                label: "Clear Activity Logs",
+                label: "Clear logs",
                 message: Message::ClearLogs,
             });
             actions.push(ActionMenuItem {
                 key: "f",
-                label: "Filter Logs / OpenVPN Log",
+                label: "Filter logs / VPN log",
                 message: Message::CycleLogFilter,
             });
         }
         FocusedPanel::ConnectionDetails => {
             actions.push(ActionMenuItem {
                 key: "y",
-                label: "Copy Public IPv4",
+                label: "Copy public IPv4",
                 message: Message::CopyIp,
             });
         }
         FocusedPanel::Security => {
             actions.push(ActionMenuItem {
                 key: "K",
-                label: "Toggle Kill Switch",
+                label: "Cycle kill switch mode",
                 message: Message::ToggleKillSwitch,
             });
         }
@@ -294,7 +294,7 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
     }
     actions.push(ActionMenuItem {
         key: "z",
-        label: "Toggle Zoom View",
+        label: "Zoom focused panel",
         message: Message::ToggleZoom,
     });
 
@@ -330,7 +330,7 @@ mod tests {
         assert!(actions.iter().any(|a| a.key == "v"));
         assert!(actions.iter().any(|a| a.key == "a")); // edit auth credentials
         assert!(actions.iter().any(|a| a.key == "A")); // clear auth credentials
-        assert!(actions.iter().any(|a| a.key == "DEL"));
+        assert!(actions.iter().any(|a| a.key == "Del"));
         assert!(actions.iter().any(|a| a.key == "s")); // sort
         assert!(actions.iter().any(|a| a.key == "R")); // rename
         assert!(actions.iter().any(|a| a.key == "z")); // universal zoom

@@ -1029,7 +1029,7 @@ impl crate::app::App {
                 }
             }
             KeyCode::Delete | KeyCode::Backspace => {
-                if let Some(item) = actions.iter().find(|a| a.key == "DEL") {
+                if let Some(item) = actions.iter().find(|a| a.key == "Del") {
                     let msg = item.message.clone();
                     self.show_action_menu = false;
                     self.show_bulk_menu = false;
