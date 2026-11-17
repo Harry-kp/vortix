@@ -285,7 +285,7 @@ fn connected_line(
     ) {
         QualityLevel::Unknown => ("─────", theme::current().text_secondary),
         QualityLevel::Poor => ("●●○○○", theme::current().error),
-        QualityLevel::Fair => ("●●●○○", theme::current().yellow),
+        QualityLevel::Fair => ("●●●○○", theme::current().warning),
         QualityLevel::Excellent => ("●●●●●", theme::current().success),
     };
 

@@ -715,7 +715,7 @@ pub mod config_viewer {
             return Line::from(Span::styled(
                 line,
                 Style::default()
-                    .fg(theme::current().yellow)
+                    .fg(theme::current().accent_secondary)
                     .add_modifier(Modifier::BOLD),
             ));
         }

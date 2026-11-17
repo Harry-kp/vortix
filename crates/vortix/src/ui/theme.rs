@@ -232,7 +232,6 @@ pub struct Theme {
     pub toast_error: Color,
 
     // --- Palette-specific colors (used for protocol badges, charts, etc.) ---
-    pub yellow: Color,
     pub nord_polar_night_4: Color,
     pub nord_frost_3: Color,
     pub nord_purple: Color,
@@ -240,7 +239,7 @@ pub struct Theme {
 
 impl Theme {
     #[cfg(test)]
-    const fn colors(self) -> [Color; 25] {
+    const fn colors(self) -> [Color; 24] {
         [
             self.panel_bg,
             self.accent_primary,
@@ -263,7 +262,6 @@ impl Theme {
             self.toast_success,
             self.toast_warning,
             self.toast_error,
-            self.yellow,
             self.nord_polar_night_4,
             self.nord_frost_3,
             self.nord_purple,
@@ -307,7 +305,6 @@ pub const SYNTHWAVE: Theme = Theme {
     toast_warning: Color::Rgb(235, 203, 139),
     toast_error: Color::Rgb(191, 97, 106),
 
-    yellow: Color::Rgb(234, 179, 8),
     nord_polar_night_4: Color::Rgb(76, 86, 106),
     nord_frost_3: Color::Rgb(129, 161, 193),
     nord_purple: Color::Rgb(180, 142, 173),
@@ -345,7 +342,6 @@ pub const TERMINAL: Theme = Theme {
     toast_warning: Color::Yellow,
     toast_error: Color::Red,
 
-    yellow: Color::Yellow,
     nord_polar_night_4: Color::DarkGray,
     nord_frost_3: Color::Blue,
     nord_purple: Color::Magenta,
@@ -382,7 +378,6 @@ pub const CATPPUCCIN_MOCHA: Theme = Theme {
     toast_warning: Color::Rgb(249, 226, 175),
     toast_error: Color::Rgb(243, 139, 168),
 
-    yellow: Color::Rgb(249, 226, 175),
     nord_polar_night_4: Color::Rgb(69, 71, 90),
     nord_frost_3: Color::Rgb(137, 180, 250),
     nord_purple: Color::Rgb(203, 166, 247),
@@ -419,7 +414,6 @@ pub const DRACULA: Theme = Theme {
     toast_warning: Color::Rgb(255, 184, 108),
     toast_error: Color::Rgb(255, 85, 85),
 
-    yellow: Color::Rgb(241, 250, 140),
     nord_polar_night_4: Color::Rgb(68, 71, 90),
     nord_frost_3: Color::Rgb(139, 233, 253),
     nord_purple: Color::Rgb(189, 147, 249),
@@ -456,7 +450,6 @@ pub const NORD: Theme = Theme {
     toast_warning: Color::Rgb(235, 203, 139),
     toast_error: Color::Rgb(220, 130, 139),
 
-    yellow: Color::Rgb(235, 203, 139),
     nord_polar_night_4: Color::Rgb(76, 86, 106),
     nord_frost_3: Color::Rgb(129, 161, 193),
     nord_purple: Color::Rgb(180, 142, 173),
@@ -493,7 +486,6 @@ pub const GRUVBOX_DARK: Theme = Theme {
     toast_warning: Color::Rgb(250, 189, 47),
     toast_error: Color::Rgb(251, 73, 52),
 
-    yellow: Color::Rgb(250, 189, 47),
     nord_polar_night_4: Color::Rgb(80, 73, 69),
     nord_frost_3: Color::Rgb(131, 165, 152),
     nord_purple: Color::Rgb(211, 134, 155),
@@ -530,7 +522,6 @@ pub const TOKYO_NIGHT: Theme = Theme {
     toast_warning: Color::Rgb(224, 175, 104),
     toast_error: Color::Rgb(247, 118, 142),
 
-    yellow: Color::Rgb(224, 175, 104),
     nord_polar_night_4: Color::Rgb(59, 66, 97),
     nord_frost_3: Color::Rgb(122, 162, 247),
     nord_purple: Color::Rgb(187, 154, 247),
@@ -618,7 +609,6 @@ const fn indexed_theme(theme: Theme) -> Theme {
         toast_success: indexed_color(theme.toast_success),
         toast_warning: indexed_color(theme.toast_warning),
         toast_error: indexed_color(theme.toast_error),
-        yellow: indexed_color(theme.yellow),
         nord_polar_night_4: indexed_color(theme.nord_polar_night_4),
         nord_frost_3: indexed_color(theme.nord_frost_3),
         nord_purple: indexed_color(theme.nord_purple),
@@ -690,7 +680,6 @@ mod tests {
                 toast_success: Color::Rgb(163, 190, 140),
                 toast_warning: Color::Rgb(235, 203, 139),
                 toast_error: Color::Rgb(191, 97, 106),
-                yellow: Color::Rgb(234, 179, 8),
                 nord_polar_night_4: Color::Rgb(76, 86, 106),
                 nord_frost_3: Color::Rgb(129, 161, 193),
                 nord_purple: Color::Rgb(180, 142, 173),

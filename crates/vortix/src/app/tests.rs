@@ -1953,7 +1953,7 @@ fn theme_toggle_persists_restyles_cached_content_and_reports_success() {
         app.cached_config.as_ref().unwrap().highlighted_lines[0].spans[0]
             .style
             .fg,
-        Some(crate::ui::theme::TERMINAL.yellow)
+        Some(crate::ui::theme::TERMINAL.accent_secondary)
     );
     let toast = app.toast.as_ref().unwrap();
     assert_eq!(toast.toast_type, ToastType::Success);

@@ -223,12 +223,12 @@ pub(crate) fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     }
 }
 
-/// Green under 50ms, yellow under 150ms, red beyond.
+/// On the thresholds `QualityLevel::from_metrics` grades latency by.
 pub(crate) fn latency_color(latency_ms: u64) -> Color {
-    if latency_ms < 50 {
+    if latency_ms < 100 {
         theme::current().success
-    } else if latency_ms < 150 {
-        theme::current().yellow
+    } else if latency_ms < 300 {
+        theme::current().warning
     } else {
         theme::current().error
     }
