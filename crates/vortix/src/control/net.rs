@@ -98,11 +98,15 @@ impl Net {
         if tightening {
             self.apply_firewall(target, mode)?;
         }
+        // Routes that failed keep the stricter firewall: traffic would leave
+        // outside the tunnel. A DNS failure keeps the tunnel up (DNS reads
+        // Unverified), so it must not keep an older block either.
         self.apply_routes(target)?;
-        self.apply_dns(target)?;
+        let dns_result = self.apply_dns(target);
         if !tightening {
             self.apply_firewall(target, mode)?;
         }
+        dns_result?;
         let routes = std::mem::take(&mut self.applied.routes);
         self.applied = target.clone();
         self.applied.routes = routes;
