@@ -37,7 +37,8 @@ Reporters are credited in the release notes unless they prefer not to be.
   follow symlinks.
 - **Credentials.** Saved OpenVPN credentials live in `~/.config/vortix/auth/`, one owner-only
   file per profile. Keys and passwords are masked in `show`, never passed on a command line, and
-  kept out of logs and JSON output.
+  kept out of logs and JSON output. A profile URL's user name, password and query reach `curl`
+  on its standard input and are left out of the log.
 - **NetBird.** A `.netbird` profile's setup key is a credential like a WireGuard private key:
   the file is owner-only, only `show --raw` prints it, and it reaches `netbird` through a
   root-only file that is deleted after each connect. Each network's identity lives in `/var/lib/vortix/netbird/` (root
