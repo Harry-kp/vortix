@@ -319,7 +319,7 @@ pub(super) fn handle_status(
         OutputMode::Json => {
             let next = if is_present {
                 vec![
-                    "sudo vortix down --json".into(),
+                    super::output::sudo_command(&["down", "--json"]),
                     "vortix list --json".into(),
                 ]
             } else {

@@ -444,8 +444,8 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
                     .and_then(|text| crate::mesh::MeshProfile::parse(&text).ok())
                     .is_some_and(|mesh| mesh.auth_key.is_none() && mesh.identity.is_none());
                 println!(
-                    "\nNext: sudo vortix up {}{}",
-                    profile.name,
+                    "\nNext: {}{}",
+                    super::output::sudo_command(&["up", &profile.name]),
                     if signs_in {
                         "  (it shows a link to sign in)"
                     } else {
@@ -459,7 +459,7 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
             "import",
             &data,
             vec![
-                format!("sudo vortix up {} --json", profile.name),
+                super::output::sudo_command(&["up", &profile.name, "--json"]),
                 "vortix list --json".into(),
             ],
         ),
@@ -617,7 +617,11 @@ pub(super) fn handle_show(profile_name: &str, raw: bool, mode: OutputMode) -> i3
             mode,
             "show",
             &data,
-            vec![format!("sudo vortix up {} --json", profile.name)],
+            vec![super::output::sudo_command(&[
+                "up",
+                &profile.name,
+                "--json",
+            ])],
         ),
         OutputMode::Quiet => {}
     }
@@ -634,7 +638,6 @@ pub(super) fn require_profile_inactive(
     active_name: &str,
     requested_name: &str,
     command: &str,
-    retry_command: &str,
     mode: OutputMode,
 ) {
     let active = crate::control::scanner::get_active_profiles(profiles);
@@ -647,7 +650,11 @@ pub(super) fn require_profile_inactive(
                 message: format!(
                     "Cannot {command} active profile '{requested_name}' — disconnect first"
                 ),
-                hint: Some(format!("sudo vortix down && {retry_command}")),
+                hint: Some(format!(
+                    "{} && {}",
+                    super::output::sudo_command(&["down", active_name]),
+                    super::output::this_command()
+                )),
             },
             ExitCode::StateConflict,
         );
@@ -672,14 +679,7 @@ pub(super) fn handle_delete(
     };
     let profile_id = profiles[idx].id.clone();
 
-    require_profile_inactive(
-        &profiles,
-        profile_name,
-        profile_name,
-        "delete",
-        &format!("vortix delete {profile_name}"),
-        mode,
-    );
+    require_profile_inactive(&profiles, profile_name, profile_name, "delete", mode);
 
     if !yes && !matches!(mode, OutputMode::Json | OutputMode::Quiet) {
         use std::io::Write;
@@ -712,14 +712,7 @@ pub(super) fn handle_delete(
         );
     };
     let fresh_name = fresh_profile.name.clone();
-    require_profile_inactive(
-        &fresh_profiles,
-        &fresh_name,
-        profile_name,
-        "delete",
-        &format!("vortix delete {profile_name}"),
-        mode,
-    );
+    require_profile_inactive(&fresh_profiles, &fresh_name, profile_name, "delete", mode);
 
     if let Err(error) =
         FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME)).delete(&profile_id)
@@ -769,14 +762,7 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
     };
     let profile_id = profiles[idx].id.clone();
 
-    require_profile_inactive(
-        &profiles,
-        old,
-        old,
-        "rename",
-        &format!("vortix rename {old} {new}"),
-        mode,
-    );
+    require_profile_inactive(&profiles, old, old, "rename", mode);
 
     let trimmed = new.trim();
     if trimmed.is_empty()
@@ -820,14 +806,7 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
     else {
         print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
     };
-    require_profile_inactive(
-        &fresh_profiles,
-        &fresh_profile.name,
-        old,
-        "rename",
-        &format!("vortix rename {old} {new}"),
-        mode,
-    );
+    require_profile_inactive(&fresh_profiles, &fresh_profile.name, old, "rename", mode);
 
     if fresh_profile.protocol == crate::profile::ProtocolKind::WireGuard
         && crate::profile::validate_wireguard_interface_name(trimmed).is_err()
