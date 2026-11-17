@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-17
+
+### Bug Fixes
+
+- NetBird polish: plain missing-tool message, idle peers shown as idle
+- Treat a DHCP-only primary service as a valid DNS baseline
+- Verify DNS key absence before recording an empty baseline
+- Prove a DNS key is missing before treating it as absent
+- Roll back a connect whose network settings fail ([#448](https://github.com/Harry-kp/vortix/pull/448))
+
+### Documentation
+
+- Tagline says VPN TUI, every copy at once ([#441](https://github.com/Harry-kp/vortix/pull/441))
+- Tagline says kill switch, the term people search for ([#446](https://github.com/Harry-kp/vortix/pull/446))
+
+### Refactor
+
+- One table of VPN tools, one missing check in check_dependencies
+- Keep a DHCP-only DNS baseline as Option
+
+
+
 ## [0.6.0] - 2026-11-02
 
 ### Highlights
