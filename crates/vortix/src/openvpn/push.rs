@@ -181,7 +181,7 @@ fn canonical_openvpn_route(route: &OvpnRoute) -> Result<OpenVpnRoute, OpenVpnRou
 pub(crate) fn pushed_route_evidence(
     log: &str,
 ) -> Result<PushedRouteEvidence, PushedRouteEvidenceError> {
-    let push_reply = latest_completed_push_reply(log)?;
+    let push_reply = latest_completed_push_options(log)?;
     let mut routes = Vec::new();
     let mut seen_routes = HashSet::new();
     let mut redirect_gateway = None;
@@ -197,8 +197,7 @@ pub(crate) fn pushed_route_evidence(
         });
     };
 
-    for option in push_reply.split(',') {
-        let option = option.trim().trim_matches(['\'', '"']);
+    for option in push_reply {
         let mut tokens = option.split_whitespace();
         let Some(directive) = tokens.next() else {
             continue;
@@ -257,19 +256,31 @@ pub(crate) fn pushed_route_evidence(
     })
 }
 
-pub(super) fn latest_completed_push_reply(
+/// Every option the latest completed negotiation pushed. A long push arrives
+/// as several `PUSH_REPLY` messages, each but the last marked
+/// `push-continuation 2`.
+pub(super) fn latest_completed_push_options(
     log: &str,
-) -> Result<Option<&str>, PushReplySelectionError> {
+) -> Result<Option<Vec<&str>>, PushReplySelectionError> {
     let session_log = latest_completed_session(log)?;
-    let Some(push_at) = session_log.rfind(PUSH_REPLY) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        session_log[push_at + PUSH_REPLY.len()..]
+    let mut options: Option<Vec<&str>> = None;
+    let mut continued = false;
+    for (at, _) in session_log.match_indices(PUSH_REPLY) {
+        let message = session_log[at + PUSH_REPLY.len()..]
             .lines()
             .next()
-            .unwrap_or_default(),
-    ))
+            .unwrap_or_default()
+            .split(',')
+            .map(|option| option.trim().trim_matches(['\'', '"']))
+            .filter(|option| !option.is_empty())
+            .collect::<Vec<_>>();
+        if !continued {
+            options = Some(Vec::new());
+        }
+        continued = message.contains(&"push-continuation 2");
+        options.get_or_insert_default().extend(message);
+    }
+    Ok(options)
 }
 
 /// Return the transport address selected by the latest successful `OpenVPN`
@@ -541,5 +552,23 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+    #[test]
+    fn a_push_split_by_push_continuation_keeps_every_part() {
+        let log = "2026-01-01 00:00:01 UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+                   2026-01-01 00:00:02 PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,route 10.1.0.0 255.255.0.0,push-continuation 2'\n\
+                   2026-01-01 00:00:02 PUSH: Received control message: 'PUSH_REPLY,route 10.2.0.0 255.255.0.0,push-continuation 1'\n\
+                   2026-01-01 00:00:03 Initialization Sequence Completed\n";
+        let evidence = pushed_route_evidence(log).unwrap();
+        assert!(evidence.redirect_gateway().is_some());
+        assert_eq!(evidence.routes().len(), 2);
+    }
+
+    #[test]
+    fn a_restarted_push_replaces_the_earlier_attempt() {
+        let log = "PUSH_REPLY,route 10.1.0.0 255.255.0.0\n\
+                   PUSH_REPLY,route 10.2.0.0 255.255.0.0\n\
+                   Initialization Sequence Completed\n";
+        assert_eq!(pushed_route_evidence(log).unwrap().routes().len(), 1);
     }
 }
