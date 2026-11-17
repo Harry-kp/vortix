@@ -98,6 +98,9 @@ dashboard's Logs panel (`f` until the title names the profile).
   code; its reason follows when it gives one. A saved password that is rejected is removed. If
   the notice says it could not be removed, clear it with `A` in the dashboard; until then every
   connect tries it again. Any other failure keeps the saved password.
+- `OpenVPN requested an unsupported interactive challenge`: the server asks for a dynamic
+  (CRV1) or push challenge, or the profile's key needs a passphrase. Vortix answers only a
+  `static-challenge` one-time code; a saved password is kept.
 - TLS timeout: the server is unreachable, or the certificates or protocol do not match.
 - Connected but no traffic: the server's pushed routes, forwarding or NAT.
 - `pull-filter must be …` at import: write `pull-filter accept|ignore|reject "text"`, with

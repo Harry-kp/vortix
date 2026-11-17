@@ -705,6 +705,12 @@ fn poll_log_until_ready(
                         let reason = error_line
                             .split_once("AUTH_FAILED")
                             .map_or("", |(_, reason)| reason.trim_start_matches(',').trim());
+                        if reason.starts_with("CRV1:") {
+                            return Err(TunnelError::Subprocess(
+                                crate::openvpn::management::ManagementAuthError::UnsupportedChallenge
+                                    .to_string(),
+                            ));
+                        }
                         return Err(TunnelError::AuthFailed(reason.to_string()));
                     }
                     return Err(TunnelError::DaemonExited(format!("OpenVPN: {error_line}")));
@@ -1857,5 +1863,29 @@ mod tests {
                 TunnelError::AuthFailed(_)
             ));
         }
+    }
+
+    #[test]
+    fn a_dynamic_challenge_in_the_log_is_not_a_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("corp.log");
+        let poll = |line: &str| {
+            std::fs::write(&log, line).unwrap();
+            poll_log_until_ready(
+                &log,
+                &temp.path().join("corp.pid"),
+                Duration::from_secs(5),
+                None,
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(
+            poll("AUTH: Received control message: AUTH_FAILED,CRV1:R,E:c3RhdGU=:YWxpY2U=:Enter OTP\n"),
+            TunnelError::Subprocess(_)
+        ));
+        assert!(matches!(
+            poll("AUTH: Received control message: AUTH_FAILED,Account expired\n"),
+            TunnelError::AuthFailed(reason) if reason == "Account expired"
+        ));
     }
 }
