@@ -49,9 +49,13 @@ impl HostCheck {
         use crate::control::dns::DnsPolicyAdapter as _;
         if let Firewall::Block(allow) = &self.plan.firewall {
             if let Err(error) = crate::platform::Firewall::verify_blocking(allow) {
-                return Some(format!(
-                    "Kill switch rules were changed outside Vortix ({error})"
-                ));
+                // The read-back error reads as a failed command; it is only detail.
+                crate::logger::log(
+                    crate::logger::LogLevel::Debug,
+                    "KILLSWITCH",
+                    format!("read-back: {error}"),
+                );
+                return Some("Kill switch rules were changed outside Vortix".to_string());
             }
         }
         let (desired, effective) = self.dns.as_ref()?;
