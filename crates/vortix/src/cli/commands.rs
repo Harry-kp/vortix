@@ -751,7 +751,10 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
             mode,
             "info",
             &data,
-            vec!["vortix list --json".into(), "vortix status --json".into()],
+            vec![
+                crate::cli::output::vortix_command(&["list", "--json"]),
+                crate::cli::output::vortix_command(&["status", "--json"]),
+            ],
         ),
         OutputMode::Quiet => {}
     }

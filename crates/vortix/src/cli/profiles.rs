@@ -466,7 +466,7 @@ fn print_import_success(
             &data,
             vec![
                 super::output::sudo_command(&["up", &profile.name, "--json"]),
-                "vortix list --json".into(),
+                crate::cli::output::vortix_command(&["list", "--json"]),
             ],
         ),
         OutputMode::Quiet => {}
@@ -552,7 +552,12 @@ fn import_from_directory(
             );
         }
         OutputMode::Json => {
-            print_success(mode, "import", &imported, vec!["vortix list --json".into()]);
+            print_success(
+                mode,
+                "import",
+                &imported,
+                vec![crate::cli::output::vortix_command(&["list", "--json"])],
+            );
         }
         OutputMode::Quiet => {}
     }
@@ -744,7 +749,12 @@ pub(super) fn handle_delete(
 
     match mode {
         OutputMode::Human => println!("Deleted '{profile_name}'"),
-        OutputMode::Json => print_success(mode, "delete", &data, vec!["vortix list --json".into()]),
+        OutputMode::Json => print_success(
+            mode,
+            "delete",
+            &data,
+            vec![crate::cli::output::vortix_command(&["list", "--json"])],
+        ),
         OutputMode::Quiet => {}
     }
     0
@@ -864,7 +874,12 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
 
     match mode {
         OutputMode::Human => println!("Renamed '{old}' → '{trimmed}'"),
-        OutputMode::Json => print_success(mode, "rename", &data, vec!["vortix list --json".into()]),
+        OutputMode::Json => print_success(
+            mode,
+            "rename",
+            &data,
+            vec![crate::cli::output::vortix_command(&["list", "--json"])],
+        ),
         OutputMode::Quiet => {}
     }
     0

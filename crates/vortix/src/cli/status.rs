@@ -320,11 +320,11 @@ pub(super) fn handle_status(
             let next = if is_present {
                 vec![
                     super::output::sudo_command(&["down", "--json"]),
-                    "vortix list --json".into(),
+                    crate::cli::output::vortix_command(&["list", "--json"]),
                 ]
             } else {
                 vec![
-                    "vortix list --json".into(),
+                    crate::cli::output::vortix_command(&["list", "--json"]),
                     "sudo vortix up <PROFILE> --json".into(),
                 ]
             };

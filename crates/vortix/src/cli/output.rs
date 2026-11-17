@@ -243,9 +243,11 @@ pub fn sudo_command(args: &[&str]) -> String {
     format!("sudo {}", vortix_command(args))
 }
 
-/// sudo resets the environment, so a directory chosen by
-/// `VORTIX_CONFIG_DIR` or `XDG_CONFIG_HOME` is passed as `-C`.
-fn vortix_command(args: &[&str]) -> String {
+/// `vortix <args>` for this config directory, quoted for a shell. sudo
+/// resets the environment, so a directory chosen by `VORTIX_CONFIG_DIR` or
+/// `XDG_CONFIG_HOME` is passed as `-C`.
+#[must_use]
+pub fn vortix_command(args: &[&str]) -> String {
     let config_dir = crate::config::get_config_dir().ok();
     let sudo_default = crate::config::user_home()
         .map(|home| home.join(".config").join(crate::constants::APP_NAME));
@@ -273,7 +275,10 @@ pub fn err_not_found(profile: &str) -> CliError {
     CliError {
         code: "not_found",
         message: format!("Profile '{profile}' not found"),
-        hint: Some("Run 'vortix list' to see available profiles".into()),
+        hint: Some(format!(
+            "See the available profiles: {}",
+            vortix_command(&["list"])
+        )),
     }
 }
 

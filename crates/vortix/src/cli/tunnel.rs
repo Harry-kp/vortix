@@ -252,7 +252,7 @@ pub(super) fn handle_up(
             "up",
             &data,
             vec![
-                "vortix status --json".into(),
+                crate::cli::output::vortix_command(&["status", "--json"]),
                 super::output::sudo_command(&["down", "--json"]),
             ],
         ),
@@ -436,7 +436,10 @@ pub(super) fn handle_down(
             mode,
             "down",
             &data,
-            vec!["vortix status --json".into(), "vortix list --json".into()],
+            vec![
+                crate::cli::output::vortix_command(&["status", "--json"]),
+                crate::cli::output::vortix_command(&["list", "--json"]),
+            ],
         ),
         OutputMode::Quiet => {}
     }
@@ -594,7 +597,7 @@ pub(super) fn handle_reconnect(
                 "reconnect",
                 &ReconnectData { reconnected },
                 vec![
-                    "vortix status --json".into(),
+                    crate::cli::output::vortix_command(&["status", "--json"]),
                     super::output::sudo_command(&["down", "--json"]),
                 ],
             );
