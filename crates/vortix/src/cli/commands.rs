@@ -743,8 +743,8 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
                 config_dir.join(constants::LOGS_DIR_NAME).display()
             );
             match &journal_session {
-                Some(path) => println!("  Session journal: {path}"),
-                None => println!("  Session journal: (disk persistence disabled)"),
+                Some(path) => println!("  Journal:     {path}"),
+                None => println!("  Journal:     (disk persistence disabled)"),
             }
         }
         OutputMode::Json => print_success(
