@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Clear},
     Frame,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ui::theme;
 
@@ -516,6 +516,58 @@ pub fn format_relative_time(time: std::time::SystemTime) -> String {
         }
         Err(_) => "0s".to_string(),
     }
+}
+
+/// Window a long text field around its cursor so the cursor stays visible:
+/// the text before it, the cursor cell, and the text after it.
+pub(crate) fn text_window(path: &str, cursor: usize, max_width: usize) -> (String, String, String) {
+    let characters = path.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(characters.len());
+    let cursor_character = characters
+        .get(cursor)
+        .copied()
+        .map_or('█', display_character);
+    let cursor_text = cursor_character.to_string();
+    let remaining = max_width.saturating_sub(cursor_text.width());
+    let (left_budget, right_budget) = if cursor == characters.len() {
+        (remaining, 0)
+    } else if cursor == 0 {
+        (0, remaining)
+    } else {
+        (remaining.div_ceil(2), remaining / 2)
+    };
+    let after_start = cursor + usize::from(cursor < characters.len());
+    (
+        truncate_start_to_width(
+            &characters[..cursor].iter().collect::<String>(),
+            left_budget,
+        ),
+        cursor_text,
+        prefix_window(&characters[after_start..], right_budget),
+    )
+}
+
+fn prefix_window(characters: &[char], budget: usize) -> String {
+    let mut width = 0;
+    let mut end = 0;
+    for (index, character) in characters.iter().enumerate() {
+        let character_width = display_character(*character).width().unwrap_or(1);
+        let ellipsis = usize::from(index + 1 < characters.len());
+        if width + character_width + ellipsis > budget {
+            break;
+        }
+        width += character_width;
+        end = index + 1;
+    }
+    let mut output = characters[..end]
+        .iter()
+        .copied()
+        .map(display_character)
+        .collect::<String>();
+    if end < characters.len() && budget > 0 {
+        output.push('…');
+    }
+    output
 }
 
 #[cfg(test)]
