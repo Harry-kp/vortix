@@ -315,25 +315,30 @@ fn autoconnect_changes_need_root_and_write_nothing_without_it() {
     }
     let before = vortix::platform::autoconnect::installed_profile();
     let config = tempfile::tempdir().unwrap();
-    for target in ["work", "off"] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box root gate
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box root gate
             .arg("--config-dir")
             .arg(config.path())
-            .args(["autoconnect", target])
+            .args(args)
             .output()
-            .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(ExitCode::PermissionDenied.code())
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!(
-                "sudo vortix -C {} autoconnect {target}",
-                config.path().canonicalize().unwrap().display()
-            )),
-            "{stderr}"
-        );
+            .unwrap()
+    };
+    let output = run(&["autoconnect", "off"]);
+    assert_eq!(
+        output.status.code(),
+        Some(ExitCode::PermissionDenied.code())
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "sudo vortix -C {} autoconnect off",
+            config.path().canonicalize().unwrap().display()
+        )),
+        "{stderr}"
+    );
+    // A typo is reported as one before asking for root.
+    for args in [["autoconnect", "nope"], ["up", "nope"]] {
+        assert_eq!(run(&args).status.code(), Some(ExitCode::NotFound.code()));
     }
     assert_eq!(vortix::platform::autoconnect::installed_profile(), before);
 }

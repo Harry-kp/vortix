@@ -397,6 +397,18 @@ struct AutoconnectData {
 fn handle_autoconnect(target: Option<&str>, config_dir: &Path, mode: OutputMode) -> i32 {
     use crate::platform::autoconnect;
     if let Some(target) = target {
+        if target != "off"
+            && !crate::config::profiles::load_profiles()
+                .iter()
+                .any(|profile| profile.name == target)
+        {
+            print_error_and_exit(
+                mode,
+                "autoconnect",
+                err_not_found(target),
+                ExitCode::NotFound,
+            );
+        }
         if !crate::platform::is_root() {
             print_error_and_exit(
                 mode,
@@ -408,17 +420,6 @@ fn handle_autoconnect(target: Option<&str>, config_dir: &Path, mode: OutputMode)
         let result = if target == "off" {
             autoconnect::remove()
         } else {
-            if !crate::config::profiles::load_profiles()
-                .iter()
-                .any(|profile| profile.name == target)
-            {
-                print_error_and_exit(
-                    mode,
-                    "autoconnect",
-                    err_not_found(target),
-                    ExitCode::NotFound,
-                );
-            }
             let env: Vec<(String, String)> = ["PATH", "SUDO_USER", "SUDO_UID", "SUDO_GID"]
                 .into_iter()
                 .filter_map(|key| Some((key.to_string(), std::env::var(key).ok()?)))
