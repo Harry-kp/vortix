@@ -79,7 +79,7 @@ fn status_badge_for(
     (s.glyph, s.style())
 }
 
-fn status_sigil_id(
+pub(super) fn status_sigil_id(
     tunnel: &TunnelView,
     protocol: Option<crate::profile::ProtocolKind>,
 ) -> crate::ui::sigils::SigilId {
