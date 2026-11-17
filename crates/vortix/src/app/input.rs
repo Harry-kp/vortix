@@ -820,17 +820,18 @@ impl crate::app::App {
                 }
             }
 
-            KeyCode::Home | KeyCode::Char('g') if self.focused_panel != FocusedPanel::Logs => {
+            // Selection keys act only where the selection is shown.
+            KeyCode::Home | KeyCode::Char('g') if self.focused_panel == FocusedPanel::Sidebar => {
                 self.handle_message(Message::ProfileMove(SelectionMove::First));
             }
-            KeyCode::End | KeyCode::Char('G') if self.focused_panel != FocusedPanel::Logs => {
+            KeyCode::End | KeyCode::Char('G') if self.focused_panel == FocusedPanel::Sidebar => {
                 self.handle_message(Message::ProfileMove(SelectionMove::Last));
             }
-            KeyCode::PageUp => {
+            KeyCode::PageUp if self.focused_panel == FocusedPanel::Sidebar => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
                 self.select_profile(current.saturating_sub(constants::PROFILE_LIST_PAGE_SIZE));
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown if self.focused_panel == FocusedPanel::Sidebar => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
                 self.select_profile(current + constants::PROFILE_LIST_PAGE_SIZE);
             }

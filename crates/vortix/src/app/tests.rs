@@ -3136,3 +3136,22 @@ fn a_long_rename_keeps_its_cursor_on_screen() {
         .collect();
     assert!(screen.contains('\u{2588}'), "the cursor is off screen");
 }
+
+#[test]
+fn selection_keys_do_nothing_outside_the_profile_list() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    add_profiles(&mut app, &["a", "b", "c"]);
+    app.profile_list_state.select(Some(0));
+    for panel in [
+        FocusedPanel::Logs,
+        FocusedPanel::Chart,
+        FocusedPanel::Security,
+    ] {
+        app.focused_panel = panel;
+        for code in [KeyCode::PageDown, KeyCode::Char('G'), KeyCode::End] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert_eq!(app.profile_list_state.selected(), Some(0), "{code:?}");
+        }
+    }
+}
