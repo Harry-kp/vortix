@@ -67,7 +67,7 @@ EXIT CODES:
     1  General error
     2  Permission denied (needs sudo)
     3  Not found (profile doesn't exist)
-    4  State conflict (already connected/disconnected)
+    4  State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start)
     5  Missing dependency (wg-quick, openvpn, netbird)
     6  Timeout";
 
@@ -252,12 +252,12 @@ pub enum Commands {
 
     /// Display the configuration of a VPN profile
     ///
-    /// Shows parsed profile details with sensitive values masked by default.
+    /// Shows the profile's name, protocol, location and file; --raw prints the file.
     ///
     /// EXAMPLES:
-    ///     vortix show work-vpn                  Parsed config with masked secrets
-    ///     vortix show work-vpn --raw            Raw profile file contents
-    ///     vortix show work-vpn --json           Parsed config as JSON
+    ///     vortix show work-vpn                  Name, protocol, location and file
+    ///     vortix show work-vpn --raw            The profile file, secrets included
+    ///     vortix show work-vpn --json           The same as JSON
     #[command(verbatim_doc_comment)]
     Show {
         /// Profile name

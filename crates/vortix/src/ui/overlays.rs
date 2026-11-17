@@ -1118,15 +1118,15 @@ pub mod help {
     const GUARD_GLOSSARY: &[(&str, &str)] = &[
     (
         "EXPOSED",
-        "No tunnel is up, or no tunnel claims your kernel default route. All internet traffic flows via your normal ISP — websites see your real IPv4 (and IPv6 if you have it). If you intended a VPN, this is the alarm state: connect a profile or check why your tunnel dropped.",
+        "No tunnel is up. All internet traffic flows via your normal ISP — websites see your real IPv4 (and IPv6 if you have it). If you intended a VPN, this is the alarm state: connect a profile or check why your tunnel dropped.",
     ),
     (
         "PARTIAL",
-        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (kill switch off, cipher weak, or DNS policy not verified). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
+        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (kill switch off, a broken cipher, or DNS policy not verified). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
     ),
     (
         "PROTECTED",
-        "A tunnel owns your kernel default route, the cipher is modern AEAD, the kill switch is engaged, and the current DNS policy has been applied and read back. New outbound connections flow through the tunnel. This is the goal state for a full-tunnel VPN.",
+        "A tunnel owns your kernel default route, the cipher is not broken, the kill switch is engaged, and the current DNS policy has been applied and read back. New outbound connections flow through the tunnel. This is the goal state for a full-tunnel VPN.",
     ),
     (
         "Identity → Real IPv4 / Real IPv6",

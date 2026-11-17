@@ -210,7 +210,7 @@ pub const CATALOG: &[Sigil] = &[
         id: SigilId::AwaitingInput,
         glyph: "?",
         label: "Awaiting input",
-        description: "Waiting for you to type a 2FA code, passphrase, or similar. Focus Connection Details and press Enter.",
+        description: "Waiting for you to type a password or one-time code in the prompt.",
         color: warning_color,
         bold: false,
         dim: false,

@@ -26,10 +26,10 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 |---|---|
 | `1`–`9` | Connect profile N from the list; on a connected profile, disconnect it |
 | `c` / `Enter` | Connect or disconnect the focused profile; on a connect in progress, cancel it |
-| `d` | Disconnect the focused tunnel, or cancel it if it is still connecting |
+| `d` | In Profiles: disconnect the focused tunnel, or cancel it if it is still connecting. Elsewhere: disconnect the primary tunnel |
 | `D` | Sidebar focused: disconnect every tunnel (asks `y`/`n` when two or more are up). Elsewhere: disconnect |
 | `r` | Sidebar focused: reconnect the focused profile, or connect it if it is down. Elsewhere: reconnect |
-| `y` | Copy the VPN IP through the terminal (works over SSH) |
+| `y` | Copy your current public IPv4 (the VPN's exit address while one is up) through the terminal (works over SSH) |
 | Mouse drag | Select any text on screen; releasing the button copies it through the terminal (works over SSH; needs a terminal with OSC 52 clipboard support, such as Ghostty, iTerm2, kitty or WezTerm) |
 | Click a link | Links are underlined; a click opens one in your browser (as you, never as root), or copies it where no browser opens, such as over SSH |
 | `i` | Add a VPN: a file, folder, link, or `netbird` ([NetBird networks](#netbird-networks)) |
@@ -129,7 +129,7 @@ vortix import ./profiles/          # every supported file in a directory
 vortix import https://example.com/work.ovpn
 vortix import netbird https://nb.example.com   # a NetBird network (see NetBird networks)
 vortix list                        # --sort name|protocol|last-used, --reverse, --protocol wireguard|openvpn|netbird, --names-only
-vortix show work                   # parsed, secrets masked; --raw for the file
+vortix show work                   # name, protocol, location and file; --raw prints the file, secrets included
 vortix rename work work-eu
 vortix delete work-eu --yes
 ```
@@ -137,7 +137,7 @@ vortix delete work-eu --yes
 Import copies the profile into the config directory; later edits to the source file do not
 apply until you import it again. A WireGuard profile name becomes the interface name, so it must be 1–15 characters of
 letters, numbers, `_`, `.` or `-`. A name already taken gets `_1`, `_2`, … (a long WireGuard
-name is shortened to fit), and import says so. Profiles may hold up to 1024 routes. Profiles that run
+name is shortened to fit), and import says so. WireGuard profiles may hold up to 1024 routes; OpenVPN up to 256, counting routes the server pushes. Profiles that run
 commands (`PreUp`/`PostUp`/`PreDown`/`PostDown`, OpenVPN `up`/`down` and similar) are refused;
 use [hooks](configuration.md#hooks) instead.
 

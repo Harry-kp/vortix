@@ -28,6 +28,7 @@ Every file Vortix writes there is owned by you and private, including under `sud
 ├── state-version      the Vortix version that last ran here (for the upgrade notes)
 ├── endpoints.json     each server hostname's last address, used when DNS gives no answer within 2 s
 ├── killswitch.state   the saved kill-switch mode
+├── lifecycle.lock     held while a Vortix session or command manages VPN state
 ├── real-ip.cache      last seen address without a VPN
 └── real-ipv6.cache
 ```
@@ -85,7 +86,7 @@ openvpn_verbosity = "3"
 connect_timeout_secs = 35                # OpenVPN and NetBird, including a NetBird login
 wireguard_handshake_timeout_secs = 20    # 1–300
 wireguard_handshake_stale_secs = 180     # 1–86400
-wireguard_health_targets = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]   # up to 64 addresses
+wireguard_health_targets = ["1.1.1.1"]   # default: config.toml's ping_targets; up to 64 addresses
 
 [journal]
 disk = true              # false: keep no session journals on disk
@@ -136,4 +137,4 @@ DNS, and Vortix leaves it alone.
   `/etc/resolv.conf` are only read, to show the current resolver.
 
 If the resolvers cannot be applied, the tunnel stays up, Security Guard shows DNS `Unverified`
-and the kill switch `Degraded`, and Vortix keeps retrying.
+and, unless the kill switch is off, the kill switch `Degraded`, and Vortix keeps retrying.

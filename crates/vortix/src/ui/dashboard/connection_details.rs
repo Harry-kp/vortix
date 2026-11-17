@@ -419,10 +419,10 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelV
         text.push(awaiting_input_hint());
     }
 
-    // Tab-cycle hint when N>1 .
+    // With several tunnels, say how to show another one here.
     if app.tunnel_count() > 1 {
         text.push(Line::from(vec![Span::styled(
-            "Press [Tab] to cycle focused tunnel",
+            "Select another tunnel in Profiles (j/k)",
             Style::default().fg(theme::current().text_secondary),
         )]));
     }
