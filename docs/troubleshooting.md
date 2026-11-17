@@ -24,10 +24,11 @@ profiles it manages and refuses to act while `profiles/` holds a file it did not
 the named file out of `~/.config/vortix/profiles/` and import it with `vortix import`; never
 copy files into that directory by hand.
 
-**Files in `~/.config/vortix` owned by root.** Give them back:
+**Files in `~/.config/vortix` owned by root, or "must be a file owned by you that no other user
+can open".** Every file there must be yours and private. Give them back:
 
 ```bash
-sudo chown -R "$(id -un):$(id -gn)" ~/.config/vortix
+sudo chown -R "$(id -un):$(id -gn)" ~/.config/vortix && chmod -R go-rwx ~/.config/vortix
 ```
 
 ## Connecting

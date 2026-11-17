@@ -412,12 +412,13 @@ fn prepare_created_descriptor(
     if unsafe { libc::fchmod(descriptor.as_raw_fd(), mode) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    if effective.0 == 0 {
-        if unsafe { libc::fchown(descriptor.as_raw_fd(), uid, gid) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    } else if effective != (uid, gid) {
+    if effective.0 != 0 && effective != (uid, gid) {
         return Err(FileError::UnsafeFile);
+    }
+    // A new file takes its directory's group on macOS (wheel under /tmp); the
+    // owner may hand it to their own group.
+    if unsafe { libc::fchown(descriptor.as_raw_fd(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
     let metadata = descriptor.metadata()?;
     if metadata.uid() != uid
@@ -649,7 +650,16 @@ pub(crate) fn pin_user_dir(dir: &Path) -> std::io::Result<(OwnedDirectory, u32, 
 /// without following links anywhere in the write.
 pub(crate) fn write_user_file_atomic(dir: &Path, name: &str, body: &[u8]) -> std::io::Result<()> {
     let (directory, uid, gid) = pin_user_dir(dir)?;
-    write_owned_atomic(&directory, name, body, uid, gid).map_err(std::io::Error::other)
+    write_owned_atomic(&directory, name, body, uid, gid).map_err(|error| match error {
+        FileError::UnsafeFile => std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be a file owned by you that no other user can open",
+                dir.join(name).display()
+            ),
+        ),
+        other => std::io::Error::other(other),
+    })
 }
 
 /// Open (creating if needed) a lock file inside a pinned directory without
@@ -853,6 +863,25 @@ mod tests {
             resolve_owner(false, Some((502, 20)), Some((0, 0)), user),
             user
         );
+    }
+
+    /// On macOS a new file takes its directory's group, and every directory
+    /// under /tmp is group wheel; the second run then refused the first run's
+    /// files.
+    #[test]
+    fn files_in_a_foreign_group_directory_belong_to_the_user_group() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        write_user_file_atomic(dir.path(), "state", b"x").unwrap();
+        let (directory, uid, _) = pin_user_dir(dir.path()).unwrap();
+        let metadata = std::fs::metadata(dir.path().join("state")).unwrap();
+        assert_eq!(
+            metadata.gid(),
+            crate::platform::effective_user_group_ids().1
+        );
+        assert!(read_owned_user_entry(&directory, "state", uid, 16)
+            .unwrap()
+            .is_some());
     }
 
     /// Locks, logs, journals and caches were left at the umask (0644), and

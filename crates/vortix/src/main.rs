@@ -292,12 +292,12 @@ fn main() -> Result<()> {
                         cli::output::CliError {
                             code: "profiles_not_readable",
                             message: format!(
-                                "Vortix cannot read its own profile directory: {}",
+                                "Vortix cannot use its own profile directory {}: {e}",
                                 profiles_dir.display()
                             ),
                             hint: Some(format!(
-                                "Some files there are owned by another user. Run: sudo chown -R $(id -u):$(id -g) {}",
-                                profiles_dir.display()
+                                "Every file there must be yours and private. Run: sudo chown -R $(id -u):$(id -g) {dir} && chmod -R go-rwx {dir}",
+                                dir = profiles_dir.display()
                             )),
                         },
                         cli::output::ExitCode::PermissionDenied,
