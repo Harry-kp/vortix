@@ -10,8 +10,9 @@ use crate::openvpn::routes::{
 };
 
 use super::parser::{
-    merge_redirect_gateways, parse_default_route_metric, parse_ipv4_default_gateway,
-    parse_ipv6_default_gateway, parse_redirect_gateway, parse_route, OvpnParsedProfile, OvpnRoute,
+    merge_redirect_gateways, openvpn_space, option_words, parse_default_route_metric,
+    parse_ipv4_default_gateway, parse_ipv6_default_gateway, parse_redirect_gateway, parse_route,
+    OvpnParsedProfile, OvpnRoute,
 };
 
 const COMPLETED: &str = "Initialization Sequence Completed";
@@ -199,7 +200,8 @@ pub(crate) fn pushed_route_evidence(
     };
 
     for option in push_reply {
-        let mut tokens = option.split_whitespace();
+        let words = option_words(option);
+        let mut tokens = words.iter().map(String::as_str);
         let Some(directive) = tokens.next() else {
             continue;
         };
@@ -270,7 +272,7 @@ pub(super) fn latest_completed_push_options<'a>(
     for message in session_log.lines().filter_map(push_reply) {
         let message = message
             .split(',')
-            .map(|option| option.trim().trim_matches(['\'', '"']))
+            .map(|option| option.trim_matches(|ch| openvpn_space(ch) || matches!(ch, '\'' | '"')))
             .filter(|option| !option.is_empty())
             .collect::<Vec<_>>();
         if !continued {
@@ -675,5 +677,29 @@ mod tests {
         let evidence = pushed_route_evidence(&OvpnParsedProfile::default(), log).unwrap();
         assert_eq!(evidence.routes().len(), 1);
         assert_eq!(evidence.routes()[0].destination.to_string(), "10.2.0.0/16");
+    }
+
+    #[test]
+    fn pushed_options_split_only_on_openvpn_whitespace() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway\u{a0}def1,route\u{a0}10.9.0.0 255.255.0.0,route\u{2003}10.8.0.0 255.255.0.0'\n\
+                   Initialization Sequence Completed\n";
+        let evidence = pushed_route_evidence(&OvpnParsedProfile::default(), log).unwrap();
+        assert!(evidence.redirect_gateway().is_none());
+        assert!(evidence.routes().is_empty());
+        // C `isspace`, which OpenVPN splits on, includes the vertical tab.
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route\x0b10.9.0.0 255.255.0.0'\n\
+                   Initialization Sequence Completed\n";
+        let nopull = crate::openvpn::parser::parse_ovpn_conf("client\nroute-nopull\n").unwrap();
+        assert!(pushed_route_evidence(&nopull, log)
+            .unwrap()
+            .routes()
+            .is_empty());
+        assert_eq!(
+            pushed_route_evidence(&OvpnParsedProfile::default(), log)
+                .unwrap()
+                .routes()
+                .len(),
+            1
+        );
     }
 }
