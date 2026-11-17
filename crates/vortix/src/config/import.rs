@@ -72,6 +72,11 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
             }
             return stage_mesh_profile(driver, &profile).map(ImportTarget::File);
         }
+        if input.contains("://") {
+            return Err(format!(
+                "Only http:// and https:// URLs can be imported: {input}"
+            ));
+        }
         return Err(format!("Path not found: {input}"));
     }
 
@@ -192,6 +197,14 @@ mod tests {
         if let Ok(ImportTarget::Url(url)) = result {
             assert_eq!(url, "https://example.com/test.conf");
         }
+    }
+
+    #[test]
+    fn another_url_scheme_is_named_as_unsupported() {
+        let Err(error) = resolve_target("ftp://example.com/x.conf") else {
+            panic!("ftp must be refused");
+        };
+        assert!(error.starts_with("Only http:// and https://"), "{error}");
     }
 
     #[test]
