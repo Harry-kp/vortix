@@ -3063,3 +3063,24 @@ mod selection {
         assert_eq!(app.routes_scroll, 0);
     }
 }
+
+#[test]
+fn the_first_public_address_is_not_logged_as_a_change() {
+    use crate::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    set_connected(&mut app, "test");
+    app.runtime.public_ip = crate::constants::MSG_DETECTING.to_string();
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::telemetry::EgressIdentity {
+            public_ip: "198.51.100.77".to_string(),
+            isp: None,
+            location: None,
+        },
+    )));
+    assert!(
+        !crate::logger::get_logs()
+            .iter()
+            .any(|entry| entry.message.contains("Detecting... -> 198.51.100.77")),
+        "a placeholder was logged as an address"
+    );
+}

@@ -692,7 +692,8 @@ impl App {
                 // As for IPv4: only a tunnel that carries the internet should change it.
                 if self.primary_id().is_some() {
                     if let (Some(real), Some(public)) = (&self.runtime.real_ipv6, &observed) {
-                        if real == public {
+                        // Once per leak, not on every poll that still sees it.
+                        if real == public && self.runtime.public_ipv6.as_ref() != Some(public) {
                             self.log(&format!(
                                 "WARN: IPv6 leak detected — public {public} matches real {real}"
                             ));
@@ -762,7 +763,7 @@ impl App {
         let carries_internet = self.primary_id().is_some();
         let old_ip = self.runtime.public_ip.clone();
 
-        if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
+        if old_ip != ip && !constants::is_unknown(&old_ip) {
             if let Some(journal) = crate::journal::global_journal() {
                 let _ = journal.append(crate::journal::JournalEvent::IpChanged {
                     old: Some(old_ip.clone()),
@@ -782,8 +783,7 @@ impl App {
             if first_detection || changed {
                 crate::telemetry::ip_cache::save(&self.runtime.config_dir, &ip);
             }
-        } else if self.runtime.public_ip != ip && self.runtime.public_ip != constants::MSG_FETCHING
-        {
+        } else if self.runtime.public_ip != ip && !constants::is_unknown(&self.runtime.public_ip) {
             self.runtime.ip_unchanged_warned = false;
             self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
         }

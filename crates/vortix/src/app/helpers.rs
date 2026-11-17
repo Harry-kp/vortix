@@ -400,12 +400,13 @@ fn classify_log_message(message: &str) -> (&str, &str, LogLevel) {
     };
     let category = message[..idx].trim();
     let content = message[idx + 1..].trim();
-    let level = match category {
-        "ERR" | "CMD_ERR" => LogLevel::Error,
-        "WARN" => LogLevel::Warning,
-        _ => LogLevel::Info,
-    };
-    (category, content, level)
+    // A level used as the category would show twice: "WARN  WARN".
+    match category {
+        "ERR" => ("APP", content, LogLevel::Error),
+        "CMD_ERR" => (category, content, LogLevel::Error),
+        "WARN" => ("APP", content, LogLevel::Warning),
+        _ => (category, content, LogLevel::Info),
+    }
 }
 
 fn osc52_clipboard(text: &str) -> String {
@@ -414,6 +415,13 @@ fn osc52_clipboard(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_level_is_not_repeated_as_the_category() {
+        assert_eq!(super::classify_log_message("WARN: x").0, "APP");
+        assert_eq!(super::classify_log_message("ERR: x").0, "APP");
+        assert_eq!(super::classify_log_message("NET: x").0, "NET");
+    }
+
     #[test]
     fn clipboard_sequence_targets_terminal_host_clipboard() {
         assert_eq!(
