@@ -55,7 +55,7 @@ disconnect_timeout = 30
 connect_max_retries = 3
 connect_retry_base_delay_secs = 2
 connect_retry_max_delay_secs = 300
-auto_reconnect = true
+auto_reconnect = true                    # a profile that needs a password stops and waits for `r`
 auto_reconnect_delay_secs = 3
 
 # Event log

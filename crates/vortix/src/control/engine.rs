@@ -986,6 +986,13 @@ impl Engine {
                 // A recovery cannot stop to ask; it waits for the user.
                 Need::Prompt(_) => {
                     self.state.start_failed(&profile_id, None);
+                    let name = self.name(&profile_id);
+                    let text = format!(
+                        "Gave up reconnecting '{name}': it needs your password. Reconnect to enter it."
+                    );
+                    self.errors.insert(profile_id.clone(), text.clone());
+                    self.notice(Level::Warning, text);
+                    self.hook(HookEvent::ConnectFailed, &profile_id);
                 }
             }
         }
@@ -1555,6 +1562,28 @@ mod tests {
             engine.state.get(&ProfileId::new("b")).is_some(),
             "b never starts; pending switches: {:?}",
             engine.after_stop.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A drop says "reconnecting"; when the retry finds it needs a password it
+    /// cannot ask for, it gives up, and block-on-drop blocks. Say so.
+    #[test]
+    fn a_retry_that_needs_a_password_says_it_gave_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
+        up(&mut engine, "a", 1);
+        engine.lost(&ProfileId::new("a"), false);
+        let before = engine.notices.len();
+
+        engine.tick();
+
+        let tunnel = engine.state.get(&ProfileId::new("a")).unwrap();
+        assert_eq!(tunnel.phase, Phase::Waiting { retry_at: None }, "gave up");
+        assert!(engine.state.plan_input().dropped, "block-on-drop blocks");
+        assert!(
+            engine.notices.len() > before,
+            "no notice after {:?}",
+            engine.notices.back().map(|notice| &notice.text)
         );
     }
 
