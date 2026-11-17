@@ -203,10 +203,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Clear any SCRV1 envelopes left on
-    // disk by a previous crash mid-connect. Runs once at startup before
-    // the CLI/TUI fork so both paths see a clean auth dir. Cheap O(N)
-    // scan; failures are swallowed.
+    // Plaintext credentials files older versions left in the auth dir.
     vortix::openvpn::scrub_stale_scrv1_auth_files();
 
     // Hold a process-lifetime scratch lease before sweeping. Concurrent CLI
