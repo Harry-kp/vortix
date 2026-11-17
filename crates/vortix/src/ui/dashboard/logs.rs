@@ -58,7 +58,12 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if all_logs.is_empty() {
         frame.render_widget(
-            Paragraph::new("No activity yet").alignment(Alignment::Center),
+            Paragraph::new(if app.log_level_filter.is_some() {
+                "Nothing at this level · f for more"
+            } else {
+                "No activity yet"
+            })
+            .alignment(Alignment::Center),
             inner,
         );
         return;
