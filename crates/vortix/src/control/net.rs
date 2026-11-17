@@ -233,6 +233,29 @@ impl Net {
         Ok(())
     }
 
+    /// Whether `plan` holds host state other software can undo.
+    #[must_use]
+    pub fn checkable(plan: &NetworkPlan) -> bool {
+        matches!(plan.firewall, Firewall::Block(_))
+    }
+
+    /// What of `plan` the host no longer carries; a read-back only.
+    #[must_use]
+    pub fn drift(plan: &NetworkPlan) -> Option<String> {
+        match &plan.firewall {
+            Firewall::Block(allow) => crate::platform::Firewall::verify_blocking(allow)
+                .err()
+                .map(|error| format!("Kill switch rules were changed outside Vortix ({error})")),
+            Firewall::Open => None,
+        }
+    }
+
+    /// Make the next [`Self::apply`] reapply the firewall even if the plan is
+    /// unchanged.
+    pub fn forget_applied(&mut self) {
+        self.saved_mode = None;
+    }
+
     fn verify_routes(target: &NetworkPlan) -> Result<(), String> {
         match Self::misrouted(target, &target.routes).first() {
             Some((cidr, interface)) => Err(format!(

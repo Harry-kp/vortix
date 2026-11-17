@@ -271,8 +271,11 @@ sudo vortix release-killswitch     # emergency: remove Vortix's rules and set th
 
 The mode is saved and re-applied whenever Vortix next runs as root. A reboot clears the rules,
 so between boot and that first run nothing is blocked; [connecting at boot](#connecting-at-boot)
-shortens that gap to the time the network takes to come up. macOS uses a `pf` anchor of its own,
-Linux an `nftables` table.
+shortens that gap to the time the network takes to come up. macOS uses a `pf` anchor of its own
+and holds its own `pf` enable reference, so another app releasing its reference does not turn
+`pf` off; Linux uses an `nftables` table. While the rules block, Vortix reads them back every
+10 seconds and puts them back if other software removed or changed them, with one warning in
+the Event Log.
 
 A NetBird network reaches its peers and relays at addresses nobody knows in advance, so the
 blocking modes let NetBird's own daemon out to any address, while it connects and while it is

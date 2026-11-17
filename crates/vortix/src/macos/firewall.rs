@@ -409,9 +409,8 @@ impl PfFirewall {
     /// there's never a window where the previous rules are gone but the
     /// new rules haven't landed yet.
     ///
-    /// `pfctl -e` is called after the load to ensure pf is enabled.
-    /// `pfctl -e` is idempotent (returns "already enabled" on the second
-    /// call), so the refresh path leaves the enabled state alone.
+    /// After the load pf is enabled through a held reference; a refresh
+    /// that still holds a live one takes no new reference.
     pub fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
         info!(
             target: "vortix::killswitch",
@@ -460,16 +459,7 @@ impl PfFirewall {
             return Err(KillswitchError::CommandFailed(err));
         }
 
-        // Ensure pf is enabled. Idempotent — emits "pf already enabled" on
-        // refresh, which we treat as success.
-        let output = pfctl(&["-e"])?;
-        if !output.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("enabled") {
-                error!(target: "vortix::killswitch", stderr = %stderr, "pfctl -e failed");
-                return Err(KillswitchError::CommandFailed(stderr.to_string()));
-            }
-        }
+        Self::hold_enable_reference()?;
 
         // Success is the complete effective-state postcondition, not merely
         // the content of the owned anchor. Root traversal or PF enabled state
@@ -482,6 +472,56 @@ impl PfFirewall {
             "kill switch ACTIVE — blocking non-VPN traffic"
         );
         Ok(())
+    }
+
+    /// Enable pf through a reference (`-E`) kept until release. pf turns
+    /// itself off when its last reference is released, and a plain `-e`
+    /// holds none, so another app's `-X` would silently drop the kill switch.
+    fn hold_enable_reference() -> Result<()> {
+        let held = crate::control::killswitch::enable_token();
+        if let Some(token) = held {
+            let references = pfctl(&["-s", "References"])?;
+            let status = pfctl(&["-s", "info"])?;
+            if references.success()
+                && lists_token(&String::from_utf8_lossy(&references.stdout), token)
+                && status.success()
+                && pf_is_enabled(&String::from_utf8_lossy(&status.stdout))
+            {
+                return Ok(());
+            }
+            let _ = pfctl(&["-X", &token.to_string()]);
+        }
+        let output = pfctl(&["-E"])?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let token = parse_enable_token(&text)
+            .filter(|_| output.success())
+            .ok_or_else(|| {
+                error!(target: "vortix::killswitch", output = %text, "pfctl -E failed");
+                KillswitchError::CommandFailed(format!("pfctl -E failed: {text}"))
+            })?;
+        crate::control::killswitch::set_enable_token(Some(token))
+    }
+
+    /// Give back the reference [`Self::hold_enable_reference`] took; a record
+    /// from an older release has none, and pf then stays on as it did.
+    fn release_enable_reference() {
+        let Some(token) = crate::control::killswitch::enable_token() else {
+            return;
+        };
+        match pfctl(&["-X", &token.to_string()]) {
+            Ok(output) if output.success() => {}
+            Ok(output) => {
+                tracing::warn!(target: "vortix::killswitch", stderr = %String::from_utf8_lossy(&output.stderr), "pfctl -X failed");
+            }
+            Err(error) => tracing::warn!(target: "vortix::killswitch", %error, "pfctl -X failed"),
+        }
+        if let Err(error) = crate::control::killswitch::set_enable_token(None) {
+            tracing::warn!(target: "vortix::killswitch", %error, "pf reference not cleared from the state file");
+        }
     }
 
     /// Disable only Vortix's anchor. pf may have been enabled before Vortix
@@ -518,6 +558,7 @@ impl PfFirewall {
         }
         let _ = fs::remove_file(PF_CONF_PATH);
         let _ = fs::remove_file(PF_CONF_PATH_LEGACY);
+        Self::release_enable_reference();
 
         info!(target: "vortix::killswitch", "kill switch DISABLED — normal traffic restored");
         Ok(())
@@ -557,6 +598,24 @@ impl PfFirewall {
     }
 }
 
+/// The token `pfctl -E` prints as `Token : <n>`.
+fn parse_enable_token(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "Token")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+/// Whether `pfctl -s References` lists `token` among the live references.
+fn lists_token(references: &str, token: u64) -> bool {
+    let token = token.to_string();
+    references
+        .split_ascii_whitespace()
+        .any(|word| word == token)
+}
+
 pub(crate) fn pf_is_enabled(status: &str) -> bool {
     status.lines().any(|line| {
         line.split_once(':').is_some_and(|(key, value)| {
@@ -590,6 +649,21 @@ mod tests {
             .join("\n");
         normalized.push('\n');
         normalized
+    }
+
+    #[test]
+    fn the_enable_reference_token_is_read_from_pfctl_output() {
+        let output = "No ALTQ support in kernel\nALTQ related functions disabled\n\
+                      pf enabled\nToken : 13950598588297253391\n";
+        assert_eq!(parse_enable_token(output), Some(13_950_598_588_297_253_391));
+        assert_eq!(parse_enable_token("pf already enabled\n"), None);
+        assert_eq!(parse_enable_token("Token : not-a-number\n"), None);
+
+        let references =
+            "TOKENS:\nPID      Process Name                TOKEN                     TIMESTAMP\n\
+                          412      vortix                      13950598588297253391      12 sec\n";
+        assert!(lists_token(references, 13_950_598_588_297_253_391));
+        assert!(!lists_token(references, 1_395_059_858_829_725_339));
     }
 
     #[test]
