@@ -511,29 +511,25 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
         }
     }
 
-    let wg_count = profiles
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for profile in &profiles {
+        *counts.entry(profile.protocol.to_string()).or_default() += 1;
+    }
+    let mut parts = counts
         .iter()
-        .filter(|p| matches!(p.protocol, ProtocolKind::WireGuard))
-        .count();
-    let ovpn_count = profiles
-        .iter()
-        .filter(|p| matches!(p.protocol, ProtocolKind::OpenVpn))
-        .count();
-
+        .map(|(protocol, count)| format!("{count} {protocol}"))
+        .collect::<Vec<_>>();
+    if errors > 0 {
+        parts.push(format!("{errors} skipped"));
+    }
     logger::log(
         LogLevel::Info,
         "PROFILE",
-        format!(
-            "Loaded {} profiles ({} WireGuard, {} OpenVPN{})",
-            profiles.len(),
-            wg_count,
-            ovpn_count,
-            if errors > 0 {
-                format!(", {errors} skipped")
-            } else {
-                String::new()
-            }
-        ),
+        if parts.is_empty() {
+            "Loaded 0 profiles".to_string()
+        } else {
+            format!("Loaded {} profiles ({})", profiles.len(), parts.join(", "))
+        },
     );
 
     profiles
