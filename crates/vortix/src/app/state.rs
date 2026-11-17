@@ -223,6 +223,8 @@ pub enum InputMode {
         query: String,
         /// Cursor position in the query.
         cursor: usize,
+        /// The selection before the search, restored by Esc.
+        before: Option<crate::profile::ProfileId>,
     },
     /// Confirm switching to a profile that conflicts with a running tunnel:
     /// both want all traffic, or both want the same networks.

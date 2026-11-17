@@ -280,10 +280,15 @@ impl App {
             InputMode::Search {
                 mut query,
                 mut cursor,
+                before,
             } => {
-                self.handle_search_keys(key, &mut query, &mut cursor);
+                self.handle_search_keys(key, &mut query, &mut cursor, before.as_ref());
                 if let InputMode::Search { .. } = self.input_mode {
-                    self.input_mode = InputMode::Search { query, cursor };
+                    self.input_mode = InputMode::Search {
+                        query,
+                        cursor,
+                        before,
+                    };
                 }
             }
             InputMode::ConfirmDelete {
@@ -1065,14 +1070,32 @@ impl crate::app::App {
         }
     }
 
-    fn handle_search_keys(&mut self, key: KeyEvent, query: &mut String, cursor: &mut usize) {
+    fn handle_search_keys(
+        &mut self,
+        key: KeyEvent,
+        query: &mut String,
+        cursor: &mut usize,
+        before: Option<&crate::profile::ProfileId>,
+    ) {
+        let restore = |app: &mut Self| {
+            if let Some(index) = before.and_then(|id| app.profile_index(id)) {
+                app.select_profile(index);
+            }
+        };
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Esc => {
+                restore(self);
                 self.input_mode = InputMode::Normal;
             }
+            KeyCode::Enter => self.input_mode = InputMode::Normal,
             KeyCode::Backspace | KeyCode::Delete | KeyCode::Char(_) => {
                 Self::handle_text_field_input(key, query, cursor);
-                self.apply_search_filter(query);
+                if query.is_empty() {
+                    self.search_match_count = self.runtime.profiles.len();
+                    restore(self);
+                } else {
+                    self.apply_search_filter(query);
+                }
             }
             _ => Self::handle_text_field_input(key, query, cursor),
         }

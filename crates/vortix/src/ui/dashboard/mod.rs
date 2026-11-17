@@ -230,7 +230,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             new_name, cursor, ..
         } => super::overlays::rename::render(frame, new_name, *cursor),
         InputMode::Help { scroll, tab } => super::overlays::help::render(frame, *scroll, *tab),
-        InputMode::Search { query, cursor } => {
+        InputMode::Search { query, cursor, .. } => {
             super::overlays::search::render(frame, app, query, *cursor, app.runtime.profiles.len());
         }
         InputMode::ConfirmSwitch {

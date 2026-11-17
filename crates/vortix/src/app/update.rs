@@ -270,6 +270,7 @@ impl App {
                 self.input_mode = InputMode::Search {
                     query: String::new(),
                     cursor: 0,
+                    before: self.selected_profile_id(),
                 };
             }
             Message::OpenHelp => {

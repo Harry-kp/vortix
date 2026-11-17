@@ -600,6 +600,7 @@ fn test_search_mode_opens() {
     app.input_mode = InputMode::Search {
         query: String::new(),
         cursor: 0,
+        before: None,
     };
     assert!(matches!(app.input_mode, InputMode::Search { .. }));
 }
@@ -3154,4 +3155,24 @@ fn selection_keys_do_nothing_outside_the_profile_list() {
             assert_eq!(app.profile_list_state.selected(), Some(0), "{code:?}");
         }
     }
+}
+
+#[test]
+fn escape_from_search_restores_the_selection() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    add_profiles(&mut app, &["alpha", "beta", "gamma"]);
+    app.profile_list_state.select(Some(2));
+    for code in [KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Esc] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    assert_eq!(app.profile_list_state.selected(), Some(2));
+    for code in [KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Backspace] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    assert_eq!(
+        app.profile_list_state.selected(),
+        Some(2),
+        "clearing the query"
+    );
 }
