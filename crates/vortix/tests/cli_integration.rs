@@ -449,7 +449,7 @@ fn emergency_release_reaches_root_gate_before_normal_startup() {
     )));
     assert!(!stderr.contains("failed to load settings"));
     assert!(!stderr.contains("profile identity migration"));
-    assert!(!stderr.contains("Fix the file or remove it"));
+    assert!(!stderr.contains("Fix the file it names"));
 }
 
 // ============================================================================

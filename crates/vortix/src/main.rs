@@ -173,16 +173,10 @@ fn main() -> Result<()> {
     // config.toml. Resolve this only after clap/env/sudo-user selection so an
     // old default-path settings file can never silently override
     // `--config-dir` or `VORTIX_CONFIG_DIR`.
-    let settings = match vortix::config::Settings::load(
-        &config_dir,
-        vortix::config::EngineSettings::default(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("warning: failed to load settings ({e}); using defaults");
-            vortix::config::Settings::default()
-        }
-    };
+    // An invalid file stops startup below, in `load_effective_config`, with its path.
+    let settings =
+        vortix::config::Settings::load(&config_dir, vortix::config::EngineSettings::default())
+            .unwrap_or_default();
 
     // Journal — open the per-session JSONL writer using the runner's own
     // tokio runtime after the authoritative settings path is known.
@@ -409,9 +403,7 @@ fn main() -> Result<()> {
         Err(e) => {
             eprintln!("Error: {e}");
             eprintln!();
-            eprintln!("Fix the file or remove it to use defaults:");
-            eprintln!("  nano {}/config.toml", config_dir.display());
-            eprintln!("  rm {}/config.toml", config_dir.display());
+            eprintln!("Fix the file it names, or remove it to use defaults.");
             std::process::exit(1);
         }
     };

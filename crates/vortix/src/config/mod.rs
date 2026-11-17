@@ -482,9 +482,19 @@ pub fn load_effective_config(config_dir: &Path) -> Result<AppConfig, String> {
         wireguard_handshake_stale_secs: config.wireguard_handshake_stale_secs,
         wireguard_health_targets: config.ping_targets.clone(),
     };
-    let settings = crate::config::Settings::load(config_dir, legacy_engine)
-        .map_err(|error| format!("Failed to resolve engine settings: {error}"))?;
-    validate_engine_settings(&settings.engine)?;
+    let settings = crate::config::Settings::load(config_dir, legacy_engine).map_err(|error| {
+        format!(
+            "Invalid settings at {}: {error}",
+            config_dir.join("settings.toml").display()
+        )
+    })?;
+    validate_engine_settings(&settings.engine).map_err(|error| {
+        format!(
+            "Invalid engine setting in {} or {}: {error}",
+            config_dir.join("settings.toml").display(),
+            config_dir.join(CONFIG_FILE).display()
+        )
+    })?;
     Ok(with_engine_settings(config, settings.engine))
 }
 
@@ -1036,6 +1046,18 @@ mod tests {
             error.contains("connect_timeout_secs must be between 1 and 600"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_bad_settings_file_is_named_in_the_error() {
+        let selected = tempfile::tempdir().unwrap();
+        std::fs::write(
+            selected.path().join("settings.toml"),
+            "[[hooks]]\nevent = \"connected\"\nexecutable = \"notify.sh\"\n",
+        )
+        .unwrap();
+        let error = load_effective_config(selected.path()).unwrap_err();
+        assert!(error.contains("settings.toml"), "{error}");
     }
 
     // ---- load_config ----
