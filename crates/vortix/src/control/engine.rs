@@ -47,7 +47,10 @@ pub(super) enum Event {
         started: Instant,
     },
     /// A dropped tunnel's teardown finished.
-    Drained { profile_id: ProfileId },
+    Drained {
+        profile_id: ProfileId,
+        result: Result<(), (Live, String)>,
+    },
     /// A connect in progress needs the user, e.g. to log in.
     Progress { profile_id: ProfileId, text: String },
 }
@@ -336,7 +339,7 @@ impl Engine {
                 } => self.started(&profile_id, result, remember, used_saved),
                 Event::Stopped { profile_id, result } => self.stopped(&profile_id, result),
                 Event::Scanned { result, started } => self.scanned(result, started),
-                Event::Drained { profile_id } => self.drained(&profile_id),
+                Event::Drained { profile_id, result } => self.drained(&profile_id, result),
                 Event::Progress { profile_id, text } => {
                     self.actions.insert(profile_id, text);
                 }
@@ -750,11 +753,18 @@ impl Engine {
             let tx = self.tx.clone();
             let profile_id = profile_id.clone();
             std::thread::spawn(move || {
+                let backup = Live {
+                    kind: live.kind.clone(),
+                    handle: live.handle.clone(),
+                };
                 // Drained must arrive even if the stop panics, or the retry never runs.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     tunnels::stop(&settings, &ownership, live)
-                }));
-                let _ = tx.send(Msg::Event(Box::new(Event::Drained { profile_id })));
+                })) {
+                    Ok(result) => result.map_err(|error| (backup, error)),
+                    Err(_) => Err((backup, "the teardown panicked".into())),
+                };
+                let _ = tx.send(Msg::Event(Box::new(Event::Drained { profile_id, result })));
             });
             true
         } else {
@@ -807,9 +817,15 @@ impl Engine {
         }
     }
 
-    fn drained(&mut self, profile_id: &ProfileId) {
+    fn drained(&mut self, profile_id: &ProfileId, result: Result<(), (Live, String)>) {
         // The teardown may have removed routes the plan needs, as in `stopped`.
         self.applied = None;
+        if result.is_err() {
+            // What is left of it must not run beside a retry.
+            self.state.drained(profile_id);
+            self.stopped(profile_id, result);
+            return;
+        }
         let stopping = self
             .state
             .get(profile_id)
@@ -1584,6 +1600,60 @@ mod tests {
             engine.notices.len() > before,
             "no notice after {:?}",
             engine.notices.back().map(|notice| &notice.text)
+        );
+    }
+
+    /// A dropped tunnel's teardown that fails leaves its process behind, and
+    /// the retry starts beside it. The failure must reach the user.
+    #[test]
+    fn a_failed_teardown_of_a_dropped_tunnel_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
+        up(&mut engine, "a", 1);
+        let handle = crate::tunnel::TunnelHandle {
+            profile_id: ProfileId::new("a"),
+            display_name: "a".into(),
+            interface_name: "utun1".into(),
+            // A live process without an ownership receipt: `down` refuses it.
+            pid: Some(std::process::id()),
+            started_at: SystemTime::now(),
+            kind: crate::tunnel::TunnelKindTag::OpenVpn,
+            generation: 1,
+            handshake: None,
+            probe_receipts: Vec::new(),
+            process_ownership: None,
+            teardown_config: None,
+            dns_request: crate::control::dns::DnsRequest::default(),
+            openvpn_routes: None,
+        };
+        let kind = tunnels::TunnelKind::new(ProtocolKind::OpenVpn, &engine.config.tunnels);
+        let probe = Live {
+            kind: tunnels::TunnelKind::new(ProtocolKind::OpenVpn, &engine.config.tunnels),
+            handle: handle.clone(),
+        };
+        let stop = tunnels::stop(&engine.config.tunnels, &engine.ownership, probe);
+        assert!(stop.is_err(), "this teardown fails: {stop:?}");
+        engine
+            .live
+            .insert(ProfileId::new("a"), Live { kind, handle });
+        engine.lost(&ProfileId::new("a"), false);
+        let drained = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        engine.handle(drained);
+
+        assert_eq!(
+            engine.state.get(&ProfileId::new("a")).unwrap().phase,
+            Phase::Waiting { retry_at: None },
+            "no retry beside what is left of it"
+        );
+
+        let texts = engine
+            .notices
+            .iter()
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.iter().any(|text| text.contains("OpenVPN")),
+            "teardown error dropped; notices: {texts:?}"
         );
     }
 
