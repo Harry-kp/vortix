@@ -1434,7 +1434,9 @@ fn dns_evidence(app: &App, s: &PanelState, w: usize) -> Vec<Line<'static>> {
             DnsSecurityStatus::NotRequested => {
                 "The profile sets no DNS, so queries use your normal resolver."
             }
-            DnsSecurityStatus::NotActive => "No tunnel: queries use your normal resolver.",
+            DnsSecurityStatus::NotActive => {
+                "No tunnel carries your internet: queries use your normal resolver."
+            }
         },
         w,
     ));
