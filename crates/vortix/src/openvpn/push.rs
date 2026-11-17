@@ -337,15 +337,23 @@ fn remote_line_parts(line: &str) -> Option<(&str, &str)> {
     Some((protocol, line[marker_at + MARKER.len()..].trim()))
 }
 
+/// `OpenVPN` 2.6 stamps `2026-01-29 15:03:26`; 2.4 and 2.5 stamp
+/// `Thu Jan 29 15:03:26 2026`.
 fn valid_openvpn_log_prefix(prefix: &str) -> bool {
+    const NAMES: [&str; 19] = [
+        "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     prefix.is_empty()
         || prefix.split_whitespace().all(|token| {
-            token.strip_prefix("us=").is_some_and(|micros| {
-                !micros.is_empty() && micros.bytes().all(|byte| byte.is_ascii_digit())
-            }) || token.bytes().all(|byte| {
-                byte.is_ascii_digit()
-                    || matches!(byte, b'-' | b':' | b'+' | b'.' | b',' | b'T' | b'Z')
-            })
+            NAMES.contains(&token)
+                || token.strip_prefix("us=").is_some_and(|micros| {
+                    !micros.is_empty() && micros.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                || token.bytes().all(|byte| {
+                    byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b':' | b'+' | b'.' | b',' | b'T' | b'Z')
+                })
         })
 }
 
@@ -570,5 +578,19 @@ mod tests {
                    PUSH_REPLY,route 10.2.0.0 255.255.0.0\n\
                    Initialization Sequence Completed\n";
         assert_eq!(pushed_route_evidence(log).unwrap().routes().len(), 1);
+    }
+    #[test]
+    fn openvpn_2_5_timestamps_still_name_the_selected_remote() {
+        let parsed =
+            crate::openvpn::parser::parse_ovpn_conf("client\nremote vpn.example 1194 udp\n")
+                .unwrap();
+        let log = "Thu Apr 29 15:03:26 2021 UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+                   Thu Apr 29 15:03:27 2021 PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1'\n\
+                   Thu Apr 29 15:03:28 2021 Initialization Sequence Completed\n";
+        let evidence = openvpn_route_evidence(&parsed, log, false).unwrap();
+        assert_eq!(
+            evidence.selected_remote(),
+            Some("198.51.100.7".parse().unwrap())
+        );
     }
 }
