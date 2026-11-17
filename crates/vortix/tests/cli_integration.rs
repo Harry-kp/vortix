@@ -363,6 +363,27 @@ fn the_root_hint_repeats_the_whole_command() {
     );
 }
 
+/// The mode list offered `vortix killswitch vpn-only`, which needs root.
+#[cfg(unix)]
+#[test]
+fn killswitch_offers_other_modes_with_sudo() {
+    let config = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box mode list
+        .arg("--config-dir")
+        .arg(config.path())
+        .arg("killswitch")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "sudo vortix -C {} killswitch vpn-only",
+            config.path().canonicalize().unwrap().display()
+        )),
+        "{stdout}"
+    );
+}
+
 /// `vortix info | head -1` crashed with "Vortix crashed unexpectedly".
 #[cfg(unix)]
 #[test]

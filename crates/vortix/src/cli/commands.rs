@@ -350,8 +350,9 @@ fn print_killswitch_status(
         println!("  be blocked — check the rules directly to be sure:");
         println!("    {}", crate::platform::Firewall::inspect_hint());
         println!(
-            "  Re-apply with `vortix killswitch {}`, or clear it with `vortix release-killswitch`.",
-            mode.cli_verb()
+            "  Re-apply with `{}`, or clear it with `{}`.",
+            super::output::sudo_command(&["killswitch", mode.cli_verb()]),
+            super::output::sudo_command(&["release-killswitch"])
         );
     } else {
         let (up, down) = mode.behavior_lines();
@@ -360,17 +361,28 @@ fn print_killswitch_status(
     }
     println!();
     println!("Other modes:");
-    for other in [
+    let others: Vec<_> = [
         crate::control::killswitch::KillSwitchMode::Off,
         crate::control::killswitch::KillSwitchMode::Auto,
         crate::control::killswitch::KillSwitchMode::AlwaysOn,
-    ] {
-        if other == mode {
-            continue;
-        }
+    ]
+    .into_iter()
+    .filter(|other| *other != mode)
+    .map(|other| {
+        (
+            super::output::sudo_command(&["killswitch", other.cli_verb()]),
+            other,
+        )
+    })
+    .collect();
+    let width = others
+        .iter()
+        .map(|(command, _)| command.len())
+        .max()
+        .unwrap_or(0);
+    for (command, other) in others {
         println!(
-            "  vortix killswitch {:<14}  {} — {}",
-            other.cli_verb(),
+            "  {command:<width$}  {} — {}",
             other.display_name(),
             other.one_liner()
         );
