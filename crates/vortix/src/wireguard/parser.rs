@@ -110,8 +110,9 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
     let mut routes = 0;
 
     for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+        // wg-quick drops a line from its first `#`; no key or value contains `#` or `;`.
+        let line = raw_line.split(['#', ';']).next().unwrap_or_default().trim();
+        if line.is_empty() {
             continue;
         }
         if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
@@ -149,12 +150,6 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                 if key.eq_ignore_ascii_case("PrivateKey") {
                     profile.has_private_key |= !value.is_empty();
                 } else if key.eq_ignore_ascii_case("DNS") {
-                    // Strip valid trailing comments before comma
-                    // tokenization. Otherwise `1.1.1.1 # note` is no
-                    // longer an IP and is misclassified as a search domain.
-                    let value = value
-                        .find(['#', ';'])
-                        .map_or(value, |comment| &value[..comment]);
                     for entry in value.split(',') {
                         let entry = entry.trim();
                         if !entry.is_empty() {
@@ -166,9 +161,6 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                         }
                     }
                 } else if key.eq_ignore_ascii_case("Address") {
-                    let value = value
-                        .find(['#', ';'])
-                        .map_or(value, |comment| &value[..comment]);
                     profile.addresses.extend(
                         value
                             .split(',')
@@ -248,11 +240,8 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                             }
                         }
                     } else if key.eq_ignore_ascii_case("PersistentKeepalive") {
-                        peer.persistent_keepalive = value
-                            .split(['#', ';'])
-                            .next()
-                            .and_then(|seconds| seconds.trim().parse::<u16>().ok())
-                            .filter(|seconds| *seconds > 0);
+                        peer.persistent_keepalive =
+                            value.parse::<u16>().ok().filter(|seconds| *seconds > 0);
                     }
                 }
             }
@@ -317,6 +306,19 @@ mod tests {
     }
     use std::net::IpAddr;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn trailing_comments_keep_peer_routes_endpoint_and_header() {
+        let parsed = parse_wg_conf(
+            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/32\n[Peer] # exit node\nPublicKey = xyz\nAllowedIPs = 0.0.0.0/0 # everything\nEndpoint = 203.0.113.7:51820 # server\nPersistentKeepalive = 25 # NAT\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.peers.len(), 1);
+        let peer = &parsed.peers[0];
+        assert_eq!(peer.allowed_ips, vec!["0.0.0.0/0".parse::<Cidr>().unwrap()]);
+        assert_eq!(peer.endpoint, Some("203.0.113.7:51820".parse().unwrap()));
+        assert_eq!(peer.persistent_keepalive, Some(25));
+    }
 
     #[test]
     fn parses_dns_and_address() {
