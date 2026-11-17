@@ -95,7 +95,8 @@ Each profile's daemon log is `~/.config/vortix/run/<profile-id>.log`, also shown
 dashboard's Logs panel (`f` until the title names the profile).
 
 - `AUTH_FAILED`: the server rejected the credentials or the one-time code. A saved password
-  that is rejected is removed.
+  that is rejected is removed. If the notice says it could not be removed, clear it with `A`
+  in the dashboard; until then every connect tries it again.
 - TLS timeout: the server is unreachable, or the certificates or protocol do not match.
 - Connected but no traffic: the server's pushed routes, forwarding or NAT.
 

@@ -566,13 +566,23 @@ impl Engine {
             Ok(live) => self.spawn_stop(profile_id, live),
             Err(error) => {
                 if error == StartError::AuthFailed && used_saved {
-                    if let Ok(store) = self.credentials.lock() {
-                        let _ = store.clear(profile_id, &name);
-                    }
-                    self.notice(
-                        Level::Warning,
-                        format!("Saved credentials for '{name}' were rejected and removed"),
-                    );
+                    let cleared = self
+                        .credentials
+                        .lock()
+                        .map_err(|_| "credential store is unavailable".to_owned())
+                        .and_then(|store| {
+                            store
+                                .clear(profile_id, &name)
+                                .map(drop)
+                                .map_err(|error| error.to_string())
+                        });
+                    let text = match cleared {
+                        Ok(()) => format!("Saved credentials for '{name}' were rejected and removed"),
+                        Err(error) => format!(
+                            "Saved credentials for '{name}' were rejected but could not be removed: {error}"
+                        ),
+                    };
+                    self.notice(Level::Warning, text);
                 }
                 if phase == Some(Phase::Stopping) {
                     self.finish_stop(profile_id);
@@ -1749,6 +1759,48 @@ mod tests {
                 HookEvent::Disconnected,
                 HookEvent::Connected
             ]
+        );
+    }
+
+    /// Rejected saved credentials that could not be removed are retried on
+    /// the next connect; the notice must not say they were removed.
+    #[test]
+    fn rejected_credentials_that_stay_are_not_called_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
+        let (uid, gid) = crate::platform::effective_user_group_ids();
+        // A store that cannot open its directory: every clear fails.
+        engine.credentials = Arc::new(Mutex::new(FsOpenVpnCredentialStore::for_owner(
+            dir.path(),
+            uid + 1,
+            gid,
+        )));
+        assert!(engine
+            .credentials
+            .lock()
+            .unwrap()
+            .clear(&ProfileId::new("a"), "a")
+            .is_err());
+        let spec = engine.entries[&ProfileId::new("a")].spec.clone().unwrap();
+        engine.state.begin(spec, 1, None, false).unwrap();
+
+        engine.started(
+            &ProfileId::new("a"),
+            Err(StartError::AuthFailed),
+            None,
+            true,
+        );
+
+        let texts = engine
+            .notices
+            .iter()
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("rejected and removed")),
+            "{texts:?}"
         );
     }
 
