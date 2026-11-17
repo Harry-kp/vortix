@@ -328,6 +328,7 @@ is connected, otherwise `null`.
 | 4 | State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start, a second NetBird network or the NetBird app's own service) |
 | 5 | Missing dependency (WireGuard tools, `openvpn`, `netbird`, or on Linux `resolvconf`/`systemd-resolved`) |
 | 6 | Timeout |
+| 141 | The output pipe closed early (`vortix report \| head`); nothing more is printed |
 
 See [Configuration](configuration.md) for files and settings, and
 [Troubleshooting](troubleshooting.md) when something fails.

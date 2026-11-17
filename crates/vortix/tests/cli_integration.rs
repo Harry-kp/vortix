@@ -332,6 +332,26 @@ fn autoconnect_changes_need_root_and_write_nothing_without_it() {
     assert_eq!(vortix::platform::autoconnect::installed_profile(), before);
 }
 
+/// `vortix info | head -1` crashed with "Vortix crashed unexpectedly".
+#[cfg(unix)]
+#[test]
+fn a_closed_output_pipe_exits_quietly() {
+    let config = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box closed stdout
+        .arg("--config-dir")
+        .arg(config.path())
+        .arg("info")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_ne!(output.status.code(), Some(101));
+}
+
 #[cfg(unix)]
 #[test]
 fn emergency_release_reaches_root_gate_before_normal_startup() {

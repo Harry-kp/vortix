@@ -24,6 +24,17 @@ fn main() -> Result<()> {
     // rules and VPN processes.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // `vortix status | head`: the reader left, which is not a crash.
+        // 141 is what a shell reports for a process ended by SIGPIPE.
+        if info
+            .payload()
+            .downcast_ref::<String>()
+            .is_some_and(|message| {
+                message.starts_with("failed printing to std") && message.contains("Broken pipe")
+            })
+        {
+            std::process::exit(141);
+        }
         restore_terminal();
         eprintln!();
         eprintln!("Vortix crashed unexpectedly.");
