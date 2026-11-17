@@ -230,10 +230,14 @@ use crate::process::CommandSpec;
 /// The `PathBuf` of the saved file, or an Error string.
 #[allow(clippy::too_many_lines)]
 pub fn download_profile(url: &str) -> Result<PathBuf, String> {
+    // The URL reaches curl as one config line on stdin; a line break would add options.
+    if url.chars().any(char::is_control) {
+        return Err("Invalid URL format".to_string());
+    }
     logger::log(
         LogLevel::Info,
         "DOWNLOAD",
-        format!("Fetching profile from URL: {url}"),
+        format!("Fetching profile from URL: {}", without_credentials(url)),
     );
 
     // Extract filename from URL path
@@ -260,7 +264,8 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
     // -S: Show errors even in silent mode
     // --max-time: Timeout
     // -o: Output file
-    let output = crate::process::run(CommandSpec::oneshot(
+    // --config -: the URL comes on stdin, so its credentials stay out of `ps`
+    let mut spec = CommandSpec::oneshot(
         "curl",
         vec![
             "-f".into(),
@@ -273,10 +278,18 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
             format!("{}/{}", constants::APP_NAME, constants::APP_VERSION),
             "-o".into(),
             target_path.to_string_lossy().into_owned(),
-            url.into(),
+            "--config".into(),
+            "-".into(),
         ],
-    ))
-    .map_err(|e| {
+    );
+    spec.stdin_bytes = Some(
+        format!(
+            "url = \"{}\"\n",
+            url.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+        .into_bytes(),
+    );
+    let output = crate::process::run(spec).map_err(|e| {
         logger::log(
             LogLevel::Error,
             "DOWNLOAD",
@@ -374,6 +387,19 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
     );
 
     Ok(target_path)
+}
+
+/// `url` without its user info and query, either of which may hold a credential.
+fn without_credentials(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let rest = rest
+        .split_once('@')
+        .filter(|(user_info, _)| !user_info.contains('/'))
+        .map_or(rest, |(_, host)| host);
+    format!("{scheme}://{rest}")
 }
 
 /// Remove a temp file left over from a URL download.
@@ -491,6 +517,39 @@ mod more_tests {
             "imported.conf"
         );
         assert!(crate::profile::validate_wireguard_interface_name("imported").is_ok());
+    }
+
+    #[test]
+    fn download_url_credentials_stay_out_of_the_log_and_argv() {
+        let (_config, _guard) = crate::config::set_temp_config_dir();
+        let _ = download_profile("https://alice:hunter2pass@vpn.example.com/x.conf?token=s3cr3t");
+        let secret = |text: &str| text.contains("hunter2pass") || text.contains("s3cr3t");
+        assert!(!crate::logger::get_logs()
+            .iter()
+            .any(|entry| secret(&entry.message)));
+        let crate::process::CommandRunner::Mock(mock) = crate::process::global_runner() else {
+            panic!("unit tests run the mock runner");
+        };
+        assert!(!mock
+            .invocations()
+            .iter()
+            .any(|call| call.args.iter().any(|arg| secret(arg))));
+        assert_eq!(
+            without_credentials("https://alice:pw@vpn.example.com/a@b.conf?t=1#x"),
+            "https://vpn.example.com/a@b.conf"
+        );
+        assert_eq!(
+            without_credentials("https://vpn.example.com/a@b.conf"),
+            "https://vpn.example.com/a@b.conf"
+        );
+    }
+
+    #[test]
+    fn a_url_with_a_line_break_is_refused() {
+        assert_eq!(
+            download_profile("https://vpn.example.com/x.conf\noutput = /etc/passwd"),
+            Err("Invalid URL format".to_string())
+        );
     }
 
     #[test]
