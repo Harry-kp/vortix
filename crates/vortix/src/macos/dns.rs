@@ -131,6 +131,30 @@ struct PlannedResolver {
     original: Option<Vec<u8>>,
 }
 
+/// A NULL read means a missing key or a failed read; only a successful
+/// listing without `key` proves it is missing.
+fn confirm_key_absent(key: &str, listing: Option<CFArray<CFString>>) -> Result<(), String> {
+    let listing = listing.ok_or_else(|| "cannot list macOS dynamic-store keys".to_string())?;
+    if listing.iter().any(|found| found.to_string() == key) {
+        Err(format!("cannot read macOS dynamic-store key {key}"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Proves `key` is missing with a listing of exactly that key.
+fn confirm_absent(store: &SCDynamicStore, key: &str) -> Result<(), String> {
+    let mut pattern = String::from("^");
+    for c in key.chars() {
+        if "\\.^$|?*+()[]{}".contains(c) {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('$');
+    confirm_key_absent(key, store.get_keys(pattern.as_str()))
+}
+
 impl MacDynamicStore {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         match self {
@@ -138,7 +162,10 @@ impl MacDynamicStore {
                 let store = SCDynamicStoreBuilder::new(SC_STORE_NAME)
                     .build()
                     .ok_or_else(|| "cannot open the macOS dynamic store".to_string())?;
-                store.get(key).map(|value| encode_plist(&value)).transpose()
+                match store.get(key) {
+                    Some(value) => encode_plist(&value).map(Some),
+                    None => confirm_absent(&store, key).map(|()| None),
+                }
             }
             #[cfg(test)]
             Self::Memory(values) => values
@@ -180,10 +207,11 @@ impl MacDynamicStore {
                 let store = SCDynamicStoreBuilder::new(SC_STORE_NAME)
                     .build()
                     .ok_or_else(|| "cannot open the macOS dynamic store".to_string())?;
-                if store.get(key).is_none() || store.remove(key) {
+                if store.remove(key) {
                     Ok(())
                 } else {
-                    Err(format!("cannot remove macOS dynamic-store key {key}"))
+                    confirm_absent(&store, key)
+                        .map_err(|_| format!("cannot remove macOS dynamic-store key {key}"))
                 }
             }
             #[cfg(test)]
@@ -1632,6 +1660,39 @@ mod policy_tests {
         let released = adapter.apply(&released_policy, Some(&first), &applied);
         assert_eq!(released.status, DnsEffectiveStatus::Released);
         assert_eq!(adapter.dynamic_store.get(&service_key).unwrap(), None);
+
+        // After a restart, release starts from no previous policy.
+        let applied = adapter.apply(&policy(3, "10.80.0.1"), None, &DnsEffectiveState::default());
+        assert_eq!(applied.status, DnsEffectiveStatus::Applied);
+        let released = adapter.apply(
+            &DnsPolicy {
+                generation: 4,
+                assignments: Vec::new(),
+            },
+            None,
+            &DnsEffectiveState::default(),
+        );
+        assert_eq!(released.status, DnsEffectiveStatus::Released);
+        assert_eq!(adapter.dynamic_store.get(&service_key).unwrap(), None);
+        assert!(adapter.primary_backup_state().unwrap().is_none());
+    }
+
+    /// Reads the real store, which needs no root; `Setup:/` always exists.
+    #[test]
+    fn an_existing_key_is_listed() {
+        let store = SCDynamicStoreBuilder::new(SC_STORE_NAME).build().unwrap();
+        assert!(confirm_absent(&store, "Setup:/").is_err());
+        assert!(confirm_absent(&store, "Setup:/.missing").is_ok());
+    }
+
+    /// A missing read is recorded as "no DNS key" only when a listing proves it.
+    #[test]
+    fn an_absent_key_needs_a_successful_listing() {
+        let key = "Setup:/Network/Service/test/DNS";
+        assert!(confirm_key_absent(key, None).is_err());
+        let listed = CFArray::from_CFTypes(&[CFString::new(key)]);
+        assert!(confirm_key_absent(key, Some(listed)).is_err());
+        assert!(confirm_key_absent(key, Some(CFArray::<CFString>::from_CFTypes(&[]))).is_ok());
     }
 
     #[test]
