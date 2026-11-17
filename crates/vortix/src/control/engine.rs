@@ -17,7 +17,7 @@ use crate::profile::{ProfileId, ProtocolKind};
 use crate::tunnel::{TunnelCancellation, TunnelExecutionContext};
 use crate::wireguard::ownership::TunnelOwnershipStore;
 
-use super::net::Net;
+use super::net::{HostCheck, Net};
 use super::plan::{plan, NetworkPlan};
 use super::specs::{self, Entry};
 use super::state::{Phase, Refusal, State};
@@ -1060,9 +1060,9 @@ impl Engine {
             std::thread::spawn(move || {
                 let started = Instant::now();
                 let result = crate::control::scanner::gather_system_state(&catalog);
-                let checked = check.map(|plan| {
-                    let drift = Net::drift(&plan);
-                    (plan, drift)
+                let checked = check.map(|check| {
+                    let drift = check.drift();
+                    (check.plan, drift)
                 });
                 let _ = tx.send(Msg::Event(Box::new(Event::Scanned {
                     result,
@@ -1075,13 +1075,13 @@ impl Engine {
 
     /// The applied plan to read back with this scan, at most every
     /// [`HOST_CHECK_EVERY`] and only while it holds something others can undo.
-    fn host_check_due(&mut self, now: Instant) -> Option<NetworkPlan> {
-        let plan = self.applied.as_ref().filter(|plan| Net::checkable(plan))?;
+    fn host_check_due(&mut self, now: Instant) -> Option<HostCheck> {
         if self.apply_error.is_some() || now < self.host_checked_at + HOST_CHECK_EVERY {
             return None;
         }
+        let check = self.net.host_check(self.applied.as_ref()?)?;
         self.host_checked_at = now;
-        Some(plan.clone())
+        Some(check)
     }
 
     /// Something outside Vortix changed what it applied: forget the applied
@@ -1674,11 +1674,17 @@ mod tests {
         engine.host_checked_at = start;
         let due = start + HOST_CHECK_EVERY;
         engine.applied = Some(NetworkPlan::default());
-        assert_eq!(engine.host_check_due(due), None, "nothing to check");
+        assert!(engine.host_check_due(due).is_none(), "nothing to check");
 
         engine.applied = Some(blocking_plan());
-        assert_eq!(engine.host_check_due(due), Some(blocking_plan()));
-        assert_eq!(engine.host_check_due(due + SCAN_EVERY), None, "too soon");
+        assert_eq!(
+            engine.host_check_due(due).map(|check| check.plan),
+            Some(blocking_plan())
+        );
+        assert!(
+            engine.host_check_due(due + SCAN_EVERY).is_none(),
+            "too soon"
+        );
         assert!(engine.host_check_due(due + HOST_CHECK_EVERY).is_some());
     }
 

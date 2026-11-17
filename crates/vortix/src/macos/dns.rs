@@ -533,6 +533,13 @@ impl MacDnsPolicy {
         Ok(format!("Setup:/Network/Service/{service}/DNS"))
     }
 
+    /// Another service is primary now. With none (offline) there is
+    /// nothing to follow, so the owned one stays.
+    fn primary_moved_from(&self, owner: &PrimaryDnsOwner) -> bool {
+        self.primary_service_key()
+            .is_ok_and(|service_key| service_key != owner.service_key)
+    }
+
     fn primary_owner_state(&self) -> Result<Option<PrimaryDnsOwner>, String> {
         self.dynamic_store
             .get(VORTIX_PRIMARY_DNS_OWNER_KEY)?
@@ -645,6 +652,24 @@ impl MacDnsPolicy {
         } else {
             Err("macOS primary DNS changed during replacement".to_string())
         }
+    }
+
+    /// macOS resolves through the primary service; when another service
+    /// took over, hand the old one back before claiming the new one.
+    fn follow_primary(
+        &self,
+        generation: u64,
+        assignment: &DnsAssignment,
+        previous: Option<(u64, &DnsAssignment)>,
+    ) -> Result<(), String> {
+        if self
+            .primary_owner_state()?
+            .is_some_and(|owner| self.primary_moved_from(&owner))
+        {
+            self.release_primary(None)?;
+            return self.apply_primary(generation, assignment, None);
+        }
+        self.apply_primary(generation, assignment, previous)
     }
 
     fn apply_primary(
@@ -765,6 +790,9 @@ impl MacDnsPolicy {
         let expected = Self::primary_owner(generation, assignment, owner.service_key.clone());
         if owner != expected {
             return Err("macOS primary DNS ownership does not match policy".to_string());
+        }
+        if self.primary_moved_from(&owner) {
+            return Err("macOS switched to another network service".to_string());
         }
         let backup = self
             .primary_backup_state()?
@@ -1107,7 +1135,7 @@ impl DnsPolicyAdapter for MacDnsPolicy {
             }
         }
         if let Some(primary) = desired_primary {
-            if let Err(error) = self.apply_primary(desired.generation, primary, previous_primary) {
+            if let Err(error) = self.follow_primary(desired.generation, primary, previous_primary) {
                 return DnsEffectiveState {
                     requested_generation: desired.generation,
                     applied_generation: previous_effective.applied_generation,
@@ -1718,6 +1746,55 @@ mod policy_tests {
         assert!(!temp.path().join("resolver/default").exists());
         let repeated_release = adapter.apply(&released_policy, Some(&released_policy), &released);
         assert_eq!(repeated_release.status, DnsEffectiveStatus::Released);
+    }
+
+    /// Wi-Fi to Ethernet makes another service primary; macOS then resolves
+    /// through that service's DNS, so the VPN DNS has to follow it.
+    #[test]
+    fn primary_dns_follows_a_new_primary_service_and_restores_the_old_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = MacDnsPolicy::at(temp.path().join("resolver"));
+        let wifi = adapter.primary_service_key().unwrap();
+        let wifi_dns = adapter.dynamic_store.get(&wifi).unwrap();
+        let first = policy(1, "10.80.0.1");
+        let applied = adapter.apply(&first, None, &DnsEffectiveState::default());
+        assert_eq!(applied.status, DnsEffectiveStatus::Applied);
+
+        let ethernet = "Setup:/Network/Service/test-ethernet/DNS";
+        let ethernet_dns = primary_dns_value(&["192.168.1.1".to_string()], &[]).unwrap();
+        adapter.dynamic_store.set(ethernet, &ethernet_dns).unwrap();
+        adapter
+            .dynamic_store
+            .set(
+                GLOBAL_IPV4_KEY,
+                &primary_service_value("test-ethernet").unwrap(),
+            )
+            .unwrap();
+        assert!(adapter.verify(&first, &applied).is_err(), "drift detected");
+
+        let reapplied = adapter.apply(&first, Some(&first), &applied);
+        assert_eq!(
+            reapplied.status,
+            DnsEffectiveStatus::Applied,
+            "{reapplied:?}"
+        );
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["10.80.0.1"]);
+        assert_eq!(adapter.dynamic_store.get(&wifi).unwrap(), wifi_dns);
+        assert!(adapter.verify(&first, &reapplied).is_ok());
+
+        let released = adapter.apply(
+            &DnsPolicy {
+                generation: 2,
+                assignments: Vec::new(),
+            },
+            Some(&first),
+            &reapplied,
+        );
+        assert_eq!(released.status, DnsEffectiveStatus::Released);
+        assert_eq!(
+            adapter.dynamic_store.get(ethernet).unwrap(),
+            Some(ethernet_dns)
+        );
     }
 
     #[test]

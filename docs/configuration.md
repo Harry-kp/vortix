@@ -133,10 +133,13 @@ DNS, and Vortix leaves it alone.
   not an IP address, or an OpenVPN `DOMAIN`), on macOS and with systemd-resolved; otherwise
   they are not used.
 
-- **macOS:** System Configuration.
+- **macOS:** System Configuration, on the primary network service. When another service
+  becomes primary (Wi-Fi to Ethernet), the DNS moves to it and the old service gets its own back.
 - **Linux:** systemd-resolved (per-link, through `resolvectl`), else `resolvconf`. With
   neither, a profile that carries DNS is refused as a missing dependency. NetworkManager and
   `/etc/resolv.conf` are only read, to show the current resolver.
 
 If the resolvers cannot be applied, the tunnel stays up, Security Guard shows DNS `Unverified`
 and, unless the kill switch is off, the kill switch `Degraded`, and Vortix keeps retrying.
+Every 10 seconds Vortix reads the applied resolvers back and reapplies them if other software
+changed them, with one warning in the Event Log.

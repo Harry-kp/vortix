@@ -9,7 +9,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::cidr::Cidr;
-use crate::control::dns::{DnsEffectiveStatus, DnsOwnedResource, DnsPolicyCoordinator};
+use crate::control::dns::{
+    DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource, DnsPolicy, DnsPolicyCoordinator,
+};
 use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::platform::DefaultRouteObservation;
 use crate::wireguard::ownership::TunnelOwnershipStore;
@@ -32,6 +34,32 @@ struct HostState {
     routes: Vec<(Cidr, String)>,
     host_routes: BTreeSet<IpAddr>,
     dns: Vec<DnsOwnedResource>,
+}
+
+/// A read-back of applied host state, run off the engine thread.
+pub struct HostCheck {
+    pub plan: NetworkPlan,
+    dns: Option<(DnsPolicy, DnsEffectiveState)>,
+}
+
+impl HostCheck {
+    /// What the host no longer carries; a read-back only.
+    #[must_use]
+    pub fn drift(&self) -> Option<String> {
+        use crate::control::dns::DnsPolicyAdapter as _;
+        if let Firewall::Block(allow) = &self.plan.firewall {
+            if let Err(error) = crate::platform::Firewall::verify_blocking(allow) {
+                return Some(format!(
+                    "Kill switch rules were changed outside Vortix ({error})"
+                ));
+            }
+        }
+        let (desired, effective) = self.dns.as_ref()?;
+        crate::platform::Dns
+            .verify(desired, effective)
+            .err()
+            .map(|errors| format!("DNS was changed outside Vortix ({})", errors.join("; ")))
+    }
 }
 
 impl Net {
@@ -233,27 +261,26 @@ impl Net {
         Ok(())
     }
 
-    /// Whether `plan` holds host state other software can undo.
+    /// What of `plan` to read back off the engine thread: the firewall while
+    /// it blocks, and the DNS Vortix applied. `None` when neither.
     #[must_use]
-    pub fn checkable(plan: &NetworkPlan) -> bool {
-        matches!(plan.firewall, Firewall::Block(_))
+    pub fn host_check(&self, plan: &NetworkPlan) -> Option<HostCheck> {
+        let dns = self
+            .dns
+            .desired()
+            .filter(|_| self.dns.effective().status == DnsEffectiveStatus::Applied)
+            .map(|desired| (desired.clone(), self.dns.effective().clone()));
+        (matches!(plan.firewall, Firewall::Block(_)) || dns.is_some()).then(|| HostCheck {
+            plan: plan.clone(),
+            dns,
+        })
     }
 
-    /// What of `plan` the host no longer carries; a read-back only.
-    #[must_use]
-    pub fn drift(plan: &NetworkPlan) -> Option<String> {
-        match &plan.firewall {
-            Firewall::Block(allow) => crate::platform::Firewall::verify_blocking(allow)
-                .err()
-                .map(|error| format!("Kill switch rules were changed outside Vortix ({error})")),
-            Firewall::Open => None,
-        }
-    }
-
-    /// Make the next [`Self::apply`] reapply the firewall even if the plan is
-    /// unchanged.
+    /// Make the next [`Self::apply`] reapply the firewall and DNS even if the
+    /// plan is unchanged.
     pub fn forget_applied(&mut self) {
         self.saved_mode = None;
+        self.dns.invalidate_effective("changed outside Vortix");
     }
 
     fn verify_routes(target: &NetworkPlan) -> Result<(), String> {
