@@ -99,6 +99,11 @@ dashboard's Logs panel (`f` until the title names the profile).
   in the dashboard; until then every connect tries it again.
 - TLS timeout: the server is unreachable, or the certificates or protocol do not match.
 - Connected but no traffic: the server's pushed routes, forwarding or NAT.
+- `pull-filter must be …` at import: write `pull-filter accept|ignore|reject "text"`, with
+  the text quoted when it has spaces; `openvpn` refuses any other form too.
+- `…route or DNS option OpenVPN itself would refuse`: the server pushed a route, redirect or
+  DNS option in another case or spacing (`Redirect-Gateway`, two spaces). Vortix refuses the
+  connect rather than guess; fix the server's `push` lines.
 
 ## NetBird
 

@@ -139,7 +139,8 @@ apply until you import it again. A WireGuard profile name becomes the interface 
 letters, numbers, `_`, `.` or `-`. A name already taken gets `_1`, `_2`, … (a long WireGuard
 name is shortened to fit), and import says so. WireGuard profiles may hold up to 1024 routes; OpenVPN up to 256, counting routes the server pushes. Profiles that run
 commands (`PreUp`/`PostUp`/`PreDown`/`PostDown`, OpenVPN `up`/`down` and similar) are refused;
-use [hooks](configuration.md#hooks) instead.
+use [hooks](configuration.md#hooks) instead. An OpenVPN profile's `route-nopull` and
+`pull-filter` decide which pushed routes and DNS Vortix applies, as they do for `openvpn`.
 
 ### NetBird networks
 
