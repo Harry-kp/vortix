@@ -53,9 +53,14 @@ pub fn run(config_dir: &Path, config_source: &str) {
     print_preview(&info);
 
     // 2. Privacy notice
+    let (dim, reset) = if io::IsTerminal::is_terminal(&io::stdout()) {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
     println!(
-        "  \x1b[2mNOT included: IP addresses, server endpoints, profile\n  \
-         names, auth credentials, DNS servers, log contents\x1b[0m\n"
+        "  {dim}NOT included: IP addresses, server endpoints, profile\n  \
+         names, auth credentials, DNS servers, log contents{reset}\n"
     );
 
     // 3. Read user description
@@ -495,10 +500,7 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
         let tail = journal.tail();
         let _ = writeln!(body, "Recent events: {}", tail.len());
         for env in tail.iter().rev().take(10).rev() {
-            // Render the event as a compact one-liner for the bug report.
-            let kind = format!("{:?}", env.event);
-            let kind = kind.split('{').next().unwrap_or(&kind).trim();
-            let _ = writeln!(body, "  {kind}");
+            let _ = writeln!(body, "  {}", event_summary(&env.event));
         }
         let _ = writeln!(body, "```\n");
     }
@@ -511,6 +513,19 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     );
 
     body
+}
+
+/// One line per journal event, without names, addresses or text.
+fn event_summary(event: &crate::journal::JournalEvent) -> String {
+    use crate::journal::JournalEvent;
+    match event {
+        JournalEvent::Notice { level, .. } => format!("{level} notice"),
+        JournalEvent::IpChanged { .. } => "public IP changed".into(),
+        JournalEvent::ConnectionHealthChanged { .. } => "connection health changed".into(),
+        JournalEvent::JournalRetentionApplied { deleted } => {
+            format!("{deleted} old journal(s) removed")
+        }
+    }
 }
 
 // ── GitHub URL construction ─────────────────────────────────────────────────
@@ -600,6 +615,16 @@ fn print_fallback(body: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// The journal lines printed enum variant names such as
+    /// `JournalRetentionApplied`.
+    #[test]
+    fn journal_events_read_as_plain_words() {
+        let line = super::event_summary(&crate::journal::JournalEvent::JournalRetentionApplied {
+            deleted: 2,
+        });
+        assert_eq!(line, "2 old journal(s) removed");
+    }
+
     use super::*;
 
     /// `PersistedState::live_state` owns the "a durable request is not kernel
