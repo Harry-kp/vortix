@@ -1569,7 +1569,7 @@ mod tests {
         );
         std::fs::write(
             temp.path().join(format!("{}.log", profile.id)),
-            "PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n",
+            "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n",
         )
         .unwrap();
         let evidence = test_tunnel(temp.path().to_path_buf())
@@ -1600,7 +1600,7 @@ mod tests {
         std::fs::write(
             temp.path().join(format!("{}.log", profile.id)),
             "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
-             PUSH_REPLY,redirect-gateway def1 bypass-dhcp,dhcp-option DNS 1.1.1.1\n\
+             PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1 bypass-dhcp,dhcp-option DNS 1.1.1.1\n\
              Initialization Sequence Completed\n",
         )
         .unwrap();
@@ -1626,7 +1626,7 @@ mod tests {
         let configured = parsed.dns_request();
         let evidence = pushed_dns_evidence(
             &parsed,
-            "PUSH_REPLY,redirect-gateway def1,ping 10\nInitialization Sequence Completed\n",
+            "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,ping 10\nInitialization Sequence Completed\n",
         );
         assert_eq!(evidence, OvpnDnsEvidence::ExplicitlyEmpty(configured));
     }
@@ -1636,7 +1636,7 @@ mod tests {
         let configured = crate::control::dns::DnsRequest::default();
         let evidence = pushed_dns_evidence(
             &crate::openvpn::parser::OvpnParsedProfile::default(),
-            "PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1\n",
+            "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1\n",
         );
         assert!(matches!(
             evidence,
@@ -1651,7 +1651,7 @@ mod tests {
     fn newer_incomplete_negotiation_does_not_reuse_old_pushed_dns() {
         let evidence = pushed_dns_evidence(
             &crate::openvpn::parser::OvpnParsedProfile::default(),
-            "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,redirect-gateway def1\n",
+            "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1\n",
         );
         assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
     }
@@ -1660,7 +1660,7 @@ mod tests {
     fn latest_completed_negotiation_replaces_older_pushed_dns() {
         let evidence = pushed_dns_evidence(
             &crate::openvpn::parser::OvpnParsedProfile::default(),
-            "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,dhcp-option DNS 10.9.0.1\nInitialization Sequence Completed\n",
+            "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.9.0.1\nInitialization Sequence Completed\n",
         );
         let OvpnDnsEvidence::Observed(request) = evidence else {
             panic!("latest completed negotiation must be observed");
@@ -1675,7 +1675,7 @@ mod tests {
     fn malformed_pushed_dns_is_unavailable_not_explicitly_empty() {
         let evidence = pushed_dns_evidence(
             &crate::openvpn::parser::OvpnParsedProfile::default(),
-            "PUSH_REPLY,dhcp-option DNS not-an-address\nInitialization Sequence Completed\n",
+            "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS not-an-address\nInitialization Sequence Completed\n",
         );
         assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
     }
@@ -1703,7 +1703,7 @@ mod tests {
     }
     #[test]
     fn route_nopull_and_pull_filter_drop_pushed_dns() {
-        let log = "PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n";
+        let log = "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n";
         for profile in [
             "client\nroute-nopull\n",
             "client\npull-filter ignore \"dhcp-option\"\n",
@@ -1722,7 +1722,7 @@ mod tests {
             "DHCP-OPTION DNS 10.8.0.1",
             "dhcp-option  DNS 10.8.0.1",
         ] {
-            let log = format!("PUSH_REPLY,{push}\nInitialization Sequence Completed\n");
+            let log = format!("PUSH: Received control message: 'PUSH_REPLY,{push}\nInitialization Sequence Completed\n");
             assert!(
                 matches!(
                     pushed_dns_evidence(
@@ -1739,7 +1739,7 @@ mod tests {
     fn openvpn_2_6_dns_options_are_captured() {
         let evidence = pushed_dns_evidence(
             &crate::openvpn::parser::OvpnParsedProfile::default(),
-            "PUSH_REPLY,dns server 0 address 10.8.0.1 [2001:db8::53]:53,dns search-domains corp.example\nInitialization Sequence Completed\n",
+            "PUSH: Received control message: 'PUSH_REPLY,dns server 0 address 10.8.0.1 [2001:db8::53]:53,dns search-domains corp.example\nInitialization Sequence Completed\n",
         );
         let OvpnDnsEvidence::Observed(request) = evidence else {
             panic!("pushed dns options must be observed");
@@ -1752,7 +1752,7 @@ mod tests {
         assert!(matches!(
             pushed_dns_evidence(
                 &crate::openvpn::parser::OvpnParsedProfile::default(),
-                "PUSH_REPLY,dns server 0 address nonsense\nInitialization Sequence Completed\n",
+                "PUSH: Received control message: 'PUSH_REPLY,dns server 0 address nonsense\nInitialization Sequence Completed\n",
             ),
             OvpnDnsEvidence::Unavailable { .. }
         ));
