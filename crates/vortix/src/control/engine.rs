@@ -553,6 +553,7 @@ impl Engine {
                     tracing::warn!(%error, "could not record last-used time");
                 }
                 for peer in replaced {
+                    self.hook(HookEvent::DisconnectStarted, &peer);
                     self.begin_stop(&peer);
                 }
                 if let Some((username, password)) = remember {
@@ -785,7 +786,9 @@ impl Engine {
             (false, false) => format!("'{name}' dropped. Reconnect or disconnect it."),
         };
         self.notice(Level::Warning, text);
-        self.hook(HookEvent::Reconnecting, profile_id);
+        if retry_at.is_some() {
+            self.hook(HookEvent::Reconnecting, profile_id);
+        }
     }
 
     // ── stopping ────────────────────────────────────────────────────────
@@ -1558,6 +1561,27 @@ mod tests {
         engine.up_at.insert(ProfileId::new(id), Instant::now());
     }
 
+    fn openvpn_live(engine: &Engine, id: &str, pid: Option<u32>) -> Live {
+        Live {
+            kind: tunnels::TunnelKind::new(ProtocolKind::OpenVpn, &engine.config.tunnels),
+            handle: crate::tunnel::TunnelHandle {
+                profile_id: ProfileId::new(id),
+                display_name: id.into(),
+                interface_name: "utun9".into(),
+                pid,
+                started_at: SystemTime::now(),
+                kind: crate::tunnel::TunnelKindTag::OpenVpn,
+                generation: 1,
+                handshake: None,
+                probe_receipts: Vec::new(),
+                process_ownership: None,
+                teardown_config: None,
+                dns_request: crate::control::dns::DnsRequest::default(),
+                openvpn_routes: None,
+            },
+        }
+    }
+
     /// A split tunnel waiting to reconnect stops at once; the switch to a
     /// profile with the same routes must still start.
     #[test]
@@ -1610,32 +1634,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut engine, rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
         up(&mut engine, "a", 1);
-        let handle = crate::tunnel::TunnelHandle {
-            profile_id: ProfileId::new("a"),
-            display_name: "a".into(),
-            interface_name: "utun1".into(),
-            // A live process without an ownership receipt: `down` refuses it.
-            pid: Some(std::process::id()),
-            started_at: SystemTime::now(),
-            kind: crate::tunnel::TunnelKindTag::OpenVpn,
-            generation: 1,
-            handshake: None,
-            probe_receipts: Vec::new(),
-            process_ownership: None,
-            teardown_config: None,
-            dns_request: crate::control::dns::DnsRequest::default(),
-            openvpn_routes: None,
-        };
-        let kind = tunnels::TunnelKind::new(ProtocolKind::OpenVpn, &engine.config.tunnels);
-        let probe = Live {
-            kind: tunnels::TunnelKind::new(ProtocolKind::OpenVpn, &engine.config.tunnels),
-            handle: handle.clone(),
-        };
+        // A live process without an ownership receipt: `down` refuses it.
+        let probe = openvpn_live(&engine, "a", Some(std::process::id()));
         let stop = tunnels::stop(&engine.config.tunnels, &engine.ownership, probe);
         assert!(stop.is_err(), "this teardown fails: {stop:?}");
-        engine
-            .live
-            .insert(ProfileId::new("a"), Live { kind, handle });
+        let live = openvpn_live(&engine, "a", Some(std::process::id()));
+        engine.live.insert(ProfileId::new("a"), live);
         engine.lost(&ProfileId::new("a"), false);
         let drained = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         engine.handle(drained);
@@ -1654,6 +1658,97 @@ mod tests {
         assert!(
             texts.iter().any(|text| text.contains("OpenVPN")),
             "teardown error dropped; notices: {texts:?}"
+        );
+    }
+
+    fn with_hooks(engine: &mut Engine) -> crate::hooks::HookDiagnostics {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let specs = HOOK_EVENTS
+            .iter()
+            .map(|event| crate::config::settings::HookSpec {
+                event: *event,
+                executable: "/usr/bin/true".into(),
+                args: Vec::new(),
+                timeout_secs: 5,
+            })
+            .collect();
+        let (runner, diagnostics) = {
+            let _guard = runtime.enter();
+            crate::hooks::HookRunner::start(
+                specs,
+                crate::config::owned_file::VerifiedOwner::from_ids(501, 20),
+                crate::process::CommandRunner::mock_default_success(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        engine.hooks = Some((runtime, runner));
+        diagnostics
+    }
+
+    const HOOK_EVENTS: [HookEvent; 6] = [
+        HookEvent::ConnectStarted,
+        HookEvent::Connected,
+        HookEvent::DisconnectStarted,
+        HookEvent::Disconnected,
+        HookEvent::ConnectFailed,
+        HookEvent::Reconnecting,
+    ];
+
+    fn fired(diagnostics: &mut crate::hooks::HookDiagnostics) -> Vec<HookEvent> {
+        let mut events = Vec::new();
+        while let Ok(diagnostic) = diagnostics.try_recv() {
+            if diagnostic.kind == crate::hooks::HookDiagnosticKind::Queued {
+                events.push(HOOK_EVENTS[diagnostic.attempt_id.hook_index]);
+            }
+        }
+        events
+    }
+
+    /// With auto-reconnect off nothing reconnects, so `reconnecting` must not fire.
+    #[test]
+    fn a_drop_without_auto_reconnect_is_not_reconnecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
+        engine.config.auto_reconnect = false;
+        let mut diagnostics = with_hooks(&mut engine);
+        up(&mut engine, "a", 1);
+        engine.lost(&ProfileId::new("a"), false);
+        assert_eq!(
+            engine.state.get(&ProfileId::new("a")).unwrap().phase,
+            Phase::Waiting { retry_at: None }
+        );
+        assert_eq!(fired(&mut diagnostics), Vec::<HookEvent>::new());
+    }
+
+    /// A tunnel a switch replaces gets `disconnected`; it must get
+    /// `disconnect_started` first, like every other stop.
+    #[test]
+    fn a_tunnel_replaced_by_a_switch_fires_disconnect_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = vec![ovpn(dir.path(), "a", 5), ovpn(dir.path(), "b", 6)];
+        let (mut engine, _rx) = test_engine(dir.path(), profiles);
+        up(&mut engine, "a", 1);
+        let spec = engine.entries[&ProfileId::new("b")].spec.clone().unwrap();
+        engine
+            .state
+            .begin(spec, 2, Some(BTreeSet::from([ProfileId::new("a")])), false)
+            .unwrap();
+        let mut diagnostics = with_hooks(&mut engine);
+        let live = openvpn_live(&engine, "b", None);
+        engine.started(&ProfileId::new("b"), Ok(live), None, false);
+        // `a` has no process here, so its stop finishes at once.
+        assert!(engine.state.get(&ProfileId::new("a")).is_none());
+        assert_eq!(
+            fired(&mut diagnostics),
+            [
+                HookEvent::DisconnectStarted,
+                HookEvent::Disconnected,
+                HookEvent::Connected
+            ]
         );
     }
 
