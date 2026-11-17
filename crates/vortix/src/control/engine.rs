@@ -28,6 +28,8 @@ use super::{
 
 const SCAN_EVERY: Duration = Duration::from_secs(1);
 const APPLY_RETRY: Duration = Duration::from_secs(2);
+/// How often a scan also reads back the firewall and DNS Vortix applied.
+const HOST_CHECK_EVERY: Duration = Duration::from_secs(10);
 const KEPT_NOTICES: usize = 64;
 const KEPT_OUTCOMES: usize = 256;
 
@@ -45,6 +47,8 @@ pub(super) enum Event {
     Scanned {
         result: ScannerResult,
         started: Instant,
+        /// The plan read back with this scan, and what no longer matches it.
+        checked: Option<(NetworkPlan, Option<String>)>,
     },
     /// A dropped tunnel's teardown finished.
     Drained {
@@ -99,6 +103,9 @@ pub(super) struct Engine {
     scan: Option<ScannerResult>,
     scanning: bool,
     next_scan: Instant,
+    host_checked_at: Instant,
+    /// A drift was announced; quiet until a read-back matches again.
+    host_drifted: bool,
     external: Vec<String>,
     last_connected: BTreeMap<ProfileId, SystemTime>,
     last_generation: u64,
@@ -209,6 +216,8 @@ impl Engine {
             scan: None,
             scanning: false,
             next_scan: Instant::now() + SCAN_EVERY,
+            host_checked_at: Instant::now(),
+            host_drifted: false,
             external: Vec::new(),
             last_connected,
             last_generation: 0,
@@ -338,7 +347,16 @@ impl Engine {
                     used_saved,
                 } => self.started(&profile_id, result, remember, used_saved),
                 Event::Stopped { profile_id, result } => self.stopped(&profile_id, result),
-                Event::Scanned { result, started } => self.scanned(result, started),
+                Event::Scanned {
+                    result,
+                    started,
+                    checked,
+                } => {
+                    self.scanned(result, started);
+                    if let Some((plan, drift)) = checked {
+                        self.host_checked(&plan, drift);
+                    }
+                }
                 Event::Drained { profile_id, result } => self.drained(&profile_id, result),
                 Event::Progress { profile_id, text } => {
                     self.actions.insert(profile_id, text);
@@ -1037,13 +1055,53 @@ impl Engine {
                 .values()
                 .map(|entry| entry.profile.clone())
                 .collect::<Vec<_>>();
+            let check = self.host_check_due(now);
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let started = Instant::now();
                 let result = crate::control::scanner::gather_system_state(&catalog);
-                let _ = tx.send(Msg::Event(Box::new(Event::Scanned { result, started })));
+                let checked = check.map(|plan| {
+                    let drift = Net::drift(&plan);
+                    (plan, drift)
+                });
+                let _ = tx.send(Msg::Event(Box::new(Event::Scanned {
+                    result,
+                    started,
+                    checked,
+                })));
             });
         }
+    }
+
+    /// The applied plan to read back with this scan, at most every
+    /// [`HOST_CHECK_EVERY`] and only while it holds something others can undo.
+    fn host_check_due(&mut self, now: Instant) -> Option<NetworkPlan> {
+        let plan = self.applied.as_ref().filter(|plan| Net::checkable(plan))?;
+        if self.apply_error.is_some() || now < self.host_checked_at + HOST_CHECK_EVERY {
+            return None;
+        }
+        self.host_checked_at = now;
+        Some(plan.clone())
+    }
+
+    /// Something outside Vortix changed what it applied: forget the applied
+    /// state so the next reconcile puts it back. A result for a plan that has
+    /// since changed is stale and dropped.
+    fn host_checked(&mut self, plan: &NetworkPlan, drift: Option<String>) {
+        if self.applied.as_ref() != Some(plan) {
+            return;
+        }
+        let Some(drift) = drift else {
+            self.host_drifted = false;
+            return;
+        };
+        tracing::warn!(target: "vortix::engine", %drift, "applied network state drifted");
+        if !self.host_drifted {
+            self.host_drifted = true;
+            self.notice(Level::Warning, format!("{drift}; restoring it"));
+        }
+        self.net.forget_applied();
+        self.applied = None;
     }
 
     fn reconcile(&mut self) {
@@ -1559,6 +1617,8 @@ mod tests {
             scan: None,
             scanning: false,
             next_scan: Instant::now() + Duration::from_secs(3600),
+            host_checked_at: Instant::now(),
+            host_drifted: false,
             external: Vec::new(),
             last_connected: BTreeMap::new(),
             last_generation: 0,
@@ -1595,6 +1655,60 @@ mod tests {
                 openvpn_routes: None,
             },
         }
+    }
+
+    fn blocking_plan() -> NetworkPlan {
+        NetworkPlan {
+            firewall: crate::control::plan::Firewall::Block(Vec::new()),
+            ..NetworkPlan::default()
+        }
+    }
+
+    /// The firewall is read back at most every ten seconds, and only while it
+    /// blocks.
+    #[test]
+    fn the_host_is_read_back_only_while_blocking_and_not_every_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), Vec::new());
+        let start = Instant::now();
+        engine.host_checked_at = start;
+        let due = start + HOST_CHECK_EVERY;
+        engine.applied = Some(NetworkPlan::default());
+        assert_eq!(engine.host_check_due(due), None, "nothing to check");
+
+        engine.applied = Some(blocking_plan());
+        assert_eq!(engine.host_check_due(due), Some(blocking_plan()));
+        assert_eq!(engine.host_check_due(due + SCAN_EVERY), None, "too soon");
+        assert!(engine.host_check_due(due + HOST_CHECK_EVERY).is_some());
+    }
+
+    /// Rules removed by someone else are put back by the next reconcile, and
+    /// the user hears about it once, not every ten seconds.
+    #[test]
+    fn a_drifted_kill_switch_is_reapplied_and_announced_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), Vec::new());
+        let plan = blocking_plan();
+        let before = engine.notices.len();
+
+        engine.applied = Some(NetworkPlan::default());
+        engine.host_checked(&plan, Some("rules gone".into()));
+        assert_eq!(engine.applied, Some(NetworkPlan::default()), "stale result");
+        assert_eq!(engine.notices.len(), before);
+
+        engine.applied = Some(plan.clone());
+        engine.host_checked(&plan, Some("rules gone".into()));
+        assert_eq!(engine.applied, None, "next reconcile reapplies");
+        assert_eq!(engine.notices.len(), before + 1);
+
+        engine.applied = Some(plan.clone());
+        engine.host_checked(&plan, Some("rules gone".into()));
+        assert_eq!(engine.notices.len(), before + 1, "announced once");
+
+        engine.applied = Some(plan.clone());
+        engine.host_checked(&plan, None);
+        engine.host_checked(&plan, Some("rules gone".into()));
+        assert_eq!(engine.notices.len(), before + 2, "a new drift is announced");
     }
 
     /// A split tunnel waiting to reconnect stops at once; the switch to a
