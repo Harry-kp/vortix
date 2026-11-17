@@ -612,7 +612,11 @@ mod nft_policy {
         for range in local_ranges {
             writeln!(ruleset, "    ip daddr {range} accept").unwrap();
         }
-        writeln!(ruleset, "    udp sport 68 udp dport 67 accept").unwrap();
+        writeln!(
+            ruleset,
+            "    ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"
+        )
+        .unwrap();
         for tunnel in active {
             if !tunnel.is_endpoint_allowlist() {
                 writeln!(ruleset, "    oifname \"{}\" accept", tunnel.interface).unwrap();
@@ -645,7 +649,7 @@ mod nft_policy {
     }
 
     fn parse_accept_rule(line: &str) -> Option<AcceptRule> {
-        if line == "udp sport 68 udp dport 67 accept" {
+        if line == "ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept" {
             return Some(AcceptRule::Dhcp);
         }
         if let Some(group) = line
@@ -773,8 +777,15 @@ mod tests {
         assert!(rules.contains("ip daddr 10.0.0.0/8 accept"));
         assert!(rules.contains("ip daddr 172.16.0.0/12 accept"));
         assert!(rules.contains("ip daddr 192.168.0.0/16 accept"));
-        assert!(rules.contains("udp sport 68 udp dport 67 accept"));
+        assert!(rules.contains("ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"));
         assert!(!rules.contains("oifname \"wg"));
+    }
+
+    #[test]
+    fn dhcp_exception_reaches_only_the_broadcast_address() {
+        let rules = nft(&[]);
+        assert!(!rules.contains("    udp sport 68 udp dport 67 accept"));
+        assert!(rules.contains("    ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"));
     }
 
     #[test]
@@ -990,7 +1001,7 @@ mod tests {
     oifname \"lo\" accept
     ip daddr 172.16.0.0/12 accept
     ip daddr 192.168.0.0/16 accept
-    udp sport 68 udp dport 67 accept
+    ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept
     oifname \"wg0\" accept
     ip daddr 1.2.3.4 accept
     oifname \"wg1\" accept

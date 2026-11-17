@@ -148,7 +148,7 @@ impl PfFirewall {
         writeln!(rules, "# Allow DHCP").unwrap();
         writeln!(
             rules,
-            "pass out quick proto udp from any port 68 to any port 67"
+            "pass out quick proto udp from any port 68 to 255.255.255.255 port 67"
         )
         .unwrap();
         writeln!(
@@ -323,9 +323,10 @@ impl PfFirewall {
 /// Unknown syntax is not accepted, and comparison remains exact after
 /// normalization so an appended label/state/action cannot hide drift.
 fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
-    if rule == "pass out quick proto udp from any port 68 to any port 67" {
+    if rule == "pass out quick proto udp from any port 68 to 255.255.255.255 port 67" {
         return Some(
-            "pass out quick proto udp from any port = 68 to any port = 67 keep state".into(),
+            "pass out quick inet proto udp from any port = 68 to 255.255.255.255 port = 67 keep state"
+                .into(),
         );
     }
     if rule == "pass in quick proto udp from any port 67 to any port 68" {
@@ -585,7 +586,7 @@ mod tests {
             "pass out quick inet from any to 172.16.0.0/12 flags any keep state",
             "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
             "pass out quick on lo0 all flags any keep state",
-            "pass out quick proto udp from any port = 68 to any port = 67 keep state",
+            "pass out quick inet proto udp from any port = 68 to 255.255.255.255 port = 67 keep state",
             "pass in quick proto udp from any port = 67 to any port = 68 keep state",
         ];
         default_optimizer_output.push(
@@ -704,7 +705,7 @@ mod tests {
             "pass out quick inet from any to 10.0.0.0/8 flags any keep state",
             "pass out quick inet from any to 172.16.0.0/12 flags any keep state",
             "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
-            "pass out quick proto udp from any port = 68 to any port = 67 keep state",
+            "pass out quick inet proto udp from any port = 68 to 255.255.255.255 port = 67 keep state",
             "pass in quick proto udp from any port = 67 to any port = 68 keep state",
             "pass out quick on utun4 all flags any keep state",
             "pass out quick inet from any to 198.51.100.7 flags any keep state",
@@ -721,6 +722,15 @@ mod tests {
 
         observed[0] = "pass out quick on lo0 all flags any keep state label \"foreign\"";
         assert!(!PfFirewall::canonical_snapshot_matches(&active, &observed));
+    }
+
+    /// Any process may bind source port 68, so the exception must not reach
+    /// arbitrary hosts; a LAN DHCP server is already covered by RFC1918.
+    #[test]
+    fn dhcp_exception_reaches_only_the_broadcast_address() {
+        let rules = PfFirewall::generate_pf_rules(&[]);
+        assert!(!rules.contains("to any port 67"));
+        assert!(rules.contains("port 68 to 255.255.255.255 port 67"));
     }
 
     /// Without `flags any`, pf matches only SYNs, so a localhost TCP flow
@@ -743,7 +753,7 @@ mod tests {
         assert!(rules.contains("pass out quick to 172.16.0.0/12"));
         assert!(rules.contains("pass out quick to 192.168.0.0/16"));
         // DHCP present.
-        assert!(rules.contains("port 68 to any port 67"));
+        assert!(rules.contains("port 68 to 255.255.255.255 port 67"));
         assert!(rules.contains("port 67 to any port 68"));
         // No per-tunnel rules.
         assert!(!rules.contains("pass out quick on utun"));
@@ -964,7 +974,7 @@ pass out quick to 172.16.0.0/12 flags any
 pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
-pass out quick proto udp from any port 68 to any port 67
+pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
 
 # Default: block all remaining egress
@@ -998,7 +1008,7 @@ pass out quick to 172.16.0.0/12 flags any
 pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
-pass out quick proto udp from any port 68 to any port 67
+pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
 
 # Tunnel: utun3 (primary=true)
@@ -1043,7 +1053,7 @@ pass out quick to 172.16.0.0/12 flags any
 pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
-pass out quick proto udp from any port 68 to any port 67
+pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
 
 # Tunnel: utun3 (primary=true)
