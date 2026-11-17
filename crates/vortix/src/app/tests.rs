@@ -2988,6 +2988,10 @@ mod overlay_keys {
 mod directory_import {
     use super::*;
 
+    /// Both tests import into the shared test config dir, whose profile store
+    /// refuses a second writer instead of waiting.
+    static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn write_profile(dir: &std::path::Path, name: &str) {
         std::fs::write(
             dir.join(format!("{name}.conf")),
@@ -3006,6 +3010,9 @@ mod directory_import {
 
     #[test]
     fn importing_a_folder_into_an_empty_list_selects_a_profile() {
+        let _store = STORE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut app = test_app();
         let dir = tempfile::tempdir().unwrap();
         let id = unique();
@@ -3020,6 +3027,9 @@ mod directory_import {
 
     #[test]
     fn importing_a_folder_keeps_the_selected_profile() {
+        let _store = STORE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut app = test_app();
         add_profiles(&mut app, &["zz-mine"]);
         app.profile_list_state.select(Some(0));
