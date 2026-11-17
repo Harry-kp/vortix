@@ -123,7 +123,8 @@ reconnect a dropped tunnel by itself. Up to 64 hooks.
 
 ## DNS
 
-When a tunnel carries DNS (WireGuard `DNS =`, or DNS an OpenVPN server pushes), Vortix applies
+When a tunnel carries DNS (WireGuard `DNS =`, or OpenVPN `dhcp-option` and `dns`, set in the
+profile or pushed by the server), Vortix applies
 it and restores the previous resolvers on disconnect. A NetBird network's own client sets its
 DNS, and Vortix leaves it alone.
 

@@ -213,19 +213,10 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             | "route-metric"
             | "route"
             | "route-ipv6" => apply_route_directive(&mut profile, &directive, &mut tokens, line),
-            "dhcp-option" => match tokens.next() {
-                Some(kind) if kind.eq_ignore_ascii_case("DNS") => {
-                    if let Some(server) = tokens.next().and_then(|value| value.parse().ok()) {
-                        profile.dns_servers.push(server);
-                    }
-                }
-                Some(kind)
-                    if kind.eq_ignore_ascii_case("DOMAIN")
-                        || kind.eq_ignore_ascii_case("DOMAIN-SEARCH") =>
-                {
-                    profile
-                        .dns_search_domains
-                        .extend(tokens.map(str::to_string));
+            "dhcp-option" | "dns" => match dns_setting(&directive, tokens) {
+                Ok(Some(DnsSetting::Servers(servers))) => profile.dns_servers.extend(servers),
+                Ok(Some(DnsSetting::Domains(domains))) => {
+                    profile.dns_search_domains.extend(domains);
                 }
                 _ => {}
             },
@@ -241,6 +232,57 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     }
 
     Ok(profile)
+}
+
+/// Resolvers or search domains one option sets.
+pub(super) enum DnsSetting {
+    Servers(Vec<IpAddr>),
+    Domains(Vec<String>),
+}
+
+/// The DNS an option sets: `dhcp-option DNS|DOMAIN|DOMAIN-SEARCH`, or
+/// `OpenVPN` 2.6's `dns server N address` and `dns search-domains`. `Ok(None)`
+/// for any other option; `Err` for one of these that is malformed.
+pub(super) fn dns_setting<'a>(
+    directive: &str,
+    mut tokens: impl Iterator<Item = &'a str>,
+) -> Result<Option<DnsSetting>, ()> {
+    let domains = |tokens: &mut dyn Iterator<Item = &'a str>| {
+        let domains = tokens.map(str::to_string).collect::<Vec<_>>();
+        if domains.is_empty() {
+            Err(())
+        } else {
+            Ok(Some(DnsSetting::Domains(domains)))
+        }
+    };
+    match (directive.trim_start_matches('-'), tokens.next()) {
+        ("dhcp-option", Some("DNS")) => {
+            let server = tokens
+                .next()
+                .and_then(|value| value.parse().ok())
+                .ok_or(())?;
+            Ok(Some(DnsSetting::Servers(vec![server])))
+        }
+        ("dhcp-option", Some("DOMAIN" | "DOMAIN-SEARCH")) | ("dns", Some("search-domains")) => {
+            domains(&mut tokens)
+        }
+        ("dns", Some("server")) if tokens.next().is_some() && tokens.next() == Some("address") => {
+            let servers = tokens
+                .map(|address| {
+                    address.parse().ok().or_else(|| {
+                        address
+                            .parse::<std::net::SocketAddr>()
+                            .ok()
+                            .map(|socket| socket.ip())
+                    })
+                })
+                .collect::<Option<Vec<IpAddr>>>()
+                .filter(|servers| !servers.is_empty())
+                .ok_or(())?;
+            Ok(Some(DnsSetting::Servers(servers)))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn parse_pull_filter(arguments: &[String]) -> Result<(PullFilterAction, String), ParseError> {
