@@ -425,7 +425,7 @@ fn extract_filename_from_url(url: &str) -> String {
         constants::EXT_CONF
     };
 
-    format!("{}.{}", constants::DEFAULT_IMPORTED_FILENAME, default_ext)
+    format!("{}{default_ext}", constants::DEFAULT_IMPORTED_FILENAME)
 }
 
 #[cfg(test)]
@@ -481,6 +481,16 @@ mod more_tests {
         assert!(std::path::Path::new(&result)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("conf")));
+    }
+
+    // The stem becomes a WireGuard interface name, so it must fit one.
+    #[test]
+    fn a_url_without_a_filename_gives_a_usable_wireguard_name() {
+        assert_eq!(
+            extract_filename_from_url("https://vpn.example.com/api/wireguard?id=7"),
+            "imported.conf"
+        );
+        assert!(crate::profile::validate_wireguard_interface_name("imported").is_ok());
     }
 
     #[test]
