@@ -235,7 +235,13 @@ impl Engine {
                 match message {
                     Msg::Shutdown => shutdown = true,
                     Msg::Settle(done) => {
+                        // A connect that came up in this same batch still counts.
+                        self.reconcile();
+                        self.settle();
+                        self.abandon_connects();
                         shutdown |= self.finish_transitions(rx);
+                        // The caller reads the outcome right after this reply.
+                        self.publish();
                         let _ = done.send(());
                     }
                     message => self.handle(message),
@@ -252,6 +258,22 @@ impl Engine {
         self.finish_transitions(rx);
         if let Some((runtime, hooks)) = self.hooks.take() {
             runtime.block_on(hooks.shutdown_bounded(Duration::from_secs(2)));
+        }
+    }
+
+    /// The caller stopped waiting: a connect it never saw finish, up but
+    /// without its network settings, is rolled back like one still starting.
+    fn abandon_connects(&mut self) {
+        let waited = self
+            .waits
+            .values()
+            .filter_map(|wait| match wait {
+                Wait::Up(profile_id) => Some(profile_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for profile_id in &waited {
+            self.stop(profile_id);
         }
     }
 
