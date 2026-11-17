@@ -489,6 +489,9 @@ pub fn load_effective_config(config_dir: &Path) -> Result<AppConfig, String> {
 }
 
 fn validate_engine_settings(engine: &crate::config::EngineSettings) -> Result<(), String> {
+    if !(1..=600).contains(&engine.connect_timeout_secs) {
+        return Err("connect_timeout_secs must be between 1 and 600 seconds".into());
+    }
     if !(1..=300).contains(&engine.wireguard_handshake_timeout_secs) {
         return Err("wireguard_handshake_timeout_secs must be between 1 and 300 seconds".into());
     }
@@ -1017,6 +1020,22 @@ mod tests {
 
         let config = load_effective_config(selected.path()).unwrap();
         assert_eq!(config.wireguard_handshake_timeout_secs, 7);
+    }
+
+    // Zero failed every OpenVPN and NetBird connect at once with a 0 s timeout.
+    #[test]
+    fn a_zero_connect_timeout_is_refused() {
+        let selected = tempfile::tempdir().unwrap();
+        std::fs::write(
+            selected.path().join("settings.toml"),
+            "[engine]\nconnect_timeout_secs = 0\n",
+        )
+        .unwrap();
+        let error = load_effective_config(selected.path()).unwrap_err();
+        assert!(
+            error.contains("connect_timeout_secs must be between 1 and 600"),
+            "{error}"
+        );
     }
 
     // ---- load_config ----
