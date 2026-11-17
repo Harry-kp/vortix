@@ -145,7 +145,7 @@ fn main() -> Result<()> {
     // available without administrator access.
     if args.command.is_none() && !vortix::platform::is_root() {
         eprintln!("Vortix needs administrator access to manage VPN connections.");
-        eprintln!("Try again with: sudo vortix");
+        eprintln!("Try again with: {}", cli::output::rerun_with_sudo());
         std::process::exit(cli::output::ExitCode::PermissionDenied.code());
     }
 

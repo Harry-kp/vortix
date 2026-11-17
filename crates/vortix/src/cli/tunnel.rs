@@ -183,7 +183,7 @@ pub(super) fn handle_up(
         print_error_and_exit(
             mode,
             "up",
-            err_permission_denied(&format!("vortix up {profile_name}")),
+            err_permission_denied(),
             ExitCode::PermissionDenied,
         );
     }
@@ -257,7 +257,7 @@ pub(super) fn handle_up(
             &data,
             vec![
                 "vortix status --json".into(),
-                "sudo vortix down --json".into(),
+                super::output::sudo_command(&["down", "--json"]),
             ],
         ),
         OutputMode::Quiet => {}
@@ -302,7 +302,8 @@ fn refuse_conflict(
             code,
             message,
             hint: Some(format!(
-                "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
+                "Pass --yes to bypass the conflict gate: {}",
+                super::output::sudo_command(&["up", profile_name, "--yes"])
             )),
         },
         ExitCode::StateConflict,
@@ -342,7 +343,7 @@ pub(super) fn handle_down(
         print_error_and_exit(
             mode,
             "down",
-            err_permission_denied("vortix down"),
+            err_permission_denied(),
             ExitCode::PermissionDenied,
         );
     }
@@ -475,7 +476,7 @@ pub(super) fn handle_reconnect(
         print_error_and_exit(
             mode,
             "reconnect",
-            err_permission_denied("vortix reconnect"),
+            err_permission_denied(),
             ExitCode::PermissionDenied,
         );
     }
@@ -598,7 +599,7 @@ pub(super) fn handle_reconnect(
                 &ReconnectData { reconnected },
                 vec![
                     "vortix status --json".into(),
-                    "sudo vortix down --json".into(),
+                    super::output::sudo_command(&["down", "--json"]),
                 ],
             );
         }

@@ -208,11 +208,62 @@ fn print_error(mode: OutputMode, command: &str, err: CliError) {
 
 /// Convenience: build a `CliError` for permission denied.
 #[must_use]
-pub fn err_permission_denied(fix_command: &str) -> CliError {
+pub fn err_permission_denied() -> CliError {
     CliError {
         code: "permission_denied",
         message: "VPN operations require root privileges".into(),
-        hint: Some(format!("Re-run with: sudo {fix_command}")),
+        hint: Some(format!("Re-run with: {}", rerun_with_sudo())),
+    }
+}
+
+/// This invocation as a `sudo` command to paste.
+#[must_use]
+pub fn rerun_with_sudo() -> String {
+    format!("sudo {}", this_command())
+}
+
+/// This invocation as a command to paste, with `-C` placed first.
+#[must_use]
+pub fn this_command() -> String {
+    let mut argv = std::env::args().skip(1);
+    let mut kept = Vec::new();
+    while let Some(arg) = argv.next() {
+        if arg == "-C" || arg == "--config-dir" {
+            argv.next();
+        } else if !arg.starts_with("-C") && !arg.starts_with("--config-dir=") {
+            kept.push(arg);
+        }
+    }
+    vortix_command(&kept.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// `sudo vortix <args>` for this config directory, quoted for a shell.
+#[must_use]
+pub fn sudo_command(args: &[&str]) -> String {
+    format!("sudo {}", vortix_command(args))
+}
+
+/// sudo resets the environment, so a directory chosen by
+/// `VORTIX_CONFIG_DIR` or `XDG_CONFIG_HOME` is passed as `-C`.
+fn vortix_command(args: &[&str]) -> String {
+    let config_dir = crate::config::get_config_dir().ok();
+    let sudo_default = crate::config::user_home()
+        .map(|home| home.join(".config").join(crate::constants::APP_NAME));
+    let mut words = vec!["vortix".to_string()];
+    if let Some(dir) = config_dir.filter(|dir| Some(dir) != sudo_default.as_ref()) {
+        words.push("-C".into());
+        words.push(shell_quote(&dir.to_string_lossy()));
+    }
+    words.extend(args.iter().map(|arg| shell_quote(arg)));
+    words.join(" ")
+}
+
+fn shell_quote(word: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c);
+    if !word.is_empty() && word.chars().all(plain) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
 }
 
@@ -229,6 +280,14 @@ pub fn err_not_found(profile: &str) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hints_quote_what_a_shell_would_split() {
+        assert_eq!(shell_quote("work"), "work");
+        assert_eq!(shell_quote("my vpn"), "'my vpn'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
 
     #[test]
     fn schema_version_is_pinned_to_2() {

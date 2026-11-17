@@ -197,7 +197,7 @@ fn err_not_found_helper() {
 
 #[test]
 fn err_permission_denied_helper() {
-    let err = vortix::cli::output::err_permission_denied("vortix up test");
+    let err = vortix::cli::output::err_permission_denied();
     assert_eq!(err.code, "permission_denied");
     assert!(err.hint.unwrap().contains("sudo"));
 }
@@ -326,10 +326,41 @@ fn autoconnect_changes_need_root_and_write_nothing_without_it() {
             output.status.code(),
             Some(ExitCode::PermissionDenied.code())
         );
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains(&format!("sudo vortix autoconnect {target}")));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "sudo vortix -C {} autoconnect {target}",
+                config.path().canonicalize().unwrap().display()
+            )),
+            "{stderr}"
+        );
     }
     assert_eq!(vortix::platform::autoconnect::installed_profile(), before);
+}
+
+/// The root hint dropped the arguments and `-C`: `down work` said to run
+/// `sudo vortix down`, which disconnects every tunnel.
+#[cfg(unix)]
+#[test]
+fn the_root_hint_repeats_the_whole_command() {
+    if vortix::platform::is_root() {
+        return;
+    }
+    let config = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box root hint
+        .arg("--config-dir")
+        .arg(config.path())
+        .args(["killswitch", "block-on-drop", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "sudo vortix -C {} killswitch block-on-drop --json",
+            config.path().canonicalize().unwrap().display()
+        )),
+        "{stdout}"
+    );
 }
 
 /// `vortix info | head -1` crashed with "Vortix crashed unexpectedly".
@@ -386,7 +417,10 @@ fn emergency_release_reaches_root_gate_before_normal_startup() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("VPN operations require root privileges"));
-    assert!(stderr.contains("sudo vortix release-killswitch"));
+    assert!(stderr.contains(&format!(
+        "sudo vortix -C {} release-killswitch",
+        config.path().canonicalize().unwrap().display()
+    )));
     assert!(!stderr.contains("failed to load settings"));
     assert!(!stderr.contains("profile identity migration"));
     assert!(!stderr.contains("Fix the file or remove it"));
@@ -833,7 +867,10 @@ fn tui_without_administrator_access_fails_before_terminal_startup() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.trim(),
-        "Vortix needs administrator access to manage VPN connections.\nTry again with: sudo vortix"
+        format!(
+            "Vortix needs administrator access to manage VPN connections.\nTry again with: sudo vortix -C {}",
+            config.path().canonicalize().unwrap().display()
+        )
     );
     assert!(!stderr.contains("Standard-mode"));
     assert!(!stderr.contains("invalid invoking owner"));

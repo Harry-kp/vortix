@@ -389,7 +389,7 @@ fn handle_autoconnect(target: Option<&str>, config_dir: &Path, mode: OutputMode)
             print_error_and_exit(
                 mode,
                 "autoconnect",
-                err_permission_denied(&format!("vortix autoconnect {target}")),
+                err_permission_denied(),
                 ExitCode::PermissionDenied,
             );
         }
@@ -517,7 +517,7 @@ fn handle_killswitch(
             print_error_and_exit(
                 output_mode,
                 "killswitch",
-                err_permission_denied(&format!("vortix killswitch {}", ks_mode.cli_verb())),
+                err_permission_denied(),
                 ExitCode::PermissionDenied,
             );
         }
@@ -587,7 +587,7 @@ pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
         print_error_and_exit(
             mode,
             "release-killswitch",
-            err_permission_denied("vortix release-killswitch"),
+            err_permission_denied(),
             ExitCode::PermissionDenied,
         );
     }
