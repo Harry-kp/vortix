@@ -35,7 +35,7 @@ pub enum SigilId {
     /// `?` yellow — awaiting credentials.
     AwaitingInput,
     /// `✗` red — Disconnected with a failure record.
-    Failed,
+
     /// `*` accent — Sidebar suffix marking the current Primary tunnel.
     PrimaryMarker,
     /// `!` warning — Sidebar risk annotation (e.g., `AddressableSuppressed`).
@@ -217,16 +217,6 @@ pub const CATALOG: &[Sigil] = &[
         category: SigilCategory::Sidebar,
     },
     Sigil {
-        id: SigilId::Failed,
-        glyph: "\u{2717}",
-        label: "Failed",
-        description: "Last connect attempt failed. The badge persists until you retry or dismiss the row.",
-        color: error_color,
-        bold: false,
-        dim: false,
-        category: SigilCategory::Sidebar,
-    },
-    Sigil {
         id: SigilId::PrimaryMarker,
         glyph: "*",
         label: "Primary marker",
@@ -350,7 +340,6 @@ mod tests {
             SigilId::Reconnecting,
             SigilId::Disconnecting,
             SigilId::AwaitingInput,
-            SigilId::Failed,
             SigilId::PrimaryMarker,
             SigilId::RiskMarker,
             SigilId::SgOk,
@@ -376,7 +365,6 @@ mod tests {
                 SigilId::Reconnecting => (),
                 SigilId::Disconnecting => (),
                 SigilId::AwaitingInput => (),
-                SigilId::Failed => (),
                 SigilId::PrimaryMarker => (),
                 SigilId::RiskMarker => (),
                 SigilId::SgOk => (),

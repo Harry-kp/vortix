@@ -188,9 +188,10 @@ fn profile_row(
         };
         let mut spans = vec![Span::styled(glyph, badge_style)];
         if signal.risk {
+            let risk = crate::ui::sigils::sigil(crate::ui::sigils::SigilId::RiskMarker);
             spans.push(Span::styled(
-                "!",
-                Style::default().fg(row_fg(is_selected, theme::current().warning)),
+                risk.glyph,
+                risk.style().fg(row_fg(is_selected, risk.color())),
             ));
         }
         Cell::from(Line::from(spans))
@@ -227,11 +228,10 @@ fn profile_row(
     let display_name = crate::ui::helpers::truncate_to_width(&profile.name, name_budget);
     let mut name_spans = vec![Span::styled(display_name, name_style)];
     if show_primary_marker {
+        let primary = crate::ui::sigils::sigil(crate::ui::sigils::SigilId::PrimaryMarker);
         name_spans.push(Span::styled(
-            " *",
-            Style::default()
-                .fg(row_fg(is_selected, signal.accent))
-                .add_modifier(Modifier::BOLD),
+            format!(" {}", primary.glyph),
+            primary.style().fg(row_fg(is_selected, primary.color())),
         ));
     }
     let name_cell = Cell::from(Line::from(name_spans));
