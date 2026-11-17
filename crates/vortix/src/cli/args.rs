@@ -209,16 +209,22 @@ pub enum Commands {
     #[command(visible_alias = "ls")]
     #[command(verbatim_doc_comment)]
     List {
-        /// Sort by: name, protocol, last-used [default: name]
-        #[arg(short, long, value_name = "FIELD")]
+        /// Sort order [default: name]
+        #[arg(short, long, value_name = "FIELD", value_parser = ["name", "protocol", "last-used"])]
         sort: Option<String>,
 
         /// Reverse sort order
         #[arg(short, long)]
         reverse: bool,
 
-        /// Filter by protocol [wireguard|openvpn]
-        #[arg(short, long, value_name = "PROTO")]
+        /// Only profiles of this protocol
+        #[arg(
+            short,
+            long,
+            value_name = "PROTO",
+            ignore_case = true,
+            value_parser = ["wireguard", "openvpn", "netbird"]
+        )]
         protocol: Option<String>,
 
         /// Print profile names only (one per line)

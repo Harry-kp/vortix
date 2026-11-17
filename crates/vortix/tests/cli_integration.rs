@@ -524,6 +524,17 @@ fn clap_parses_list_with_filters() {
     }
 }
 
+/// `--sort bogus` sorted by name and `--protocol wg` listed nothing, silently.
+#[test]
+fn clap_rejects_unknown_list_values() {
+    use clap::Parser;
+    use vortix::cli::args::Args;
+    for (flag, value) in [("--sort", "bogus"), ("--protocol", "wg")] {
+        assert!(Args::try_parse_from(["vortix", "list", flag, value]).is_err());
+    }
+    assert!(Args::try_parse_from(["vortix", "list", "--protocol", "NetBird"]).is_ok());
+}
+
 #[test]
 fn clap_parses_down_force() {
     use clap::Parser;
