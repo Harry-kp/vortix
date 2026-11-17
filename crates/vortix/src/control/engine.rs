@@ -428,10 +428,12 @@ impl Engine {
             // Linux refuses a second identical route, so a tunnel cannot come
             // up beside one with the same split routes: stop those first.
             if !overlapping.is_empty() {
+                // Registered first: a peer with nothing running stops at once.
+                self.after_stop
+                    .insert(profile_id, (ticket, overlapping.clone()));
                 for peer in &overlapping {
                     self.stop(peer);
                 }
-                self.after_stop.insert(profile_id, (ticket, overlapping));
                 return;
             }
         }
@@ -1433,6 +1435,127 @@ mod tests {
             range: range.into(),
             selected,
         }
+    }
+
+    fn ovpn(dir: &std::path::Path, name: &str, server: u8) -> crate::config::profiles::VpnProfile {
+        let path = dir.join(format!("{name}.ovpn"));
+        std::fs::write(
+            &path,
+            format!("client\ndev tun\nremote 203.0.113.{server} 1194\nroute 10.250.0.0 255.255.255.0\nauth-user-pass\n"),
+        )
+        .unwrap();
+        crate::config::profiles::VpnProfile {
+            id: ProfileId::new(name),
+            name: name.into(),
+            protocol: ProtocolKind::OpenVpn,
+            location: String::new(),
+            config_path: path,
+            last_used: None,
+            group: None,
+        }
+    }
+
+    fn test_engine(
+        dir: &std::path::Path,
+        profiles: Vec<crate::config::profiles::VpnProfile>,
+    ) -> (Engine, mpsc::Receiver<Msg>) {
+        let (uid, gid) = crate::platform::effective_user_group_ids();
+        let ownership =
+            Arc::new(TunnelOwnershipStore::new(dir.join("runtime"), uid, uid, "boot").unwrap());
+        let (tx, rx) = mpsc::channel();
+        let config = Config {
+            config_dir: dir.to_path_buf(),
+            tunnels: tunnels::Settings {
+                config_dir: dir.to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 5,
+                wireguard_handshake_timeout_secs: 5,
+                wireguard_health_targets: Vec::new(),
+            },
+            openvpn_timeout: Duration::from_secs(5),
+            mesh_timeout: Duration::from_secs(5),
+            wireguard_timeout: Duration::from_secs(5),
+            auto_reconnect: true,
+            reconnect_delay: Duration::ZERO,
+            max_retries: 3,
+            retry_base: Duration::from_secs(1),
+            retry_max: Duration::from_secs(8),
+            wireguard_stale_after: Duration::from_secs(180),
+        };
+        let engine = Engine {
+            net: Net::new(
+                dir.to_path_buf(),
+                NetworkPlan::default(),
+                Arc::clone(&ownership),
+            ),
+            hooks: None,
+            health: BTreeMap::new(),
+            entries: specs::load(dir, profiles),
+            config,
+            state: State::new(KillSwitchMode::Auto),
+            live: BTreeMap::new(),
+            up_at: BTreeMap::new(),
+            cancel: BTreeMap::new(),
+            errors: BTreeMap::new(),
+            actions: BTreeMap::new(),
+            prompts: BTreeMap::new(),
+            waits: BTreeMap::new(),
+            after_stop: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
+            notices: VecDeque::new(),
+            seq: 0,
+            drops: 0,
+            applied: None,
+            apply_error: None,
+            applied_at: Instant::now(),
+            ownership,
+            credentials: Arc::new(Mutex::new(FsOpenVpnCredentialStore::for_owner(
+                dir, uid, gid,
+            ))),
+            tx,
+            shared: Arc::new(super::super::Shared::default()),
+            published: Snapshot::default(),
+            scan: None,
+            scanning: false,
+            next_scan: Instant::now() + Duration::from_secs(3600),
+            external: Vec::new(),
+            last_connected: BTreeMap::new(),
+            last_generation: 0,
+        };
+        (engine, rx)
+    }
+
+    /// Bring `id` up in the tunnel list without starting a process.
+    fn up(engine: &mut Engine, id: &str, rank: u64) {
+        let spec = engine.entries[&ProfileId::new(id)].spec.clone().unwrap();
+        engine.state.begin(spec, rank, None, false).unwrap();
+        engine
+            .state
+            .came_up(&ProfileId::new(id), format!("utun{rank}"), [], [], None);
+        engine.up_at.insert(ProfileId::new(id), Instant::now());
+    }
+
+    /// A split tunnel waiting to reconnect stops at once; the switch to a
+    /// profile with the same routes must still start.
+    #[test]
+    fn a_switch_past_a_waiting_split_tunnel_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = vec![ovpn(dir.path(), "a", 5), ovpn(dir.path(), "b", 6)];
+        let (mut engine, _rx) = test_engine(dir.path(), profiles);
+        up(&mut engine, "a", 1);
+        engine.lost(&ProfileId::new("a"), false);
+
+        engine.command(7, Command::Switch(ProfileId::new("b")));
+
+        assert!(
+            engine.state.get(&ProfileId::new("a")).is_none(),
+            "a stopped"
+        );
+        assert!(
+            engine.state.get(&ProfileId::new("b")).is_some(),
+            "b never starts; pending switches: {:?}",
+            engine.after_stop.keys().collect::<Vec<_>>()
+        );
     }
 
     /// A failed read keeps the last networks; a list read empty (the admin
