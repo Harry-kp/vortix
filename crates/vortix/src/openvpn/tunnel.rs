@@ -470,20 +470,20 @@ impl OvpnTunnel {
         let profile_text = std::fs::read_to_string(&profile.config_path).map_err(|error| {
             TunnelError::Subprocess(format!("read OpenVPN profile for DNS intent: {error}"))
         })?;
-        let configured = parse_ovpn_conf(&profile_text)
-            .map_err(|error| TunnelError::Subprocess(format!("parse OpenVPN DNS intent: {error}")))?
-            .dns_request();
+        let parsed = parse_ovpn_conf(&profile_text).map_err(|error| {
+            TunnelError::Subprocess(format!("parse OpenVPN DNS intent: {error}"))
+        })?;
         let log_path = self.runtime_log_path(profile);
         let log = match std::fs::read_to_string(&log_path) {
             Ok(log) => log,
             Err(error) => {
                 return Ok(OvpnDnsEvidence::Unavailable {
-                    configured,
+                    configured: parsed.dns_request(),
                     reason: format!("read {}: {error}", log_path.display()),
                 });
             }
         };
-        Ok(pushed_dns_evidence(configured, &log))
+        Ok(pushed_dns_evidence(&parsed, &log))
     }
 
     fn runtime_log_path(&self, profile: &Profile) -> PathBuf {
@@ -507,7 +507,7 @@ impl OvpnTunnel {
                 log_path.display()
             ))
         })?;
-        let dns = pushed_dns_evidence(parsed.dns_request(), &log);
+        let dns = pushed_dns_evidence(&parsed, &log);
         let routes = crate::openvpn::push::openvpn_route_evidence(&parsed, &log, false).map_err(
             |error| TunnelError::Subprocess(format!("validate OpenVPN route evidence: {error}")),
         )?;
@@ -798,8 +798,12 @@ fn process_exists(pid: u32) -> bool {
 /// Missing, incomplete, or malformed runtime evidence is never interpreted
 /// as an authoritative empty request. The corresponding options are filtered
 /// from `OpenVPN` itself, so this is intent capture only.
-fn pushed_dns_evidence(mut request: crate::control::dns::DnsRequest, log: &str) -> OvpnDnsEvidence {
-    let push_reply = match latest_completed_push_options(log) {
+fn pushed_dns_evidence(
+    parsed: &crate::openvpn::parser::OvpnParsedProfile,
+    log: &str,
+) -> OvpnDnsEvidence {
+    let mut request = parsed.dns_request();
+    let push_reply = match latest_completed_push_options(parsed, log) {
         Ok(Some(push_reply)) => push_reply,
         Ok(None) => return OvpnDnsEvidence::ExplicitlyEmpty(request),
         Err(PushReplySelectionError::NoCompletedNegotiation) => {
@@ -1614,7 +1618,7 @@ mod tests {
     #[test]
     fn pushed_dns_is_captured_without_platform_mutation() {
         let evidence = pushed_dns_evidence(
-            crate::control::dns::DnsRequest::default(),
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
             "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example'\nInitialization Sequence Completed\n",
         );
         let OvpnDnsEvidence::Observed(request) = evidence else {
@@ -1690,12 +1694,13 @@ mod tests {
 
     #[test]
     fn completed_negotiation_without_pushed_dns_is_explicitly_empty() {
-        let configured = crate::control::dns::DnsRequest {
-            servers: vec!["1.1.1.1".parse().unwrap()],
-            search_domains: Vec::new(),
+        let parsed = crate::openvpn::parser::OvpnParsedProfile {
+            dns_servers: vec!["1.1.1.1".parse().unwrap()],
+            ..Default::default()
         };
+        let configured = parsed.dns_request();
         let evidence = pushed_dns_evidence(
-            configured.clone(),
+            &parsed,
             "PUSH_REPLY,redirect-gateway def1,ping 10\nInitialization Sequence Completed\n",
         );
         assert_eq!(evidence, OvpnDnsEvidence::ExplicitlyEmpty(configured));
@@ -1705,7 +1710,7 @@ mod tests {
     fn truncated_negotiation_is_unavailable_not_explicitly_empty() {
         let configured = crate::control::dns::DnsRequest::default();
         let evidence = pushed_dns_evidence(
-            configured.clone(),
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
             "PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1\n",
         );
         assert!(matches!(
@@ -1720,7 +1725,7 @@ mod tests {
     #[test]
     fn newer_incomplete_negotiation_does_not_reuse_old_pushed_dns() {
         let evidence = pushed_dns_evidence(
-            crate::control::dns::DnsRequest::default(),
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
             "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,redirect-gateway def1\n",
         );
         assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
@@ -1729,7 +1734,7 @@ mod tests {
     #[test]
     fn latest_completed_negotiation_replaces_older_pushed_dns() {
         let evidence = pushed_dns_evidence(
-            crate::control::dns::DnsRequest::default(),
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
             "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,dhcp-option DNS 10.9.0.1\nInitialization Sequence Completed\n",
         );
         let OvpnDnsEvidence::Observed(request) = evidence else {
@@ -1743,9 +1748,8 @@ mod tests {
 
     #[test]
     fn malformed_pushed_dns_is_unavailable_not_explicitly_empty() {
-        let configured = crate::control::dns::DnsRequest::default();
         let evidence = pushed_dns_evidence(
-            configured,
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
             "PUSH_REPLY,dhcp-option DNS not-an-address\nInitialization Sequence Completed\n",
         );
         assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
@@ -1771,5 +1775,19 @@ mod tests {
             OvpnDnsEvidence::Unavailable { configured, .. }
                 if configured.servers == vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]
         ));
+    }
+    #[test]
+    fn route_nopull_and_pull_filter_drop_pushed_dns() {
+        let log = "PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n";
+        for profile in [
+            "client\nroute-nopull\n",
+            "client\npull-filter ignore \"dhcp-option\"\n",
+        ] {
+            let parsed = parse_ovpn_conf(profile).unwrap();
+            assert_eq!(
+                pushed_dns_evidence(&parsed, log),
+                OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
+            );
+        }
     }
 }

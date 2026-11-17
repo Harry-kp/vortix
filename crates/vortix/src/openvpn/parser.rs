@@ -70,6 +70,52 @@ pub struct OvpnParsedProfile {
     pub dns_search_domains: Vec<String>,
     /// The first `cipher` directive.
     pub cipher: Option<String>,
+    /// Which pushed options the profile takes.
+    pub pull: PullPolicy,
+}
+
+/// `route-nopull` and `pull-filter`: which pushed options `OpenVPN` takes.
+#[derive(Debug, Default, Clone)]
+pub struct PullPolicy {
+    /// Pushed routes and DNS are not taken.
+    pub route_nopull: bool,
+    /// In profile order; the first one that matches wins.
+    pub filters: Vec<(PullFilterAction, String)>,
+}
+
+/// What a `pull-filter` does with a pushed option that starts with its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullFilterAction {
+    Accept,
+    Ignore,
+    /// `OpenVPN` restarts the connection instead, so no completed session holds one.
+    Reject,
+}
+
+impl PullPolicy {
+    /// Whether `OpenVPN` takes this pushed option, as `pull-filter` and
+    /// `route-nopull` decide.
+    #[must_use]
+    pub fn pulls(&self, option: &str) -> bool {
+        let filtered = self
+            .filters
+            .iter()
+            .find(|(_, text)| option.starts_with(text.as_str()))
+            .is_some_and(|(action, _)| *action != PullFilterAction::Accept);
+        let directive = option.split_whitespace().next().unwrap_or_default();
+        let route_or_dns = [
+            "route",
+            "route-ipv6",
+            "redirect-gateway",
+            "redirect-gateway-ipv6",
+            "redirect-private",
+            "dhcp-option",
+            "dns",
+        ]
+        .iter()
+        .any(|name| directive.eq_ignore_ascii_case(name));
+        !(filtered || self.route_nopull && route_or_dns)
+    }
 }
 
 impl OvpnParsedProfile {
@@ -154,6 +200,8 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             "remote-random" => {
                 profile.remote_random = true;
             }
+            "route-nopull" => profile.pull.route_nopull = true,
+            "pull-filter" => profile.pull.filters.push(parse_pull_filter(arguments)?),
             "cipher" if profile.cipher.is_none() => {
                 profile.cipher = tokens.next().map(str::to_string);
             }
@@ -193,6 +241,25 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     }
 
     Ok(profile)
+}
+
+fn parse_pull_filter(arguments: &[String]) -> Result<(PullFilterAction, String), ParseError> {
+    let [action, text] = arguments else {
+        return Err(pull_filter_error());
+    };
+    let action = match action.as_str() {
+        "accept" => PullFilterAction::Accept,
+        "ignore" => PullFilterAction::Ignore,
+        "reject" => PullFilterAction::Reject,
+        _ => return Err(pull_filter_error()),
+    };
+    Ok((action, text.clone()))
+}
+
+fn pull_filter_error() -> ParseError {
+    ParseError::Unsupported(
+        "OpenVPN `pull-filter` must be `pull-filter accept|ignore|reject \"text\"`: quote text that has spaces".into(),
+    )
 }
 
 fn apply_route_directive<'a, I>(
@@ -933,5 +1000,19 @@ mod tests {
             assert!(error.contains("TAP"), "{body}: {error}");
         }
         assert!(parse_ovpn_conf("client\ndev tun\n").is_ok());
+    }
+    #[test]
+    fn a_pull_filter_openvpn_would_refuse_is_refused() {
+        for line in [
+            "pull-filter ignore\n",
+            "pull-filter drop \"route\"\n",
+            "pull-filter ignore route 10.0.0.0\n",
+        ] {
+            let error = parse_ovpn_conf(&format!("client\n{line}")).unwrap_err();
+            assert!(error.to_string().contains("pull-filter"), "{line}");
+        }
+        let parsed = parse_ovpn_conf("client\npull-filter ignore \"dhcp-option DNS\"\n").unwrap();
+        assert!(!parsed.pull.pulls("dhcp-option DNS 10.8.0.1"));
+        assert!(parsed.pull.pulls("dhcp-option DOMAIN corp.example"));
     }
 }
