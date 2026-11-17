@@ -394,21 +394,8 @@ pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &
     }
 }
 
-/// Scan the `OpenVPN` auth directory and delete any leftover transient
-/// `<safe>.scrv1.auth` credentials bundle.
-///
-/// The bundle is a 3-line `user\npass\notp\n` file the submit handler
-/// writes for the protocol layer to consume at the start of a
-/// static-challenge connect. The protocol layer deletes the file
-/// immediately on read; if it's still on disk at vortix startup,
-/// something crashed mid-connect and the file is now an orphaned
-/// plaintext OTP that should never persist. The OTP would also be
-/// stale (TOTP expires in 30s), so the only correct cleanup is
-/// deletion — the user re-enters credentials on the next connect.
-///
-/// Silently skips files it can't read or delete — the scrubber must
-/// not block app startup. Each deletion is logged at warn level with
-/// the file name (NOT the file contents).
+/// Delete `<profile>.scrv1.auth` files older versions wrote: plaintext
+/// username, password and one-time code that nothing reads any more.
 pub fn scrub_stale_scrv1_auth_files() {
     let Ok(root) = crate::config::get_config_dir() else {
         return;
@@ -425,7 +412,7 @@ pub fn scrub_stale_scrv1_auth_files() {
         if name.to_ascii_lowercase().ends_with(".scrv1.auth") {
             tracing::warn!(
                 file = %name,
-                "AUTH: stale credentials bundle — clearing"
+                "AUTH: stale credentials file — clearing"
             );
             let _ = std::fs::remove_file(&path);
         }

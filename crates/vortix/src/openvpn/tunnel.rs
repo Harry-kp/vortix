@@ -197,35 +197,6 @@ fn remove_stale_managed_configs(parent: &Path, profile: &Profile, keep: &Path) {
     }
 }
 
-/// Read the credentials bundle file written by the TUI/CLI auth flow
-///. Returns
-/// `Ok(Some((user, pass, otp)))` when the file exists and has the
-/// expected 3-line shape, `Ok(None)` when the file is absent
-/// (non-MFA connect path), `Err` when the file exists but is
-/// malformed.
-fn read_mgmt_credentials_bundle(path: &Path) -> std::io::Result<Option<(String, String, String)>> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let mut lines = content.lines();
-            let user = lines.next().unwrap_or("").to_string();
-            let pass = lines.next().unwrap_or("").to_string();
-            let otp = lines.next().unwrap_or("").to_string();
-            // Best-effort delete: keep the credentials surface tiny.
-            // If delete fails the startup scrub catches the residue.
-            let _ = std::fs::remove_file(path);
-            if user.is_empty() || pass.is_empty() || otp.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "mgmt credentials bundle: empty field(s)",
-                ));
-            }
-            Ok(Some((user, pass, otp)))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 /// Adapt the shared bounded management driver to the tunnel
 /// error vocabulary. A non-empty answer selects the supported SCRV1 static
 /// challenge; every other interactive challenge remains fail-closed.
@@ -529,16 +500,6 @@ impl OvpnTunnel {
             ))
     }
 
-    /// Path used by the static-challenge SCRV1 envelope. The connect path writes the
-    /// envelope to this sibling of the canonical auth file, hands it
-    /// to openvpn via `--auth-user-pass`, and deletes it immediately
-    /// after the daemon fork returns — keeping the canonical
-    /// `<safe>.auth` plain at all times, with no race window for the
-    /// async TUI worker thread to lose against.
-    fn scrv1_auth_path(&self, profile_id: &str) -> PathBuf {
-        self.auth_dir.join(format!("{profile_id}.scrv1.auth"))
-    }
-
     fn management_socket_path(&self, profile_id: &str) -> PathBuf {
         super::management_socket_path(&self.run_dir, profile_id)
     }
@@ -563,10 +524,6 @@ impl OvpnTunnel {
 
     fn existing_auth_path(&self, profile: &Profile) -> Option<PathBuf> {
         existing_artifact(profile, |key| self.auth_path(key))
-    }
-
-    fn existing_scrv1_auth_path(&self, profile: &Profile) -> Option<PathBuf> {
-        existing_artifact(profile, |key| self.scrv1_auth_path(key))
     }
 }
 
@@ -934,18 +891,10 @@ impl OvpnTunnel {
             "ovpn.up: DNS mutation suppressed for coordinator-owned policy"
         );
 
-        // #191: if the
-        // credentials bundle file is present, this is a
-        // static-challenge connect. Read user/pass/otp out of the
-        // bundle (the file is consumed/deleted on read), spawn
-        // openvpn with `--management <sock> unix --management-hold
-        // --management-query-passwords --daemon`, and drive the auth
-        // dance over the socket on a worker thread while
-        // run_to_output waits for the parent to daemonize.
-        //
-        // Non-MFA profiles take the existing --auth-user-pass file
-        // path unchanged.
-        let service_creds = self
+        // A static-challenge connect gets its credentials in memory and
+        // answers OpenVPN over the management socket; every other profile
+        // uses `--auth-user-pass <file>`.
+        let mgmt_creds = self
             .static_challenge_credentials
             .as_ref()
             .map(|slot| {
@@ -963,25 +912,6 @@ impl OvpnTunnel {
                     })
             })
             .transpose()?;
-        let bundle_path = service_creds
-            .is_none()
-            .then(|| self.existing_scrv1_auth_path(profile))
-            .flatten();
-        let file_creds = if let Some(p) = &bundle_path {
-            read_mgmt_credentials_bundle(p)
-                .map_err(|e| TunnelError::Subprocess(format!("mgmt creds bundle: {e}")))?
-        } else {
-            None
-        };
-        let mgmt_creds = service_creds.or_else(|| {
-            file_creds.map(|(username, password, answer)| {
-                OpenVpnStaticChallengeCredentials::new(
-                    username,
-                    password,
-                    Secret::new(answer.into_bytes()),
-                )
-            })
-        });
 
         let mgmt_sock_path = if mgmt_creds.is_some() {
             let path = self.management_socket_path(artifact_key);
@@ -1264,10 +1194,6 @@ mod tests {
         assert_ne!(tunnel.pid_path(&first), tunnel.pid_path(&second));
         assert_ne!(tunnel.log_path(&first), tunnel.log_path(&second));
         assert_ne!(tunnel.auth_path(&first), tunnel.auth_path(&second));
-        assert_ne!(
-            tunnel.scrv1_auth_path(&first),
-            tunnel.scrv1_auth_path(&second)
-        );
         assert_ne!(
             tunnel.management_socket_path(&first),
             tunnel.management_socket_path(&second)

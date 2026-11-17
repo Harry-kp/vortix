@@ -278,8 +278,8 @@ pub enum InputMode {
         connect_after: bool,
         /// Prompt text from the .ovpn's `static-challenge` directive. When
         /// `Some`, the overlay renders a third (OTP) field labelled with
-        /// this text and the submit handler embeds the OTP in the
-        /// SCRV1 envelope. When `None`, the
+        /// this text and the connect answers it as the static challenge.
+        /// When `None`, the
         /// overlay renders the two-field layout unchanged.
         static_challenge_prompt: Option<String>,
         /// Show the password and OTP in the clear. Off by default and never

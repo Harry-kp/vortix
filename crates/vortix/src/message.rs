@@ -142,8 +142,8 @@ pub enum Message {
         password: crate::app::state::SecretText,
         /// 2FA code from the static-challenge OTP field, when the profile
         /// declares a `static-challenge` directive.
-        /// `None` for non-MFA profiles; the connect path embeds `Some(otp)`
-        /// in the SCRV1 envelope and the save path always writes plain.
+        /// `None` for non-MFA profiles; the connect path answers `Some(otp)`
+        /// over the management socket and the save path never stores it.
         otp: Option<crate::app::state::SecretText>,
         /// Whether to persist credentials for future sessions
         save: bool,
