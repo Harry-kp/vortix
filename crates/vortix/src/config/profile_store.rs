@@ -955,7 +955,10 @@ impl FsProfileStore {
         let new_config_file = format!("{new_name}.{extension}");
         let new_config = self.safe_profile_path(&new_config_file)?;
         let new_sidecar = self.sidecar_path(new_name);
-        if new_config.exists() || new_sidecar.exists() {
+        let taken = |new: &Path, old: &Path| new.exists() && !same_file_other_case(new, old);
+        if taken(&new_config, &profile.config_path)
+            || taken(&new_sidecar, &self.sidecar_path(&profile.display_name))
+        {
             return Err(ProfileStoreError::NameCollision {
                 name: new_name.to_string(),
             });
@@ -1025,6 +1028,9 @@ fn move_once(source: &Path, destination: &Path) -> std::io::Result<()> {
     match (source.exists(), destination.exists()) {
         (true, false) => std::fs::rename(source, destination),
         (false, true) => Ok(()),
+        (true, true) if same_file_other_case(source, destination) => {
+            std::fs::rename(source, destination)
+        }
         (true, true) => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -1042,6 +1048,18 @@ fn move_once(source: &Path, destination: &Path) -> std::io::Result<()> {
             ),
         )),
     }
+}
+
+/// Two names, differing only in case, for one file: a case-insensitive disk such as macOS's.
+fn same_file_other_case(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let lower = |path: &Path| path.to_string_lossy().to_lowercase();
+    a != b
+        && lower(a) == lower(b)
+        && matches!(
+            (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)),
+            (Ok(a), Ok(b)) if (a.dev(), a.ino()) == (b.dev(), b.ino())
+        )
 }
 
 fn remove_if_exists(path: &Path) -> std::io::Result<()> {
@@ -1285,6 +1303,22 @@ mod tests {
             Err(ProfileStoreError::InvalidWireGuardName(_))
         ));
         assert_eq!(store.list().unwrap()[0].display_name, "corp");
+    }
+
+    #[test]
+    fn rename_can_change_only_the_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsProfileStore::new(tmp.path().join("profiles"));
+        let profile = Profile::new(id(1), "Work", ProtocolKind::OpenVpn, PathBuf::from("x"));
+        store.insert(&profile, b"client\n").unwrap();
+        assert_eq!(store.rename(&id(1), "work").unwrap().display_name, "work");
+        let mut names = std::fs::read_dir(&store.profiles_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| !name.starts_with('.'))
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["work.meta.toml", "work.ovpn"]);
     }
 
     #[test]
