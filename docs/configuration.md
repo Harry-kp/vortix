@@ -47,7 +47,7 @@ api_timeout = 5
 ping_timeout = 2
 
 # Connecting and reconnecting (seconds)
-connect_timeout = 35                     # OpenVPN and NetBird, including a NetBird login
+connect_timeout = 35                     # 1–600; OpenVPN and NetBird, including a NetBird login
 wireguard_handshake_timeout_secs = 20
 wireguard_handshake_stale_secs = 180
 disconnect_timeout = 30
@@ -82,7 +82,7 @@ designed for dark backgrounds.
 ```toml
 [engine]
 openvpn_verbosity = "3"
-connect_timeout_secs = 35                # OpenVPN and NetBird, including a NetBird login
+connect_timeout_secs = 35                # 1–600; OpenVPN and NetBird, including a NetBird login
 wireguard_handshake_timeout_secs = 20    # 1–300
 wireguard_handshake_stale_secs = 180     # 1–86400
 wireguard_health_targets = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]   # up to 64 addresses
