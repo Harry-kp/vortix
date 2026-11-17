@@ -3119,3 +3119,20 @@ fn the_header_keeps_the_protocol_of_a_long_name_at_80_columns() {
     let tag = app.control_snapshot.tunnels[0].protocol.short();
     assert!(header.contains(&format!("/{tag})")), "{header}");
 }
+
+#[test]
+fn a_long_rename_keeps_its_cursor_on_screen() {
+    let name = "a-very-long-company-vpn-profile-name-for-the-frankfurt-region-01";
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| crate::ui::overlays::rename::render(f, name, name.chars().count()))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(screen.contains('\u{2588}'), "the cursor is off screen");
+}

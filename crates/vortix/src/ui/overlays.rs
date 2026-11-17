@@ -1678,7 +1678,6 @@ pub mod help {
     }
 }
 pub mod import {
-    use crate::ui::helpers::display_character;
     use crate::{constants, ui::theme};
     use ratatui::{
         layout::Alignment,
@@ -1687,59 +1686,6 @@ pub mod import {
         widgets::{Block, Borders, Paragraph},
         Frame,
     };
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-    fn prefix_window(characters: &[char], budget: usize) -> String {
-        let mut width = 0;
-        let mut end = 0;
-        for (index, character) in characters.iter().enumerate() {
-            let character_width = display_character(*character).width().unwrap_or(1);
-            let ellipsis = usize::from(index + 1 < characters.len());
-            if width + character_width + ellipsis > budget {
-                break;
-            }
-            width += character_width;
-            end = index + 1;
-        }
-        let mut output = characters[..end]
-            .iter()
-            .copied()
-            .map(display_character)
-            .collect::<String>();
-        if end < characters.len() && budget > 0 {
-            output.push('…');
-        }
-        output
-    }
-
-    /// Window a long path around its insertion cursor so the cursor is always
-    /// visible without widening the compact import dialog.
-    fn visible_path(path: &str, cursor: usize, max_width: usize) -> (String, String, String) {
-        let characters = path.chars().collect::<Vec<_>>();
-        let cursor = cursor.min(characters.len());
-        let cursor_character = characters
-            .get(cursor)
-            .copied()
-            .map_or('█', display_character);
-        let cursor_text = cursor_character.to_string();
-        let remaining = max_width.saturating_sub(cursor_text.width());
-        let (left_budget, right_budget) = if cursor == characters.len() {
-            (remaining, 0)
-        } else if cursor == 0 {
-            (0, remaining)
-        } else {
-            (remaining.div_ceil(2), remaining / 2)
-        };
-        let after_start = cursor + usize::from(cursor < characters.len());
-        (
-            crate::ui::helpers::truncate_start_to_width(
-                &characters[..cursor].iter().collect::<String>(),
-                left_budget,
-            ),
-            cursor_text,
-            prefix_window(&characters[after_start..], right_budget),
-        )
-    }
 
     pub fn render(frame: &mut Frame, path: &str, cursor: usize) {
         let area = frame.area();
@@ -1760,8 +1706,11 @@ pub mod import {
         let inner = block.inner(popup_area);
         frame.render_widget(block, popup_area);
 
-        let (before, cursor_char, after) =
-            visible_path(path, cursor, usize::from(inner.width.saturating_sub(3)));
+        let (before, cursor_char, after) = crate::ui::helpers::text_window(
+            path,
+            cursor,
+            usize::from(inner.width.saturating_sub(3)),
+        );
 
         let mut text = vec![
             Line::from(Span::styled(
@@ -1856,8 +1805,10 @@ pub mod import {
 
         #[test]
         fn long_path_keeps_the_cursor_visible_inside_the_fixed_dialog() {
+            use unicode_width::UnicodeWidthStr;
             let path = "/Users/harshit/Library/Application Support/vortix/profiles/imports";
-            let (before, cursor, after) = visible_path(path, path.chars().count(), 20);
+            let (before, cursor, after) =
+                crate::ui::helpers::text_window(path, path.chars().count(), 20);
             assert!(before.starts_with('…'), "{before}");
             assert_eq!(cursor, "█");
             assert!(after.is_empty());
@@ -1866,7 +1817,7 @@ pub mod import {
 
         #[test]
         fn path_window_sanitizes_control_characters_without_changing_cursor_position() {
-            let (before, cursor, after) = visible_path("ab\u{1b}cd", 2, 20);
+            let (before, cursor, after) = crate::ui::helpers::text_window("ab\u{1b}cd", 2, 20);
             assert_eq!(before, "ab");
             assert_eq!(cursor, "�");
             assert_eq!(after, "cd");
@@ -1913,12 +1864,12 @@ pub mod rename {
         let inner = block.inner(overlay);
         frame.render_widget(block, overlay);
 
-        let before: String = name.chars().take(cursor).collect();
-        let cursor_char: String = name
-            .chars()
-            .nth(cursor)
-            .map_or_else(|| "\u{2588}".to_string(), |c| c.to_string());
-        let after: String = name.chars().skip(cursor + 1).collect();
+        // "> " leads the field; the window keeps the cursor on screen.
+        let (before, cursor_char, after) = crate::ui::helpers::text_window(
+            name,
+            cursor,
+            usize::from(inner.width.saturating_sub(3)),
+        );
 
         let mut spans = vec![Span::styled(
             "> ",
@@ -1985,12 +1936,12 @@ pub mod search {
         let inner = block.inner(bar_area);
         frame.render_widget(block, bar_area);
 
-        let before: String = query.chars().take(cursor).collect();
-        let cursor_char: String = query
-            .chars()
-            .nth(cursor)
-            .map_or_else(|| "\u{2588}".to_string(), |c| c.to_string());
-        let after: String = query.chars().skip(cursor + 1).collect();
+        // "/" leads the field; the window keeps the cursor on screen.
+        let (before, cursor_char, after) = crate::ui::helpers::text_window(
+            query,
+            cursor,
+            usize::from(inner.width.saturating_sub(2)),
+        );
 
         let mut spans = vec![Span::styled(
             "/",
