@@ -86,10 +86,14 @@ pub fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, boo
     // One protocol-owned, bounded `wg show all dump` replaces one subprocess
     // per WireGuard profile. Interface resolution remains platform-owned; the
     // exact resolved interface selects its typed status from this snapshot.
-    let (wireguard_statuses, wireguard_observation_complete) = if profiles
-        .iter()
-        .any(|profile| matches!(profile.protocol, ProtocolKind::WireGuard))
-    {
+    // A profile whose interface does not resolve cannot be detected, so with
+    // none resolving there is nothing to ask `wg`. Without root the runtime
+    // files may be unreadable, so `wg` still decides there.
+    let (wireguard_statuses, wireguard_observation_complete) = if profiles.iter().any(|profile| {
+        matches!(profile.protocol, ProtocolKind::WireGuard)
+            && (!crate::platform::is_root()
+                || crate::platform::Interface::resolve_wireguard_interface(&profile.name).is_some())
+    }) {
         match crate::wireguard::WgTunnel::observe_all_interfaces() {
             Ok(statuses) => (statuses, true),
             // An absent `wg` is not an ambiguous observation. Vortix brings
