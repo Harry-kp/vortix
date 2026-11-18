@@ -112,11 +112,11 @@ pub fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, boo
     };
 
     // 1. Batch lookup for OpenVPN
-    let (openvpn_pids, openvpn_observation_complete) = if profiles
+    let (openvpn_processes, openvpn_observation_complete) = if profiles
         .iter()
         .any(|profile| matches!(profile.protocol, ProtocolKind::OpenVpn))
     {
-        get_all_openvpn_pids().map_or_else(|| (Vec::new(), false), |pids| (pids, true))
+        get_all_openvpn_processes().map_or_else(|| (Vec::new(), false), |found| (found, true))
     } else {
         (Vec::new(), true)
     };
@@ -128,14 +128,18 @@ pub fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, boo
                 let path_str = profile.config_path.to_str().unwrap_or("");
                 // Match either the exact source config argument or Vortix's
                 // exact generation-bound private config name.
-                openvpn_pids
+                openvpn_processes
                     .iter()
-                    .find(|(path, _)| {
-                        openvpn_config_matches_profile(path, path_str, profile.id.as_str())
+                    .find(|process| {
+                        openvpn_config_matches_profile(
+                            &process.config,
+                            path_str,
+                            profile.id.as_str(),
+                        )
                     })
-                    .and_then(|(_, pid)| {
-                        check_openvpn_by_pid(
-                            *pid,
+                    .and_then(|process| {
+                        check_openvpn_process(
+                            process,
                             &profile.config_path,
                             profile.id.as_str(),
                             &profile.name,
@@ -239,31 +243,53 @@ fn shell_words(command: &str) -> Vec<String> {
     words
 }
 
-fn get_all_openvpn_pids() -> Option<Vec<(PathBuf, u32)>> {
-    let mut processes = Vec::new();
-    // Use ps -ax -o pid,args to get PID and full command line
-    let output = cmd_output("ps", &["-ax", "-o", "pid,command"])?;
+/// A running `openvpn` with a `--config`, as one `ps` listing shows it.
+#[derive(Debug, PartialEq, Eq)]
+struct OpenVpnProcess {
+    config: PathBuf,
+    pid: u32,
+    started_at: Option<SystemTime>,
+    command: String,
+}
+
+fn get_all_openvpn_processes() -> Option<Vec<OpenVpnProcess>> {
+    let output = cmd_output("ps", &["-ax", "-o", "pid,etime,command"])?;
     if !output.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(parse_openvpn_processes(
+        &String::from_utf8_lossy(&output.stdout),
+        SystemTime::now(),
+    ))
+}
+
+/// Every `openvpn` with a `--config` in `ps -ax -o pid,etime,command` output.
+fn parse_openvpn_processes(stdout: &str, now: SystemTime) -> Vec<OpenVpnProcess> {
+    let mut processes = Vec::new();
     for line in stdout.lines().skip(1) {
-        // Skip header
-        let line = line.trim();
-        // Parse each process command once; profile matching below stays
-        // allocation-free even with many profiles and processes.
-        let mut fields = line.splitn(2, char::is_whitespace);
-        let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+        // The command keeps its own spacing: it can hold a quoted path.
+        let Some((pid, rest)) = line.trim_start().split_once(char::is_whitespace) else {
             continue;
         };
-        let command = fields.next().map(str::trim).unwrap_or_default();
-        if command.contains("openvpn") {
-            if let Some(config) = openvpn_config_argument(command) {
-                processes.push((PathBuf::from(config), pid));
-            }
+        let Some((etime, command)) = rest.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let (Ok(pid), command) = (pid.parse::<u32>(), command.trim()) else {
+            continue;
+        };
+        if !command.contains("openvpn") {
+            continue;
+        }
+        if let Some(config) = openvpn_config_argument(command) {
+            processes.push(OpenVpnProcess {
+                config: PathBuf::from(config),
+                pid,
+                started_at: parse_ps_etime(etime).and_then(|elapsed| now.checked_sub(elapsed)),
+                command: command.to_owned(),
+            });
         }
     }
-    Some(processes)
+    processes
 }
 
 /// Checks if a `WireGuard` interface exists and returns session details.
@@ -369,30 +395,21 @@ fn check_wireguard_by_name(
 /// - Internal IP from the tun/tap interface
 /// - MTU from the interface
 /// - Remote endpoint from process args or config file
-fn check_openvpn_by_pid(
-    pid: u32,
+fn check_openvpn_process(
+    process: &OpenVpnProcess,
     config_path: &Path,
     profile_id: &str,
     display_name: &str,
 ) -> Option<ActiveSession> {
+    let pid = process.pid;
     let mut session = ActiveSession {
+        started_at: process.started_at,
         details: crate::tunnel::DetailedConnectionInfo {
             pid: Some(pid),
             ..Default::default()
         },
         ..Default::default()
     };
-
-    // Get process elapsed time using ps etime format: [[dd-]hh:]mm:ss
-    if let Some(output) = cmd_output("ps", &["-p", &pid.to_string(), "-o", "etime="]) {
-        let etime = String::from_utf8_lossy(&output.stdout);
-        let etime = etime.trim();
-        if !etime.is_empty() {
-            if let Some(duration) = parse_ps_etime(etime) {
-                session.started_at = SystemTime::now().checked_sub(duration);
-            }
-        }
-    }
 
     // 2. Find OpenVPN tun/tap interface
     let mut detected_iface = String::new();
@@ -489,16 +506,14 @@ fn check_openvpn_by_pid(
     }
 
     // Try to get remote server from process arguments first
-    if let Some(output) = cmd_output("ps", &["-p", &pid.to_string(), "-o", "args="]) {
-        let args = String::from_utf8_lossy(&output.stdout);
-        if let Some(remote_idx) = args.find("--remote") {
-            let rest = args.get(remote_idx + "--remote ".len()..).unwrap_or("");
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            if !parts.is_empty() {
-                let host = parts[0];
-                let port = parts.get(1).unwrap_or(&"1194");
-                session.details.endpoint = format!("{host}:{port}");
-            }
+    let args = &process.command;
+    if let Some(remote_idx) = args.find("--remote") {
+        let rest = args.get(remote_idx + "--remote ".len()..).unwrap_or("");
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if !parts.is_empty() {
+            let host = parts[0];
+            let port = parts.get(1).unwrap_or(&"1194");
+            session.details.endpoint = format!("{host}:{port}");
         }
     }
 
@@ -669,6 +684,26 @@ mod tests {
                 crate::platform::DefaultRouteObservation::ProbeFailed
             ),
             "default ScannerResult must have no route interface"
+        );
+    }
+
+    #[test]
+    fn openvpn_processes_carry_start_time_and_args_from_one_listing() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let listing = "  PID     ELAPSED COMMAND
+    1  2-03:04:05 /sbin/launchd
+  812       01:23 openvpn --config '/p/my  corp.ovpn' --remote vpn.example 443
+  900       00:05 openvpn --version
+  901 bogus
+";
+        assert_eq!(
+            parse_openvpn_processes(listing, now),
+            vec![OpenVpnProcess {
+                config: PathBuf::from("/p/my  corp.ovpn"),
+                pid: 812,
+                started_at: Some(now - Duration::from_secs(83)),
+                command: "openvpn --config '/p/my  corp.ovpn' --remote vpn.example 443".into(),
+            }]
         );
     }
 
