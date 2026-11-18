@@ -213,6 +213,7 @@ fn main() -> Result<()> {
 
     // Plaintext credentials files older versions left in the auth dir.
     vortix::openvpn::scrub_stale_scrv1_auth_files();
+    vortix::config::remove_retired_files(&config_dir);
 
     // Hold a process-lifetime scratch lease before sweeping. Concurrent CLI
     // and TUI processes intentionally have different journal session IDs;

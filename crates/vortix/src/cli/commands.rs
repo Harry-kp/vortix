@@ -916,27 +916,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn unreadable_control_history_does_not_block_emergency_release_persistence() {
-        let config = tempfile::tempdir().unwrap();
-        let control_dir = config.path().join("control");
-        std::fs::create_dir(&control_dir).unwrap();
-        std::fs::write(control_dir.join("control-state.json"), b"corrupt").unwrap();
-        std::fs::write(control_dir.join("control-state.previous.json"), b"corrupt").unwrap();
-
-        persist_emergency_release_off(config.path()).unwrap();
-
-        let saved =
-            std::fs::read_to_string(config.path().join(crate::constants::KILLSWITCH_STATE_FILE))
-                .unwrap();
-        let state: crate::control::killswitch::PersistedState =
-            serde_json::from_str(&saved).unwrap();
-        assert_eq!(state.mode, crate::control::killswitch::KillSwitchMode::Off);
-        assert_eq!(
-            state.state,
-            crate::control::killswitch::KillSwitchState::Disabled
-        );
-        assert!(state.emergency_release_fence);
-    }
 }

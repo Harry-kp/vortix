@@ -597,6 +597,12 @@ pub fn check_migration(new_dir: &Path) -> Option<PathBuf> {
 /// # Errors
 ///
 /// Returns an error if file operations fail.
+/// State earlier versions kept in the config directory that nothing reads now.
+pub fn remove_retired_files(config_dir: &Path) {
+    let _ = std::fs::remove_dir_all(config_dir.join("control"));
+    let _ = std::fs::remove_file(config_dir.join("vortix-receipt.json"));
+}
+
 pub fn migrate_data(old_dir: &Path, new_dir: &Path) -> std::io::Result<()> {
     use crate::constants::{
         KILLSWITCH_STATE_FILE, LOGS_DIR_NAME, OPENVPN_AUTH_DIR, OPENVPN_RUN_DIR, PROFILES_DIR_NAME,
@@ -888,6 +894,20 @@ pub(crate) fn set_temp_config_dir() -> (tempfile::TempDir, std::sync::MutexGuard
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_state_is_removed_and_profiles_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("control")).unwrap();
+        std::fs::write(dir.path().join("control/control-state.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("vortix-receipt.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        std::fs::write(dir.path().join("profiles/a.conf"), "x").unwrap();
+        remove_retired_files(dir.path());
+        assert!(!dir.path().join("control").exists());
+        assert!(!dir.path().join("vortix-receipt.json").exists());
+        assert!(dir.path().join("profiles/a.conf").exists());
+    }
 
     #[test]
     fn home_relative_replaces_only_a_whole_home_directory() {
