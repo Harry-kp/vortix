@@ -614,7 +614,9 @@ fn run_tui(
             // render frame is the difference between smooth-scrolling and
             // the TUI feeling wedged for tens of seconds while it grinds
             // through a backlog the user already left behind.
-            dispatch_event(&mut app, events.next()?);
+            if let Some(event) = events.next_within(std::time::Duration::from_secs(1))? {
+                dispatch_event(&mut app, event);
+            }
             while let Some(event) = events.try_next()? {
                 dispatch_event(&mut app, event);
             }

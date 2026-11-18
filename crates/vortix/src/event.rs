@@ -101,13 +101,21 @@ impl EventHandler {
         }
     }
 
-    /// Blocks until the next event is available.
+    /// The next event, or `None` after `timeout` without one: on a hung-up
+    /// terminal the input thread can stall, and the caller must still see
+    /// a quit request.
     ///
     /// # Errors
     ///
     /// Returns an error if the event channel is disconnected.
-    pub fn next(&self) -> Result<Event> {
-        Ok(self.receiver.recv()?)
+    pub fn next_within(&self, timeout: Duration) -> Result<Option<Event>> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(eyre::eyre!("Event channel disconnected"))
+            }
+        }
     }
 
     /// Non-blocking poll for the next event. Returns `Ok(None)` when the
