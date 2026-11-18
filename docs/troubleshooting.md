@@ -46,10 +46,11 @@ left running. The rest of the message names what failed.
 **"This profile needs saved credentials".** The CLI cannot type an OpenVPN username and
 password. Save them once in the dashboard (`a` on the profile).
 
-**"Not started by Vortix, left running".** `down` found a tunnel Vortix did not start: another
-VPN tool's, or one an earlier Vortix version left behind. Stop it with the tool that started
-it; for a leftover from Vortix 0.4.3, restart the computer once (see
-[Upgrading](MIGRATION.md)).
+**"Not started by Vortix, left running"** or **"… is up but Vortix did not start it"**. `down`
+found, or a connect would stack on, a tunnel Vortix did not start: another VPN tool's, or one an
+earlier Vortix version or a crashed Vortix left behind. A full tunnel like that also blocks
+connecting another full tunnel (exit 4). Stop it with the tool that started it, or restart the
+computer once (see [Upgrading](MIGRATION.md) for a leftover from Vortix 0.4.3).
 
 **A split tunnel connects but the public IP does not change.** Expected: it carries only its
 own routes. Security Guard shows `split-route — no exit`. Check a routed address instead:

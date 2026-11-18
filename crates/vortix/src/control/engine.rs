@@ -440,6 +440,27 @@ impl Engine {
                 return;
             }
         };
+        // A tunnel Vortix did not start cannot be stopped or switched away
+        // from; a full tunnel stacked on top of one broke the host's routing.
+        let blocking = self.external.iter().find(|name| {
+            **name == entry.profile.name
+                || (crate::cidr::is_full(&spec.routes)
+                    && self.entries.values().any(|other| {
+                        other.profile.name == **name
+                            && other
+                                .spec
+                                .as_ref()
+                                .is_ok_and(|other| crate::cidr::is_full(&other.routes))
+                    }))
+        });
+        if let Some(name) = blocking {
+            let text = format!(
+                "'{name}' is up but Vortix did not start it; stop it with the tool that started it, or restart the computer"
+            );
+            self.notice(Level::Error, text.clone());
+            self.outcomes.insert(ticket, Outcome::Failed(text));
+            return;
+        }
         // A running tunnel knows the routes its server pushed.
         let known = self
             .state
@@ -1918,6 +1939,28 @@ mod tests {
                 HookEvent::Connected
             ]
         );
+    }
+
+    /// A full tunnel Vortix did not start cannot be switched away from, so
+    /// another full tunnel is refused rather than stacked on top of it.
+    #[test]
+    fn a_full_tunnel_vortix_did_not_start_blocks_another_full_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = vec![ovpn(dir.path(), "a", 5), ovpn(dir.path(), "b", 6)];
+        for profile in &profiles {
+            let mut text = std::fs::read_to_string(&profile.config_path).unwrap();
+            text.push_str("redirect-gateway def1\n");
+            std::fs::write(&profile.config_path, text).unwrap();
+        }
+        let (mut engine, _rx) = test_engine(dir.path(), profiles);
+        engine.external = vec!["a".into()];
+        engine.connect(7, ProfileId::new("b"), true);
+        assert!(
+            matches!(&engine.outcomes[&7], Outcome::Failed(text) if text.contains("'a' is up but Vortix did not start it")),
+            "{:?}",
+            engine.outcomes.get(&7)
+        );
+        assert!(engine.state.get(&ProfileId::new("b")).is_none());
     }
 
     /// The routes move to the new tunnel before the old one's teardown starts:

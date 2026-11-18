@@ -265,7 +265,7 @@ fn failure_code(message: &str) -> (&'static str, ExitCode) {
         || message.contains("Missing dependencies:")
     {
         ("dependency_missing", ExitCode::DependencyMissing)
-    } else if message.contains("can run at a time") {
+    } else if message.contains("can run at a time") || message.contains("Vortix did not start it") {
         // Another network of the same kind, or its vendor's own app, holds it.
         ("state_conflict", ExitCode::StateConflict)
     } else if message.contains("rejected the credentials") {
