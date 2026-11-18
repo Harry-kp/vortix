@@ -680,7 +680,7 @@ mod handshake_status_tests {
                 Some("WireGuard"),
                 60,
             ),
-            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C stops waiting, not the connecting)…".into())
+            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C cancels)…".into())
         );
         assert_eq!(
             lifecycle_progress_message(
@@ -690,7 +690,7 @@ mod handshake_status_tests {
                 None,
                 30,
             ),
-            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s (Ctrl-C stops waiting, not the disconnecting)…".into())
+            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s…".into())
         );
         assert!(lifecycle_progress_message(
             OutputMode::Json,

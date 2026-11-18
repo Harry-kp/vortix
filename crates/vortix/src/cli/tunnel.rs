@@ -23,13 +23,14 @@ pub(super) fn lifecycle_progress_message(
         return None;
     }
     let protocol = protocol.map_or_else(String::new, |value| format!(" ({value})"));
-    // Nothing here installs a SIGINT handler, so Ctrl-C only stops this
-    // process waiting — the admitted operation carries on and can still
-    // bring the tunnel up. Saying "cancels" left people believing an
-    // interrupted connect had been called off while it was completing.
+    // Ctrl-C rolls a connect back; a disconnect finishes either way.
+    let cancel = if action == "Disconnecting" {
+        ""
+    } else {
+        " (Ctrl-C cancels)"
+    };
     Some(format!(
-        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s (Ctrl-C stops waiting, not the {action_lower})…",
-        action_lower = action.to_lowercase()
+        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s{cancel}…"
     ))
 }
 

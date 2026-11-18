@@ -635,6 +635,9 @@ fn run_tui(
                 }
             }
         }
+        if vortix::process::termination_requested() {
+            app.handle_message(vortix::message::Message::Quit);
+        }
         app.process_external();
         let frame = terminal.draw(|frame| ui::render(frame, &mut app))?;
         app.open_clicked_link(frame.buffer);

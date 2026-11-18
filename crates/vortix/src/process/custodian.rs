@@ -12,7 +12,6 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -550,8 +549,7 @@ fn run_hidden() -> Result<(), CustodianError> {
     if !request.identity.has_valid_token() {
         return Err(CustodianError::Protocol("invalid identity".into()));
     }
-    TERMINATE.store(false, Ordering::Relaxed);
-    install_termination_handler();
+    super::handle_termination(&[libc::SIGTERM, libc::SIGINT]);
     let _profile_lock = lock_profile(&request.identity.profile_id)?;
     let socket_path = socket_path(&request.identity);
     let _ = std::fs::remove_file(&socket_path);
@@ -560,7 +558,7 @@ fn run_hidden() -> Result<(), CustodianError> {
     listener.set_nonblocking(true)?;
 
     let graceful_timeout = Duration::from_millis(request.graceful_timeout_ms.clamp(1, 60_000));
-    if TERMINATE.load(Ordering::Relaxed) {
+    if super::termination_requested() {
         return Err(CustodianError::Protocol(
             "custodian terminated before child spawn".into(),
         ));
@@ -588,7 +586,7 @@ fn run_hidden() -> Result<(), CustodianError> {
         }
     };
     let owned_result = (|| -> Result<(), CustodianError> {
-        if TERMINATE.load(Ordering::Relaxed) {
+        if super::termination_requested() {
             return Err(CustodianError::Protocol(
                 "custodian terminated during child spawn".into(),
             ));
@@ -617,7 +615,7 @@ fn run_hidden() -> Result<(), CustodianError> {
         drop(input);
 
         loop {
-            if TERMINATE.load(Ordering::Relaxed) {
+            if super::termination_requested() {
                 custodian.stop(&request.identity)?;
                 break;
             }
@@ -765,7 +763,7 @@ fn handle_client<P: ProcessLifecycle>(
 
 fn read_commit_interruptible<R: BufRead>(input: &mut R) -> Result<HandoffFrame, CustodianError> {
     loop {
-        if TERMINATE.load(Ordering::Relaxed) {
+        if super::termination_requested() {
             return Err(CustodianError::Protocol(
                 "custodian terminated before COMMIT".into(),
             ));
@@ -1011,25 +1009,6 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
             return Err(std::io::Error::last_os_error());
         }
         Ok(uid)
-    }
-}
-
-static TERMINATE: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn termination_handler(_: libc::c_int) {
-    TERMINATE.store(true, Ordering::Relaxed);
-}
-
-fn install_termination_handler() {
-    // SAFETY: the handler only performs one lock-free atomic store.
-    #[allow(unsafe_code)]
-    unsafe {
-        // Reify to a pointer before the integer cast: a direct function-item
-        // cast is what `function_casts_as_integer` warns about, and this is
-        // the handler that lets the custodian tear tunnels down on exit.
-        let handler = termination_handler as *const () as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGINT, handler);
     }
 }
 

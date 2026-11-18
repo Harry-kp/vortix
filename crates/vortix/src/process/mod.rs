@@ -62,6 +62,32 @@ use std::sync::OnceLock;
 
 static GLOBAL_RUNNER: OnceLock<CommandRunner> = OnceLock::new();
 
+static TERMINATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn termination_handler(_: libc::c_int) {
+    TERMINATE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Turn `signals` into a flag the process polls with [`termination_requested`],
+/// so it can finish or roll back what it started instead of dying halfway.
+pub fn handle_termination(signals: &[libc::c_int]) {
+    // SAFETY: the handler only performs one lock-free atomic store.
+    #[allow(unsafe_code)]
+    unsafe {
+        // Reify to a pointer before the integer cast: a direct function-item
+        // cast is what `function_casts_as_integer` warns about.
+        let handler = termination_handler as *const () as libc::sighandler_t;
+        for signal in signals {
+            libc::signal(*signal, handler);
+        }
+    }
+}
+
+/// A signal [`handle_termination`] set up has arrived.
+pub fn termination_requested() -> bool {
+    TERMINATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Get the process-wide runner. Unit tests that never install one get a
 /// mock that succeeds at every call; everything else gets the real runner,
 /// so a missing setup can never turn commands into silent successes.
