@@ -107,7 +107,7 @@ dashboard's Logs panel (`f` until the title names the profile).
   `static-challenge` one-time code; a saved password is kept.
 - TLS timeout: the server is unreachable, or the certificates or protocol do not match.
 - Connected but no traffic: the server's pushed routes, forwarding or NAT.
-- `pull-filter must be …` at import: write `pull-filter accept|ignore|reject "text"`, with
+- ``OpenVPN `pull-filter` must be …`` at import: write `pull-filter accept|ignore|reject "text"`, with
   the text quoted when it has spaces; `openvpn` refuses any other form too.
 
 ## NetBird
