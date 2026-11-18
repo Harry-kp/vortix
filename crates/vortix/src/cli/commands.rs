@@ -143,19 +143,40 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
     if let Some(pid) = pid_filter {
         snapshots.retain(|s| s.pid == pid);
     }
+    let remotes: Vec<_> = snapshots
+        .iter()
+        .filter_map(|s| s.remote.map(|r| r.ip()).filter(|ip| !ip.is_unspecified()))
+        .collect();
+    let mut routed = crate::platform::Routes::route_interfaces_for(&remotes).into_iter();
+    for s in &mut snapshots {
+        if s.remote.is_some_and(|r| !r.ip().is_unspecified()) {
+            s.interface = routed
+                .next()
+                .and_then(|observed| observed.interface().map(str::to_string));
+        }
+    }
     if vpn_only {
-        // Best-effort: filter to sockets whose `interface` field matches the
-        // active WireGuard interface (when resolvable). Today the
-        // Linux /proc impl doesn't populate `interface`, so this filter is a
-        // future-hardening hook — the doc warns users that v0.3.0 may show
-        // an empty result.
-        snapshots.retain(|s| s.interface.is_some());
+        let tunnels: Vec<String> =
+            crate::control::scanner::get_active_profiles(&crate::config::profiles::load_profiles())
+                .into_iter()
+                .map(|session| session.details.interface)
+                .collect();
+        snapshots.retain(|s| s.interface.as_ref().is_some_and(|i| tunnels.contains(i)));
     }
     snapshots.sort_by_key(|s| s.pid);
 
     match mode {
         OutputMode::Human => {
-            println!("PID    COMMAND          PROTO   LOCAL                            REMOTE                           IFACE");
+            let width = snapshots
+                .iter()
+                .map(|s| s.command.chars().count())
+                .max()
+                .unwrap_or(0)
+                .clamp(7, 32);
+            println!(
+                "{:<6} {:<width$} {:<5} {:<32} {:<32} IFACE",
+                "PID", "COMMAND", "PROTO", "LOCAL", "REMOTE"
+            );
             for s in &snapshots {
                 // An unresolved owner came out as a bare `0`, which reads as
                 // the kernel rather than "not known" — and stays 0 for many
@@ -172,7 +193,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
                     s.command.as_str()
                 };
                 println!(
-                    "{:<6} {:<16} {:<7} {:<32} {:<32} {}",
+                    "{:<6} {:<width$} {:<5} {:<32} {:<32} {}",
                     pid,
                     command,
                     s.protocol,
