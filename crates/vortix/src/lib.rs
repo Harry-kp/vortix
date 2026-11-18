@@ -45,6 +45,7 @@ pub mod platform;
 pub mod state;
 pub mod theme;
 pub mod topology_policy;
+pub mod trace;
 pub mod tunnel;
 pub mod ui;
 pub mod utils;

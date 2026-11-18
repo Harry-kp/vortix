@@ -91,6 +91,17 @@ impl CachedConfigView {
 /// evidence already accepted for this scope" names no cause the user controls
 /// and suggests no action. Ordering and busy conditions resolve on the next
 /// poll, so they belong in the log, not in a red toast.
+/// Whether an interface name belongs to a VPN tunnel.
+///
+/// Interface naming is the only cross-platform signal available here:
+/// `tun*`/`tap*` for `OpenVPN`, `utun*` on macOS, `wg*` for `WireGuard`.
+pub(crate) fn is_tunnel_interface(name: &str) -> bool {
+    name.starts_with("tun")
+        || name.starts_with("tap")
+        || name.starts_with("utun")
+        || name.starts_with("wg")
+}
+
 pub(crate) fn control_failure_message(error: &str) -> Option<String> {
     let lowered = error.to_ascii_lowercase();
     if lowered.contains("older than evidence")
@@ -415,6 +426,21 @@ impl App {
         self.handle_message(Message::Tick);
     }
 
+    /// Whether the kernel currently sends internet traffic through a tunnel.
+    ///
+    /// Asked of the route table, not of Vortix's own bookkeeping, so a tunnel
+    /// Vortix does not own still counts. The scanner resolves this per tick
+    /// (`ip route get` / `route -n get`), which follows an `OpenVPN` split
+    /// default the same way real traffic does.
+    pub(crate) fn egress_leaves_through_a_tunnel(&self) -> bool {
+        self.control_snapshot
+            .observed
+            .default_route
+            .as_ref()
+            .and_then(|route| route.interface_name.as_deref())
+            .is_some_and(is_tunnel_interface)
+    }
+
     /// Surface a control-service failure once per transition.
     ///
     /// The service is polled continuously, so a persistent fault used to
@@ -426,8 +452,11 @@ impl App {
         let Some(message) = control_failure_message(error) else {
             // Self-correcting and already retried. A red toast naming the
             // internals gave the user nothing to do about a condition that
-            // clears itself on the next poll.
+            // clears itself on the next poll — but a condition that keeps
+            // recurring stops being transient, and hiding it from the log
+            // too left a frozen view with nothing to explain it.
             tracing::debug!(target: "vortix::control", %error, "transient control condition");
+            self.log(&format!("DIAG: system reading rejected — {error}"));
             return;
         };
         if self.last_control_error.as_deref() == Some(message.as_str()) {

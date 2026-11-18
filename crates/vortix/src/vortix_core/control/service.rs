@@ -1219,7 +1219,7 @@ impl ControlHandle {
                     // routes from rejecting (or racing) the future target.
                     if matches!(
                         &request.command,
-                        UserCommand::ConnectExclusive { profile_id: target }
+                        UserCommand::ConnectExclusive { profile_id: target, .. }
                             if target == profile_id
                     ) {
                         continue;
@@ -1694,11 +1694,28 @@ struct OwnerState {
     unexpected_recoveries: BTreeMap<OperationId, UnexpectedRecovery>,
     lifecycle_operations: BTreeMap<OperationId, LifecycleOperation>,
     topology_transaction: Option<TopologyTransaction>,
+    abandoned_work: Vec<(ProfileId, OperationId)>,
     next_lifecycle_event: u64,
     diagnostics: crate::vortix_core::control::DiagnosticBuffer,
 }
 
 impl OwnerState {
+    /// Remember work an operation still owns as it ends without succeeding.
+    ///
+    /// The executor is cooperative, not interruptible: a connect waiting on a
+    /// credential prompt the user closed keeps running until its own deadline
+    /// and then reports a failure against state a later command already owns,
+    /// which is how one refused prompt used to time out every connect and
+    /// disconnect that followed it. The service loop cancels these once the
+    /// supervisor is in scope.
+    fn abandon_operation_work(&mut self, operation_id: &OperationId, profiles: Vec<ProfileId>) {
+        self.abandoned_work.extend(
+            profiles
+                .into_iter()
+                .map(|profile_id| (profile_id, operation_id.clone())),
+        );
+    }
+
     fn release_operation_admission(&mut self, operation_id: &OperationId) {
         self.work_admissions
             .retain(|(operation, _), _| operation != operation_id);
@@ -1898,7 +1915,7 @@ impl ControlRuntime<'_> {
         if projection_inputs_changed {
             derive_tunnel_projections(snapshot, Some(owner), self.config);
         } else {
-            derive_dns_security_projection(snapshot, self.config);
+            derive_dns_security_projection(snapshot, Some(&owner.tunnel_revisions), self.config);
         }
         persisted_before_effects
     }
@@ -2111,6 +2128,7 @@ async fn run_service(
     let tunnel_revisions = initial_tunnel_revisions(&snapshot, supervisor.as_deref());
     let exclusive_switch_operations = recover_exclusive_switch_operations(&snapshot);
     let mut owner = OwnerState {
+        abandoned_work: Vec::new(),
         challenge_terminals: BTreeMap::new(),
         challenge_answers: BTreeMap::new(),
         observation_clocks: BTreeMap::new(),
@@ -2449,6 +2467,7 @@ fn drive_supervision(
     config: &ControlServiceConfig,
     events: &mut Vec<ControlEvent>,
 ) {
+    let abandoned = std::mem::take(&mut owner.abandoned_work);
     if selection == ExecutionSelection::LegacyAuthority
         || !snapshot.readiness.reconciliation_complete
         || !snapshot.readiness.authority_verified
@@ -2458,6 +2477,10 @@ fn drive_supervision(
     let Some(supervisor) = supervisor else {
         return;
     };
+
+    for (profile_id, operation_id) in abandoned {
+        supervisor.cancel_work_for_operation(&profile_id, &operation_id);
+    }
 
     if supervisor.lost_results() > 0 {
         invalidate_gates(
@@ -2716,6 +2739,17 @@ fn drive_supervision(
                         | OperationIntent::ProfileMutation { .. } => None,
                     })
                     .unwrap_or_else(|| vec![result.profile_id.clone()]);
+                // A refused prompt is as definitive as a rejected password:
+                // the user declined, no tunnel was ever raised, and there is
+                // no residue to chase. Left supervised as degraded, the
+                // profile kept failing the pre-policy barrier, so no later
+                // revision could be published and every command after it
+                // waited for a proof that never came.
+                let _ = supervisor.retire_definitive_connect_failure(
+                    &result.profile_id,
+                    &result.revision,
+                    &result.operation_id,
+                );
                 let completion = complete_operation(
                     OperationCompletion {
                         operation_id: result.operation_id.clone(),
@@ -2994,6 +3028,22 @@ fn drive_supervision(
         {
             effective_outcome = PolicyOutcome::Failed;
         }
+        if exact_transaction
+            && result.stage == PolicyStage::PreTunnelBlocking
+            && result.outcome == PolicyOutcome::Applied
+        {
+            accept_pre_block_readback(
+                supervisor,
+                ControlRevision {
+                    authority_epoch: result.authority_epoch,
+                    generation: result.generation,
+                    digest: result.digest.clone(),
+                },
+                result.operation_id.clone(),
+                result.verification,
+                now,
+            );
+        }
         let failed_transaction = if exact_transaction {
             let transaction = owner
                 .topology_transaction
@@ -3071,15 +3121,26 @@ fn drive_supervision(
 
     while let Some(result) = supervisor.poll_policy_audit() {
         if let Ok(readback) = result.result {
-            let _ = accept_policy_readback(
-                supervisor,
-                snapshot,
-                owner,
-                result.revision,
-                result.operation_id,
-                readback,
-                now,
-            );
+            match result.stage {
+                PolicyStage::PreTunnelBlocking => accept_pre_block_readback(
+                    supervisor,
+                    result.revision,
+                    result.operation_id,
+                    Some(readback),
+                    now,
+                ),
+                PolicyStage::Final => {
+                    let _ = accept_policy_readback(
+                        supervisor,
+                        snapshot,
+                        owner,
+                        result.revision,
+                        result.operation_id,
+                        readback,
+                        now,
+                    );
+                }
+            }
         }
     }
     let _ = supervisor.submit_policy_audit_if_due(now);
@@ -3107,6 +3168,18 @@ fn drive_supervision(
                 fact.interface_name.as_deref(),
             );
         }
+    }
+    if let Some(displaced) = tunnel_displaced_by_address_collision(snapshot) {
+        // Withdraw the newcomer's intent so the normal teardown reclaims it.
+        // Leaving both up keeps the host with no working network at all.
+        rollback_connect_intent(
+            std::slice::from_ref(&displaced),
+            snapshot.desired.generation,
+            snapshot,
+            owner,
+            now,
+            events,
+        );
     }
     let supervised = supervisor.profiles();
     let tombstones = supervisor.tombstones();
@@ -3699,13 +3772,7 @@ fn settle_teardowns_that_reached_absence(
         .operations
         .values()
         .filter(|operation| {
-            !operation.status.is_terminal()
-                // A cleanup recovery exists to drive teardown of a residual
-                // effect the observation layer cannot see. Settling it the
-                // moment the scanner reports absence would strand that
-                // residue, so recoveries keep running to their deadline.
-                && !owner.recovery_operations.contains(&operation.id)
-                && reached_requested_absence(operation, snapshot)
+            !operation.status.is_terminal() && reached_requested_absence(operation, snapshot)
         })
         .map(|operation| (operation.id.clone(), operation.desired_generation))
         .collect::<Vec<_>>();
@@ -3779,6 +3846,36 @@ fn submit_required_pre_block(
             );
         }
     }
+}
+
+/// Carry the emergency barrier's own firewall read-back to the supervisor.
+///
+/// Deliberately not routed through [`accept_policy_readback`]: that publishes
+/// whole-topology `ProtectionEvidence`, and a pre-block has no tunnel, route
+/// or resolver to speak for. An unprovable read-back is simply not published
+/// — the barrier itself stays installed either way, so failing the operation
+/// over it would be fail-open.
+fn accept_pre_block_readback(
+    supervisor: &Supervisor,
+    revision: ControlRevision,
+    operation_id: OperationId,
+    readback: Option<crate::vortix_core::control::worker::PolicyExecutionEvidence>,
+    now: u64,
+) {
+    let Some(readback) = readback else {
+        return;
+    };
+    let verification = PolicyVerification {
+        revision,
+        operation_id,
+        observed_at_millis: readback.observed_at_millis,
+        received_at_millis: now,
+        interface_verified: readback.interface_verified,
+        route_verified: readback.route_verified,
+        dns_verified: readback.dns_verified,
+        firewall_verified: readback.firewall_verified,
+    };
+    let _ = supervisor.verify_pre_block(&verification, now);
 }
 
 fn accept_policy_readback(
@@ -3957,6 +4054,50 @@ fn system_time_millis(time: std::time::SystemTime) -> u64 {
         })
 }
 
+/// The tunnel that cannot work because another live tunnel already holds its
+/// address.
+///
+/// Two profiles pointed at the same server draw from the same address pool, so
+/// both interfaces come up with the same local address and subnet. The kernel
+/// cannot route that: the host loses egress entirely — no DNS, no inbound
+/// answers, every application stalling on a network that is simply gone. It
+/// looks like a frozen machine and survives until something tears a tunnel
+/// down.
+///
+/// Declared routes cannot catch this. A profile whose server pushes
+/// `redirect-gateway` declares nothing, so the route-conflict guard has no
+/// claims to compare. The address the kernel actually handed out is the fact
+/// that matters, and the scanner already reports it.
+///
+/// The newcomer loses: the tunnel that was already carrying traffic keeps it.
+fn tunnel_displaced_by_address_collision(snapshot: &ControlSnapshot) -> Option<ProfileId> {
+    let mut live = snapshot
+        .observed
+        .tunnel_details
+        .iter()
+        .filter(|(profile_id, _)| {
+            snapshot
+                .observed
+                .tunnels
+                .get(*profile_id)
+                .is_some_and(|fact| fact.active)
+        })
+        .filter(|(_, details)| !details.details.internal_ip.is_empty())
+        .collect::<Vec<_>>();
+    live.sort_by_key(|(_, details)| details.started_at);
+    for (index, (profile_id, details)) in live.iter().enumerate() {
+        let collides = live[..index]
+            .iter()
+            .any(|(_, earlier)| earlier.details.internal_ip == details.details.internal_ip);
+        if collides
+            && snapshot.desired.tunnels.get(*profile_id) == Some(&RequestedTunnelState::Connected)
+        {
+            return Some((*profile_id).clone());
+        }
+    }
+    None
+}
+
 fn operation_for_generation(
     snapshot: &ControlSnapshot,
     generation: u64,
@@ -3981,6 +4122,13 @@ fn operation_for_tunnel_action(
         snapshot.desired.generation
     };
     operation_for_generation(snapshot, dispatch_generation)
+}
+
+/// The profiles whose supervised work an operation owns.
+fn operation_work_profiles(operation: &OperationRecord) -> Vec<ProfileId> {
+    operation_intent_tunnels(&operation.intent)
+        .map(|tunnels| tunnels.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn operation_intent_is_compatible(operation: &OperationRecord, snapshot: &ControlSnapshot) -> bool {
@@ -4288,11 +4436,27 @@ fn seal_final_topology_policy(
         if *protocol != crate::vortix_core::profile::ProtocolKind::OpenVpn {
             continue;
         }
+        // Negotiated evidence belongs to the tunnel incarnation that observed
+        // it, not to the topology generation that happened to be current at
+        // the time. Keyed to the latter, connecting a second profile bumped
+        // the generation and silently discarded the already-connected
+        // tunnel's pushed routes and pushed DNS — a standing tunnel never
+        // re-observes, so it could never match again, and a full tunnel lost
+        // the resolvers it had already applied. Keying to the tunnel revision
+        // still rejects evidence from a superseded incarnation of the same
+        // profile, which is what the fence is for.
+        let expected_generation = final_policy
+            .tunnel_revisions
+            .get(profile_id)
+            .map(|revision| revision.generation);
         let Some(observed) = snapshot
             .observed
             .openvpn_routes
             .get(profile_id)
-            .filter(|observed| observed.desired_generation == final_policy.generation)
+            .filter(|observed| {
+                expected_generation
+                    .is_none_or(|generation| generation == observed.desired_generation)
+            })
         else {
             // Standard mode has no helper-authenticated negotiated evidence
             // yet, so its existing configured-route contract remains intact.
@@ -4311,11 +4475,15 @@ fn seal_final_topology_policy(
             .openvpn_routes
             .insert(profile_id.clone(), observed.evidence.clone());
 
-        if let Some(observed_dns) = snapshot
-            .observed
-            .openvpn_dns
-            .get(profile_id)
-            .filter(|observed| observed.desired_generation == final_policy.generation)
+        if let Some(observed_dns) =
+            snapshot
+                .observed
+                .openvpn_dns
+                .get(profile_id)
+                .filter(|observed| {
+                    expected_generation
+                        .is_none_or(|generation| generation == observed.desired_generation)
+                })
         {
             final_policy
                 .target
@@ -4644,7 +4812,7 @@ fn handle_envelope(
                 );
             }
             if !expired {
-                if let UserCommand::ConnectExclusive { profile_id } = &request.command {
+                if let UserCommand::ConnectExclusive { profile_id, .. } = &request.command {
                     owner.exclusive_switch_operations.insert(
                         operation_id.clone(),
                         ExclusiveSwitchOperation {
@@ -4869,14 +5037,55 @@ fn apply_desired(
         authority_epoch: snapshot.desired.authority_epoch,
         generation: snapshot.desired.generation,
     };
-    for profile_id in target_profiles {
+    // Switching displaces the tunnel it conflicts with, not every profile on
+    // the machine. This command used to target the whole catalogue, so
+    // accepting a takeover tore down unrelated split tunnels and briefly
+    // marked every row in the list as disconnecting — including profiles
+    // that had never been connected.
+    let displaced: Vec<ProfileId> = match command {
+        UserCommand::ConnectExclusive {
+            profile_id,
+            displacing,
+        } => displacing.as_ref().map_or_else(
+            || {
+                snapshot
+                    .desired
+                    .tunnels
+                    .iter()
+                    .filter(|(candidate, state)| {
+                        *candidate != profile_id && **state == RequestedTunnelState::Connected
+                    })
+                    .map(|(candidate, _)| candidate.clone())
+                    .collect()
+            },
+            |named| {
+                let connected =
+                    snapshot.desired.tunnels.get(named) == Some(&RequestedTunnelState::Connected);
+                if named != profile_id && connected {
+                    vec![named.clone()]
+                } else {
+                    Vec::new()
+                }
+            },
+        ),
+        _ => Vec::new(),
+    };
+    let touched: Vec<ProfileId> = match command {
+        UserCommand::ConnectExclusive { profile_id, .. } => displaced
+            .iter()
+            .cloned()
+            .chain(std::iter::once(profile_id.clone()))
+            .collect(),
+        _ => target_profiles.to_vec(),
+    };
+    for profile_id in &touched {
         owner
             .tunnel_revisions
             .insert(profile_id.clone(), tunnel_revision);
     }
     match command {
         UserCommand::Connect { profile_id, .. }
-        | UserCommand::ConnectExclusive { profile_id }
+        | UserCommand::ConnectExclusive { profile_id, .. }
         | UserCommand::Reconnect {
             profile_id: Some(profile_id),
         }
@@ -4944,8 +5153,8 @@ fn apply_desired(
                 }
             }
         }
-        UserCommand::ConnectExclusive { profile_id } => {
-            for candidate in target_profiles {
+        UserCommand::ConnectExclusive { profile_id, .. } => {
+            for candidate in &displaced {
                 snapshot
                     .desired
                     .tunnels
@@ -5174,7 +5383,7 @@ fn intent_for_command(command: &UserCommand, operation_profiles: &[ProfileId]) -
         | UserCommand::RenameProfile { .. }
         | UserCommand::DeleteProfile { .. } => None,
     };
-    let tunnels = if let UserCommand::ConnectExclusive { profile_id } = command {
+    let tunnels = if let UserCommand::ConnectExclusive { profile_id, .. } = command {
         operation_profiles
             .iter()
             .cloned()
@@ -5215,7 +5424,7 @@ fn intent_for_command(command: &UserCommand, operation_profiles: &[ProfileId]) -
 fn command_profile(command: &UserCommand) -> Option<&ProfileId> {
     match command {
         UserCommand::Connect { profile_id, .. }
-        | UserCommand::ConnectExclusive { profile_id }
+        | UserCommand::ConnectExclusive { profile_id, .. }
         | UserCommand::Disconnect {
             profile_id: Some(profile_id),
         }
@@ -5318,7 +5527,7 @@ fn lifecycle_for_command(
     target_profiles: &[ProfileId],
     snapshot: &ControlSnapshot,
 ) -> Option<LifecycleRegistration> {
-    if let UserCommand::ConnectExclusive { profile_id } = command {
+    if let UserCommand::ConnectExclusive { profile_id, .. } = command {
         let teardown = target_profiles
             .iter()
             .filter(|candidate| *candidate != profile_id)
@@ -5412,7 +5621,7 @@ fn validate_profile_mutation_input(
     config: &ControlServiceConfig,
 ) -> Result<(), AdmissionError> {
     if let UserCommand::Connect { profile_id, .. }
-    | UserCommand::ConnectExclusive { profile_id }
+    | UserCommand::ConnectExclusive { profile_id, .. }
     | UserCommand::Reconnect {
         profile_id: Some(profile_id),
     } = command
@@ -5758,17 +5967,31 @@ fn apply_observation_to(
                 snapshot.observed.connection_health.remove(&profile_id);
                 snapshot.observed.tunnel_details.remove(&profile_id);
             }
-            invalidate_gates(
-                snapshot,
-                DriftGates {
-                    interface: true,
-                    route: true,
-                    dns: true,
-                    firewall: true,
-                },
-                observed_at_millis,
-                now,
-            );
+            // Only a *change* in what the platform shows can invalidate the
+            // gates. The scanner repeats the state it sees so that a steady
+            // tunnel keeps counting as fresh; treating every repeat as drift
+            // would throw away the protection proof a few times a second and
+            // nothing could ever be verified.
+            let state_changed = snapshot
+                .observed
+                .tunnels
+                .get(&profile_id)
+                .is_none_or(|previous| {
+                    previous.active != active || previous.interface_name != interface_name
+                });
+            if state_changed {
+                invalidate_gates(
+                    snapshot,
+                    DriftGates {
+                        interface: true,
+                        route: true,
+                        dns: true,
+                        firewall: true,
+                    },
+                    observed_at_millis,
+                    now,
+                );
+            }
             snapshot.observed.tunnels.insert(
                 profile_id,
                 ObservedTunnel {
@@ -5971,6 +6194,10 @@ fn complete_operation(
         .operations
         .get(&completion.operation_id)
         .map_or_else(Vec::new, client_connected_profiles);
+    let work_profiles = snapshot
+        .operations
+        .get(&completion.operation_id)
+        .map_or_else(Vec::new, operation_work_profiles);
     let success_is_current = match &completion.outcome {
         CompletionOutcome::ObservedSuccess(evidence) => evidence_matches(evidence, snapshot, now),
         CompletionOutcome::Failed(_) | CompletionOutcome::Cancelled => true,
@@ -6006,6 +6233,7 @@ fn complete_operation(
             events,
         );
         let was_recovery = owner.recovery_operations.remove(&completion.operation_id);
+        owner.abandon_operation_work(&completion.operation_id, work_profiles);
         owner.release_operation_admission(&completion.operation_id);
         if was_recovery {
             snapshot.operations.remove(&completion.operation_id);
@@ -6089,6 +6317,9 @@ fn complete_operation(
         config.max_challenges,
         events,
     );
+    if status != OperationStatus::Succeeded {
+        owner.abandon_operation_work(&completion.operation_id, work_profiles);
+    }
     owner.release_operation_admission(&completion.operation_id);
     if owner.recovery_operations.remove(&completion.operation_id) {
         snapshot.operations.remove(&completion.operation_id);
@@ -6300,6 +6531,13 @@ fn expire_operations(
             }
         }
         cancel_operation_challenges(&id, snapshot, owner, config.max_challenges, events);
+        if !settled_absence {
+            let work_profiles = snapshot
+                .operations
+                .get(&id)
+                .map_or_else(Vec::new, operation_work_profiles);
+            owner.abandon_operation_work(&id, work_profiles);
+        }
         owner.release_operation_admission(&id);
         if was_recovery {
             snapshot.operations.remove(&id);
@@ -7026,6 +7264,7 @@ fn tunnel_details_exceed_bounds(
 
 fn topology_routes(
     snapshot: &ControlSnapshot,
+    tunnel_revisions: Option<&BTreeMap<ProfileId, TunnelRevision>>,
     config: &ControlServiceConfig,
     profile_id: &ProfileId,
 ) -> Vec<Cidr> {
@@ -7040,7 +7279,17 @@ fn topology_routes(
         .observed
         .openvpn_routes
         .get(profile_id)
-        .filter(|observed| observed.desired_generation == snapshot.desired.generation)
+        // Keyed to the tunnel that observed them, not the live topology
+        // generation: otherwise a standing tunnel's pushed routes vanish from
+        // the UI and from role classification as soon as anything else
+        // connects, and a full tunnel stops looking like one.
+        .filter(|observed| {
+            tunnel_revisions.is_none_or(|revisions| {
+                revisions
+                    .get(profile_id)
+                    .is_none_or(|revision| revision.generation == observed.desired_generation)
+            })
+        })
     {
         routes.extend(crate::vortix_core::control::worker::openvpn_route_claims(
             &observed.evidence,
@@ -7180,7 +7429,7 @@ fn derive_tunnel_projections(
         .map(|profile_id| {
             (
                 profile_id.clone(),
-                topology_routes(snapshot, config, profile_id),
+                topology_routes(snapshot, tunnel_revisions, config, profile_id),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -7362,10 +7611,14 @@ fn derive_tunnel_projections(
     snapshot.primary = primary;
     snapshot.tunnels = projections;
     snapshot.profile_routes = routes_by_profile;
-    derive_dns_security_projection(snapshot, config);
+    derive_dns_security_projection(snapshot, tunnel_revisions, config);
 }
 
-fn derive_dns_security_projection(snapshot: &mut ControlSnapshot, config: &ControlServiceConfig) {
+fn derive_dns_security_projection(
+    snapshot: &mut ControlSnapshot,
+    tunnel_revisions: Option<&BTreeMap<ProfileId, TunnelRevision>>,
+    config: &ControlServiceConfig,
+) {
     use crate::vortix_core::control::{DnsSecurityProjection, DnsSecurityStatus};
 
     let Some(primary) = snapshot.primary.as_ref() else {
@@ -7376,7 +7629,17 @@ fn derive_dns_security_projection(snapshot: &mut ControlSnapshot, config: &Contr
         .observed
         .openvpn_dns
         .get(primary)
-        .filter(|observed| observed.desired_generation == snapshot.desired.generation)
+        // Negotiated DNS belongs to the tunnel that observed it, not to the
+        // topology generation current at the time. Comparing against the live
+        // generation blanked the resolvers of a standing primary the moment a
+        // second profile connected, and the row fell back to the LAN's.
+        .filter(|observed| {
+            tunnel_revisions.is_none_or(|revisions| {
+                revisions
+                    .get(primary)
+                    .is_none_or(|revision| revision.generation == observed.desired_generation)
+            })
+        })
         .map(|observed| &observed.request)
         .or_else(|| {
             config
@@ -7421,6 +7684,8 @@ fn derive_effective(
     supervisor: Option<&Supervisor>,
 ) {
     let desired = &snapshot.desired;
+    let pre_block_blocking =
+        supervisor.is_some_and(|supervisor| supervisor.pre_block_blocking(now));
     let Some(evidence) = snapshot.observed.evidence.as_ref() else {
         snapshot.effective = EffectiveState {
             protection: ProtectionStatus::Unknown,
@@ -7431,9 +7696,13 @@ fn derive_effective(
                 ceiling_millis: MAX_PROTECTION_AGE_MILLIS,
                 ..Freshness::default()
             },
-            kill_switch: (desired.kill_switch
-                == crate::vortix_core::state::killswitch::KillSwitchMode::Off)
-                .then_some(crate::vortix_core::state::killswitch::KillSwitchState::Disabled),
+            kill_switch: pre_block_kill_switch(desired.kill_switch, pre_block_blocking).or_else(
+                || {
+                    (desired.kill_switch
+                        == crate::vortix_core::state::killswitch::KillSwitchMode::Off)
+                        .then_some(crate::vortix_core::state::killswitch::KillSwitchState::Disabled)
+                },
+            ),
         };
         return;
     };
@@ -7453,8 +7722,12 @@ fn derive_effective(
     };
     let firewall_verified = firewall_gate_proven(evidence, current);
     let applied = supervisor.and_then(Supervisor::applied_topology);
-    let kill_switch =
-        derive_effective_kill_switch(desired.kill_switch, firewall_verified, applied.as_ref());
+    let kill_switch = derive_effective_kill_switch(
+        desired.kill_switch,
+        firewall_verified,
+        applied.as_ref(),
+        pre_block_blocking,
+    );
     snapshot.effective = EffectiveState {
         protection,
         desired_generation: desired.generation,
@@ -7478,6 +7751,31 @@ const fn firewall_gate_proven(evidence: &ProtectionEvidence, current: bool) -> b
     current && matches!(evidence.firewall, GateEvidence::Verified)
 }
 
+/// A proven emergency pre-tunnel barrier is the whole firewall truth while
+/// the tunnel is down.
+///
+/// `block-on-drop` installs that barrier on an unexpected drop, and the final
+/// policy — the one carrying the four-gate proof the row normally reads — can
+/// only run once a tunnel is back. Deriving from the final evidence alone
+/// therefore reported `Degraded` for the entire drop window: the user was
+/// told the kill switch was broken at exactly the moment it was protecting
+/// them. `pre_block_blocking` is the supervisor's fenced platform read-back
+/// of that barrier, never worker completion.
+///
+/// Only `block-on-drop` has a pre-block stage, so no other mode can be
+/// answered here.
+const fn pre_block_kill_switch(
+    mode: crate::vortix_core::state::killswitch::KillSwitchMode,
+    pre_block_blocking: bool,
+) -> Option<crate::vortix_core::state::killswitch::KillSwitchState> {
+    match mode {
+        crate::vortix_core::state::killswitch::KillSwitchMode::Auto if pre_block_blocking => {
+            Some(crate::vortix_core::state::killswitch::KillSwitchState::Blocking)
+        }
+        _ => None,
+    }
+}
+
 /// The kill switch is a firewall fact, so it is derived from firewall
 /// read-back alone.
 ///
@@ -7495,7 +7793,11 @@ fn derive_effective_kill_switch(
     mode: crate::vortix_core::state::killswitch::KillSwitchMode,
     firewall_verified: bool,
     applied: Option<&TopologyState>,
+    pre_block_blocking: bool,
 ) -> Option<crate::vortix_core::state::killswitch::KillSwitchState> {
+    if let Some(state) = pre_block_kill_switch(mode, pre_block_blocking) {
+        return Some(state);
+    }
     match mode {
         crate::vortix_core::state::killswitch::KillSwitchMode::Off => {
             Some(crate::vortix_core::state::killswitch::KillSwitchState::Disabled)
@@ -7542,8 +7844,8 @@ fn publish_then_events(
 mod target_profiles_tests {
     use super::*;
     use crate::vortix_core::control::worker::{
-        wait_until, CancellationToken, PolicyBarrier, PolicyExecutor, TunnelExecutionReceipt,
-        TunnelExecutor,
+        wait_until, CancellationToken, PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor,
+        TunnelExecutionReceipt, TunnelExecutor,
     };
     use crate::vortix_core::control::DnsSecurityStatus;
     use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
@@ -7857,6 +8159,71 @@ mod target_profiles_tests {
         assert_eq!(owner.observation_clocks[&ObservationScope::Firewall], 4);
     }
 
+    /// Connecting a second profile must not blank the first tunnel's DNS.
+    /// The pushed resolvers are stamped with the generation of the connect
+    /// that observed them, and a standing tunnel never re-observes — so
+    /// comparing against the live topology generation dropped them the
+    /// moment anything else connected, and the Security Guard fell back to
+    /// reading the LAN resolver as "Not provided".
+    #[test]
+    fn a_standing_primarys_pushed_dns_survives_a_second_profile_connecting() {
+        let primary = ProfileId::new("full-tunnel");
+        let mut snapshot = ControlSnapshot {
+            primary: Some(primary.clone()),
+            ..ControlSnapshot::default()
+        };
+        // The topology has moved on twice since this tunnel connected.
+        snapshot.desired.generation = 11;
+        snapshot.observed.openvpn_dns.insert(
+            primary.clone(),
+            crate::vortix_core::control::model::ObservedOpenVpnDns {
+                desired_generation: 9,
+                request: crate::vortix_core::ports::dns::DnsRequest {
+                    servers: vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()],
+                    search_domains: Vec::new(),
+                },
+            },
+        );
+        // The profile's own config declares no resolvers: they are pushed.
+        let config = ControlServiceConfig {
+            known_profiles: BTreeSet::from([primary.clone()]),
+            profile_topologies: BTreeMap::from([(primary.clone(), ProfileTopology::default())]),
+            ..ControlServiceConfig::default()
+        };
+        let revisions = BTreeMap::from([(
+            primary.clone(),
+            TunnelRevision {
+                authority_epoch: AuthorityEpoch(1),
+                generation: 9,
+            },
+        )]);
+
+        derive_dns_security_projection(&mut snapshot, Some(&revisions), &config);
+
+        assert_eq!(
+            snapshot.dns.intended_servers,
+            vec![
+                "1.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+                "1.1.1.1".parse::<std::net::IpAddr>().unwrap()
+            ],
+            "a standing tunnel keeps the resolvers it negotiated"
+        );
+
+        // A genuinely superseded incarnation is still rejected.
+        let stale = BTreeMap::from([(
+            primary,
+            TunnelRevision {
+                authority_epoch: AuthorityEpoch(1),
+                generation: 10,
+            },
+        )]);
+        derive_dns_security_projection(&mut snapshot, Some(&stale), &config);
+        assert!(
+            snapshot.dns.intended_servers.is_empty(),
+            "evidence from a previous incarnation of the same tunnel stays rejected"
+        );
+    }
+
     #[test]
     fn dns_projection_uses_primary_tunnel_intent_and_exact_policy_proof() {
         let profile_id = ProfileId::new("corp");
@@ -7893,7 +8260,7 @@ mod target_profiles_tests {
             ..ControlServiceConfig::default()
         };
 
-        derive_dns_security_projection(&mut snapshot, &config);
+        derive_dns_security_projection(&mut snapshot, None, &config);
 
         assert_eq!(
             snapshot.dns.intended_servers,
@@ -7902,7 +8269,7 @@ mod target_profiles_tests {
         assert_eq!(snapshot.dns.status, DnsSecurityStatus::Protected);
 
         snapshot.effective.freshness.current = false;
-        derive_dns_security_projection(&mut snapshot, &config);
+        derive_dns_security_projection(&mut snapshot, None, &config);
 
         assert_eq!(snapshot.dns.status, DnsSecurityStatus::Unverified);
     }
@@ -7919,7 +8286,7 @@ mod target_profiles_tests {
             ..ControlServiceConfig::default()
         };
 
-        derive_dns_security_projection(&mut snapshot, &config);
+        derive_dns_security_projection(&mut snapshot, None, &config);
 
         assert_eq!(snapshot.dns.status, DnsSecurityStatus::NotRequested);
         assert!(snapshot.dns.intended_servers.is_empty());
@@ -7958,7 +8325,7 @@ mod target_profiles_tests {
             ..ControlServiceConfig::default()
         };
 
-        derive_dns_security_projection(&mut snapshot, &config);
+        derive_dns_security_projection(&mut snapshot, None, &config);
 
         assert_eq!(
             snapshot.dns.intended_servers,
@@ -8286,27 +8653,32 @@ mod target_profiles_tests {
         };
 
         assert_eq!(
-            derive_effective_kill_switch(KillSwitchMode::Off, true, None),
+            derive_effective_kill_switch(KillSwitchMode::Off, true, None, false),
             Some(KillSwitchState::Disabled)
         );
         assert_eq!(
-            derive_effective_kill_switch(KillSwitchMode::Auto, true, Some(&armed)),
+            derive_effective_kill_switch(KillSwitchMode::Auto, true, Some(&armed), false),
             Some(KillSwitchState::Armed)
         );
         assert_eq!(
-            derive_effective_kill_switch(KillSwitchMode::Auto, true, Some(&blocking_auto)),
+            derive_effective_kill_switch(KillSwitchMode::Auto, true, Some(&blocking_auto), false),
             Some(KillSwitchState::Blocking)
         );
         assert_eq!(
-            derive_effective_kill_switch(KillSwitchMode::AlwaysOn, true, Some(&blocking_always)),
+            derive_effective_kill_switch(
+                KillSwitchMode::AlwaysOn,
+                true,
+                Some(&blocking_always),
+                false
+            ),
             Some(KillSwitchState::Blocking)
         );
         assert_eq!(
-            derive_effective_kill_switch(KillSwitchMode::Auto, false, Some(&armed)),
+            derive_effective_kill_switch(KillSwitchMode::Auto, false, Some(&armed), false),
             Some(KillSwitchState::Degraded)
         );
         assert_eq!(
-            derive_effective_kill_switch(KillSwitchMode::AlwaysOn, true, None),
+            derive_effective_kill_switch(KillSwitchMode::AlwaysOn, true, None, false),
             None
         );
     }
@@ -8349,7 +8721,8 @@ mod target_profiles_tests {
             derive_effective_kill_switch(
                 KillSwitchMode::Auto,
                 evidence.firewall == GateEvidence::Verified,
-                Some(&armed)
+                Some(&armed),
+                false
             ),
             Some(KillSwitchState::Armed),
             "block-on-drop with a verified firewall is Watching, not Degraded"
@@ -8358,7 +8731,8 @@ mod target_profiles_tests {
             derive_effective_kill_switch(
                 KillSwitchMode::AlwaysOn,
                 evidence.firewall == GateEvidence::Verified,
-                Some(&blocking_always)
+                Some(&blocking_always),
+                false
             ),
             Some(KillSwitchState::Blocking),
             "vpn-only with a verified blocking firewall is Blocking, not Degraded"
@@ -8370,7 +8744,8 @@ mod target_profiles_tests {
                 derive_effective_kill_switch(
                     mode,
                     evidence.firewall == GateEvidence::Verified,
-                    Some(&blocking_always)
+                    Some(&blocking_always),
+                    false
                 ),
                 Some(KillSwitchState::Degraded),
                 "an unprovable firewall must never be presented as effective truth ({mode:?})"
@@ -8489,6 +8864,279 @@ mod target_profiles_tests {
         }
     }
 
+    /// Drive the real pipeline for an unexpected drop under `block-on-drop`:
+    /// submit the emergency pre-tunnel barrier, run it through the policy
+    /// worker, carry its read-back out, and derive the snapshot.
+    fn pre_block_snapshot(
+        executor: Arc<dyn PolicyExecutor>,
+        now: u64,
+    ) -> (ControlSnapshot, Supervisor, TopologyPolicy) {
+        pre_block_snapshot_for(executor, now, TopologyTransitionKind::Recovery)
+    }
+
+    fn pre_block_snapshot_for(
+        executor: Arc<dyn PolicyExecutor>,
+        now: u64,
+        transition: TopologyTransitionKind,
+    ) -> (ControlSnapshot, Supervisor, TopologyPolicy) {
+        let supervisor = Supervisor::new(AuthorityEpoch(9), Arc::new(NoopTunnel), executor, 1, 2);
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.desired.authority_epoch = AuthorityEpoch(9);
+        snapshot.desired.kill_switch = KillSwitchMode::Auto;
+        snapshot.desired.refresh_policy_digest();
+        let operation_id = OperationId::from_parts(AuthorityEpoch(9), 1);
+        let policy = TopologyPolicy {
+            generation: snapshot.desired.generation,
+            authority_epoch: snapshot.desired.authority_epoch,
+            digest: snapshot.desired.policy_digest.clone(),
+            operation_id,
+            deadline: Instant::now() + Duration::from_secs(5),
+            prior: TopologyState::default(),
+            target: TopologyState {
+                kill_switch: KillSwitchMode::Auto,
+                ..TopologyState::default()
+            },
+            prior_tunnel_revisions: BTreeMap::new(),
+            tunnel_revisions: BTreeMap::new(),
+            transition,
+            required_blocking: true,
+            stage: PolicyStage::PreTunnelBlocking,
+        };
+        supervisor
+            .submit_policy(&policy)
+            .expect("pre-block submitted");
+        let result = wait_until(Duration::from_secs(1), || supervisor.poll_policy())
+            .expect("pre-block result observed");
+        assert_eq!(result.outcome, PolicyOutcome::Applied);
+        accept_pre_block_readback(
+            &supervisor,
+            policy.revision(),
+            policy.operation_id.clone(),
+            result.verification,
+            now,
+        );
+        derive_effective(
+            &mut snapshot,
+            now,
+            ExecutionSelection::CanonicalAuthority,
+            Some(&supervisor),
+        );
+        (snapshot, supervisor, policy)
+    }
+
+    struct PreBlockReadback {
+        observed_at_millis: std::sync::atomic::AtomicU64,
+        fail_final: bool,
+    }
+
+    impl PreBlockReadback {
+        fn at(observed_at_millis: u64) -> Self {
+            Self {
+                observed_at_millis: std::sync::atomic::AtomicU64::new(observed_at_millis),
+                fail_final: false,
+            }
+        }
+
+        fn failing_final(observed_at_millis: u64) -> Self {
+            Self {
+                fail_final: true,
+                ..Self::at(observed_at_millis)
+            }
+        }
+
+        fn evidence(&self) -> PolicyExecutionEvidence {
+            PolicyExecutionEvidence {
+                observed_at_millis: self
+                    .observed_at_millis
+                    .load(std::sync::atomic::Ordering::Acquire),
+                interface_verified: false,
+                route_verified: false,
+                dns_verified: false,
+                firewall_verified: true,
+            }
+        }
+    }
+
+    impl PolicyExecutor for PreBlockReadback {
+        fn apply(&self, policy: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            if self.fail_final && policy.stage == PolicyStage::Final {
+                return Err("injected final policy failure".into());
+            }
+            Ok(())
+        }
+
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn audit(&self, policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+            (policy.stage == PolicyStage::PreTunnelBlocking)
+                .then(|| self.evidence())
+                .ok_or_else(|| "only the pre-block is audited here".to_string())
+        }
+
+        fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
+            (policy.stage == PolicyStage::PreTunnelBlocking).then(|| self.evidence())
+        }
+    }
+
+    /// The reported gap: `block-on-drop` really does engage the firewall on
+    /// an unexpected drop, but the block never reached the snapshot, so the
+    /// user was shown `Degraded` at exactly the moment they were protected.
+    ///
+    /// Read-back of the emergency barrier is the only gate that exists while
+    /// it stands alone, and it has to be enough to report it.
+    #[test]
+    fn a_proven_pre_block_reports_the_block_it_engaged() {
+        let (snapshot, _supervisor, _policy) =
+            pre_block_snapshot(Arc::new(PreBlockReadback::at(40)), 40);
+
+        assert_eq!(
+            snapshot.effective.kill_switch,
+            Some(KillSwitchState::Blocking),
+            "a read-back-proven emergency barrier is `Blocking`, not `Degraded`"
+        );
+        assert_eq!(
+            snapshot.effective.protection,
+            ProtectionStatus::Unknown,
+            "the tunnel is still down, so whole-topology protection stays unclaimed"
+        );
+    }
+
+    /// The honest bar: a worker that says it applied the barrier proves
+    /// nothing. Only a platform read-back may publish `Blocking`.
+    #[test]
+    fn worker_completion_alone_never_reports_a_pre_block() {
+        let (snapshot, _supervisor, _policy) = pre_block_snapshot(Arc::new(NoopPolicy), 40);
+
+        assert_ne!(
+            snapshot.effective.kill_switch,
+            Some(KillSwitchState::Blocking),
+            "`PolicyOutcome::Applied` is not proof that the firewall is installed"
+        );
+    }
+
+    /// The same freshness ceiling the final path uses. A proof that has aged
+    /// out stops answering, so a barrier that was torn down behind Vortix's
+    /// back cannot keep being reported.
+    #[test]
+    fn a_pre_block_proof_ages_out_of_the_snapshot() {
+        let (_snapshot, supervisor, _policy) =
+            pre_block_snapshot(Arc::new(PreBlockReadback::at(40)), 40);
+
+        assert!(supervisor.pre_block_blocking(40 + MAX_PROTECTION_AGE_MILLIS));
+        assert!(!supervisor.pre_block_blocking(40 + MAX_PROTECTION_AGE_MILLIS + 1));
+    }
+
+    /// `block-on-drop` also pre-blocks for a planned reconnect or primary
+    /// transfer. The firewall really is engaged there, but the VPN did not
+    /// drop, and `(block-on-drop, Blocking)` renders as "VPN dropped" — so
+    /// only a recovery barrier may answer the row.
+    #[test]
+    fn a_planned_transition_barrier_never_claims_the_vpn_dropped() {
+        for transition in [
+            TopologyTransitionKind::Reconnect,
+            TopologyTransitionKind::PrimaryTransfer,
+        ] {
+            let (snapshot, supervisor, _policy) =
+                pre_block_snapshot_for(Arc::new(PreBlockReadback::at(40)), 40, transition);
+            assert!(
+                !supervisor.pre_block_blocking(40),
+                "{transition:?} is a transition the user asked for, not a drop"
+            );
+            assert_ne!(
+                snapshot.effective.kill_switch,
+                Some(KillSwitchState::Blocking),
+                "{transition:?} must not put `VPN dropped` on screen"
+            );
+        }
+    }
+
+    /// A block that is reported for five seconds and then flips to
+    /// `Degraded` while it is still installed is not a fix. The audit cadence
+    /// has to re-read the barrier for as long as it stands, so the row stays
+    /// steady across a reconnect loop that never succeeds.
+    #[test]
+    fn the_audit_cadence_keeps_re_proving_a_standing_pre_block() {
+        let executor = Arc::new(PreBlockReadback::at(40));
+        let (_snapshot, supervisor, _policy) = pre_block_snapshot(executor.clone(), 40);
+
+        let refresh_at = 40 + MAX_PROTECTION_AGE_MILLIS;
+        assert!(
+            !supervisor.pre_block_blocking(refresh_at + 1),
+            "the first proof has aged out by now"
+        );
+        executor
+            .observed_at_millis
+            .store(refresh_at, std::sync::atomic::Ordering::Release);
+        assert!(supervisor
+            .submit_policy_audit_if_due(refresh_at)
+            .expect("pre-block audit submitted"));
+
+        let audit = wait_until(Duration::from_secs(1), || supervisor.poll_policy_audit())
+            .expect("audit result observed");
+        assert_eq!(audit.stage, PolicyStage::PreTunnelBlocking);
+        accept_pre_block_readback(
+            &supervisor,
+            audit.revision,
+            audit.operation_id,
+            Some(audit.result.expect("audit read-back")),
+            refresh_at,
+        );
+
+        assert!(
+            supervisor.pre_block_blocking(refresh_at + 1),
+            "the refreshed read-back keeps the standing block reportable"
+        );
+    }
+
+    /// The final-after-pre barrier list deliberately omits `Blocking`, so a
+    /// final stage that fails at the tunnel, route, DNS or observation
+    /// barrier leaves the emergency barrier standing. That is fail-closed and
+    /// correct — undoing it on a failed transition is exactly the leak
+    /// `block-on-drop` exists to prevent — but it was silent: the row said
+    /// `Degraded` over a firewall that was still blocking every packet.
+    #[test]
+    fn a_pre_block_preserved_through_a_failed_final_is_still_reported() {
+        let (_snapshot, supervisor, policy) =
+            pre_block_snapshot(Arc::new(PreBlockReadback::failing_final(40)), 40);
+        assert!(supervisor.pre_block_blocking(40));
+
+        let mut fin = policy;
+        fin.stage = PolicyStage::Final;
+        supervisor.submit_policy(&fin).expect("final submitted");
+        let result = wait_until(Duration::from_secs(1), || supervisor.poll_policy())
+            .expect("final result observed");
+        assert_eq!(result.outcome, PolicyOutcome::Failed);
+
+        assert!(
+            supervisor.pre_block_blocking(40),
+            "the barrier is still installed, so it is still the truth to report"
+        );
+    }
+
+    /// Once the final stage publishes, it owns the richer four-gate truth and
+    /// the pre-block claim must step aside — otherwise a stale emergency
+    /// barrier would keep reporting `Blocking` over a healthy tunnel.
+    #[test]
+    fn a_published_final_stage_takes_the_pre_block_claim_back() {
+        let (_snapshot, supervisor, policy) =
+            pre_block_snapshot(Arc::new(PreBlockReadback::at(40)), 40);
+        assert!(supervisor.pre_block_blocking(40));
+
+        let mut fin = policy;
+        fin.stage = PolicyStage::Final;
+        supervisor.submit_policy(&fin).expect("final submitted");
+        let result = wait_until(Duration::from_secs(1), || supervisor.poll_policy())
+            .expect("final result observed");
+        assert_eq!(result.outcome, PolicyOutcome::Applied);
+
+        assert!(
+            !supervisor.pre_block_blocking(40),
+            "the applied final policy is the newer, richer truth"
+        );
+    }
+
     /// Stale evidence is not proof, whatever the gate bits say. Pins the
     /// freshness half of the firewall claim so a snapshot cannot keep
     /// reporting `Watching` from a read-back that has aged out.
@@ -8515,7 +9163,8 @@ mod target_profiles_tests {
             derive_effective_kill_switch(
                 KillSwitchMode::Auto,
                 firewall_gate_proven(&evidence, false),
-                Some(&armed)
+                Some(&armed),
+                false
             ),
             Some(KillSwitchState::Degraded)
         );

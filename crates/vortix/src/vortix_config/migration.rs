@@ -1035,7 +1035,7 @@ fn discover_downgrade_runtime_sidecars(
     let mut recovered = Vec::with_capacity(unexplained.len());
     for name in unexplained {
         let Some(runtime_stem) = managed_openvpn_runtime_stem(&name, &known_profile_ids) else {
-            return Err(invalid_data(format!("unexplained sidecar {name}")));
+            return Err(unexplained_sidecar(&name));
         };
         let path = profiles_dir.join(&name);
         let file = open_legacy_sidecar(&path)?;
@@ -1056,7 +1056,7 @@ fn discover_downgrade_runtime_sidecars(
             && sidecar.imported_at.is_some()
             && sidecar.last_used.is_none();
         if !exact_v1_shape {
-            return Err(invalid_data(format!("unexplained sidecar {name}")));
+            return Err(unexplained_sidecar(&name));
         }
         recovered.push(LegacySidecarArchiveEntry {
             file_name: name,
@@ -1149,9 +1149,7 @@ fn validate_pending_archive(
         .iter()
         .find(|name| !active.contains(name.as_str()) && !pending.contains(name.as_str()))
     {
-        return Err(invalid_data(format!(
-            "unexplained sidecar {unexplained} appeared during migration"
-        )));
+        return Err(unexplained_sidecar(unexplained));
     }
     let archive = profiles_dir.join(LEGACY_SIDECAR_ARCHIVE_DIR);
     for entry in &inventory.legacy_sidecars_pending_archive {
@@ -1293,7 +1291,7 @@ fn validate_inventory(profiles_dir: &Path, inventory: &MigrationInventory) -> st
         .iter()
         .find(|name| !active_sidecars.contains(name.as_str()))
     {
-        return Err(invalid_data(format!("unexplained sidecar {unexplained}")));
+        return Err(unexplained_sidecar(unexplained));
     }
     Ok(())
 }
@@ -1373,6 +1371,44 @@ fn reject_symlink_path(path: &Path) -> std::io::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// A profile metadata file sitting in the profile directory that the
+/// recorded inventory does not account for.
+///
+/// Carried as a typed cause rather than only a message so the CLI can name
+/// the file and tell the user how to clear it. Vortix refuses to touch a
+/// profile directory that has drifted from its inventory, and that refusal
+/// stops every command — so the error has to be answerable.
+#[derive(Debug)]
+pub struct UnexplainedSidecar {
+    /// File name inside the profile directory.
+    pub file_name: String,
+}
+
+impl std::fmt::Display for UnexplainedSidecar {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "unexplained sidecar {}", self.file_name)
+    }
+}
+
+impl std::error::Error for UnexplainedSidecar {}
+
+/// Find the unexplained-sidecar cause behind a migration failure.
+#[must_use]
+pub fn unexplained_sidecar_cause(error: &std::io::Error) -> Option<&UnexplainedSidecar> {
+    error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<UnexplainedSidecar>())
+}
+
+fn unexplained_sidecar(file_name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        UnexplainedSidecar {
+            file_name: file_name.to_string(),
+        },
+    )
 }
 
 fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
@@ -1540,6 +1576,10 @@ mod tests {
         let error = migrate_legacy_profiles(tmp.path()).unwrap_err();
 
         assert!(error.to_string().contains("unexplained sidecar"), "{error}");
+        // The refusal stops every command, so the CLI has to be able to name
+        // the offending file rather than print a blanket instruction.
+        let cause = unexplained_sidecar_cause(&error).expect("typed unexplained-sidecar cause");
+        assert_eq!(cause.file_name, format!("{runtime_stem}.meta.toml"));
         assert!(unverified_path.exists());
     }
 

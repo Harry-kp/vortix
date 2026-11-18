@@ -370,6 +370,23 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
         let expected = resolved_state_for(assignment);
         let current = read_resolved_state(&mut self.runner, interface)?;
         if let Some(owned) = self.ownership.resolved.get(interface) {
+            if current != owned.applied && current == owned.prior {
+                // The link is back in the state we would have restored it to,
+                // so what we applied is already gone — the interface went away
+                // and took its configuration with it. Nothing of anyone's is
+                // being clobbered here; the record is a leftover from a tunnel
+                // that has left. Holding on to it blocked the next tunnel to
+                // take this interface name, which is what a switch does one
+                // second after tearing the old one down.
+                tracing::debug!(
+                    target: "vortix::dns",
+                    %interface,
+                    "link DNS already back to its pre-Vortix state; reclaiming the interface"
+                );
+                self.ownership.resolved.remove(interface);
+            }
+        }
+        if let Some(owned) = self.ownership.resolved.get(interface) {
             if current != owned.applied {
                 return Err(format!(
                     "refusing to overwrite DNS on {interface}: current resolved state no longer matches Vortix ownership"
@@ -563,9 +580,24 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             }
         };
         if current != owned.applied {
-            return Err(format!(
-                "refusing to restore DNS on {interface}: current resolved state no longer matches Vortix ownership"
-            ));
+            // Someone else already changed this link — usually the kernel and
+            // resolved themselves, which drop a link's configuration when its
+            // interface goes away. Writing our captured "prior" over that
+            // would clobber whatever is there now, so we still do not write.
+            //
+            // But we must let go of the record. Keeping it meant the next
+            // tunnel to take this interface name found ownership it could not
+            // match and refused to configure DNS at all — "VPN DNS could not
+            // be applied safely" on a connect that had nothing to do with the
+            // tunnel that left. Nothing of ours remains on this link; stop
+            // claiming it.
+            tracing::warn!(
+                target: "vortix::dns",
+                %interface,
+                "link DNS changed outside Vortix before release; dropping ownership without restoring"
+            );
+            self.ownership.resolved.remove(interface);
+            return Ok(());
         }
         self.mutated_resolved.insert(interface.to_string());
         write_resolved_state(&mut self.runner, interface, &owned.prior)?;
@@ -585,9 +617,15 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             })?;
         let current = read_resolvconf_record(&mut self.runner, interface)?;
         if current.as_deref().map(normalized_record) != Some(normalized_record(&owned.applied)) {
-            return Err(format!(
-                "refusing to restore DNS record vortix.{interface}: current record no longer matches Vortix ownership"
-            ));
+            // As above: not ours to restore any more, and holding the record
+            // would poison the next tunnel that reuses this interface name.
+            tracing::warn!(
+                target: "vortix::dns",
+                %interface,
+                "resolvconf record changed outside Vortix before release; dropping ownership without restoring"
+            );
+            self.ownership.resolvconf.remove(interface);
+            return Ok(());
         }
         self.mutated_resolvconf.insert(interface.to_string());
         write_resolvconf_record(&mut self.runner, interface, owned.prior.as_deref())?;
@@ -1218,6 +1256,22 @@ fn try_get_dns_nmcli() -> Option<String> {
 fn try_get_dns_resolv_conf() -> Option<String> {
     let content = std::fs::read_to_string(RESOLV_CONF_PATH).ok()?;
     parse_resolv_conf_server(&content)
+}
+
+/// Whether a network interface still exists on this host.
+///
+/// `if_nametoindex` is POSIX, so this holds on every distribution and inside
+/// containers or namespaces where `/sys` may be absent or restricted. Matching
+/// `resolvectl`'s error text would have been neither stable nor portable.
+fn interface_exists(interface: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(interface) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
+    // call. `if_nametoindex` only reads it and returns 0 for an unknown link.
+    #[allow(unsafe_code)]
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    index != 0
 }
 
 #[cfg(test)]
@@ -1884,20 +1938,4 @@ IP4.DNS[1]:                             192.168.1.100
             Some("2606:4700:4700::1111".to_string())
         );
     }
-}
-
-/// Whether a network interface still exists on this host.
-///
-/// `if_nametoindex` is POSIX, so this holds on every distribution and inside
-/// containers or namespaces where `/sys` may be absent or restricted. Matching
-/// `resolvectl`'s error text would have been neither stable nor portable.
-fn interface_exists(interface: &str) -> bool {
-    let Ok(name) = std::ffi::CString::new(interface) else {
-        return false;
-    };
-    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
-    // call. `if_nametoindex` only reads it and returns 0 for an unknown link.
-    #[allow(unsafe_code)]
-    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-    index != 0
 }

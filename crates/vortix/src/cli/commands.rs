@@ -839,15 +839,27 @@ fn handle_up(
                     ),
                 ),
             };
+            // Two tunnels cannot both carry all traffic, so a default-route
+            // takeover has no "connect anyway" outcome to offer — the remedy
+            // is to take the current one down. Route overlap is different:
+            // both tunnels can coexist, so that one keeps its bypass.
+            let hint = match &conflict {
+                crate::vortix_core::engine::Conflict::DefaultRouteTakeover { current, .. } => {
+                    format!(
+                        "Only one VPN can carry all traffic. Disconnect the current one first: sudo vortix down {current}"
+                    )
+                }
+                crate::vortix_core::engine::Conflict::RouteOverlap { .. } => format!(
+                    "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
+                ),
+            };
             print_error_and_exit(
                 mode,
                 "up",
                 CliError {
                     code,
                     message,
-                    hint: Some(format!(
-                        "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
-                    )),
+                    hint: Some(hint),
                 },
                 ExitCode::StateConflict,
             );
@@ -1740,24 +1752,16 @@ fn handle_status(
     let is_connected = snap.connection_state == "connected";
     let is_present = snap.connection_state != "disconnected";
 
-    // Transitional shape: the registry-driven multi-tunnel snapshot
-    // lands later. Until then, "primary" is the single active tunnel
-    // (when connected), and `connections` is a one-element vec mirroring
-    // it. When disconnected, `connections` is empty and `primary` /
+    // `connections` lists every active tunnel, primary first; `primary`
+    // names the one carrying general egress; `connection` mirrors it for v1
+    // readers. When disconnected, `connections` is empty and `primary` /
     // `connection` are both `null`.
+    let connections = connection_entries(&snap);
     let visible_entry = if is_present {
-        Some(ConnectionEntry {
-            state: snap.connection_state.clone(),
-            profile: snap.profile.clone(),
-            protocol: snap.protocol.clone(),
-            uptime_secs: snap.uptime_secs,
-            health: snap.health.as_ref().map(connection_health_entry),
-            generation: snap.generation,
-        })
+        connections.first().cloned()
     } else {
         None
     };
-    let connections: Vec<ConnectionEntry> = visible_entry.iter().cloned().collect();
     let primary: Option<String> = if is_connected {
         snap.profile.clone()
     } else {
@@ -1826,6 +1830,14 @@ fn handle_status(
                 );
                 if let Some(health) = &snap.health {
                     println!("  Health       {}", connection_health_human(health));
+                }
+                // Extra tunnels get one line each rather than a repeated
+                // block: a host with several is common, and duplicating the
+                // whole panel per tunnel buries the primary.
+                for (index, tunnel) in snap.tunnels.iter().skip(1).enumerate() {
+                    let label = if index == 0 { "Also up" } else { "" };
+                    let interface = tunnel.interface.as_deref().unwrap_or("-");
+                    println!("  {label:<13}{} ({interface})", tunnel.profile);
                 }
             } else {
                 println!("{}", human_status_headline(&snap));
@@ -1971,6 +1983,10 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                     health: Option<ConnectionHealthEntry>,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     generation: Option<u64>,
+                    /// Every active tunnel, primary first. A watcher that
+                    /// reads only the scalars above cannot see a second
+                    /// tunnel appear or disappear.
+                    connections: Vec<ConnectionEntry>,
                 }
                 let line = WatchLine {
                     ts: chrono_now(),
@@ -1979,6 +1995,18 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                     uptime_secs: snap.uptime_secs,
                     health: snap.health.as_ref().map(connection_health_entry),
                     generation: snap.generation,
+                    connections: snap
+                        .tunnels
+                        .iter()
+                        .map(|tunnel| ConnectionEntry {
+                            state: tunnel.state.clone(),
+                            profile: Some(tunnel.profile.clone()),
+                            protocol: tunnel.protocol.clone(),
+                            uptime_secs: tunnel.uptime_secs,
+                            health: tunnel.health.as_ref().map(connection_health_entry),
+                            generation: tunnel.generation,
+                        })
+                        .collect(),
                 };
                 println!("{}", serde_json::to_string(&line).unwrap_or_default());
             }
@@ -2004,21 +2032,48 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
     }
 }
 
+/// Every active tunnel as a JSON envelope entry, primary first.
+///
+/// The envelope documents `data.connections` as every active tunnel. It used
+/// to be built from an `Option`, so it could never hold more than one however
+/// many were up.
+fn connection_entries(
+    snap: &crate::vpn_runtime::connection::StatusSnapshot,
+) -> Vec<ConnectionEntry> {
+    snap.tunnels
+        .iter()
+        .map(|tunnel| ConnectionEntry {
+            state: tunnel.state.clone(),
+            profile: Some(tunnel.profile.clone()),
+            protocol: tunnel.protocol.clone(),
+            uptime_secs: tunnel.uptime_secs,
+            health: tunnel.health.as_ref().map(connection_health_entry),
+            generation: tunnel.generation,
+        })
+        .collect()
+}
+
 fn human_status_headline(snap: &crate::vpn_runtime::connection::StatusSnapshot) -> String {
     let profile = snap.profile.as_deref().unwrap_or("unknown");
     let protocol = snap.protocol.as_deref().unwrap_or("");
+    // One line has to say a host is carrying more than one tunnel, or the
+    // brief form claims a single-tunnel host that is not one.
+    let extra = match snap.tunnels.len() {
+        0 | 1 => String::new(),
+        count => format!(" +{} more", count - 1),
+    };
     match snap.connection_state.as_str() {
         "connected" => snap.health.as_ref().map_or_else(
-            || format!("● Connected to {profile} ({protocol})"),
+            || format!("● Connected to {profile} ({protocol}){extra}"),
             |health| match health {
                 crate::vortix_core::engine::state::ConnectionHealth::Degraded { .. } => format!(
-                    "⚠ Connected to {profile} ({protocol}) — {}",
+                    "⚠ Connected to {profile} ({protocol}){extra} — {}",
                     connection_health_human(health)
                 ),
-                _ => format!("● Connected to {profile} ({protocol})"),
+                _ => format!("● Connected to {profile} ({protocol}){extra}"),
             },
         ),
-        "handshaking" => format!("◐ Handshaking with {profile} (WireGuard)"),
+        "handshaking" => format!("◐ Handshaking with {profile} (WireGuard){extra}"),
         "connecting" => format!("◐ Connecting to {profile} (OpenVPN)"),
         "reconnecting" => format!("↻ Reconnecting to {profile} ({protocol})"),
         "disconnecting" => format!("◑ Disconnecting {profile} ({protocol})"),
@@ -2100,8 +2155,53 @@ mod handshake_status_tests {
     use crate::vortix_core::ipc::{PassiveSnapshot, PassiveTunnel};
     use crate::vortix_core::profile::ProfileId;
 
+    fn tunnel(profile: &str, interface: &str) -> crate::vpn_runtime::connection::TunnelStatus {
+        crate::vpn_runtime::connection::TunnelStatus {
+            state: "connected".into(),
+            profile: profile.into(),
+            protocol: Some("OpenVPN".into()),
+            health: None,
+            generation: None,
+            uptime_secs: Some(30),
+            server: None,
+            interface: Some(interface.into()),
+            internal_ip: None,
+            download_bytes: None,
+            upload_bytes: None,
+            encryption: None,
+        }
+    }
+
+    /// `data.connections` is documented as every active tunnel. It was built
+    /// from an `Option`, so two live tunnels still serialised as one and any
+    /// script reading the documented contract under-reported.
+    #[test]
+    fn the_status_envelope_lists_every_active_tunnel() {
+        let mut snap = snapshot("connected", "OpenVPN");
+        snap.tunnels = vec![tunnel("full", "tun0"), tunnel("split", "tun1")];
+
+        let entries = connection_entries(&snap);
+
+        assert_eq!(entries.len(), 2, "both tunnels reach the envelope");
+        assert_eq!(entries[0].profile.as_deref(), Some("full"));
+        assert_eq!(entries[1].profile.as_deref(), Some("split"));
+    }
+
+    /// The brief line is one line, so the only way it can report a second
+    /// tunnel is a suffix — without one it claims a single-tunnel host.
+    #[test]
+    fn the_brief_headline_says_when_more_than_one_tunnel_is_up() {
+        let mut snap = snapshot("connected", "OpenVPN");
+        snap.tunnels = vec![tunnel("full", "tun0"), tunnel("split", "tun1")];
+        assert!(human_status_headline(&snap).contains("+1 more"));
+
+        snap.tunnels = vec![tunnel("full", "tun0")];
+        assert!(!human_status_headline(&snap).contains("more"));
+    }
+
     fn snapshot(state: &str, protocol: &str) -> crate::vpn_runtime::connection::StatusSnapshot {
         crate::vpn_runtime::connection::StatusSnapshot {
+            tunnels: Vec::new(),
             connection_state: state.into(),
             health: None,
             generation: None,

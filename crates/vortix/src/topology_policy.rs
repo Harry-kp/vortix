@@ -450,6 +450,25 @@ pub struct CanonicalPolicyExecutor {
     readback: Mutex<Option<Readback>>,
 }
 
+/// Kernel destinations to re-pin for one claim.
+///
+/// A default claim is never re-pinned as `0.0.0.0/0`: that entry is the LAN's
+/// own default route, and moving it onto a tunnel is how a host loses its way
+/// back to the network. `OpenVPN`'s `redirect-gateway def1` — what a full
+/// tunnel actually installs — leaves the LAN default alone and adds the two
+/// halves that outrank it, so those are the entries that decide egress and
+/// the only ones worth moving.
+fn repin_destinations(claim: crate::vortix_core::control::worker::RouteClaim) -> Vec<String> {
+    if !claim.is_default() {
+        return vec![claim.to_string()];
+    }
+    if claim.network().is_ipv4() {
+        vec!["0.0.0.0/1".to_string(), "128.0.0.0/1".to_string()]
+    } else {
+        vec!["::/1".to_string(), "8000::/1".to_string()]
+    }
+}
+
 impl CanonicalPolicyExecutor {
     #[must_use]
     pub fn new(
@@ -601,6 +620,76 @@ impl CanonicalPolicyExecutor {
             .collect())
     }
 
+    /// Which target profile, if any, owns an observed interface. Naming the
+    /// other tunnel turns "did not resolve" into something a user can act on.
+    fn interface_owner(&self, state: &TopologyState, interface: &str) -> Option<ProfileId> {
+        state
+            .profiles
+            .iter()
+            .find(|profile| {
+                self.session_interface(state, profile)
+                    .is_ok_and(|observed| observed == interface)
+            })
+            .cloned()
+    }
+
+    /// Pin claimed routes onto the tunnel that claims them, before the gate
+    /// that judges them reads the kernel.
+    ///
+    /// Deliberately narrow. It acts only when another tunnel *in this same
+    /// topology* is carrying the route, and never on a default route. With a
+    /// single tunnel up there is no other tunnel to attribute a stray route
+    /// to, so this cannot fire and single-tunnel behaviour is untouched. A
+    /// route resolving through the LAN is left alone too: that means the route
+    /// is missing, not stolen, and moving it could black-hole traffic.
+    /// Failures change nothing — `verify_routes` still reports exactly what it
+    /// would have reported without this step.
+    fn reconcile_routes(&self, policy: &TopologyPolicy) {
+        if policy.target.profiles.len() < 2 {
+            return;
+        }
+        let Ok(plan) = self.route_probe_plan(policy) else {
+            return;
+        };
+        let route_table = &crate::platform::current_platform().route_table;
+        for expectation in plan {
+            if std::time::Instant::now() >= policy.deadline {
+                return;
+            }
+            let DefaultRouteObservation::Interface(observed) =
+                route_table.route_interface_for(expectation.target)
+            else {
+                continue;
+            };
+            if observed == expectation.interface
+                || self.interface_owner(&policy.target, &observed).is_none()
+            {
+                continue;
+            }
+            for (profile, claim) in &expectation.claims {
+                for destination in &repin_destinations(*claim) {
+                    match crate::platform::repin_route(destination, &expectation.interface) {
+                        Ok(()) => tracing::info!(
+                            target: "vortix::topology",
+                            %profile,
+                            route = %destination,
+                            from = %observed,
+                            to = %expectation.interface,
+                            "moved a route onto the tunnel that claims it"
+                        ),
+                        Err(error) => tracing::warn!(
+                            target: "vortix::topology",
+                            %profile,
+                            route = %destination,
+                            reason = %error,
+                            "could not move a route onto the tunnel that claims it"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     fn verify_routes(&self, policy: &TopologyPolicy) -> Result<(), String> {
         // Route and Observation invoke this separately on purpose: the latter
         // is the fresh final read-back required for protection publication.
@@ -629,10 +718,31 @@ impl CanonicalPolicyExecutor {
                     .claims
                     .first()
                     .expect("route probe expectation has at least one claim");
-                return Err(format!(
-                    "route {claim} for profile {profile} did not resolve through {}: {observation:?}",
-                    expectation.interface
-                ));
+                let own = &expectation.interface;
+                return Err(match &observation {
+                    DefaultRouteObservation::Interface(observed) => {
+                        match self.interface_owner(&policy.target, observed) {
+                            Some(other) if other != *profile => format!(
+                                "route {claim} for profile {profile} is carried by {observed}, \
+                                 which belongs to profile {other}, instead of its own tunnel \
+                                 {own}. Traffic for that network would leave through the other \
+                                 VPN, so this tunnel cannot be reported as carrying it."
+                            ),
+                            _ => format!(
+                                "route {claim} for profile {profile} is carried by {observed} \
+                                 instead of its own tunnel {own}"
+                            ),
+                        }
+                    }
+                    DefaultRouteObservation::NoDefaultRoute => format!(
+                        "route {claim} for profile {profile} has no route through its own \
+                         tunnel {own}"
+                    ),
+                    DefaultRouteObservation::ProbeFailed => format!(
+                        "route {claim} for profile {profile} could not be checked against its \
+                         own tunnel {own}"
+                    ),
+                });
             }
         }
         Ok(())
@@ -893,6 +1003,14 @@ impl CanonicalPolicyExecutor {
         Ok(())
     }
 
+    /// Read the emergency barrier back out of the kernel without mutating
+    /// it. This is the one gate a pre-tunnel block can prove, and the only
+    /// evidence that lets the kill-switch row claim the block it engaged.
+    fn verify_pre_tunnel_blocking(&self, policy: &TopologyPolicy) -> Result<(), String> {
+        let active = self.pre_block_tunnels(policy)?;
+        crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
+    }
+
     fn apply_final_firewall(&self, policy: &TopologyPolicy) -> Result<(), String> {
         if firewall_transition_requires_authority(policy.target.kill_switch) {
             self.require_global_authority()?;
@@ -967,7 +1085,20 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
         self.with_readback(policy, |_| {});
         match barrier {
             PolicyBarrier::Blocking if policy.stage == PolicyStage::PreTunnelBlocking => {
-                self.install_pre_tunnel_blocking(policy)
+                self.install_pre_tunnel_blocking(policy)?;
+                let observed_at_millis = crate::utils::boot_elapsed_millis().ok_or_else(|| {
+                    "OS boot clock is unavailable for policy evidence".to_string()
+                })?;
+                // An unprovable read-back does not undo the barrier — the
+                // kernel already holds it and rolling back here would be
+                // fail-open. It only means the block cannot be reported.
+                let firewall_verified =
+                    gate_verified(policy, "firewall", self.verify_pre_tunnel_blocking(policy));
+                self.with_readback(policy, |evidence| {
+                    evidence.firewall_verified = firewall_verified;
+                    evidence.observed_at_millis = observed_at_millis;
+                });
+                Ok(())
             }
             PolicyBarrier::Blocking => {
                 self.apply_final_firewall(policy)?;
@@ -980,6 +1111,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
                 Ok(())
             }
             PolicyBarrier::Route => {
+                self.reconcile_routes(policy);
                 self.verify_routes(policy)?;
                 self.with_readback(policy, |evidence| evidence.route_verified = true);
                 Ok(())
@@ -1032,11 +1164,24 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
     }
 
     fn audit(&self, policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
-        if policy.stage != PolicyStage::Final {
-            return Err("only a final topology policy can be audited".into());
-        }
         let observed_at_millis = crate::utils::boot_elapsed_millis()
             .ok_or_else(|| "OS boot clock is unavailable for policy evidence".to_string())?;
+        if policy.stage == PolicyStage::PreTunnelBlocking {
+            // The emergency barrier has exactly one gate. Re-proving it on
+            // the audit cadence is what keeps a reported block from ageing
+            // out into `Degraded` while it is still installed.
+            return Ok(PolicyExecutionEvidence {
+                observed_at_millis,
+                firewall_verified: gate_verified(
+                    policy,
+                    "firewall",
+                    self.verify_pre_tunnel_blocking(policy),
+                ),
+                interface_verified: false,
+                route_verified: false,
+                dns_verified: false,
+            });
+        }
         // Every gate is read back independently, firewall first. Bailing at the
         // first failure meant one unverifiable resolver reported the firewall as
         // broken, and the cheapest, most safety-critical read-back was last in
@@ -1057,12 +1202,19 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
     fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         let state = self.readback.lock().ok()?;
         let readback = state.as_ref()?;
-        (readback.key == Self::key(policy)
-            && readback.evidence.interface_verified
-            && readback.evidence.route_verified
-            && readback.evidence.dns_verified
-            && readback.evidence.firewall_verified)
-            .then_some(readback.evidence)
+        if readback.key != Self::key(policy) {
+            return None;
+        }
+        let proven = match policy.stage {
+            PolicyStage::PreTunnelBlocking => readback.evidence.firewall_verified,
+            PolicyStage::Final => {
+                readback.evidence.interface_verified
+                    && readback.evidence.route_verified
+                    && readback.evidence.dns_verified
+                    && readback.evidence.firewall_verified
+            }
+        };
+        proven.then_some(readback.evidence)
     }
 }
 
@@ -1510,6 +1662,71 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("more than 256 distinct probes"));
+    }
+
+    /// A full tunnel's egress lives in the two `def1` halves, not in
+    /// `0.0.0.0/0` — that entry is the LAN's own default route. Re-pinning it
+    /// onto a tunnel is how a host loses its way back to the network, so the
+    /// halves are moved and the default is left alone.
+    #[test]
+    fn a_default_claim_moves_the_tunnel_halves_and_never_the_lan_default() {
+        let claim = crate::vortix_core::control::worker::RouteClaim::parse("0.0.0.0/0")
+            .expect("default claim parses");
+
+        let destinations = repin_destinations(claim);
+
+        assert_eq!(destinations, vec!["0.0.0.0/1", "128.0.0.0/1"]);
+        assert!(
+            !destinations.iter().any(|entry| entry == "0.0.0.0/0"),
+            "the LAN default route is never moved onto a tunnel"
+        );
+
+        let v6 = crate::vortix_core::control::worker::RouteClaim::parse("::/0")
+            .expect("v6 default claim parses");
+        assert_eq!(repin_destinations(v6), vec!["::/1", "8000::/1"]);
+
+        let split = crate::vortix_core::control::worker::RouteClaim::parse("10.250.0.0/24")
+            .expect("split claim parses");
+        assert_eq!(repin_destinations(split), vec!["10.250.0.0/24"]);
+    }
+
+    /// Two tunnels to one VPN server share its subnet, so the kernel binds the
+    /// second tunnel's gateway route to the first tunnel's device. The probe
+    /// then reports the wrong interface, and the only way a user can act on
+    /// that is if the message names the tunnel that actually carries it.
+    #[test]
+    fn a_route_carried_by_another_tunnel_names_that_tunnel() {
+        let temp = tempfile::tempdir().unwrap();
+        let full = ProfileId::new("full");
+        let split = ProfileId::new("split");
+        let executor = CanonicalPolicyExecutor::new(
+            temp.path().into(),
+            {
+                let full = full.clone();
+                let split = split.clone();
+                move |candidate| {
+                    let interface = if candidate == &full {
+                        "tun0"
+                    } else if candidate == &split {
+                        "tun1"
+                    } else {
+                        return None;
+                    };
+                    Some(ActiveSession {
+                        interface: interface.into(),
+                        interface_authoritative: true,
+                        ..ActiveSession::default()
+                    })
+                }
+            },
+            || 0,
+        );
+        let mut state = target(&split);
+        state.profiles.insert(full.clone());
+
+        assert_eq!(executor.interface_owner(&state, "tun0"), Some(full));
+        assert_eq!(executor.interface_owner(&state, "tun1"), Some(split));
+        assert_eq!(executor.interface_owner(&state, "tun9"), None);
     }
 
     #[test]

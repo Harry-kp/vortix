@@ -1645,6 +1645,11 @@ struct TopologyCapture {
     openvpn_evidence: Mutex<BTreeMap<ProfileId, OpenVpnRouteEvidence>>,
     openvpn_dns: Mutex<BTreeMap<ProfileId, DnsRequest>>,
     fail_next_tunnel: Mutex<BTreeSet<ProfileId>>,
+    hold_connect_until_cancelled: Mutex<BTreeSet<ProfileId>>,
+    cancelled_connects: Mutex<BTreeSet<ProfileId>>,
+    hold_disconnect: Mutex<BTreeSet<ProfileId>>,
+    release_disconnects: AtomicBool,
+    cancelled_disconnects: Mutex<BTreeSet<ProfileId>>,
 }
 
 impl TopologyCapture {
@@ -1688,13 +1693,54 @@ impl TopologyCapture {
     fn fail_next_tunnel(&self, profile_id: ProfileId) {
         self.fail_next_tunnel.lock().unwrap().insert(profile_id);
     }
+
+    /// Model the canonical executor's credential prompt: the connect sits in
+    /// the worker until its cancellation token fires.
+    fn hold_connect_until_cancelled(&self, profile_id: ProfileId) {
+        self.hold_connect_until_cancelled
+            .lock()
+            .unwrap()
+            .insert(profile_id);
+    }
+
+    fn connect_was_cancelled(&self, profile_id: &ProfileId) -> bool {
+        self.cancelled_connects.lock().unwrap().contains(profile_id)
+    }
+
+    /// Keep a teardown in the worker so a command can end while it is still
+    /// mid-flight — the window where cancelling it would strand the tunnel's
+    /// routes on the host.
+    fn hold_disconnect(&self, profile_id: ProfileId) {
+        self.hold_disconnect.lock().unwrap().insert(profile_id);
+    }
+
+    fn release_disconnects(&self) {
+        self.release_disconnects.store(true, Ordering::SeqCst);
+    }
+
+    fn disconnect_was_cancelled(&self, profile_id: &ProfileId) -> bool {
+        self.cancelled_disconnects
+            .lock()
+            .unwrap()
+            .contains(profile_id)
+    }
 }
 
 impl TunnelExecutor for TopologyCapture {
+    /// Mirror the canonical executor: a prompt the user closed is a refused
+    /// challenge, not a generic effect failure.
+    fn classify_failure(&self, error: &str) -> WorkFailure {
+        if error.contains("interactive challenge") {
+            WorkFailure::ChallengeFailed
+        } else {
+            WorkFailure::EffectFailed
+        }
+    }
+
     fn execute(
         &self,
         work: &TunnelWork,
-        _: &CancellationToken,
+        cancellation: &CancellationToken,
     ) -> Result<TunnelExecutionReceipt, String> {
         self.tunnel_calls.lock().unwrap().push((
             work.profile_id.clone(),
@@ -1713,6 +1759,49 @@ impl TunnelExecutor for TopologyCapture {
             .remove(&work.profile_id)
         {
             return Err("injected retryable tunnel failure".into());
+        }
+        if work.mutation == TunnelMutation::Disconnect
+            && self
+                .hold_disconnect
+                .lock()
+                .unwrap()
+                .contains(&work.profile_id)
+        {
+            let give_up = std::time::Instant::now() + Duration::from_secs(5);
+            while !self.release_disconnects.load(Ordering::SeqCst) {
+                if cancellation.is_cancelled() {
+                    self.cancelled_disconnects
+                        .lock()
+                        .unwrap()
+                        .insert(work.profile_id.clone());
+                    return Err("teardown was cancelled mid-flight".into());
+                }
+                if std::time::Instant::now() >= give_up {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            return Ok(execution_receipt(work));
+        }
+        if work.mutation == TunnelMutation::Connect
+            && self
+                .hold_connect_until_cancelled
+                .lock()
+                .unwrap()
+                .contains(&work.profile_id)
+        {
+            let give_up = std::time::Instant::now() + Duration::from_secs(5);
+            while !cancellation.is_cancelled() {
+                if std::time::Instant::now() >= give_up {
+                    return Err("held connect was never cancelled".into());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.cancelled_connects
+                .lock()
+                .unwrap()
+                .insert(work.profile_id.clone());
+            return Err("interactive challenge was cancelled".into());
         }
         let receipt = execution_receipt(work);
         let receipt = self
@@ -1784,8 +1873,19 @@ impl PolicyExecutor for TopologyCapture {
     }
 }
 
-async fn wait_for_condition(mut condition: impl FnMut() -> bool, message: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+async fn wait_for_condition(condition: impl FnMut() -> bool, message: &str) {
+    wait_for_condition_within(condition, message, Duration::from_secs(1)).await;
+}
+
+/// Wait with an explicit budget, for a test whose sequence spans several
+/// settlements and would otherwise run out of a one-second default while the
+/// rest of the suite shares the machine.
+async fn wait_for_condition_within(
+    mut condition: impl FnMut() -> bool,
+    message: &str,
+    budget: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + budget;
     while !condition() {
         assert!(tokio::time::Instant::now() < deadline, "{message}");
         tokio::task::yield_now().await;
@@ -1793,6 +1893,18 @@ async fn wait_for_condition(mut condition: impl FnMut() -> bool, message: &str) 
 }
 
 async fn observe_connected(service: &ControlService, profile_id: &ProfileId, interface_name: &str) {
+    observe_connected_at(service, profile_id, interface_name, 0).await;
+}
+
+/// Observe a tunnel up at a given clock reading. A scope that already carries
+/// a later stamp rejects an older observation as stale, so a test that has
+/// moved its clock has to say when it is looking.
+async fn observe_connected_at(
+    service: &ControlService,
+    profile_id: &ProfileId,
+    interface_name: &str,
+    observed_at_millis: u64,
+) {
     let desired = service.client().snapshot().desired;
     service
         .observer()
@@ -1800,12 +1912,12 @@ async fn observe_connected(service: &ControlService, profile_id: &ProfileId, int
             profile_id: profile_id.clone(),
             active: true,
             interface_name: Some(interface_name.into()),
-            observed_at_millis: 0,
+            observed_at_millis,
             protection: Some(ProtectionEvidence {
                 desired_generation: desired.generation,
                 authority_epoch: desired.authority_epoch,
                 policy_digest: desired.policy_digest,
-                observed_at_millis: 0,
+                observed_at_millis,
                 interface: GateEvidence::Verified,
                 route: GateEvidence::Verified,
                 dns: GateEvidence::Verified,
@@ -4400,6 +4512,147 @@ async fn a_disconnect_that_reached_absence_does_not_time_out() {
     );
 }
 
+/// Submit a connect, issue its credential prompt, and close the prompt —
+/// the sequence behind every "it broke after I pressed Esc" report.
+async fn connect_and_refuse_prompt(
+    service: &ControlService,
+    profile_id: &ProfileId,
+    idempotency_key: &str,
+) -> OperationId {
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: profile_id.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new(idempotency_key),
+            deadline: Deadline(60_000),
+        })
+        .await
+        .expect("connect admitted");
+    let challenge = service
+        .completer()
+        .issue_challenge(
+            admitted.operation_id.clone(),
+            profile_id.clone(),
+            vortix::vortix_core::control::ChallengeKind::Generic {
+                label: "OpenVPN credentials".into(),
+            },
+            "OpenVPN username and password".to_string(),
+            60_000,
+        )
+        .await
+        .expect("challenge issued")
+        .record
+        .id;
+    service
+        .client()
+        .cancel_challenge(challenge)
+        .await
+        .expect("the user closes the prompt");
+    let operation_id = admitted.operation_id.clone();
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&operation_id]
+                .status
+                .is_terminal()
+        },
+        "the refused connect did not settle",
+    )
+    .await;
+    admitted.operation_id
+}
+
+/// The user's report: after closing profile 04's credential prompt, every
+/// later connect and disconnect timed out — a tunnel that was up and working
+/// was torn down for a deadline it had nothing to do with.
+///
+/// The executor is cooperative: a connect waiting on a prompt keeps running
+/// until its token is cancelled. Terminating the operation was not enough —
+/// the refused connect stayed in the worker holding the profile, and
+/// surfaced its failure long afterwards against state a later command owned.
+#[tokio::test]
+async fn refusing_a_prompt_stops_the_connect_it_abandoned() {
+    let refused = profile("refused-prompt-profile");
+    let wanted = profile("working-profile");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) = clocked_topology_service(
+        BTreeSet::from([refused.clone(), wanted.clone()]),
+        clock.clone(),
+    );
+    let client = service.client();
+    capture.publish_readback();
+    capture.hold_connect_until_cancelled(refused.clone());
+
+    connect_and_refuse_prompt(&service, &refused, "refused-prompt").await;
+    wait_for_condition(
+        || capture.connect_was_cancelled(&refused),
+        "refusing the prompt left its connect running in the worker",
+    )
+    .await;
+    // A profile that is desired-absent yet still supervised is the one state
+    // the pre-policy barrier will not pass, and the barrier spans every
+    // desired tunnel: one profile left behind here stopped any policy from
+    // being published for any later revision, so DNS and the firewall never
+    // reached the tunnel and every later command timed out.
+    wait_for_condition(
+        || supervisor.profile_truth(&refused).is_none(),
+        "a refused prompt left the profile supervised, which blocks every later policy",
+    )
+    .await;
+
+    let connect = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: wanted.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("connect-after-refusal"),
+            deadline: Deadline(60_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&wanted)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "the connect never reached the observation gate",
+    )
+    .await;
+    observe_connected(&service, &wanted, "tun-working-profile").await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&connect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "the refused prompt held back the connect after it",
+    )
+    .await;
+
+    let disconnect = client
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(wanted.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("disconnect-after-refusal"),
+            deadline: Deadline(60_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    observe_disconnected(&service, &wanted).await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&disconnect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "the refused prompt held back the disconnect after it",
+    )
+    .await;
+}
+
 /// The user's sequence, from their control state: cancel a credential prompt,
 /// then connect a different profile. Their log showed the cancel succeeding
 /// and then *every* subsequent connect expiring — while an earlier session
@@ -4418,45 +4671,7 @@ async fn a_connect_after_a_refused_prompt_still_succeeds() {
     capture.publish_readback();
 
     // Admit a connect and refuse its credential prompt.
-    let abandoned = client
-        .submit(CommandRequest {
-            command: UserCommand::Connect {
-                profile_id: refused.clone(),
-                conflict_acknowledgement: None,
-            },
-            idempotency_key: IdempotencyKey::new("refused-prompt"),
-            deadline: Deadline(60_000),
-        })
-        .await
-        .expect("connect admitted");
-    let challenge = service
-        .completer()
-        .issue_challenge(
-            abandoned.operation_id.clone(),
-            refused.clone(),
-            vortix::vortix_core::control::ChallengeKind::Generic {
-                label: "OpenVPN credentials".into(),
-            },
-            "OpenVPN username and password".to_string(),
-            60_000,
-        )
-        .await
-        .expect("challenge issued")
-        .record
-        .id;
-    client
-        .cancel_challenge(challenge)
-        .await
-        .expect("the user closes the prompt");
-    wait_for_condition(
-        || {
-            service.client().snapshot().operations[&abandoned.operation_id]
-                .status
-                .is_terminal()
-        },
-        "the refused connect did not settle",
-    )
-    .await;
+    connect_and_refuse_prompt(&service, &refused, "refused-prompt").await;
 
     // Now connect something else. This is what was expiring in the field.
     let next = client
@@ -5455,8 +5670,330 @@ async fn policy_waits_for_attested_tunnel_and_carries_complete_topology() {
     }
 }
 
+/// Two profiles pointed at the same server draw from the same address pool,
+/// so both tunnels come up holding the same local address. The kernel cannot
+/// route that: the host loses egress completely — measured on Ubuntu as
+/// `ping 8.8.8.8` failing for as long as both stayed up, with DNS stalled and
+/// inbound connections unanswered, which reads as a frozen laptop.
+///
+/// Multi-tunnel itself is fine; this one case is not survivable, so the
+/// newcomer's intent is withdrawn and the tunnel already carrying traffic
+/// keeps it. Declared routes cannot catch it — a profile whose server pushes
+/// `redirect-gateway` declares nothing — so the address the kernel handed out
+/// is what decides.
 #[tokio::test]
-async fn expired_client_connect_rolls_back_with_cleanup_only_recovery() {
+async fn a_second_tunnel_holding_the_same_address_is_withdrawn() {
+    let established = profile("same-address-first");
+    let newcomer = profile("same-address-second");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) = clocked_topology_service(
+        BTreeSet::from([established.clone(), newcomer.clone()]),
+        clock.clone(),
+    );
+    capture.publish_readback();
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &established,
+        "same-address-first-connect",
+    )
+    .await;
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: newcomer.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("same-address-second-connect"),
+            deadline: Deadline(60_000),
+        })
+        .await
+        .expect("second connect admitted");
+    assert_eq!(
+        service.client().snapshot().desired.tunnels.get(&newcomer),
+        Some(&RequestedTunnelState::Connected),
+        "the second connect should be wanted until the collision is observed"
+    );
+
+    // Both interfaces report the same address, which is what the server's
+    // pool actually hands out to two tunnels from one host.
+    for (profile_id, interface, started_at) in [
+        (&established, "tun0", 1_000u64),
+        (&newcomer, "tun1", 2_000u64),
+    ] {
+        observe_connected(&service, profile_id, interface).await;
+        service
+            .observer()
+            .observe(Observation::TunnelDetails {
+                profile_id: profile_id.clone(),
+                details: Box::new(vortix::vortix_core::engine::state::DetailedConnectionInfo {
+                    interface: interface.to_string(),
+                    internal_ip: "10.80.0.2".to_string(),
+                    ..Default::default()
+                }),
+                started_at: Some(
+                    std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(started_at),
+                ),
+                observed_at_millis: 0,
+            })
+            .await
+            .expect("tunnel details accepted");
+    }
+
+    wait_for_condition_within(
+        || {
+            service.client().snapshot().desired.tunnels.get(&newcomer)
+                == Some(&RequestedTunnelState::Disconnected)
+        },
+        "a second tunnel holding the same address as a live one was left up, which takes the host's network down",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        service
+            .client()
+            .snapshot()
+            .desired
+            .tunnels
+            .get(&established),
+        Some(&RequestedTunnelState::Connected),
+        "the tunnel already carrying traffic must keep it"
+    );
+}
+
+/// Ending a command must never cancel a teardown. A teardown is what puts the
+/// host back: it removes the tunnel's routes and hands DNS back. Interrupted
+/// mid-flight, it can leave the machine routing through an interface that no
+/// longer exists — every packet into a black hole, DNS hanging, inbound
+/// connections unanswered, and nothing on screen to explain it. An exclusive
+/// switch carries the outgoing tunnel and the incoming one in a single
+/// operation, so ending it used to cancel the teardown too.
+#[tokio::test]
+async fn ending_a_switch_never_cancels_the_teardown_it_started() {
+    let leaving = profile("switch-leaving");
+    let arriving = profile("switch-arriving");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) = clocked_topology_service(
+        BTreeSet::from([leaving.clone(), arriving.clone()]),
+        clock.clone(),
+    );
+    capture.publish_readback();
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &leaving,
+        "switch-leaving-connect",
+    )
+    .await;
+
+    // The teardown sits in the worker, mid-flight, while the switch runs out
+    // of time.
+    capture.hold_disconnect(leaving.clone());
+    let switching = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::ConnectExclusive {
+                profile_id: arriving.clone(),
+                displacing: None,
+            },
+            idempotency_key: IdempotencyKey::new("switch-that-expires"),
+            deadline: Deadline(10),
+        })
+        .await
+        .expect("switch admitted");
+    wait_for_condition_within(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &leaving && *mutation == TunnelMutation::Disconnect
+                })
+        },
+        "the switch never started tearing the old tunnel down",
+        Duration::from_secs(5),
+    )
+    .await;
+    clock.0.store(10, Ordering::Release);
+    service.client().refresh().expect("expiry refresh");
+    wait_for_condition_within(
+        || {
+            service.client().snapshot().operations[&switching.operation_id]
+                .status
+                .is_terminal()
+        },
+        "the switch never settled",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !capture.disconnect_was_cancelled(&leaving),
+        "ending the switch cancelled the teardown, which strands the tunnel's routes on the host"
+    );
+    capture.release_disconnects();
+}
+
+/// The user's laptop going dark, reproduced: with `block-on-drop` armed,
+/// switching the default route from one tunnel to another raises a
+/// default-DROP barrier *before* any tunnel work. When that switch stalls and
+/// expires, the recovery that follows raises the barrier *again* rather than
+/// taking it down, so the machine is left with a closed firewall and no
+/// tunnel behind it — no network, no SSH, every app retrying into a wall,
+/// recoverable only by `vortix release-killswitch` or a power cycle.
+///
+/// Ignored because it fails: a barrier's lifetime is not bounded by the work
+/// it protects, and giving it one is a deliberate design decision rather than
+/// a patch. Kept as the executable reproduction for backlog row 237 — run it
+/// with `--ignored` when picking that up.
+#[ignore = "reproduces backlog row 237: a blocking barrier outlives the switch it protects"]
+#[tokio::test]
+async fn a_switch_that_ends_before_its_tunnel_releases_the_blocking_barrier() {
+    let holder = profile("barrier-holder");
+    let taker = profile("barrier-taker");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) = clocked_topology_service(
+        BTreeSet::from([holder.clone(), taker.clone()]),
+        clock.clone(),
+    );
+    capture.publish_readback();
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &holder,
+        "barrier-holder-connect",
+    )
+    .await;
+    set_killswitch_and_settle(
+        &service,
+        &capture,
+        vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
+        "barrier-block-on-drop",
+    )
+    .await;
+
+    // The switch stalls inside the blocking barrier, exactly where the user
+    // sat looking at a confirmation popup.
+    let stalled_generation = service.client().snapshot().desired.generation + 1;
+    capture.hold_pre_block(stalled_generation);
+    let switching = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::ConnectExclusive {
+                profile_id: taker.clone(),
+                displacing: None,
+            },
+            idempotency_key: IdempotencyKey::new("barrier-taker-connect"),
+            deadline: Deadline(10),
+        })
+        .await
+        .expect("switch admitted");
+    wait_for_condition_within(
+        || capture.pre_block_entered(stalled_generation),
+        "the switch never raised its blocking barrier",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // The command runs out of time while the barrier is still engaged.
+    clock.0.store(10, Ordering::Release);
+    service.client().refresh().expect("expiry refresh");
+    wait_for_condition_within(
+        || {
+            service.client().snapshot().operations[&switching.operation_id]
+                .status
+                .is_terminal()
+        },
+        "the stalled switch never settled",
+        Duration::from_secs(5),
+    )
+    .await;
+    capture.release_pre_block(stalled_generation);
+
+    // Whatever the platform is left holding must not be a closed firewall.
+    wait_for_condition_within(
+        || {
+            capture
+                .policies
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|policy| !policy.required_blocking)
+        },
+        "a stalled switch left the default-DROP barrier engaged with no tunnel behind it",
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+/// The user's cascade, from their own log: one command times out, and every
+/// command after it times out too — a restart does not clear it, because the
+/// stuck record is persisted. The cleanup a timeout authorizes has to settle
+/// once absence is proven; while it was still holding the revision, nothing
+/// that came later could ever finish.
+#[tokio::test]
+async fn the_cleanup_a_timeout_authorizes_settles_on_proof() {
+    let target = profile("after-a-timeout");
+    let clock = Arc::new(TestClock::default());
+    let (service, _supervisor, capture) =
+        clocked_topology_service(BTreeSet::from([target.clone()]), clock.clone());
+    let client = service.client();
+    // The field shape: the platform cannot prove the gates right after a
+    // teardown, so the cleanup can only settle on the absence the scanner
+    // already reported.
+    capture.withhold_readback();
+
+    let expiring = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("expiring-connect"),
+            deadline: Deadline(10),
+        })
+        .await
+        .expect("connect admitted");
+    clock.0.store(10, Ordering::Release);
+    client.refresh().expect("expiry refresh");
+    wait_for_condition_within(
+        || client.snapshot().operations[&expiring.operation_id].status == OperationStatus::Expired,
+        "the connect did not expire",
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_condition_within(
+        || {
+            !client
+                .snapshot()
+                .operations
+                .values()
+                .any(|operation| !operation.status.is_terminal())
+        },
+        "the cleanup a timeout authorized never settled, so it still holds the revision",
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+/// An expired connect must both withdraw its intent and leave nothing
+/// behind. The cleanup it authorizes is bounded by proof, not by a record:
+/// once the teardown reports absence there is no residue left to chase, so
+/// the recovery settles rather than holding the revision — a recovery that
+/// outlived its own proof pinned the control plane and timed out every
+/// command that followed it.
+#[tokio::test]
+async fn expired_client_connect_rolls_back_and_cleans_up() {
     let clock = Arc::new(TestClock::default());
     let target = profile("expired-connect");
     let service = ControlService::start_supervised(
@@ -5502,17 +6039,21 @@ async fn expired_client_connect_rolls_back_with_cleanup_only_recovery() {
         snapshot.desired.tunnels.get(&target),
         Some(&RequestedTunnelState::Disconnected)
     );
-    let recovery = snapshot
-        .operations
-        .values()
-        .find(|operation| operation.id != admitted.operation_id)
-        .expect("timeout rollback must authorize cleanup of any residual effect");
-    assert_eq!(recovery.desired_generation, snapshot.desired.generation);
-    assert!(matches!(
-        &recovery.intent,
-        OperationIntent::DesiredSubset { tunnels, .. }
-            if tunnels.get(&target) == Some(&RequestedTunnelState::Disconnected)
-    ));
+    assert!(
+        snapshot
+            .observed
+            .tunnels
+            .get(&target)
+            .is_some_and(|fact| !fact.active),
+        "timeout rollback must prove the residual effect is gone"
+    );
+    assert!(
+        !snapshot
+            .operations
+            .values()
+            .any(|operation| !operation.status.is_terminal()),
+        "a cleanup that proved absence must not keep holding the revision"
+    );
 }
 
 #[tokio::test]

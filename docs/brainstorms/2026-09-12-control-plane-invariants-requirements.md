@@ -40,7 +40,7 @@ struct EgressReading { value: IpAddr, taken_through_tunnel: bool, at: Instant }
 Landing this deletes all three ad-hoc flags. Touches `vpn_runtime`,
 `app/update.rs`, `ui/dashboard/security.rs`.
 
-## Flaw 2 — sibling lifecycles are coupled by convention, not construction
+## Flaw 2 — sibling lifecycles are coupled by convention, not construction (DONE)
 
 A challenge, an operation, a policy transaction and a tunnel worker each have
 independent lifecycles, linked only by ids and reconciled by a level-triggered
@@ -56,9 +56,14 @@ loop. Nothing forces terminating one to terminate what it owns.
 
 `cancel_operation_for_refused_challenge` is one instance of the missing seam.
 
-**Wanted:** a single "terminate this operation and everything it owns" path
-that cancel, expire and fail all route through, so they cannot diverge again.
-Control-plane surgery — deserves its own focused pass.
+**Done:** every terminal transition that is not a success now records the
+profiles the operation still owns (`OwnerState::abandon_operation_work`), and
+the service loop cancels that work through the supervisor before it reconciles
+anything else. Cancel, expire and fail all reach it through
+`complete_operation` and `expire_operations`, so they cannot diverge again.
+Cancellation stays cooperative: the executor still reports its result, so
+ownership, reservations and a teardown's absence receipt follow their normal
+course.
 
 ## Flaw 3 — refactors leave live gates behind (DONE)
 

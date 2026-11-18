@@ -581,6 +581,7 @@ fn every_canonical_mutation_family_has_normalized_local_remote_parity() {
         },
         UserCommand::ConnectExclusive {
             profile_id: profile('a'),
+            displacing: None,
         },
         UserCommand::Disconnect {
             profile_id: Some(profile('a')),

@@ -43,6 +43,7 @@ impl App {
     /// Handle a message from the action menu or other sources
     #[allow(clippy::too_many_lines)]
     pub fn handle_message(&mut self, msg: crate::message::Message) {
+        crate::trace::message(&msg);
         // Slow-handler observability. The UI thread runs every
         // `handle_message` synchronously, so anything that ties it up
         // for more than ~50ms is likely to manifest as visible TUI
@@ -100,36 +101,14 @@ impl App {
                     self.confirm_delete_profile(&profile_id);
                 }
             }
-            Message::ConfirmDefaultRouteTakeover { idx } => {
+            Message::SwitchExclusiveAndConnect { idx, displacing } => {
+                // The user chose to switch exits on the takeover overlay.
+                // Exactly the tunnel named in that overlay stands down; any
+                // other tunnel conflicts with nothing and keeps running.
                 self.input_mode = InputMode::Normal;
                 if let Some(profile) = self.runtime.profiles.get(idx) {
                     self.log(&format!(
-                        "ACTION: Switching active exit to '{}'; both tunnels stay connected",
-                        profile.name
-                    ));
-                }
-                // The "primary inverts" scenario: both tunnels stay
-                // connected; the new one claims the kernel default
-                // route and the prior primary becomes
-                // `Split tunnel (0.0.0.0/0, yielded)` in the registry's
-                // role derivation. Symmetric with
-                // `ConfirmRouteOverlap` below — neither path
-                // disconnects the existing tunnel. The conflict was
-                // already surfaced via the overlay, so retry the
-                // connect with the `detect_conflict` gate bypassed.
-                self.connect_profile_forced(idx);
-            }
-            Message::SwitchExclusiveAndConnect { idx } => {
-                // User chose the legacy "switch VPNs" path on the
-                // takeover overlay: disconnect the current tunnel,
-                // queue the new one to fire once teardown completes.
-                // This is the pre-multi-tunnel UX preserved as an
-                // opt-in `[S]` hotkey for users who don't want both
-                // VPNs active at once.
-                self.input_mode = InputMode::Normal;
-                if let Some(profile) = self.runtime.profiles.get(idx) {
-                    self.log(&format!(
-                        "ACTION: Disconnecting current tunnel before connecting '{}'",
+                        "ACTION: Standing down the current exit before connecting '{}'",
                         profile.name
                     ));
                 }
@@ -140,7 +119,10 @@ impl App {
                     .map(|profile| profile.id.clone())
                 {
                     self.issue_control_command(
-                        crate::vortix_core::control::UserCommand::ConnectExclusive { profile_id },
+                        crate::vortix_core::control::UserCommand::ConnectExclusive {
+                            profile_id,
+                            displacing: Some(displacing),
+                        },
                     );
                 }
             }
@@ -967,7 +949,8 @@ impl App {
                 let is_connected = self.has_active_connection();
                 let disconnect_safe = self.runtime.scanner_first_tick_done
                     && self.runtime.last_kernel_session_count == 0
-                    && !is_connected;
+                    && !is_connected
+                    && !self.egress_leaves_through_a_tunnel();
                 let no_tunnel_routes_v6 = is_connected
                     && !self.registry.snapshot_all().into_iter().any(|snap| {
                         use crate::vortix_core::engine::{Connection, Role};
@@ -1085,9 +1068,17 @@ impl App {
 
         // Cache the real address only after both scanner and registry prove
         // that no tunnel owns the egress path.
+        //
+        // The session count only sees tunnels Vortix can attribute to a known
+        // profile, so one it does not own — a leftover process, a tunnel
+        // raised outside Vortix, a renamed profile — read as "no VPN" and the
+        // exit address was remembered as the user's real one, permanently and
+        // across restarts. The kernel's own answer to "which interface
+        // carries traffic to the internet" does not care who started it.
         let safe_to_cache = self.runtime.scanner_first_tick_done
             && self.runtime.last_kernel_session_count == 0
-            && !is_connected;
+            && !is_connected
+            && !self.egress_leaves_through_a_tunnel();
         if safe_to_cache {
             let first_detection = self.runtime.real_ip.is_none();
             let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());

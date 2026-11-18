@@ -491,22 +491,30 @@ fn find_route_conflict(
         if Some(*lease_id) == excluded || lease.profile_id == *profile_id {
             continue;
         }
+        // Two questions, asked separately. Both wanting the default route is a
+        // takeover — one of them has to yield it. Everything else is only a
+        // conflict when two *specific* claims collide: a default route
+        // contains every address, so measuring specific claims against it
+        // marked every split tunnel as conflicting with a full one, which is
+        // the ordinary way to run two tunnels side by side.
+        let both_claim_default = routes.iter().any(|route| route.is_default())
+            && lease.routes.iter().any(|route| route.is_default());
         let overlapping = routes
             .iter()
+            .filter(|route| !route.is_default())
             .filter(|route| {
                 lease
                     .routes
                     .iter()
+                    .filter(|existing| !existing.is_default())
                     .any(|existing| existing.overlaps(**route))
             })
             .copied()
             .collect::<Vec<_>>();
-        if overlapping.is_empty() {
+        if !both_claim_default && overlapping.is_empty() {
             continue;
         }
-        let conflict = if overlapping.iter().any(|route| route.is_default())
-            && lease.routes.iter().any(|route| route.is_default())
-        {
+        let conflict = if both_claim_default {
             Conflict::DefaultRouteTakeover {
                 current: lease.profile_id.clone(),
                 new: profile_id.clone(),
@@ -1257,15 +1265,21 @@ pub trait PolicyExecutor: Send + Sync + 'static {
         self.audit(policy)
     }
 
-    /// Return fresh platform read-back produced by the exact final policy.
-    /// Implementations that cannot prove every gate return `None`; worker
-    /// completion alone is never protection truth.
+    /// Return fresh platform read-back produced by the exact policy that was
+    /// just applied. Implementations that cannot prove the gates that stage
+    /// is able to prove return `None`; worker completion alone is never
+    /// protection truth.
+    ///
+    /// A [`PolicyStage::Final`] policy must prove all four gates. A
+    /// [`PolicyStage::PreTunnelBlocking`] policy can only prove the firewall:
+    /// while the emergency barrier is the only thing installed there is no
+    /// tunnel, route or resolver left to read back.
     fn verification(&self, _policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         None
     }
 }
 
-/// Platform read-back attached only to an exact successful final policy.
+/// Platform read-back attached only to an exact successful policy stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // Explicit gates are an auditable proof bit-set.
 pub struct PolicyExecutionEvidence {
@@ -1346,6 +1360,7 @@ pub struct PolicyResult {
 pub struct PolicyAuditResult {
     pub revision: ControlRevision,
     pub operation_id: OperationId,
+    pub stage: PolicyStage,
     pub result: Result<PolicyExecutionEvidence, WorkFailure>,
 }
 
@@ -1612,6 +1627,7 @@ fn run_policy_audit(
 ) -> PolicyAuditResult {
     let revision = policy.revision();
     let operation_id = policy.operation_id.clone();
+    let stage = policy.stage;
     let result = if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
         Err(WorkFailure::Cancelled)
     } else if Instant::now() >= policy.deadline {
@@ -1638,6 +1654,7 @@ fn run_policy_audit(
     PolicyAuditResult {
         revision,
         operation_id,
+        stage,
         result,
     }
 }
@@ -1763,7 +1780,11 @@ fn run_policy(
             }
         }
     }
-    let verification = (outcome == PolicyOutcome::Applied && policy.stage == PolicyStage::Final)
+    // Every applied stage offers its read-back, not only the final one. The
+    // emergency pre-tunnel barrier is a real firewall the user is relying on;
+    // withholding its proof left the kill-switch row reporting `Degraded`
+    // during the exact window the block was in force.
+    let verification = (outcome == PolicyOutcome::Applied)
         .then(|| executor.verification(&policy))
         .flatten();
     PolicyResult {

@@ -39,6 +39,15 @@ const CONTROL_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 /// A completed scan can therefore be at most this old before another starts;
 /// scans that take longer are followed immediately rather than queued.
 const SCANNER_REFRESH_CEILING: Duration = Duration::from_millis(250);
+/// How often an *unchanged* tunnel fact is republished.
+///
+/// The control plane trusts an observation only while it is fresh, so steady
+/// state has to keep being reported — but the scanner sweeps four times a
+/// second, and republishing every sweep put a full snapshot clone and a TUI
+/// wake behind each one. One republish every two seconds keeps every fact
+/// inside the freshness ceiling at a fraction of the cost; a real change is
+/// still published the moment it is seen.
+const OBSERVATION_HEARTBEAT: Duration = Duration::from_secs(2);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SUPERVISED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -1701,6 +1710,7 @@ pub struct LocalControlSession {
     sessions: Arc<Mutex<Vec<ActiveSession>>>,
     scanner_lifecycle_revision: Arc<AtomicU64>,
     published_observations: RefCell<BTreeMap<ProfileId, (bool, Option<String>)>>,
+    observation_published_at: RefCell<BTreeMap<ProfileId, Instant>>,
     published_default_route:
         RefCell<crate::vortix_core::ports::route_table::DefaultRouteObservation>,
     published_tunnel_details: RefCell<BTreeMap<ProfileId, PublishedTunnelDetails>>,
@@ -2003,6 +2013,7 @@ impl LocalControlSession {
             sessions: Arc::new(Mutex::new(Vec::new())),
             scanner_lifecycle_revision: Arc::new(AtomicU64::new(0)),
             published_observations: RefCell::new(BTreeMap::new()),
+            observation_published_at: RefCell::new(BTreeMap::new()),
             published_default_route: RefCell::new(
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
             ),
@@ -2303,6 +2314,7 @@ impl LocalControlSession {
             sessions,
             scanner_lifecycle_revision,
             published_observations: RefCell::new(BTreeMap::new()),
+            observation_published_at: RefCell::new(BTreeMap::new()),
             published_default_route: RefCell::new(
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
             ),
@@ -2904,6 +2916,62 @@ impl LocalControlSession {
             .await
     }
 
+    /// The per-tunnel detail observations whose content actually changed,
+    /// with the cache updates they imply and the profiles they covered.
+    fn tunnel_detail_changes(
+        &self,
+        profiles: &[VpnProfile],
+        sessions: &[ActiveSession],
+        observed_at_millis: u64,
+    ) -> (
+        Vec<Observation>,
+        Vec<(ProfileId, PublishedTunnelDetails)>,
+        std::collections::BTreeSet<ProfileId>,
+    ) {
+        let mut observations = Vec::new();
+        let mut updates = Vec::new();
+        let mut covered = std::collections::BTreeSet::new();
+        for session in sessions {
+            let Some(profile) = profiles.iter().find(|profile| profile.name == session.name) else {
+                continue;
+            };
+            covered.insert(profile.id.clone());
+            let published = PublishedTunnelDetails::from(session);
+            if self.published_tunnel_details.borrow().get(&profile.id) != Some(&published) {
+                observations.push(Observation::TunnelDetails {
+                    profile_id: profile.id.clone(),
+                    details: Box::new(published.details.clone()),
+                    started_at: published.started_at,
+                    observed_at_millis,
+                });
+                updates.push((profile.id.clone(), published));
+            }
+        }
+        (observations, updates, covered)
+    }
+
+    /// The facts worth sending this sweep: anything that changed, plus
+    /// anything whose last publication is old enough to be aging out of the
+    /// freshness window.
+    fn facts_due_for_publication(
+        &self,
+        profiles: &[VpnProfile],
+        sessions: &[ActiveSession],
+        now: Instant,
+    ) -> Vec<(ProfileId, (bool, Option<String>))> {
+        let published = self.published_observations.borrow();
+        let published_at = self.observation_published_at.borrow();
+        observation_facts(profiles, sessions)
+            .into_iter()
+            .filter(|(profile_id, state)| {
+                published.get(profile_id) != Some(state)
+                    || published_at.get(profile_id).is_none_or(|last| {
+                        now.saturating_duration_since(*last) >= OBSERVATION_HEARTBEAT
+                    })
+            })
+            .collect()
+    }
+
     async fn publish_observations_from_revision(
         &self,
         scan: crate::core::scanner::ScannerResult,
@@ -2944,28 +3012,11 @@ impl LocalControlSession {
                 observed_at_millis,
             });
         }
-        let mut observed_detail_profiles = std::collections::BTreeSet::new();
-        let mut detail_updates = Vec::new();
-        for session in &sessions {
-            let Some(profile) = profiles.iter().find(|profile| profile.name == session.name) else {
-                continue;
-            };
-            observed_detail_profiles.insert(profile.id.clone());
-            let published = PublishedTunnelDetails::from(session);
-            let changed =
-                self.published_tunnel_details.borrow().get(&profile.id) != Some(&published);
-            if changed {
-                observations.push(Observation::TunnelDetails {
-                    profile_id: profile.id.clone(),
-                    details: Box::new(published.details.clone()),
-                    started_at: published.started_at,
-                    observed_at_millis,
-                });
-                detail_updates.push((profile.id.clone(), published));
-            }
-        }
-        let changed =
-            observation_changes(&profiles, &sessions, &self.published_observations.borrow());
+        let (detail_observations, detail_updates, observed_detail_profiles) =
+            self.tunnel_detail_changes(&profiles, &sessions, observed_at_millis);
+        observations.extend(detail_observations);
+        let now_instant = Instant::now();
+        let changed = self.facts_due_for_publication(&profiles, &sessions, now_instant);
         observations.extend(
             changed
                 .iter()
@@ -2994,6 +3045,9 @@ impl LocalControlSession {
             published.retain(|profile_id, _| observed_detail_profiles.contains(profile_id));
         }
         for (profile_id, state) in changed {
+            self.observation_published_at
+                .borrow_mut()
+                .insert(profile_id.clone(), now_instant);
             self.published_observations
                 .borrow_mut()
                 .insert(profile_id, state);
@@ -3098,7 +3152,7 @@ fn validate_command_target(
 ) -> Result<(), LocalControlError> {
     let target = match command {
         UserCommand::Connect { profile_id, .. }
-        | UserCommand::ConnectExclusive { profile_id }
+        | UserCommand::ConnectExclusive { profile_id, .. }
         | UserCommand::Disconnect {
             profile_id: Some(profile_id),
         }
@@ -3172,20 +3226,30 @@ fn validate_command_target(
     Ok(())
 }
 
-fn observation_changes(
+/// Every profile's current session state, reported on every scan.
+///
+/// The control plane only treats an observation as proof while it is fresh,
+/// so a fact published once and never repeated ages out: a tunnel that came
+/// up half a minute ago stopped counting as established, its policy was never
+/// published, and the command that raised it expired and tore it down. Steady
+/// state has to keep being reported for the freshness rule to mean anything.
+/// Repeats are cheap because an unchanged fact no longer invalidates the
+/// protection gates.
+fn observation_facts(
     profiles: &[VpnProfile],
     sessions: &[ActiveSession],
-    published: &BTreeMap<ProfileId, (bool, Option<String>)>,
 ) -> Vec<(ProfileId, (bool, Option<String>))> {
     profiles
         .iter()
-        .filter_map(|profile| {
+        .map(|profile| {
             let session = sessions.iter().find(|session| session.name == profile.name);
-            let state = (
-                session.is_some(),
-                session.map(|session| session.interface.clone()),
-            );
-            (published.get(&profile.id) != Some(&state)).then(|| (profile.id.clone(), state))
+            (
+                profile.id.clone(),
+                (
+                    session.is_some(),
+                    session.map(|session| session.interface.clone()),
+                ),
+            )
         })
         .collect()
 }
@@ -3289,13 +3353,22 @@ fn restore_owned_sessions(
                 (owned.tunnel_generation, owned.operation_id)
             }
             Protocol::OpenVPN => {
-                let Some(owner) = crate::tunnel::standard_openvpn_owner(&profile.id, session)
-                    .map_err(|error| LocalControlError::Recovery {
-                        profile: profile.name.clone(),
-                        reason: error,
-                    })?
-                else {
-                    continue;
+                // One tunnel Vortix cannot attest to must not stop it
+                // adopting the others. Refusing to start left a user with a
+                // dead CLI and every tunnel unmanaged, which is strictly
+                // worse than managing the ones whose ownership is provable.
+                let owner = match crate::tunnel::standard_openvpn_owner(&profile.id, session) {
+                    Ok(Some(owner)) => owner,
+                    Ok(None) => continue,
+                    Err(reason) => {
+                        tracing::warn!(
+                            target: "vortix::control",
+                            profile = %profile.name,
+                            %reason,
+                            "leaving this tunnel unadopted; other tunnels still start"
+                        );
+                        continue;
+                    }
                 };
                 let Some(operation_id) = recovered_openvpn_operation(
                     operations,
@@ -3308,20 +3381,23 @@ fn restore_owned_sessions(
                 (owner.generation(), operation_id)
             }
         };
-        executor
-            .restore_standard_profile(
-                supervisor,
-                &profile.id,
-                TunnelRevision {
-                    authority_epoch: STANDARD_AUTHORITY_EPOCH,
-                    generation,
-                },
-                operation_id,
-            )
-            .map_err(|reason| LocalControlError::Recovery {
-                profile: profile.name.clone(),
-                reason,
-            })?;
+        if let Err(reason) = executor.restore_standard_profile(
+            supervisor,
+            &profile.id,
+            TunnelRevision {
+                authority_epoch: STANDARD_AUTHORITY_EPOCH,
+                generation,
+            },
+            operation_id,
+        ) {
+            tracing::warn!(
+                target: "vortix::control",
+                profile = %profile.name,
+                %reason,
+                "leaving this tunnel unadopted; other tunnels still start"
+            );
+            continue;
+        }
         restored.insert(profile.id.clone());
     }
     Ok(restored)
@@ -4038,8 +4114,11 @@ mod tests {
         ));
     }
 
+    /// Steady state has to keep being reported: the control plane only trusts
+    /// an observation while it is fresh, so a fact published once and never
+    /// repeated ages out and a healthy tunnel stops counting as established.
     #[test]
-    fn scanner_cache_publishes_only_presence_or_interface_changes() {
+    fn scanner_reports_every_profile_on_every_scan() {
         let profile = VpnProfile {
             id: profile_id('a'),
             name: "corp".into(),
@@ -4053,31 +4132,35 @@ mod tests {
             interface: "wg0".into(),
             ..ActiveSession::default()
         };
-        let initial = observation_changes(
+        let first = observation_facts(
             std::slice::from_ref(&profile),
             std::slice::from_ref(&session),
-            &BTreeMap::new(),
         );
         assert_eq!(
-            initial,
+            first,
             vec![(profile.id.clone(), (true, Some("wg0".into())))]
         );
-
-        let published = BTreeMap::from_iter(initial);
-        assert!(observation_changes(
-            std::slice::from_ref(&profile),
-            std::slice::from_ref(&session),
-            &published,
-        )
-        .is_empty());
+        assert_eq!(
+            observation_facts(
+                std::slice::from_ref(&profile),
+                std::slice::from_ref(&session),
+            ),
+            first,
+            "an unchanged tunnel must still be reported so it stays fresh"
+        );
 
         let changed = ActiveSession {
             interface: "wg1".into(),
             ..session
         };
         assert_eq!(
-            observation_changes(&[profile], &[changed], &published),
-            vec![(profile_id('a'), (true, Some("wg1".into())))]
+            observation_facts(std::slice::from_ref(&profile), &[changed]),
+            vec![(profile.id.clone(), (true, Some("wg1".into())))]
+        );
+        assert_eq!(
+            observation_facts(&[profile], &[]),
+            vec![(profile_id('a'), (false, None))],
+            "a profile with no session is reported absent, not omitted"
         );
     }
 

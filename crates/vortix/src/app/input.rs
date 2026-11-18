@@ -95,6 +95,14 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     pub fn handle_key(&mut self, key: KeyEvent) {
+        crate::trace_event!(
+            "key",
+            "{:?} mods={:?} mode={} panel={:?}",
+            key.code,
+            key.modifiers,
+            self.input_mode.trace_name(),
+            self.focused_panel
+        );
         // 1. Global: Quit
         // Ctrl+C always force-quits.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -344,34 +352,16 @@ impl App {
             },
             InputMode::ConfirmDefaultRouteTakeover {
                 to_profile_id,
+                from_profile_id,
                 mut confirm_selected,
                 ..
             } => {
-                // Key bindings on this overlay:
+                // Two tunnels cannot both carry all traffic, so this
+                // overlay offers the only two outcomes that exist:
                 //
-                //   [Y]/Enter  -> SwitchExclusiveAndConnect (legacy:
-                //                 disconnect current, then connect new)
-                //   [B]/[b]    -> ConfirmDefaultRouteTakeover (new:
-                //                 keep both connected, new becomes
-                //                 active exit, old becomes split
-                //                 tunnel)
+                //   [Y]/Enter  -> SwitchExclusiveAndConnect (disconnect
+                //                 current, then connect new)
                 //   [N]/Esc    -> Cancel
-                //
-                // The Y/N cursor still navigates the Yes/No buttons.
-                // [B] is a side hotkey for the multi-connect path.
-                if matches!(key.code, KeyCode::Char('b' | 'B')) {
-                    let idx = self
-                        .runtime
-                        .profiles
-                        .iter()
-                        .position(|p| p.id == to_profile_id);
-                    if let Some(i) = idx {
-                        self.handle_message(Message::ConfirmDefaultRouteTakeover { idx: i });
-                    } else {
-                        self.handle_message(Message::CloseOverlay);
-                    }
-                    return;
-                }
                 match handle_confirm_keys(key, &mut confirm_selected) {
                     ConfirmAction::Confirmed => {
                         // [Y]es fires the exclusive canonical switch. The
@@ -384,7 +374,10 @@ impl App {
                             .iter()
                             .position(|p| p.id == to_profile_id);
                         if let Some(i) = idx {
-                            self.handle_message(Message::SwitchExclusiveAndConnect { idx: i });
+                            self.handle_message(Message::SwitchExclusiveAndConnect {
+                                idx: i,
+                                displacing: from_profile_id.clone(),
+                            });
                         } else {
                             self.handle_message(Message::CloseOverlay);
                         }

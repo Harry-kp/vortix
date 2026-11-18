@@ -124,8 +124,48 @@ pub fn is_root() -> bool {
 /// Returns an error if directory creation fails.
 pub fn create_user_dir(path: &std::path::Path) -> std::io::Result<()> {
     create_private_dir_all(path)?;
+    make_private(path);
     crate::config::fix_ownership(path);
     Ok(())
+}
+
+/// Drop group and world access from a directory that already exists.
+///
+/// [`create_private_dir_all`] only sets the mode on directories it creates,
+/// so an install made before Vortix set 0700 keeps whatever the umask gave
+/// it — 0755 on macOS, 0775 on Ubuntu — for the rest of its life. These
+/// directories hold VPN private keys, inline certificates and credentials,
+/// so the mode is repaired on every run rather than only at creation.
+///
+/// Owner bits are preserved and access is only ever narrowed. A failure is
+/// not fatal: the durable-state checks reject a directory that is still
+/// unsafe, with a message that names it.
+pub fn make_private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return;
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        let private = mode & 0o700;
+        if private == mode {
+            return;
+        }
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(private))
+        {
+            tracing::warn!(
+                target: "vortix::config",
+                path = %path.display(),
+                from = format!("{mode:04o}"),
+                to = format!("{private:04o}"),
+                %error,
+                "could not restrict a Vortix directory to owner-only access"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// `create_dir_all` with 0700 on every directory it creates.
@@ -255,9 +295,9 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
     let root = get_app_config_dir()?;
     let path = root.join(crate::constants::PROFILES_DIR_NAME);
 
-    if !path.exists() {
-        create_user_dir(&path)?;
-    }
+    // Unconditional: `create_user_dir` is idempotent, and running it on an
+    // existing directory is what repairs the mode of an older install.
+    create_user_dir(&path)?;
 
     Ok(path)
 }
@@ -2049,5 +2089,71 @@ mod tests {
         let b = get_tmp_config_dir(&sid).unwrap();
         assert_eq!(a, b);
         assert!(a.exists());
+    }
+
+    /// An install predating the 0700 rule keeps the umask's mode forever
+    /// unless startup repairs it. macOS gives 0755, Ubuntu 0775; both leave
+    /// VPN private keys readable by every other account on the machine.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_readable_directory_is_repaired() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vortix-make-private-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        for laxity in [0o755, 0o775, 0o700] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(laxity))
+                .expect("set mode");
+            make_private(&dir);
+            let mode = std::fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "a directory created as {laxity:04o} must end up owner-only"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Narrowing only. A directory with no owner-execute bit must not gain
+    /// one just because the repair ran.
+    #[cfg(unix)]
+    #[test]
+    fn make_private_never_widens_owner_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vortix-make-private-narrow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).expect("set mode");
+
+        make_private(&dir);
+
+        assert_eq!(
+            std::fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "owner bits are preserved exactly; only group and other are dropped"
+        );
+
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

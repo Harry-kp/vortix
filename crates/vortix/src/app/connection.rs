@@ -178,7 +178,12 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
             CONTROL_STARTING_MESSAGE.to_string()
         }
         LocalControlError::Admission(AdmissionError::RouteConflict) => {
-            "This VPN overlaps an active route. Review the confirmation and try again.".to_string()
+            // Reached only when the confirmation overlay could not be reopened
+            // - see `recover_route_conflict`. By that point the conflicting
+            // tunnel is no longer in our snapshot, so naming it would be a
+            // guess. Telling the user to "review the confirmation" was worse:
+            // there was no confirmation anywhere to review.
+            "Another tunnel claimed these routes first. Try connecting again.".to_string()
         }
         LocalControlError::Admission(AdmissionError::ProfileActive) => {
             "Disconnect this profile before changing it.".to_string()
@@ -204,6 +209,36 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
             reason.clone()
         }
         _ => "Vortix could not start this action. See Event Log for details.".to_string(),
+    }
+}
+
+/// Whether a refusal is the service saying "these routes are already claimed".
+///
+/// Both the in-process and the daemon-backed control paths can raise it, and
+/// the user's situation is identical either way, so both must be recognised.
+fn is_route_conflict(error: &crate::cli::control::LocalControlError) -> bool {
+    use crate::cli::control::LocalControlError;
+    use crate::vortix_core::control::AdmissionError;
+    matches!(
+        error,
+        LocalControlError::Admission(AdmissionError::RouteConflict)
+            | LocalControlError::Remote(crate::daemon::service::RemoteControlError::Admission(
+                AdmissionError::RouteConflict
+            ))
+    )
+}
+
+/// The profile a connect-shaped command targeted, if it was one.
+///
+/// Deliberately narrower than [`lifecycle_command_profile_id`]: only a connect
+/// can be refused for a route conflict, and recovering one means re-offering
+/// the *connect*.
+fn connect_target(command: Option<&crate::vortix_core::control::UserCommand>) -> Option<ProfileId> {
+    use crate::vortix_core::control::UserCommand;
+    match command? {
+        UserCommand::Connect { profile_id, .. }
+        | UserCommand::ConnectExclusive { profile_id, .. } => Some(profile_id.clone()),
+        _ => None,
     }
 }
 
@@ -259,6 +294,122 @@ pub(crate) struct CatalogFeedback {
 
 const CATALOG_FEEDBACK_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Say, in the user's own words, which link of the completion chain did not
+/// close. Completion needs the tunnels an operation named to match what the
+/// scanner reports, a platform read-back naming the current revision, and
+/// four verified gates. Any one of them failing stalled the operation
+/// silently until its deadline, so the timeout said only "it timed out".
+fn convergence_stall_detail(
+    profiles: &[crate::state::VpnProfile],
+    operation_id: &crate::vortix_core::control::OperationId,
+    snapshot: &crate::vortix_core::control::ControlSnapshot,
+) -> String {
+    use crate::vortix_core::control::{OperationIntent, RequestedTunnelState};
+
+    let named_tunnels = |intent: &OperationIntent| match intent {
+        OperationIntent::DesiredSubset { tunnels, .. }
+        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels.clone(),
+        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
+            std::collections::BTreeMap::new()
+        }
+    };
+    let describe = |profile_id: &ProfileId, requested: RequestedTunnelState| {
+        let name = profiles
+            .iter()
+            .find(|profile| profile.id == *profile_id)
+            .map_or_else(
+                || "unknown profile".to_string(),
+                |profile| profile.name.clone(),
+            );
+        let seen = match snapshot.observed.tunnels.get(profile_id) {
+            None => "never seen",
+            Some(fact) if fact.active => "seen up",
+            Some(_) => "seen down",
+        };
+        let asked = if requested == RequestedTunnelState::Connected {
+            "connect"
+        } else {
+            "disconnect"
+        };
+        format!("{name} asked to {asked}, {seen}")
+    };
+
+    let asked = snapshot
+        .operations
+        .get(operation_id)
+        .map(|operation| named_tunnels(&operation.intent))
+        .unwrap_or_default()
+        .iter()
+        .map(|(profile_id, requested)| describe(profile_id, *requested))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let blocking = snapshot
+        .desired
+        .tunnels
+        .iter()
+        .filter(|(profile_id, requested)| {
+            snapshot
+                .observed
+                .tunnels
+                .get(*profile_id)
+                .is_none_or(|fact| fact.active != (**requested == RequestedTunnelState::Connected))
+        })
+        .map(|(profile_id, requested)| describe(profile_id, *requested))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let still_running = snapshot
+        .operations
+        .values()
+        .filter(|operation| !operation.status.is_terminal() && operation.id != *operation_id)
+        .map(|operation| {
+            let tunnels = named_tunnels(&operation.intent)
+                .iter()
+                .map(|(profile_id, requested)| describe(profile_id, *requested))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            let tunnels = if tunnels.is_empty() {
+                "service work".to_string()
+            } else {
+                tunnels
+            };
+            format!("{tunnels} ({:?})", operation.status)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let (proof, gates) = read_back_summary(snapshot);
+    format!(
+        "this command wanted [{asked}]; still off target [{blocking}]; \
+         other commands still running [{still_running}]; {proof}; gates[{gates}]"
+    )
+}
+
+/// How the platform read-back stands against the revision in force.
+fn read_back_summary(snapshot: &crate::vortix_core::control::ControlSnapshot) -> (String, String) {
+    use crate::vortix_core::control::GateEvidence;
+
+    let Some(evidence) = snapshot.observed.evidence.as_ref() else {
+        return ("no platform read-back yet".to_string(), "none".to_string());
+    };
+    let mut proof = vec![format!(
+        "read-back for revision {} while now on {}",
+        evidence.desired_generation, snapshot.desired.generation
+    )];
+    if evidence.policy_digest != snapshot.desired.policy_digest {
+        proof.push("policy differs".to_string());
+    }
+    if evidence.authority_epoch != snapshot.desired.authority_epoch {
+        proof.push("authority differs".to_string());
+    }
+    let gates = format!(
+        "interface={} route={} dns={} firewall={}",
+        evidence.interface == GateEvidence::Verified,
+        evidence.route == GateEvidence::Verified,
+        evidence.dns == GateEvidence::Verified,
+        evidence.firewall == GateEvidence::Verified,
+    );
+    (proof.join(", "), gates)
+}
+
 fn control_command_subject(
     command: Option<&crate::vortix_core::control::UserCommand>,
 ) -> Option<PendingControlSubject> {
@@ -312,7 +463,7 @@ fn lifecycle_command_profile_id(
     use crate::vortix_core::control::UserCommand;
     match command? {
         UserCommand::Connect { profile_id, .. }
-        | UserCommand::ConnectExclusive { profile_id }
+        | UserCommand::ConnectExclusive { profile_id, .. }
         | UserCommand::Reconnect {
             profile_id: Some(profile_id),
         }
@@ -490,11 +641,32 @@ impl App {
     ) -> Option<()> {
         let wait = self.control_command_timeout(&command);
         let idempotency_key = self.next_control_request_key();
+        crate::trace_event!(
+            "cmd",
+            "submit {command:?} key={idempotency_key} wait={wait:?} desired_gen={}",
+            self.control_snapshot.desired.generation
+        );
+        // Captured before `command` moves into the queue: a route-conflict
+        // refusal has to know which profile was asking in order to re-offer it.
+        let conflict_target = connect_target(Some(&command));
         let result = self
             .control_session
             .as_ref()
             .expect("control command requires an attached session")
             .enqueue_tui_command(command, wait, idempotency_key);
+        if let Err(error) = &result {
+            crate::trace_event!("cmd", "refused {error}");
+            if is_route_conflict(error) {
+                if let Some(profile_id) = conflict_target {
+                    if self.recover_route_conflict(&profile_id) {
+                        self.log(
+                            "CONTROL: connect refused for a route conflict; reopened the confirmation",
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
         self.report_control_enqueue(result)
     }
 
@@ -544,7 +716,7 @@ impl App {
         };
         let seconds = match command {
             UserCommand::Connect { profile_id, .. }
-            | UserCommand::ConnectExclusive { profile_id } => protocol(profile_id).map_or_else(
+            | UserCommand::ConnectExclusive { profile_id, .. } => protocol(profile_id).map_or_else(
                 || {
                     self.runtime
                         .config
@@ -654,6 +826,8 @@ impl App {
                     }
                 }
                 crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
+                    // Read before anything below can consume `result.command`.
+                    let conflict_target = connect_target(result.command.as_ref());
                     if let Some(request_key) = import_request_key.as_deref() {
                         self.reject_pending_profile_import(request_key);
                     }
@@ -668,6 +842,18 @@ impl App {
                         .import_display_name
                         .as_deref()
                         .map_or_else(|| "command".to_owned(), |name| format!("import '{name}'"));
+                    // A route conflict is a decision, not a failure. Offer the
+                    // takeover confirmation instead of a toast the user cannot
+                    // act on — and do not write it to the event log as an
+                    // error either, because nothing went wrong: the user is
+                    // about to be asked a question.
+                    if is_route_conflict(&error) {
+                        if let Some(profile_id) = conflict_target {
+                            if self.recover_route_conflict(&profile_id) {
+                                continue;
+                            }
+                        }
+                    }
                     self.log(&format!("ERR: Control {subject} refused: {error}"));
                     self.show_toast(control_error_message(&error), ToastType::Error);
                 }
@@ -714,6 +900,108 @@ impl App {
         snapshot: crate::vortix_core::control::ControlSnapshot,
     ) {
         use crate::state::KillSwitchState;
+
+        if crate::trace::enabled() {
+            let previous = &self.control_snapshot;
+            if previous.desired.generation != snapshot.desired.generation {
+                crate::trace_event!(
+                    "ctl",
+                    "desired {} -> {} tunnels={:?} killswitch={:?}",
+                    previous.desired.generation,
+                    snapshot.desired.generation,
+                    snapshot
+                        .desired
+                        .tunnels
+                        .iter()
+                        .map(|(id, state)| (id.to_string()[..8].to_owned(), format!("{state:?}")))
+                        .collect::<Vec<_>>(),
+                    snapshot.desired.kill_switch
+                );
+            }
+            for (id, operation) in &snapshot.operations {
+                let before = previous.operations.get(id).map(|old| old.status);
+                if before != Some(operation.status) {
+                    crate::trace_event!(
+                        "ctl",
+                        "op {} {:?} -> {:?} gen={} intent={:?} result={:?}",
+                        &id.to_string()[..12.min(id.to_string().len())],
+                        before,
+                        operation.status,
+                        operation.desired_generation,
+                        operation.intent,
+                        operation.result
+                    );
+                }
+            }
+            for (id, fact) in &snapshot.observed.tunnels {
+                let before = previous.observed.tunnels.get(id).map(|old| old.active);
+                if before != Some(fact.active) {
+                    crate::trace_event!(
+                        "ctl",
+                        "observed {} active {:?} -> {} iface={:?}",
+                        &id.to_string()[..8],
+                        before,
+                        fact.active,
+                        fact.interface_name
+                    );
+                }
+            }
+            let gates = snapshot.observed.evidence.as_ref().map(|evidence| {
+                (
+                    evidence.desired_generation,
+                    evidence.interface == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.route == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.dns == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.firewall == crate::vortix_core::control::GateEvidence::Verified,
+                )
+            });
+            let was = previous.observed.evidence.as_ref().map(|evidence| {
+                (
+                    evidence.desired_generation,
+                    evidence.interface == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.route == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.dns == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.firewall == crate::vortix_core::control::GateEvidence::Verified,
+                )
+            });
+            if gates != was {
+                crate::trace_event!("ctl", "readback {was:?} -> {gates:?}");
+            }
+        }
+
+        // What the system scan reports is the only thing completion trusts,
+        // and it was invisible: a tunnel the UI showed as up could be absent
+        // here with nothing in the log to say so.
+        let scan_changes = snapshot
+            .observed
+            .tunnels
+            .iter()
+            .filter(|(profile_id, fact)| {
+                self.control_snapshot
+                    .observed
+                    .tunnels
+                    .get(*profile_id)
+                    .is_none_or(|previous| previous.active != fact.active)
+            })
+            .map(|(profile_id, fact)| {
+                let name = self
+                    .runtime
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == *profile_id)
+                    .map_or_else(
+                        || "unknown profile".to_string(),
+                        |profile| profile.name.clone(),
+                    );
+                format!("{name} {}", if fact.active { "up" } else { "down" })
+            })
+            .collect::<Vec<_>>();
+        if !scan_changes.is_empty() {
+            self.log(&format!(
+                "DIAG: system scan now sees {}",
+                scan_changes.join(", ")
+            ));
+        }
 
         if self.control_snapshot.last_connected_at != snapshot.last_connected_at {
             let mut activity_changed = false;
@@ -1163,53 +1451,8 @@ impl App {
         operation_id: &crate::vortix_core::control::OperationId,
         snapshot: &crate::vortix_core::control::ControlSnapshot,
     ) {
-        use crate::vortix_core::control::{OperationIntent, RequestedTunnelState};
-
-        let wanted = snapshot
-            .operations
-            .get(operation_id)
-            .map(|operation| match &operation.intent {
-                OperationIntent::DesiredSubset { tunnels, .. }
-                | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels.clone(),
-                OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
-                    std::collections::BTreeMap::new()
-                }
-            })
-            .unwrap_or_default();
-
-        let observed_any = wanted
-            .keys()
-            .all(|profile_id| snapshot.observed.tunnels.contains_key(profile_id));
-        let converged = wanted.iter().all(|(profile_id, requested)| {
-            snapshot
-                .observed
-                .tunnels
-                .get(profile_id)
-                .is_some_and(|fact| fact.active == (*requested == RequestedTunnelState::Connected))
-        });
-        let evidence = snapshot.observed.evidence.as_ref();
-        let evidence_current = evidence.is_some_and(|evidence| {
-            evidence.desired_generation == snapshot.desired.generation
-                && evidence.authority_epoch == snapshot.desired.authority_epoch
-                && evidence.policy_digest == snapshot.desired.policy_digest
-        });
-        let gates = evidence.map_or_else(
-            || "none".to_string(),
-            |evidence| {
-                format!(
-                    "interface={} route={} dns={} firewall={}",
-                    evidence.interface == crate::vortix_core::control::GateEvidence::Verified,
-                    evidence.route == crate::vortix_core::control::GateEvidence::Verified,
-                    evidence.dns == crate::vortix_core::control::GateEvidence::Verified,
-                    evidence.firewall == crate::vortix_core::control::GateEvidence::Verified,
-                )
-            },
-        );
-        self.log(&format!(
-            "DIAG: convergence stalled — observed={observed_any} converged={converged} \
-             evidence={} current={evidence_current} gates[{gates}]",
-            evidence.is_some(),
-        ));
+        let detail = convergence_stall_detail(&self.runtime.profiles, operation_id, snapshot);
+        self.log(&format!("DIAG: convergence stalled - {detail}"));
     }
 
     fn report_terminal_control_operations(
@@ -1596,6 +1839,65 @@ impl App {
     /// Fire the appropriate confirm overlay for a registry-reported
     /// conflict. Logs an ACTION line so the activity panel
     /// reflects the blocked attempt.
+    /// Turn a route-conflict refusal into the confirmation the user can act on.
+    ///
+    /// `control_connect_profile` already opens this overlay when the *local*
+    /// snapshot shows a conflict. That snapshot can lag the service, though:
+    /// the peer tunnel may claim the route between our last snapshot and the
+    /// command landing, and a connect issued from anywhere that does not route
+    /// through `control_connect_profile` never consults it at all. Either way
+    /// the service refuses with `RouteConflict` and, before this, the user got
+    /// a dead-end toast telling them to review a confirmation that was never
+    /// shown.
+    ///
+    /// Re-resolve against the now-current snapshot and open the same overlay.
+    /// Returns whether it could - a caller that gets `false` must still report
+    /// the error, because the conflict has since cleared and there is nothing
+    /// to confirm.
+    pub(super) fn recover_route_conflict(&mut self, profile_id: &ProfileId) -> bool {
+        // The snapshot can describe the conflict, and usually does. It cannot
+        // when the profiles declare no routes of their own — their server
+        // pushes them at connect time — which is exactly when the service
+        // refuses because a live tunnel already holds that server. The
+        // refusal is the fact that matters; name the tunnel holding it and
+        // offer the same choice rather than dead-ending on a toast.
+        let conflict = self
+            .control_snapshot
+            .topology_conflict(profile_id)
+            .or_else(|| {
+                self.control_snapshot
+                    .tunnels
+                    .iter()
+                    .find(|(live_id, tunnel)| {
+                        *live_id != profile_id
+                            && !matches!(
+                                tunnel.state,
+                                crate::vortix_core::engine::state::Connection::Disconnected { .. }
+                            )
+                    })
+                    .map(|(live_id, _)| Conflict::DefaultRouteTakeover {
+                        current: live_id.clone(),
+                        new: profile_id.clone(),
+                    })
+            });
+        let Some(conflict) = conflict else {
+            return false;
+        };
+        let Some(idx) = self.profile_index(profile_id) else {
+            return false;
+        };
+        let Some(name) = self
+            .runtime
+            .profiles
+            .get(idx)
+            .map(|profile| profile.name.clone())
+        else {
+            return false;
+        };
+        self.fire_conflict_overlay(conflict, idx, profile_id.clone(), name);
+        true
+    }
+
     fn fire_conflict_overlay(
         &mut self,
         conflict: Conflict,
@@ -1619,6 +1921,7 @@ impl App {
                 ));
                 self.input_mode = InputMode::ConfirmDefaultRouteTakeover {
                     from: current_name,
+                    from_profile_id: current,
                     to_profile_id: new,
                     to_name: target_name,
                     confirm_selected: true,

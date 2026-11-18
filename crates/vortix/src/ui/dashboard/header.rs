@@ -23,7 +23,12 @@ use unicode_width::UnicodeWidthStr;
 /// either put the user's real IPv4 under a green `VPN:` label.
 fn header_egress_value(app: &App, want_through_tunnel: bool) -> String {
     let ip = &app.runtime.public_ip;
-    if app.runtime.egress_v4_through_tunnel() != want_through_tunnel
+    // A tunnel Vortix does not own still carries the traffic, and the sample's
+    // own provenance cannot see it — so the exit address was printed as the
+    // user's real one. The kernel's route answer covers that gap.
+    let through_tunnel =
+        app.runtime.egress_v4_through_tunnel() || app.egress_leaves_through_a_tunnel();
+    if through_tunnel != want_through_tunnel
         || ip.is_empty()
         || ip == constants::MSG_DETECTING
         || ip == constants::MSG_FETCHING

@@ -66,6 +66,24 @@ pub(crate) fn helper_owned_dns() -> Box<dyn OwnedDns> {
     }
 }
 
+/// Pin one already-installed route onto the interface that claims it.
+///
+/// Only Linux can do this today, and only Linux needs it: the gateway-route
+/// ambiguity this repairs comes from `OpenVPN`'s `ip route` insertion. Every
+/// other platform reports it as unsupported, which leaves their behaviour
+/// exactly as it was.
+pub(crate) fn repin_route(destination: &str, interface: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::vortix_platform_linux::route_table::repin_route(destination, interface)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (destination, interface);
+        Err("pinning a route to its own interface is not supported on this platform".into())
+    }
+}
+
 pub(crate) fn helper_owned_routes() -> Box<dyn OwnedRoutes> {
     #[cfg(target_os = "linux")]
     {
@@ -147,14 +165,12 @@ pub fn current_platform() -> &'static Platform {
 /// `None` means the platform does not confine wg-quick and the caller may
 /// stage wherever it likes.
 pub(crate) fn wireguard_staging_dir() -> Option<&'static std::path::Path> {
-    #[cfg(target_os = "linux")]
-    {
-        Some(std::path::Path::new("/etc/wireguard/vortix"))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: AppArmor confines wg-quick on Linux only
+    const STAGING_DIR: Option<&str> = Some("/etc/wireguard/vortix");
+    #[cfg(not(target_os = "linux"))] // xtask:allow-platform-cfg: see above
+    const STAGING_DIR: Option<&str> = None;
+
+    STAGING_DIR.map(std::path::Path::new)
 }
 
 pub(crate) fn observe_process_identity(

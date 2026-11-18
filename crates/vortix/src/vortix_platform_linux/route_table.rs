@@ -77,6 +77,101 @@ impl RouteTable for LinuxRouteTable {
     }
 }
 
+/// Longest an `ip route` mutation may take before it is abandoned.
+const ROUTE_MUTATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Move one already-installed route onto the interface that claims it,
+/// preserving the gateway and metric the kernel already holds.
+///
+/// `OpenVPN` installs server-pushed routes as gateway routes carrying no
+/// device (`net_route_v4_add: 10.250.0.0/24 via 10.80.0.1 dev [NULL]`). The
+/// kernel resolves that gateway to a device once, at insert time. Two tunnels
+/// to one server share its subnet, so both hold a connected route for it and
+/// the gateway resolves to whichever tunnel came up first — the newcomer's
+/// route lands on the incumbent's device, and the incumbent silently carries
+/// traffic it does not own. `WireGuard` never has this problem because
+/// `wg-quick` writes device routes; this restores the same property.
+pub(crate) fn repin_route(destination: &str, interface: &str) -> Result<(), String> {
+    if !valid_interface(interface) {
+        return Err(format!("refusing to pin a route to {interface:?}"));
+    }
+    if !valid_destination(destination) {
+        return Err(format!(
+            "refusing to pin the malformed route {destination:?}"
+        ));
+    }
+    let family = if destination.contains(':') {
+        "-6"
+    } else {
+        "-4"
+    };
+    let observed = run_ip(&[
+        family,
+        "route",
+        "show",
+        "table",
+        "main",
+        "exact",
+        destination,
+    ])?;
+    let Some(entry) = observed.lines().next() else {
+        return Err(format!("no exact route for {destination} to pin"));
+    };
+    let tokens = entry.split_whitespace().collect::<Vec<_>>();
+    if field(&tokens, "dev") == Some(interface) {
+        return Ok(());
+    }
+    let mut arguments = vec![family, "route", "replace", destination];
+    if let Some(gateway) = field(&tokens, "via") {
+        arguments.extend(["via", gateway]);
+    }
+    arguments.extend(["dev", interface]);
+    if let Some(metric) = field(&tokens, "metric") {
+        arguments.extend(["metric", metric]);
+    }
+    run_ip(&arguments).map(|_| ())
+}
+
+fn run_ip(arguments: &[&str]) -> Result<String, String> {
+    let spec =
+        // xtask:allow-shell-regression: `ip route` is the supported Linux route-mutation surface; no libc port exposes it without a hand-rolled RTNETLINK writer.
+        CommandSpec::oneshot("ip", arguments.iter().map(|a| (*a).into()).collect::<Vec<_>>())
+            .timeout(ROUTE_MUTATION_TIMEOUT)
+            .output_limit(64 * 1024)
+            .privilege(crate::vortix_process::PrivilegeReq::Root);
+    let output = crate::vortix_process::run_to_output(spec)
+        .map_err(|error| format!("`ip {}` could not run: {error}", arguments.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`ip {}` failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn field<'a>(tokens: &[&'a str], key: &str) -> Option<&'a str> {
+    let index = tokens.iter().position(|token| *token == key)?;
+    tokens.get(index + 1).copied()
+}
+
+fn valid_interface(interface: &str) -> bool {
+    !interface.is_empty()
+        && interface.len() <= 15
+        && interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_destination(destination: &str) -> bool {
+    !destination.is_empty()
+        && destination.len() <= 43
+        && destination
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b'.' | b':' | b'/'))
+}
+
 /// Run `ip route get <ROUTE_PROBE_TARGET>` and return stdout as UTF-8
 /// (lossy).
 ///

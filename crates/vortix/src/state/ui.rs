@@ -217,6 +217,9 @@ pub enum InputMode {
     ConfirmDefaultRouteTakeover {
         /// Name of the profile currently holding the default route (display only).
         from: String,
+        /// Identity of that profile. Switching stands down exactly this
+        /// tunnel; anything else that is connected keeps running.
+        from_profile_id: ProfileId,
         /// Profile id of the new tunnel attempting the takeover.
         to_profile_id: ProfileId,
         /// Display name of the new tunnel.
@@ -287,6 +290,26 @@ pub enum InputMode {
         /// while the field is dots, so the user needs a way to look.
         reveal_secrets: bool,
     },
+}
+
+impl InputMode {
+    /// Short, stable name for traces. Never renders secrets.
+    #[must_use]
+    pub const fn trace_name(&self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Search { .. } => "Search",
+            Self::Import { .. } => "Import",
+            Self::AuthPrompt { .. } => "AuthPrompt",
+            Self::Help { .. } => "Help",
+            Self::BackgroundSetup { .. } => "BackgroundSetup",
+            Self::DependencyError { .. } => "DependencyError",
+            Self::PermissionDenied { .. } => "PermissionDenied",
+            Self::ConfirmDefaultRouteTakeover { .. } => "ConfirmDefaultRouteTakeover",
+            Self::ConfirmRouteOverlap { .. } => "ConfirmRouteOverlap",
+            _ => "Other",
+        }
+    }
 }
 
 /// Number of rows the tabbed help-overlay's chrome eats from the

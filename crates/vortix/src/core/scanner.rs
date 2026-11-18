@@ -597,7 +597,18 @@ fn check_openvpn_by_pid(
     #[cfg(target_os = "linux")]
     // xtask:allow-platform-cfg: ip-addr-based OpenVPN tun-iface discovery is Linux-only
     {
-        // On Linux, use `ip addr` to find tun/tap interfaces
+        // On Linux, use `ip addr` to read the address and MTU of this
+        // profile's interface.
+        //
+        // Which interface that is comes from Method 0 — the profile's own
+        // openvpn log — and nothing here may override it. `ip addr` lists
+        // every tun on the host and cannot say which process owns one, so
+        // taking "the first tun with an address" gave *every* profile the
+        // same interface the moment a second tunnel existed: two profiles
+        // both reported as `tun0`, the control plane saw two tunnels
+        // claiming one interface, and the second connect could never
+        // converge. Multi-tunnel was unusable for exactly that reason.
+        let profile_iface = (!detected_iface.is_empty()).then(|| detected_iface.clone());
         if let Some(output) = cmd_output("ip", &["addr"]) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut current_iface = String::new();
@@ -610,6 +621,10 @@ fn check_openvpn_by_pid(
                         current_iface = name_part.trim().to_string();
                         found_tun =
                             current_iface.starts_with("tun") || current_iface.starts_with("tap");
+                        if let Some(owned) = profile_iface.as_deref() {
+                            // Only this profile's own interface is of interest.
+                            found_tun = found_tun && current_iface == owned;
+                        }
 
                         if found_tun {
                             // Check it's not a WireGuard interface through the
@@ -640,10 +655,12 @@ fn check_openvpn_by_pid(
                             session.internal_ip =
                                 parts[1].split('/').next().unwrap_or("").to_string();
                             session.interface.clone_from(&current_iface);
-                            // Linux `ip addr` reliably attributes each
-                            // tun/tap device — no multi-PID collision
-                            // surface like the macOS Method B fallback.
-                            iface_authoritative = true;
+                            // Authority comes from the profile's own log, not
+                            // from `ip addr`: the kernel can say an interface
+                            // exists, never whose tunnel it is. Without that
+                            // proof this is a guess, and a guess must not be
+                            // allowed to elect a primary.
+                            iface_authoritative = profile_iface.is_some();
                             break;
                         }
                     }

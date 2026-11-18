@@ -153,7 +153,7 @@ const ROLE_GLOSSARY: &[(&str, &str)] = &[
     ),
     (
         "Split tunnel (yielded)",
-        "Wanted to be your exit (declared 0.0.0.0/0) but another tunnel won the race. 'Yielded' = stood down. Sits as a hot standby: if the active primary drops, the kernel re-routes through this tunnel and you'll see a toast naming the new active exit. You see this label after pressing Shift+B (Both) on the takeover overlay.",
+        "Wanted to be your exit (declared 0.0.0.0/0) but another tunnel won the race. 'Yielded' = stood down. Sits as a hot standby: if the active primary drops, the kernel re-routes through this tunnel and you'll see a toast naming the new active exit. This shows up when two tunnels that both want to be your exit are running — raised outside Vortix, or adopted at startup.",
     ),
     (
         "Split tunnel (multi, yielded)",

@@ -24,11 +24,21 @@ pub enum UserCommand {
         #[serde(default)]
         conflict_acknowledgement: Option<crate::vortix_core::engine::registry::Conflict>,
     },
-    /// Make one tunnel the sole requested connection in a single durable
-    /// desired-state transition. The service tears down every other managed
-    /// tunnel before it dispatches the target connect.
+    /// Bring one tunnel up in place of another, in a single durable
+    /// desired-state transition.
+    ///
+    /// `displacing` names the tunnel standing down — normally the one holding
+    /// the default route, which is the only thing a newcomer can actually
+    /// conflict with. Tunnels that are not named keep running: a split tunnel
+    /// conflicts with nothing, and tearing it down alongside the switch loses
+    /// a connection the user never asked to drop.
+    ///
+    /// `None` means "be the only tunnel" and stands every connected tunnel
+    /// down. Profiles that were not connected are never touched either way.
     ConnectExclusive {
         profile_id: ProfileId,
+        #[serde(default)]
+        displacing: Option<ProfileId>,
     },
     Disconnect {
         profile_id: Option<ProfileId>,

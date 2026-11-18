@@ -129,9 +129,20 @@ impl ControlSnapshot {
                     new: profile_id.clone(),
                 });
             }
+            // A default route contains every address, so comparing against it
+            // marks any split tunnel as "overlapping" a full one — which is
+            // the ordinary way to run two tunnels, not a conflict. Whether
+            // two profiles both want the default route is decided above, on
+            // its own terms; here only specific claims can collide.
             let overlapping_cidrs = requested
                 .iter()
-                .filter(|route| existing.iter().any(|current| route.intersects(current)))
+                .filter(|route| route.prefix_len != 0)
+                .filter(|route| {
+                    existing
+                        .iter()
+                        .filter(|current| current.prefix_len != 0)
+                        .any(|current| route.intersects(current))
+                })
                 .copied()
                 .collect::<Vec<_>>();
             if !overlapping_cidrs.is_empty() {

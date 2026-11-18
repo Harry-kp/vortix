@@ -1,33 +1,71 @@
 # Multi-tunnel manual verification matrix
 
-12 scenarios that exercise every branch of the multi-tunnel state-authority contract
-(see `docs/brainstorms/2026-06-01-multi-tunnel-state-authority-requirements.md`).
-Each row names the setup and the per-surface expected output. Run them on a real
-macOS host with the one-droplet compatibility lab available (run
-`scripts/vpn-lab.sh up`) and import its profiles. Use `01`/`03`/`05` or `wg08`/`wg11`
-as full-tunnel profiles and `02`/`04`/`06`/`wg07` as split-only profiles.
+17 scenarios covering multi-tunnel across **both** protocols and in both
+directions (see
+`docs/brainstorms/2026-06-01-multi-tunnel-state-authority-requirements.md`).
+Run them on a real host with the one-droplet compatibility lab available (run
+`scripts/vpn-lab.sh up`) and import its profiles. Use `01`/`03`/`05` or
+`wg08`/`wg11` as full-tunnel profiles and `02`/`04`/`06`/`wg07` as split-only
+profiles.
+
+Earlier versions of this matrix treated WireGuard and OpenVPN profiles as
+interchangeable "full" and "split" classes. They are not, and that assumption
+hid a real defect — see the asymmetry section below before reading the table.
 
 **Terminology**:
-- **F1**, **F2**, **F1'** — full-tunnel profiles (client config has `redirect-gateway`
-  or aggregated /1 split routes that claim default).
-- **S** — split-only profile (no default-route claim).
+- **F** — a full-tunnel profile (claims the default route).
+- **S** — a split-only profile (claims specific CIDRs, never the default).
+- **W** prefix means WireGuard, **O** prefix means OpenVPN: `WF` = WireGuard full
+  (`wg08`), `WS` = WireGuard split (`wg07`), `OF` = OpenVPN full (`01`, `03`),
+  `OS` = OpenVPN split (`02`, `04`).
 - **Egress probe**: `curl -sS https://api.ipify.org` shows whose exit IP.
 - **Kernel probe**: `route -n get 8.8.8.8` (macOS) / `ip route get 8.8.8.8` (Linux).
+- Evidence for a whole state in one command: `./scripts/verify-multi-tunnel.sh`.
 
-| # | Setup | Header `CONNECTED (?/?)` | Sidebar `*` on | Role (F1) | Role (F2) | Role (S) | SG IP row | Overlay |
-|---|---|---|---|---|---|---|---|---|
-| 1 | Connect F1 alone | F1 | F1 | Primary | — | — | F1's exit IP, ✓ | none |
-| 2 | Connect S alone | (no exit) | — (S has dot only, no `*`) | — | — | Addressable | "split-route — no exit" | none |
-| 3 | F1 up, then connect S (disjoint CIDR) | F1 | F1 | Primary | — | Addressable | F1's exit IP, ✓ | none (disjoint = no prompt) |
-| 4 | F1 up, then connect S where S's route overlaps F1's | F1 | F1 | Primary | — | Addressable | F1's exit IP, ✓ | ConfirmRouteOverlap → press Y |
-| 5 | F1 up, then connect F2, press Y on takeover (Switch) | F2 | F2 | — (disconnected) | Primary | — | F2's exit IP, ✓ | ConfirmDefaultRouteTakeover → Y |
-| 6 | F1 up, then connect F2, press B on takeover (Both) | F2 | F2 | AddressableSuppressed | Primary | — | F2's exit IP, ✓ | ConfirmDefaultRouteTakeover → B |
-| 7 | From #6 state, disconnect F2 | F1 | F1 | Primary | — | — | F1's exit IP, ✓ | none — user disconnects/reconnects manually if they want a different primary |
-| 8 | From #6 state, disconnect F1 | F2 | F2 | — | Primary | — | F2's exit IP, ✓ | none |
-| 9 | From #3 state, disconnect S | F1 | F1 | Primary | — | — | F1's exit IP, ✓ | none |
-| 10 | From #3 state, disconnect F1 | (no exit) | — | — | — | Addressable | "split-route — no exit" | none |
-| 11 | From #6 state, connect F1' (third F-class profile) | F1' | F1' | AddressableSuppressed | AddressableSuppressed | — | F1''s exit IP, ✓ | ConfirmDefaultRouteTakeover → B |
-| 12 | Connect S, then connect F1 (S already up, no overlap) | F1 | F1 | Primary | — | Addressable | F1's exit IP, ✓ | none (no conflict — S didn't own default) |
+## What Vortix knows before you connect — the asymmetry that drives these cases
+
+The protocols do not declare their routes the same way, and every conflict
+decision happens *before* a tunnel exists:
+
+| | Where the default-route claim lives | Known before connecting? |
+|---|---|---|
+| WireGuard | `AllowedIPs = 0.0.0.0/0` in the `.conf` | **Yes** — parsed from the file |
+| OpenVPN | pushed by the server (`redirect-gateway`) at negotiation | **No** — only after the tunnel is up |
+
+The lab's `01` contains no `redirect-gateway` and no `route` line at all; its
+full-tunnel nature arrives entirely from the server. So a conflict against an
+*already-connected* OpenVPN tunnel is detectable (its claim has been observed),
+while a conflict against an OpenVPN tunnel *being connected* is not. Any
+scenario below whose "claim known" column says **no** is a case where Vortix
+cannot prompt before the fact — treat a missing overlay there as the known gap,
+not a fresh bug.
+
+Two tunnels can never both hold the default route. The only offered outcomes
+are **[Y] Switch** and **[N] Cancel**; the old "keep both, demote one to a split
+tunnel" option was removed — it served no real use case and never converged.
+
+| # | Setup | Claim known before connect? | Expected overlay | Expected outcome |
+|---|---|---|---|---|
+| 1 | Connect `WF` alone | — | none | `WF` primary, its exit IP |
+| 2 | Connect `OF` alone | — | none | `OF` primary, its exit IP |
+| 3 | Connect `S` alone (either protocol) | — | none | no exit; split routes only |
+| 4 | `OF` up, connect `OS` (disjoint) | n/a — no default claimed | none | both up; `OS` carries its subnet on its own interface |
+| 5 | `OS` up, connect `OF` | n/a | none | both up; `OF` takes egress, `OS` keeps its subnet |
+| 6 | `OF` up, connect second `OF` | yes (incumbent observed) | takeover → `[Y]`/`[N]` | `[Y]`: incumbent stands down, newcomer takes egress, **any split tunnel stays up** |
+| 7 | `WF` up, connect second `WF` | yes (both declared) | takeover → `[Y]`/`[N]` | as #6 |
+| 8 | `WF` up, connect `OF` | **no** — OpenVPN claim is pushed | *none today* | known gap: both claim default, convergence stalls |
+| 9 | `OF` up, connect `WF` | yes (incumbent observed + declared) | takeover → `[Y]`/`[N]` | as #6 |
+| 10 | `WF` up, connect `OS` | n/a | none | both up; split subnet on its own interface |
+| 11 | `WS` up, connect `OF` | n/a | none | both up |
+| 12 | `OF` + `OS` up, connect another `OF`, press `[Y]` | yes | takeover names the **full** tunnel only | the other full tunnel goes; the split tunnel keeps running |
+| 13 | From #4, disconnect `OS` | — | none | `OF` still up and still carrying egress |
+| 14 | From #4, disconnect `OF` | — | none | `OS` still up; no exit |
+| 15 | Disconnect all with two up | — | confirm when multi | both torn down, both named |
+| 16 | Two up, restart the TUI | — | none | both adopted; check DNS row still names the VPN resolvers |
+| 17 | Two up, kill switch `vpn-only` | — | none | `nft` shows an accept rule per tunnel interface |
+
+Rows 6, 7, 9 and 12 are the ones that used to offer a third "keep both" choice.
+They must now offer exactly two.
 
 ## Critical invariants every scenario must hold
 

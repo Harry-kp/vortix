@@ -467,75 +467,6 @@ fn add_stored_profile(
 // VPN switching tests
 // ====================================================================
 #[test]
-fn confirm_default_route_takeover_message_runs_multi_connect_path() {
-    // Message-handler-level test (not keybinding): when
-    // `Message::ConfirmDefaultRouteTakeover` fires directly, the
-    // multi-connect path runs without a Disconnecting state. The
-    // "primary inverts" scenario: both
-    // tunnels stay connected, the new one claims the default
-    // route. This message is what the overlay's [B] key produces;
-    // the keybinding test covers the input path.
-    let mut app = test_app();
-    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
-    set_connected(&mut app, "vpn-a");
-
-    app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
-
-    assert!(
-        !matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
-        "multi-connect path must not transition to Disconnecting; got {:?}",
-        app.legacy_state()
-    );
-    // Note: `connection_state` is the legacy single-tunnel mirror —
-    // it can only hold one profile at a time, so vpn-b's connect
-    // necessarily overwrites vpn-a's slot. Once a later stage retires
-    // this enum entirely, both tunnels' states will be visible via
-    // the registry exclusively.
-}
-#[test]
-fn takeover_b_key_dispatches_multi_connect_path() {
-    // [B]/[b] on the takeover overlay fires the opt-in multi-connect
-    // path: both tunnels stay connected, the new one becomes the
-    // active exit, the prior primary becomes split-tunnel-yielded.
-    // No Disconnecting state.
-    let mut app = test_app();
-    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
-    set_connected(&mut app, "vpn-a");
-    // connect_profile_forced (the multi-connect path's downstream)
-    // checks `is_root`; without it we'd hit InputMode::PermissionDenied
-    // instead of Normal. The test cares about the behavioral path,
-    // not the privilege check.
-    app.runtime.is_root = true;
-    app.toggle_connection(1);
-
-    app.handle_key(key_char('b'));
-
-    // Behavior contract: NO disconnect of the existing tunnel.
-    assert!(
-        !matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
-        "multi-connect path must not transition to Disconnecting; got {:?}",
-        app.legacy_state()
-    );
-    assert!(matches!(app.input_mode, InputMode::Normal));
-}
-
-#[test]
-fn takeover_capital_b_also_dispatches_multi_connect() {
-    // Case-insensitive: [B] should work whether shift is held or not.
-    let mut app = test_app();
-    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
-    set_connected(&mut app, "vpn-a");
-    app.runtime.is_root = true;
-    app.toggle_connection(1);
-
-    app.handle_key(key_char('B'));
-
-    assert!(!matches!(
-        app.legacy_state(),
-        ConnectionState::Disconnecting { .. }
-    ));
-}
-#[test]
 fn test_toggle_while_connecting_is_rejected() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
@@ -2869,15 +2800,22 @@ fn force_disconnect_without_exact_projection_never_submits_disconnect_all() {
 }
 
 #[test]
-fn attached_control_requires_and_consumes_exact_topology_confirmation() {
+fn a_second_full_tunnel_is_only_admitted_by_switching_to_it() {
     let temp = tempfile::tempdir().unwrap();
     let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
     std::fs::create_dir(&profiles_dir).unwrap();
     let make_profile = |seed: char, name: &str| {
         let config_path = profiles_dir.join(format!("{name}.conf"));
+        // Distinct endpoints and addresses: these model two different VPNs.
+        // Two profiles on one server draw from one address pool, which is a
+        // collision the service refuses outright, and that is not what this
+        // test is about.
         std::fs::write(
             &config_path,
-            b"[Interface]\nPrivateKey = abc=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
+            format!(
+                "[Interface]\nPrivateKey = abc=\nAddress = 10.0.{seed_octet}.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.{seed_octet}:51820\nAllowedIPs = 0.0.0.0/0\n",
+                seed_octet = u32::from(seed as u8),
+            ),
         )
         .unwrap();
         VpnProfile {
@@ -2894,6 +2832,7 @@ fn attached_control_requires_and_consumes_exact_topology_confirmation() {
         }
     };
     let first = make_profile('8', "first");
+    let first_id = first.id.clone();
     let second = make_profile('9', "second");
     let control = crate::cli::control::LocalControlSession::start_profile_test(
         temp.path(),
@@ -2928,7 +2867,10 @@ fn attached_control_requires_and_consumes_exact_topology_confirmation() {
         .tunnels
         .contains_key(&second.id));
 
-    app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
+    app.handle_message(Message::SwitchExclusiveAndConnect {
+        idx: 1,
+        displacing: first_id.clone(),
+    });
     for _ in 0..20 {
         app.process_external();
         if app
@@ -2948,11 +2890,13 @@ fn attached_control_requires_and_consumes_exact_topology_confirmation() {
         app.toast.as_ref().map(|toast| &toast.message),
         app.control_session.as_ref().unwrap().current_snapshot()
     );
-    assert!(app
-        .control_snapshot
-        .desired
-        .conflict_acknowledgements
-        .contains_key(&second.id));
+    assert!(
+        !app.control_snapshot
+            .desired
+            .conflict_acknowledgements
+            .contains_key(&second.id),
+        "switching needs no conflict waiver: the tunnel it conflicted with is going away"
+    );
 }
 
 #[test]
@@ -3918,6 +3862,59 @@ fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
 }
 
 #[test]
+fn refused_route_conflict_reopens_the_confirmation_instead_of_a_dead_end_toast() {
+    use crate::vortix_core::engine::Conflict;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["candidate"]);
+    set_connected(&mut app, "existing");
+    let existing = ProfileId::new("existing");
+    let candidate = ProfileId::new("candidate");
+
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.pending_route_conflicts.insert(
+        candidate.clone(),
+        Conflict::DefaultRouteTakeover {
+            current: existing.clone(),
+            new: candidate.clone(),
+        },
+    );
+    app.apply_control_snapshot(snapshot);
+    // The conflict alone must not open anything: this test is about what the
+    // *refusal* does, so the dialog below has to be attributable to it.
+    assert!(matches!(app.input_mode, InputMode::Normal));
+
+    assert!(
+        app.recover_route_conflict(&candidate),
+        "a live conflict must be recoverable into a confirmation"
+    );
+    assert!(matches!(
+        app.input_mode,
+        InputMode::ConfirmDefaultRouteTakeover {
+            ref from,
+            ref to_profile_id,
+            ref to_name,
+            ..
+        } if from == "existing" && to_profile_id == &candidate && to_name == "candidate"
+    ));
+}
+
+#[test]
+fn a_cleared_route_conflict_falls_back_to_the_error_message() {
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["candidate"]);
+
+    // No conflict in the snapshot: the peer released the route between the
+    // refusal and now. There is nothing to confirm, so the caller must be told
+    // to fall through and report the error rather than opening an empty dialog.
+    assert!(!app.recover_route_conflict(&ProfileId::new("candidate")));
+    assert!(matches!(app.input_mode, InputMode::Normal));
+}
+
+#[test]
 fn terminal_authentication_failure_is_shown_to_tui_user() {
     use crate::vortix_core::control::{
         AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
@@ -4797,5 +4794,39 @@ fn a_surfaced_control_failure_names_an_action() {
     assert!(
         generic.contains("vortix report"),
         "expected a fallback action: {generic}"
+    );
+}
+
+/// A tunnel Vortix does not own still owns the egress path. The session count
+/// only sees tunnels attributable to a known profile, so a leftover process or
+/// one raised outside Vortix read as "no VPN" and its exit address was saved
+/// as the user's real IP — permanently, and across restarts, poisoning every
+/// later leak check.
+#[test]
+fn an_unowned_tunnel_stops_the_exit_address_being_saved_as_real() {
+    let mut app = test_app();
+    app.runtime.scanner_first_tick_done = true;
+    app.runtime.last_kernel_session_count = 0;
+    app.control_snapshot.observed.default_route =
+        Some(crate::vortix_core::control::ObservedDefaultRoute {
+            interface_name: Some("tun0".into()),
+            observed_at_millis: 0,
+            received_at_millis: 0,
+        });
+
+    assert!(
+        app.egress_leaves_through_a_tunnel(),
+        "a tun interface carrying internet traffic is a tunnel, whoever started it"
+    );
+
+    app.control_snapshot.observed.default_route =
+        Some(crate::vortix_core::control::ObservedDefaultRoute {
+            interface_name: Some("wlp3s0".into()),
+            observed_at_millis: 0,
+            received_at_millis: 0,
+        });
+    assert!(
+        !app.egress_leaves_through_a_tunnel(),
+        "an ordinary link is not a tunnel"
     );
 }

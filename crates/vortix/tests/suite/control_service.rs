@@ -47,18 +47,33 @@ fn request(key: &str, profile_id: ProfileId, deadline: u64) -> CommandRequest {
     }
 }
 
+/// Switching displaces the tunnel that is actually in the way — the one
+/// holding the default route — and nothing else. Targeting the whole
+/// catalogue tore down unrelated split tunnels and marked every profile in
+/// the list as disconnecting, including ones that were never connected.
 #[tokio::test]
-async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
-    let first = profile('a');
-    let target = profile('b');
-    let untouched = profile('c');
+async fn a_switch_displaces_only_the_tunnel_holding_the_default_route() {
+    let full = profile('a');
+    let split = profile('b');
+    let target = profile('c');
+    let untouched = profile('d');
+    let routed = |route: &str| ProfileTopology {
+        routes: [route.to_string()].into_iter().collect(),
+        ..ProfileTopology::default()
+    };
     let service = ControlService::start(ControlServiceConfig {
-        known_profiles: [first.clone(), target.clone(), untouched.clone()]
-            .into_iter()
-            .collect(),
+        known_profiles: [
+            full.clone(),
+            split.clone(),
+            target.clone(),
+            untouched.clone(),
+        ]
+        .into_iter()
+        .collect(),
         profile_topologies: [
-            (first.clone(), ProfileTopology::default()),
-            (target.clone(), ProfileTopology::default()),
+            (full.clone(), routed("0.0.0.0/0")),
+            (split.clone(), routed("10.250.0.0/24")),
+            (target.clone(), routed("0.0.0.0/0")),
             (untouched.clone(), ProfileTopology::default()),
         ]
         .into_iter()
@@ -67,8 +82,8 @@ async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
     });
     let client = service.client();
     for (key, profile_id) in [
-        ("connect-first", first.clone()),
-        ("connect-target", target.clone()),
+        ("connect-full", full.clone()),
+        ("connect-split", split.clone()),
     ] {
         client
             .submit(request(key, profile_id, u64::MAX))
@@ -77,46 +92,47 @@ async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
     }
     let before = client.subscribe().snapshot();
     assert_eq!(
-        before.desired.tunnels.get(&first),
+        before.desired.tunnels.get(&full),
         Some(&vortix::vortix_core::control::RequestedTunnelState::Connected)
     );
     assert_eq!(
-        before.desired.tunnels.get(&target),
+        before.desired.tunnels.get(&split),
         Some(&vortix::vortix_core::control::RequestedTunnelState::Connected)
     );
 
-    let admitted = client
+    client
         .submit(CommandRequest {
             command: UserCommand::ConnectExclusive {
                 profile_id: target.clone(),
+                displacing: Some(full.clone()),
             },
             idempotency_key: IdempotencyKey::new("exclusive-target"),
             deadline: Deadline(u64::MAX),
         })
         .await
         .unwrap();
+
     let after = client.subscribe().snapshot();
     assert_eq!(after.desired.generation, before.desired.generation + 1);
     assert_eq!(
-        after.desired.tunnels.get(&first),
-        Some(&vortix::vortix_core::control::RequestedTunnelState::Disconnected)
-    );
-    assert_eq!(
         after.desired.tunnels.get(&target),
-        Some(&vortix::vortix_core::control::RequestedTunnelState::Connected)
+        Some(&vortix::vortix_core::control::RequestedTunnelState::Connected),
+        "the tunnel being switched to comes up"
     );
     assert_eq!(
-        after.desired.tunnels.get(&untouched),
+        after.desired.tunnels.get(&full),
         Some(&vortix::vortix_core::control::RequestedTunnelState::Disconnected),
-        "the atomic subset must explicitly include untouched catalog profiles"
+        "the tunnel holding the default route stands down"
     );
-    let operation = after.operations.get(&admitted.operation_id).unwrap();
-    let vortix::vortix_core::control::OperationIntent::DesiredSubset { tunnels, .. } =
-        &operation.intent
-    else {
-        panic!("exclusive switch must retain its exact desired subset");
-    };
-    assert_eq!(tunnels, &after.desired.tunnels);
+    assert_eq!(
+        after.desired.tunnels.get(&split),
+        Some(&vortix::vortix_core::control::RequestedTunnelState::Connected),
+        "a split tunnel conflicts with nothing and keeps running"
+    );
+    assert!(
+        !after.desired.tunnels.contains_key(&untouched),
+        "a profile that was never connected is not dragged into the switch"
+    );
 }
 
 fn config() -> ControlServiceConfig {
