@@ -1901,9 +1901,9 @@ pub mod search {
     pub fn render(frame: &mut Frame, app: &App, query: &str, cursor: usize, total: usize) {
         let area = frame.area();
         let bar_area = Rect {
-            x: 1,
+            x: 0,
             y: area.height.saturating_sub(3),
-            width: area.width.saturating_sub(2).min(60),
+            width: area.width.min(60),
             height: 3,
         };
 
@@ -1961,6 +1961,29 @@ pub mod search {
         }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        #[test]
+        fn the_bar_covers_the_footer_from_the_first_column() {
+            let app = crate::app::App::new_test();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(ratatui::widgets::Paragraph::new("[".repeat(80)), {
+                        let mut row = frame.area();
+                        row.y = 23;
+                        row.height = 1;
+                        row
+                    });
+                    super::render(frame, &app, "x", 1, 3);
+                })
+                .unwrap();
+            assert_eq!(terminal.backend().buffer()[(0, 23)].symbol(), "└");
+        }
     }
 }
 pub mod toast {
