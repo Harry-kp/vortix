@@ -90,6 +90,8 @@ pub(super) struct Engine {
     outcomes: BTreeMap<u64, Outcome>,
     notices: VecDeque<Notice>,
     seq: u64,
+    /// Start time; prefixes hook event ids so they differ between runs.
+    started_ms: u64,
     drops: u32,
     net: Net,
     applied: Option<NetworkPlan>,
@@ -109,7 +111,11 @@ pub(super) struct Engine {
     external: Vec<String>,
     last_connected: BTreeMap<ProfileId, SystemTime>,
     last_generation: u64,
-    hooks: Option<(tokio::runtime::Runtime, crate::hooks::HookRunner)>,
+    hooks: Option<(
+        tokio::runtime::Runtime,
+        crate::hooks::HookRunner,
+        crate::hooks::HookDiagnostics,
+    )>,
     health: BTreeMap<
         ProfileId,
         (
@@ -204,6 +210,7 @@ impl Engine {
             outcomes: BTreeMap::new(),
             notices: VecDeque::new(),
             seq: 0,
+            started_ms: super::dns::now_unix_ms(),
             drops: 0,
             applied: None,
             apply_error: None,
@@ -268,7 +275,7 @@ impl Engine {
             }
         }
         self.finish_transitions(rx);
-        if let Some((runtime, hooks)) = self.hooks.take() {
+        if let Some((runtime, hooks, _)) = self.hooks.take() {
             runtime.block_on(hooks.shutdown_bounded(Duration::from_secs(2)));
         }
     }
@@ -1017,6 +1024,7 @@ impl Engine {
     // ── loop steps ──────────────────────────────────────────────────────
 
     fn tick(&mut self) {
+        self.report_hook_failures();
         let now = Instant::now();
         let due = self
             .state
@@ -1465,6 +1473,20 @@ impl Engine {
         )
     }
 
+    fn report_hook_failures(&mut self) {
+        let mut failures = Vec::new();
+        if let Some((_, _, diagnostics)) = &mut self.hooks {
+            while let Ok(diagnostic) = diagnostics.try_recv() {
+                if let crate::hooks::HookDiagnosticKind::Failed(failure) = diagnostic.kind {
+                    failures.push((diagnostic.attempt_id.hook_index + 1, failure));
+                }
+            }
+        }
+        for (hook, failure) in failures {
+            self.notice(Level::Warning, format!("Hook {hook} failed: {failure}"));
+        }
+    }
+
     fn notice(&mut self, level: Level, text: String) {
         tracing::info!(target: "vortix::engine", ?level, %text);
         if let Some(journal) = crate::journal::global_journal() {
@@ -1485,7 +1507,7 @@ impl Engine {
     }
 
     fn hook(&mut self, event: HookEvent, profile_id: &ProfileId) {
-        let Some((_, hooks)) = &self.hooks else {
+        let Some((_, hooks, _)) = &self.hooks else {
             return;
         };
         let Some(entry) = self.entries.get(profile_id) else {
@@ -1493,7 +1515,7 @@ impl Engine {
         };
         self.seq += 1;
         hooks.dispatcher().dispatch(&LifecycleFact {
-            event_id: HookEventId::from_parts(1, self.seq),
+            event_id: HookEventId::from_parts(self.started_ms, self.seq),
             event,
             profile_id: profile_id.clone(),
             display_name: entry.profile.name.clone(),
@@ -1509,18 +1531,22 @@ fn session<'a>(sessions: &'a [ActiveSession], name: &str) -> Option<&'a ActiveSe
 
 fn start_hooks(
     config_dir: &std::path::Path,
-) -> Option<(tokio::runtime::Runtime, crate::hooks::HookRunner)> {
+) -> Option<(
+    tokio::runtime::Runtime,
+    crate::hooks::HookRunner,
+    crate::hooks::HookDiagnostics,
+)> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("vortix-hooks")
         .enable_all()
         .build()
         .ok()?;
-    let runner = {
+    let (runner, diagnostics) = {
         let _guard = runtime.enter();
         crate::hooks::start(config_dir)?
     };
-    Some((runtime, runner))
+    Some((runtime, runner, diagnostics))
 }
 
 #[cfg(test)]
@@ -1603,6 +1629,7 @@ mod tests {
             outcomes: BTreeMap::new(),
             notices: VecDeque::new(),
             seq: 0,
+            started_ms: 0,
             drops: 0,
             applied: None,
             apply_error: None,
@@ -1820,7 +1847,7 @@ mod tests {
             .unwrap()
             .unwrap()
         };
-        engine.hooks = Some((runtime, runner));
+        engine.hooks = Some((runtime, runner, diagnostics.resubscribe()));
         diagnostics
     }
 

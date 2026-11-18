@@ -119,7 +119,8 @@ Hooks run as you, not root, after the change has happened, with a clean environm
 `VORTIX_EVENT`, `VORTIX_EVENT_ID`, `VORTIX_PROFILE_ID`, `VORTIX_PROFILE_NAME` and
 `VORTIX_PROTOCOL` (`wireguard`, `openvpn` or `netbird`). They cannot block or delay a connect, run at most once per event, and can be
 lost if Vortix crashes. `reconnecting` fires on a reconnect (`r`) and when Vortix will
-reconnect a dropped tunnel by itself. Up to 64 hooks.
+reconnect a dropped tunnel by itself. `VORTIX_EVENT_ID` is unique per event, across runs too.
+A hook that fails, times out or prints too much shows a warning in the Event Log. Up to 64 hooks.
 
 ## DNS
 
