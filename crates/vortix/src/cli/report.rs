@@ -39,6 +39,8 @@ struct ReportInfo {
     config_toml_status: String,
     profile_counts: (u32, u32, u32),
     killswitch_state: String,
+    /// The newest session journal and its events.
+    journal: Option<(String, Vec<crate::journal::JournalEvent>)>,
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────
@@ -185,6 +187,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
         config_toml_status,
         profile_counts,
         killswitch_state: ks_state,
+        journal: latest_journal(&config_dir.join("sessions")),
     }
 }
 
@@ -487,23 +490,21 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     let _ = writeln!(body, "Kill switch: {}", info.killswitch_state);
     let _ = writeln!(body, "```\n");
 
-    // Diagnostic Journal — surface the JSONL session path
-    // and the in-memory tail so triagers can replay locally.
-    if let Some(journal) = crate::journal::global_journal() {
-        let _ = writeln!(body, "## Diagnostic Journal\n");
-        let _ = writeln!(body, "```");
-        if let Some(path) = &journal.session_path {
-            let _ = writeln!(body, "Session file: {}", crate::config::home_relative(path));
-        } else {
-            let _ = writeln!(body, "Session file: (disk persistence disabled)");
+    let _ = writeln!(body, "## Diagnostic Journal\n");
+    let _ = writeln!(body, "```");
+    match &info.journal {
+        Some((path, events)) => {
+            let _ = writeln!(body, "Session file: {path}");
+            let _ = writeln!(body, "Recent events: {}", events.len());
+            for event in events.iter().rev().take(10).rev() {
+                let _ = writeln!(body, "  {}", event_summary(event));
+            }
         }
-        let tail = journal.tail();
-        let _ = writeln!(body, "Recent events: {}", tail.len());
-        for env in tail.iter().rev().take(10).rev() {
-            let _ = writeln!(body, "  {}", event_summary(&env.event));
+        None => {
+            let _ = writeln!(body, "Session file: none");
         }
-        let _ = writeln!(body, "```\n");
     }
+    let _ = writeln!(body, "```\n");
 
     // Additional Context
     let _ = writeln!(body, "## Additional Context\n");
@@ -513,6 +514,23 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     );
 
     body
+}
+
+/// The most recently written session journal in `dir`.
+fn latest_journal(dir: &Path) -> Option<(String, Vec<crate::journal::JournalEvent>)> {
+    let path = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())?;
+    let events = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<crate::journal::EventEnvelope>(line).ok())
+        .map(|envelope| envelope.event)
+        .collect();
+    Some((crate::config::home_relative(&path), events))
 }
 
 /// One line per journal event, without names, addresses or text.
@@ -763,6 +781,7 @@ mod tests {
             config_toml_status: "found".to_string(),
             profile_counts: (2, 1, 0),
             killswitch_state: "off".to_string(),
+            journal: None,
         };
 
         let body = format_issue_body(&info, "WireGuard shows connected but no traffic");
@@ -792,6 +811,7 @@ mod tests {
             config_toml_status: "not found (using defaults)".to_string(),
             profile_counts: (0, 0, 0),
             killswitch_state: "off".to_string(),
+            journal: None,
         };
 
         let body = format_issue_body(&info, "");

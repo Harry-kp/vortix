@@ -91,7 +91,7 @@ wireguard_health_targets = ["1.1.1.1"]   # default: config.toml's ping_targets; 
 [journal]
 disk = true              # false: keep no session journals on disk
 retention_days = 30
-retention_count = 30
+retention_count = 30     # at most this many; a run that records no event writes none
 ```
 
 The five `[engine]` keys also exist in `config.toml` (under slightly different names for
