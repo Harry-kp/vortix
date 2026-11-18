@@ -577,6 +577,12 @@ impl Engine {
                 if let Err(error) = store.touch(profile_id) {
                     tracing::warn!(%error, "could not record last-used time");
                 }
+                // Move the shared routes and DNS to this tunnel before the old
+                // one's teardown runs: `wg-quick down` on macOS deletes routes
+                // by destination, so a retarget racing it left no VPN route.
+                if !replaced.is_empty() {
+                    self.reconcile();
+                }
                 for peer in replaced {
                     self.hook(HookEvent::DisconnectStarted, &peer);
                     self.begin_stop(&peer);
@@ -1911,6 +1917,32 @@ mod tests {
                 HookEvent::Disconnected,
                 HookEvent::Connected
             ]
+        );
+    }
+
+    /// The routes move to the new tunnel before the old one's teardown starts:
+    /// macOS `wg-quick down` deletes routes by destination, so a teardown that
+    /// races the retarget leaves no VPN route for a moment.
+    #[test]
+    fn a_switch_moves_routes_to_the_new_tunnel_before_stopping_the_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = vec![ovpn(dir.path(), "a", 5), ovpn(dir.path(), "b", 6)];
+        let (mut engine, _rx) = test_engine(dir.path(), profiles);
+        up(&mut engine, "a", 1);
+        let spec = engine.entries[&ProfileId::new("b")].spec.clone().unwrap();
+        engine
+            .state
+            .begin(spec, 2, Some(BTreeSet::from([ProfileId::new("a")])), false)
+            .unwrap();
+        let mut live = openvpn_live(&engine, "b", None);
+        live.handle.interface_name = "utun2".into();
+        engine.started(&ProfileId::new("b"), Ok(live), None, false);
+        let applied = engine.applied.as_ref().expect("reconciled before the stop");
+        assert_eq!(
+            applied.routes.values().collect::<Vec<_>>(),
+            vec!["utun2"],
+            "{:?}",
+            applied.routes
         );
     }
 
