@@ -760,9 +760,6 @@ fn fetch_security_info(tx: &Tx, cfg: &std::sync::Arc<TelemetryConfig>) {
     });
 }
 
-// Network stats delta calculation is now handled directly in App::poll_network_stats()
-// using last_bytes_in / last_bytes_out fields on the App struct.
-
 #[cfg(test)]
 mod tests {
     use super::*;
