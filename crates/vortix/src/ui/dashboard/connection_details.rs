@@ -37,7 +37,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // user is browsing other panels).
     let focused_profile_id = app.focused_profile_id();
 
-    if app.effective_flipped(&crate::app::FocusedPanel::ConnectionDetails) {
+    if app.is_flipped(&crate::app::FocusedPanel::ConnectionDetails) {
         render_back(frame, app, focused_profile_id.as_ref(), area, border_style);
         return;
     }

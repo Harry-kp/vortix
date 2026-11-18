@@ -1501,10 +1501,10 @@ fn flip_multiple_panels_independently() {
 fn flip_effective_state_at_midpoint() {
     let mut app = test_app();
     app.focused_panel = FocusedPanel::Security;
-    assert!(!app.effective_flipped(&FocusedPanel::Security));
+    assert!(!app.is_flipped(&FocusedPanel::Security));
     app.handle_message(Message::ToggleFlip);
     // Just-started animation hasn't passed the midpoint yet.
-    assert!(!app.effective_flipped(&FocusedPanel::Security));
+    assert!(!app.is_flipped(&FocusedPanel::Security));
 }
 
 #[test]
@@ -1545,14 +1545,14 @@ fn advance_animation_noop_when_still_running() {
 }
 
 #[test]
-fn effective_flipped_shows_target_after_midpoint() {
+fn flip_shows_target_after_midpoint() {
     use std::time::Duration;
     let mut app = test_app();
     let mut state = crate::app::state::FlipState::new(Duration::from_millis(100));
     state.flip();
     app.flip_states.insert(FocusedPanel::Security, state);
     std::thread::sleep(Duration::from_millis(75));
-    assert!(app.effective_flipped(&FocusedPanel::Security));
+    assert!(app.is_flipped(&FocusedPanel::Security));
 }
 
 // ====================================================================
@@ -1917,6 +1917,10 @@ fn routine_packet_loss_and_jitter_samples_do_not_flood_the_event_log() {
         1,
         "recovery and subsequent healthy samples must emit one transition"
     );
+    assert!(crate::logger::get_logs()
+        .iter()
+        .filter(|entry| entry.message.starts_with("Network quality"))
+        .all(|entry| entry.category == "NET"));
 }
 
 #[test]

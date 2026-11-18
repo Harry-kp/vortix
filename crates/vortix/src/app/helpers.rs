@@ -85,8 +85,12 @@ impl App {
     /// Add a log message via centralized logger
     pub(crate) fn log(&mut self, message: &str) {
         let (category, content, level) = classify_log_message(message);
+        self.log_as(level, category, content);
+    }
 
-        // Log via centralized logger
+    /// [`Self::log`] with the level and category given, for a warning that
+    /// belongs to a category other than APP.
+    pub(crate) fn log_as(&mut self, level: LogLevel, category: &str, content: &str) {
         logger::log(level, category, content);
 
         if self.logs_auto_scroll {

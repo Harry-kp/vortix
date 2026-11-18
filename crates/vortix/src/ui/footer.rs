@@ -66,7 +66,12 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         | crate::app::FocusedPanel::Security
         | crate::app::FocusedPanel::ConnectionDetails) => {
             if panel.flips() {
-                context_hints.push(("f", panel.flip_label()));
+                let label = if app.is_flipped(panel) {
+                    "Flip back"
+                } else {
+                    panel.flip_label()
+                };
+                context_hints.push(("f", label));
             }
             context_hints.push(("z", "Zoom"));
         }
@@ -295,6 +300,29 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(text.contains("i Add VPN"), "{text}");
+    }
+
+    #[test]
+    fn a_flipped_panel_offers_flip_back() {
+        let mut app = App::new_test();
+        app.focused_panel = crate::app::FocusedPanel::Security;
+        app.handle_message(crate::message::Message::ToggleFlip);
+        while app.has_active_animation() {
+            app.advance_animation();
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(97, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_dashboard(frame, &app, frame.area()))
+            .expect("footer");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("f Flip back"), "{text}");
     }
 
     #[test]

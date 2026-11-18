@@ -643,7 +643,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(theme::current().border_default)
     };
 
-    if app.effective_flipped(&crate::app::FocusedPanel::Security) {
+    if app.is_flipped(&crate::app::FocusedPanel::Security) {
         render_back(frame, app, area, border_style);
         return;
     }

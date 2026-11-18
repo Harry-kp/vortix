@@ -353,12 +353,6 @@ impl App {
         }
     }
 
-    /// Effective flip state for rendering, accounting for mid-animation view swap.
-    #[must_use]
-    pub fn effective_flipped(&self, panel: &FocusedPanel) -> bool {
-        self.is_flipped(panel)
-    }
-
     /// Borrow the flip state for `panel`, creating a default one if missing.
     pub fn flip_state_mut(&mut self, panel: FocusedPanel) -> &mut FlipState {
         self.flip_states.entry(panel).or_default()

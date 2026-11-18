@@ -695,9 +695,13 @@ impl App {
                     if let (Some(real), Some(public)) = (&self.runtime.real_ipv6, &observed) {
                         // Once per leak, not on every poll that still sees it.
                         if real == public && self.runtime.public_ipv6.as_ref() != Some(public) {
-                            self.log(&format!(
-                                "WARN: IPv6 leak detected — public {public} matches real {real}"
-                            ));
+                            self.log_as(
+                                logger::LogLevel::Warning,
+                                "NET",
+                                &format!(
+                                    "IPv6 leak detected — public {public} matches real {real}"
+                                ),
+                            );
                         }
                     }
                 }
@@ -793,9 +797,13 @@ impl App {
             && !self.runtime.ip_unchanged_warned
         {
             self.runtime.ip_unchanged_warned = true;
-            self.log(&format!(
-                "WARN: Public IPv4 matches the pre-VPN address ({ip}) — possible leak or split-tunnel"
-            ));
+            self.log_as(
+                logger::LogLevel::Warning,
+                "NET",
+                &format!(
+                    "Public IPv4 matches the pre-VPN address ({ip}) — possible leak or split-tunnel"
+                ),
+            );
         }
         self.runtime.public_ip = ip;
         let checked_at = Instant::now();
@@ -816,10 +824,28 @@ impl App {
         }
         self.last_logged_network_quality = quality;
         match quality {
-            QualityLevel::Unknown => self.log("WARN: Network quality unavailable"),
+            QualityLevel::Unknown => {
+                self.log_as(
+                    logger::LogLevel::Warning,
+                    "NET",
+                    "Network quality unavailable",
+                );
+            }
             QualityLevel::Excellent => self.log("NET: Network quality: excellent"),
-            QualityLevel::Fair => self.log("WARN: Network quality degraded: fair"),
-            QualityLevel::Poor => self.log("WARN: Network quality degraded: poor"),
+            QualityLevel::Fair => {
+                self.log_as(
+                    logger::LogLevel::Warning,
+                    "NET",
+                    "Network quality degraded: fair",
+                );
+            }
+            QualityLevel::Poor => {
+                self.log_as(
+                    logger::LogLevel::Warning,
+                    "NET",
+                    "Network quality degraded: poor",
+                );
+            }
         }
     }
 
