@@ -63,6 +63,9 @@ pub fn resolve_target(input: &str) -> Result<ImportTarget, String> {
 
     // 3. Check file existence and type; a mesh vendor's name adds its network.
     if !path.exists() {
+        if let Some((driver, account)) = crate::provider::account_from_words(input) {
+            return crate::provider::add(driver, &account?).map(ImportTarget::File);
+        }
         if let Some((driver, profile)) = crate::mesh::profile_from_words(input) {
             let profile = profile?;
             if let Some(existing) = joined_already(driver, &profile) {

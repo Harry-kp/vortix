@@ -1736,6 +1736,18 @@ pub mod import {
                 ]));
             }
         }
+        for provider in crate::provider::ProviderDriver::ALL {
+            text.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} <account number>", provider.slug()),
+                    Style::default().fg(theme::current().success),
+                ),
+                Span::styled(
+                    format!(" → {}", provider.name()),
+                    Style::default().fg(theme::current().text_secondary),
+                ),
+            ]));
+        }
 
         frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
     }
@@ -1764,6 +1776,10 @@ pub mod import {
             assert!(
                 output.contains(".netbird → NetBird")
                     && output.contains("netbird https://server.url → NetBird"),
+                "{output}"
+            );
+            assert!(
+                output.contains("mullvad <account number> → Mullvad"),
                 "{output}"
             );
         }

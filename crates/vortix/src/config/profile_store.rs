@@ -1001,12 +1001,19 @@ impl FsProfileStore {
             config_file,
             stage: DeleteStage::Prepared,
         };
+        let provider_device =
+            crate::provider::device_of(&self.profiles_dir.join(&intent.config_file));
         self.save_delete_intent(&intent)?;
         let protocol = intent.protocol;
         self.resume_delete(&mut intent)?;
         if let ProtocolKind::Mesh(driver) = protocol {
             if let Err(error) = crate::mesh::forget(driver, id) {
                 tracing::warn!(%error, "could not remove the deleted network's identity");
+            }
+        }
+        if let Some((driver, device)) = provider_device {
+            if let Err(error) = crate::provider::release(driver, &device) {
+                tracing::warn!(%error, "could not remove the deleted profile's provider device");
             }
         }
         Ok(())

@@ -243,7 +243,7 @@ pub enum Commands {
     #[command(verbatim_doc_comment)]
     Import {
         /// Path to a `.conf`/`.ovpn`/`.netbird` file, directory or URL, or `netbird`
-        #[arg(value_hint = ValueHint::AnyPath, required = true, num_args = 1..=2)]
+        #[arg(value_hint = ValueHint::AnyPath, required = true, num_args = 1..)]
         file: Vec<String>,
     },
 
@@ -420,8 +420,12 @@ pub enum Commands {
 pub fn import_input(words: &[String]) -> Option<String> {
     match words {
         [path] => Some(path.clone()),
-        [first, server] if first.eq_ignore_ascii_case("netbird") => {
-            Some(format!("{first} {server}"))
+        [first, ..]
+            if ["netbird", "mullvad"]
+                .iter()
+                .any(|vendor| first.eq_ignore_ascii_case(vendor)) =>
+        {
+            Some(words.join(" "))
         }
         _ => None,
     }
@@ -473,6 +477,16 @@ mod tests {
         assert_eq!(
             super::import_input(&file).as_deref(),
             Some("netbird https://nb.example.com")
+        );
+        let account = parse(&[
+            "vortix", "import", "mullvad", "1111", "2222", "3333", "4444",
+        ]);
+        let Some(Commands::Import { file }) = account.command else {
+            panic!("expected Import");
+        };
+        assert_eq!(
+            super::import_input(&file).as_deref(),
+            Some("mullvad 1111 2222 3333 4444")
         );
         let two_files = parse(&["vortix", "import", "a.conf", "b.conf"]);
         let Some(Commands::Import { file }) = two_files.command else {

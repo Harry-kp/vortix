@@ -29,6 +29,7 @@ pub mod platform;
 #[doc(hidden)]
 pub mod process;
 pub mod profile;
+pub mod provider;
 pub mod telemetry;
 pub mod tunnel;
 pub mod ui;
