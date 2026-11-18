@@ -1180,8 +1180,9 @@ mod tests {
             "{top}"
         );
         for _ in 0..20 {
-            app.handle_message(crate::message::Message::Scroll(
-                crate::message::ScrollMove::Down,
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
             ));
         }
         let scrolled = back_at(&mut app, 100, 16);

@@ -996,7 +996,7 @@ pub mod help {
             &[
                 ("1-9", "Quick connect to profile N"),
                 ("d", "Disconnect focused tunnel / Cancel"),
-                ("D", "Sidebar: disconnect all (asks if 2+); else: focused"),
+                ("D", "Sidebar: disconnect all (asks if 2+); else: primary"),
                 ("r", "Reconnect"),
                 ("i", "Add a VPN (file, folder, link, netbird)"),
                 ("K", "Cycle kill switch mode"),

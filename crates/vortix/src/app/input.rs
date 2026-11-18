@@ -862,7 +862,7 @@ impl crate::app::App {
                 self.handle_message(Message::Disconnect);
             }
             // Uppercase `D` disconnects every tunnel from the sidebar and the
-            // focused one elsewhere; the message layer asks only when 2+ are up.
+            // primary elsewhere; the message layer asks only when 2+ are up.
             KeyCode::Char('D') => {
                 if self.focused_panel == FocusedPanel::Sidebar {
                     self.handle_message(Message::RequestDisconnectAll);
@@ -966,8 +966,17 @@ impl crate::app::App {
                     _ => {}
                 }
             }
-            // Read-only panels
-            FocusedPanel::ConnectionDetails | FocusedPanel::Chart | FocusedPanel::Security => {}
+            // The routes and peers on its back side scroll.
+            FocusedPanel::ConnectionDetails => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.handle_message(Message::Scroll(ScrollMove::Down));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.handle_message(Message::Scroll(ScrollMove::Up));
+                }
+                _ => {}
+            },
+            FocusedPanel::Chart | FocusedPanel::Security => {}
         }
     }
 
