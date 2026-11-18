@@ -285,26 +285,12 @@ fn connected_line(
     ) {
         QualityLevel::Unknown => ("─────", theme::current().text_secondary),
         QualityLevel::Poor => ("●●○○○", theme::current().error),
-        QualityLevel::Fair => ("●●●○○", theme::current().yellow),
+        QualityLevel::Fair => ("●●●○○", theme::current().warning),
         QualityLevel::Excellent => ("●●●●●", theme::current().success),
     };
 
-    let proto_tag = app
-        .runtime
-        .profiles
-        .iter()
-        .find(|p| p.name == profile_name)
-        .map_or("", |p| match p.protocol {
-            crate::profile::ProtocolKind::WireGuard => "WG",
-            crate::profile::ProtocolKind::OpenVpn => "OVPN",
-            crate::profile::ProtocolKind::Mesh(driver) => driver.short(),
-        });
-
-    let proto_suffix = if proto_tag.is_empty() {
-        ")".to_string()
-    } else {
-        format!("/{proto_tag})")
-    };
+    // From the tunnel: the name may already be shortened.
+    let proto_suffix = format!("/{})", primary_snap.protocol.short());
 
     let mut header_spans = vec![
         Span::styled(
@@ -438,14 +424,13 @@ fn render_primary_line(
 
 /// Per-phase badge char + colour used in the tunnels strip. Mirrors the
 /// sidebar's badge mapping so cross-surface signal stays consistent.
-fn strip_badge(phase: Phase) -> (&'static str, Color) {
-    match phase {
-        Phase::Up => ("●", theme::current().success),
-        Phase::Starting => ("…", theme::current().warning),
-        Phase::Waiting { .. } => ("↻", theme::current().warning),
-        Phase::Stopping => ("⏻", theme::current().warning),
-        Phase::AwaitingCredentials => ("?", theme::current().warning),
-    }
+/// The sidebar's sigil for this tunnel, so both show one state the same way.
+fn strip_badge(tunnel: &TunnelView) -> (&'static str, Color) {
+    let sigil = crate::ui::sigils::sigil(super::sidebar::status_sigil_id(
+        tunnel,
+        Some(tunnel.protocol),
+    ));
+    (sigil.glyph, sigil.color())
 }
 
 /// Compute the rendered display width (in terminal cells) of a `Line`.
@@ -490,7 +475,7 @@ fn append_tunnels_strip(
     let visible: Vec<(&TunnelView, &'static str, Color)> = ordered
         .iter()
         .map(|s| {
-            let (glyph, color) = strip_badge(s.phase);
+            let (glyph, color) = strip_badge(s);
             (*s, glyph, color)
         })
         .collect();
@@ -1084,7 +1069,7 @@ mod tests {
         let visible: Vec<_> = snaps
             .iter()
             .map(|s| {
-                let (g, c) = strip_badge(s.phase);
+                let (g, c) = strip_badge(s);
                 (s, g, c)
             })
             .collect();
@@ -1102,7 +1087,7 @@ mod tests {
         let visible: Vec<_> = snaps
             .iter()
             .map(|s| {
-                let (g, c) = strip_badge(s.phase);
+                let (g, c) = strip_badge(s);
                 (s, g, c)
             })
             .collect();
@@ -1124,7 +1109,7 @@ mod tests {
         let visible: Vec<_> = snaps
             .iter()
             .map(|s| {
-                let (g, c) = strip_badge(s.phase);
+                let (g, c) = strip_badge(s);
                 (s, g, c)
             })
             .collect();

@@ -49,11 +49,6 @@ pub struct StatusSnapshot {
     pub observation_complete: bool,
 }
 
-/// Printed instead of "Disconnected" when nothing was seen but the scan was
-/// incomplete: an unprivileged `status` cannot see `WireGuard` tunnels.
-const UNKNOWN_HEADLINE: &str =
-    "? Tunnel state unknown: VPN tunnels are only visible to root. Run: sudo vortix status";
-
 impl StatusSnapshot {
     /// Nothing seen, but the scan could not see everything.
     #[must_use]
@@ -319,13 +314,16 @@ pub(super) fn handle_status(
         OutputMode::Json => {
             let next = if is_present {
                 vec![
-                    "sudo vortix down --json".into(),
-                    "vortix list --json".into(),
+                    super::output::sudo_command(&["down", "--json"]),
+                    crate::cli::output::vortix_command(&["list", "--json"]),
                 ]
             } else {
                 vec![
-                    "vortix list --json".into(),
-                    "sudo vortix up <PROFILE> --json".into(),
+                    crate::cli::output::vortix_command(&["list", "--json"]),
+                    format!(
+                        "{} <PROFILE> --json",
+                        crate::cli::output::sudo_command(&["up"])
+                    ),
                 ]
             };
             print_success(mode, "status", &data, next);
@@ -481,7 +479,10 @@ fn other_tunnel_lines(snap: &StatusSnapshot) -> Vec<String> {
 
 fn snapshot_headline(snap: &StatusSnapshot) -> String {
     if snap.state_unknown() {
-        UNKNOWN_HEADLINE.to_string()
+        format!(
+            "? Tunnel state unknown: VPN tunnels are only visible to root. Run: {}",
+            crate::cli::output::sudo_command(&["status"])
+        )
     } else {
         human_status_headline(snap.focus())
     }
@@ -594,7 +595,11 @@ mod handshake_status_tests {
         assert_eq!(snapshot_headline(&snap), "○ Disconnected");
         snap.observation_complete = false;
         assert!(snapshot_headline(&snap).starts_with("? Tunnel state unknown"));
-        assert!(snapshot_headline(&snap).contains("sudo vortix status"));
+        let headline = snapshot_headline(&snap);
+        assert!(
+            headline.contains("sudo vortix") && headline.ends_with(" status"),
+            "{headline}"
+        );
     }
 
     fn session(name: &str, interface: &str) -> SessionStatus {
@@ -675,7 +680,7 @@ mod handshake_status_tests {
                 Some("WireGuard"),
                 60,
             ),
-            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C stops waiting, not the connecting)…".into())
+            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C cancels)…".into())
         );
         assert_eq!(
             lifecycle_progress_message(
@@ -685,7 +690,7 @@ mod handshake_status_tests {
                 None,
                 30,
             ),
-            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s (Ctrl-C stops waiting, not the disconnecting)…".into())
+            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s…".into())
         );
         assert!(lifecycle_progress_message(
             OutputMode::Json,

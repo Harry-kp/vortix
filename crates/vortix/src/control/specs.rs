@@ -262,6 +262,32 @@ mod tests {
         );
     }
 
+    /// A trailing comment once dropped the route and the endpoint: a full tunnel planned as split.
+    #[test]
+    fn a_commented_wireguard_profile_is_full_with_its_server() {
+        let profile = VpnProfile {
+            id: ProfileId::new("b".repeat(64)),
+            name: "wg0".into(),
+            protocol: ProtocolKind::WireGuard,
+            location: String::new(),
+            config_path: PathBuf::new(),
+            last_used: None,
+            group: None,
+        };
+        let spec = parse(
+            &profile,
+            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = xyz\nAllowedIPs = 0.0.0.0/0 # all\nEndpoint = 203.0.113.7:51820 # nl\n",
+            &mut EndpointCache::default(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(crate::cidr::is_full(&spec.routes), "{:?}", spec.routes);
+        assert_eq!(
+            spec.server_ips.into_iter().collect::<Vec<_>>(),
+            ["203.0.113.7".parse::<IpAddr>().unwrap()]
+        );
+    }
+
     #[test]
     fn the_cache_file_keeps_its_format() {
         let cache = cache_with(r#"{"vpn.example.com:51820":"203.0.113.7"}"#);

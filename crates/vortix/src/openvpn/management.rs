@@ -20,6 +20,8 @@ pub(crate) enum ManagementAuthError {
     Closed,
     #[error("OpenVPN rejected authentication")]
     AuthenticationRejected,
+    #[error("the OpenVPN server refused the connection for now; connect again later")]
+    TemporarilyRefused,
     #[error("OpenVPN requested an unsupported interactive challenge")]
     UnsupportedChallenge,
     #[error("OpenVPN exited during authentication")]
@@ -70,9 +72,17 @@ pub(crate) fn authenticate(
                 return Err(ManagementAuthError::UnsupportedChallenge);
             }
             send_credentials(&mut writer, username, password, None, deadline)?;
+        } else if event.starts_with(">PASSWORD:Verification Failed") && event.contains("['TEMP") {
+            return Err(ManagementAuthError::TemporarilyRefused);
+        } else if event.starts_with(">PASSWORD:Verification Failed") && event.contains("['CRV1:") {
+            // A dynamic challenge, not a rejection.
+            return Err(ManagementAuthError::UnsupportedChallenge);
         } else if event.starts_with(">PASSWORD:Verification Failed") {
             return Err(ManagementAuthError::AuthenticationRejected);
-        } else if event.starts_with(">PASSWORD:Need '") || event.starts_with(">NEED-STR:") {
+        } else if event.starts_with(">PASSWORD:Need '")
+            || event.starts_with(">NEED-STR:")
+            || event.starts_with(">INFOMSG:CR_TEXT:")
+        {
             return Err(ManagementAuthError::UnsupportedChallenge);
         } else if event.starts_with(">FATAL:") {
             return Err(ManagementAuthError::DaemonExited);
@@ -170,7 +180,7 @@ fn remaining(deadline: Instant) -> Result<Duration, ManagementAuthError> {
         .ok_or(ManagementAuthError::Timeout)
 }
 
-fn valid_quoted_value(value: &str) -> bool {
+pub(crate) fn valid_quoted_value(value: &str) -> bool {
     !value.is_empty() && !value.as_bytes().iter().any(u8::is_ascii_control)
 }
 
@@ -333,5 +343,37 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, ManagementAuthError::Timeout);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dynamic_and_pending_challenges_are_unsupported_not_rejected() {
+        for event in [
+            &b">PASSWORD:Verification Failed: 'Auth' ['CRV1:R,E:c3RhdGU=:YWxpY2U=:Enter OTP']\n"[..],
+            b">INFOMSG:CR_TEXT:R,E:Enter push code\n",
+        ] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            server.write_all(event).unwrap();
+            let error = authenticate(
+                client,
+                "alice",
+                "pw",
+                b"1",
+                Some(OpenVpnChallengeKind::Static),
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert_eq!(error, ManagementAuthError::UnsupportedChallenge);
+        }
+    }
+
+    #[test]
+    fn a_temporary_refusal_is_not_a_rejection() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .write_all(b">PASSWORD:Verification Failed: 'Auth' ['TEMP[backoff 30]:server busy']\n")
+            .unwrap();
+        let error =
+            authenticate(client, "alice", "pw", &[], None, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error, ManagementAuthError::TemporarilyRefused);
     }
 }

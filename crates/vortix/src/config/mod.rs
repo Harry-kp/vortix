@@ -254,7 +254,12 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
     if !path.exists() {
         // Track which ancestors already exist so we only chown dirs we create.
         let first_existing_ancestor = path.ancestors().find(|a| a.exists());
-        std::fs::create_dir_all(&path)?;
+        std::fs::create_dir_all(&path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot create config directory {}: {error}", path.display()),
+            )
+        })?;
         // `create_dir_all` applies the caller's umask. Ubuntu defaults to 002,
         // which yields a group-writable 0775 — and Vortix's own durable-state
         // checks reject any group- or world-writable directory, so a first run
@@ -282,6 +287,13 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
                 dir = d.parent();
             }
         }
+    }
+
+    if !path.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "config directory {} is not a directory",
+            path.display()
+        )));
     }
 
     // An install created before Vortix set 0700 keeps the umask's mode
@@ -470,13 +482,26 @@ pub fn load_effective_config(config_dir: &Path) -> Result<AppConfig, String> {
         wireguard_handshake_stale_secs: config.wireguard_handshake_stale_secs,
         wireguard_health_targets: config.ping_targets.clone(),
     };
-    let settings = crate::config::Settings::load(config_dir, legacy_engine)
-        .map_err(|error| format!("Failed to resolve engine settings: {error}"))?;
-    validate_engine_settings(&settings.engine)?;
+    let settings = crate::config::Settings::load(config_dir, legacy_engine).map_err(|error| {
+        format!(
+            "Invalid settings at {}: {error}",
+            config_dir.join("settings.toml").display()
+        )
+    })?;
+    validate_engine_settings(&settings.engine).map_err(|error| {
+        format!(
+            "Invalid engine setting (in {}, {} or a VORTIX_ENGINE__ variable): {error}",
+            config_dir.join("settings.toml").display(),
+            config_dir.join(CONFIG_FILE).display()
+        )
+    })?;
     Ok(with_engine_settings(config, settings.engine))
 }
 
 fn validate_engine_settings(engine: &crate::config::EngineSettings) -> Result<(), String> {
+    if !(1..=600).contains(&engine.connect_timeout_secs) {
+        return Err("connect_timeout_secs must be between 1 and 600 seconds".into());
+    }
     if !(1..=300).contains(&engine.wireguard_handshake_timeout_secs) {
         return Err("wireguard_handshake_timeout_secs must be between 1 and 300 seconds".into());
     }
@@ -572,6 +597,12 @@ pub fn check_migration(new_dir: &Path) -> Option<PathBuf> {
 /// # Errors
 ///
 /// Returns an error if file operations fail.
+/// State earlier versions kept in the config directory that nothing reads now.
+pub fn remove_retired_files(config_dir: &Path) {
+    let _ = std::fs::remove_dir_all(config_dir.join("control"));
+    let _ = std::fs::remove_file(config_dir.join("vortix-receipt.json"));
+}
+
 pub fn migrate_data(old_dir: &Path, new_dir: &Path) -> std::io::Result<()> {
     use crate::constants::{
         KILLSWITCH_STATE_FILE, LOGS_DIR_NAME, OPENVPN_AUTH_DIR, OPENVPN_RUN_DIR, PROFILES_DIR_NAME,
@@ -865,6 +896,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retired_state_is_removed_and_profiles_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("control")).unwrap();
+        std::fs::write(dir.path().join("control/control-state.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("vortix-receipt.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        std::fs::write(dir.path().join("profiles/a.conf"), "x").unwrap();
+        remove_retired_files(dir.path());
+        assert!(!dir.path().join("control").exists());
+        assert!(!dir.path().join("vortix-receipt.json").exists());
+        assert!(dir.path().join("profiles/a.conf").exists());
+    }
+
+    #[test]
     fn home_relative_replaces_only_a_whole_home_directory() {
         let home = user_home().expect("home");
         assert_eq!(home_relative(&home.join("a/b.conf")), "~/a/b.conf");
@@ -1005,6 +1050,34 @@ mod tests {
 
         let config = load_effective_config(selected.path()).unwrap();
         assert_eq!(config.wireguard_handshake_timeout_secs, 7);
+    }
+
+    // Zero failed every OpenVPN and NetBird connect at once with a 0 s timeout.
+    #[test]
+    fn a_zero_connect_timeout_is_refused() {
+        let selected = tempfile::tempdir().unwrap();
+        std::fs::write(
+            selected.path().join("settings.toml"),
+            "[engine]\nconnect_timeout_secs = 0\n",
+        )
+        .unwrap();
+        let error = load_effective_config(selected.path()).unwrap_err();
+        assert!(
+            error.contains("connect_timeout_secs must be between 1 and 600"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_bad_settings_file_is_named_in_the_error() {
+        let selected = tempfile::tempdir().unwrap();
+        std::fs::write(
+            selected.path().join("settings.toml"),
+            "[[hooks]]\nevent = \"connected\"\nexecutable = \"notify.sh\"\n",
+        )
+        .unwrap();
+        let error = load_effective_config(selected.path()).unwrap_err();
+        assert!(error.contains("settings.toml"), "{error}");
     }
 
     // ---- load_config ----
@@ -1277,6 +1350,15 @@ ip_api_fallbacks = ["https://fallback1.example.com"]
         assert_eq!(result, expected);
         // resolve_config_dir must create the directory
         assert!(custom.is_dir());
+    }
+
+    #[test]
+    fn a_config_dir_that_is_a_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let error = resolve_config_dir(Some(&file)).unwrap_err();
+        assert!(error.to_string().ends_with("is not a directory"), "{error}");
     }
 
     #[test]

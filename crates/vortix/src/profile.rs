@@ -25,6 +25,20 @@ pub fn validate_wireguard_interface_name(name: &str) -> Result<(), String> {
     }
 }
 
+/// A new profile name is a file name in the profile directory.
+pub fn validate_profile_name(name: &str) -> Result<(), String> {
+    let problem = if name.is_empty() {
+        "must not be empty"
+    } else if name.starts_with('.') {
+        "must not start with '.'"
+    } else if name.contains(['/', '\\']) || name.contains("..") {
+        "must not contain path separators or '..'"
+    } else {
+        return Ok(());
+    };
+    Err(format!("Invalid name: {problem}"))
+}
+
 /// An interface name that fits `IFNAMSIZ` and is safe to write into pf and
 /// nft rules unquoted: `[A-Za-z0-9_.-]`, 1–15 bytes.
 #[must_use]
@@ -175,6 +189,18 @@ impl ResolvedEndpoint {
     }
 }
 
+impl ProtocolKind {
+    /// The two-letter tag the sidebar and header show.
+    #[must_use]
+    pub const fn short(self) -> &'static str {
+        match self {
+            Self::WireGuard => "WG",
+            Self::OpenVpn => "OV",
+            Self::Mesh(driver) => driver.short(),
+        }
+    }
+}
+
 impl std::fmt::Display for ProtocolKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -313,8 +339,22 @@ pub fn detect_conf_protocol(text: &str) -> Result<ProtocolKind, String> {
 mod tests {
     use super::{
         detect_conf_protocol, hex, is_safe_interface_name, sanitize_profile_name,
-        unambiguous_legacy_artifact_key, ProfileId, ProtocolKind,
+        unambiguous_legacy_artifact_key, validate_profile_name, ProfileId, ProtocolKind,
     };
+
+    /// `rename w4 ""` was told the name held a path separator.
+    #[test]
+    fn each_invalid_profile_name_says_what_is_wrong() {
+        assert!(validate_profile_name("").unwrap_err().contains("empty"));
+        assert!(validate_profile_name(".hidden")
+            .unwrap_err()
+            .contains("start with '.'"));
+        assert!(validate_profile_name("a/b")
+            .unwrap_err()
+            .contains("separators"));
+        assert!(validate_profile_name("a..b").unwrap_err().contains("'..'"));
+        assert!(validate_profile_name("work-eu").is_ok());
+    }
 
     #[test]
     fn digest_keys_are_stable_sha256_prefixes() {

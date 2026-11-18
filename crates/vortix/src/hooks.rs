@@ -153,6 +153,19 @@ mod runner {
         RunnerStopped,
     }
 
+    impl std::fmt::Display for HookFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Self::QueueSaturated => "too many hooks queued, event skipped",
+                Self::Timeout => "timed out",
+                Self::NonZeroExit => "exited with an error",
+                Self::OutputLimitExceeded => "printed too much output",
+                Self::RunnerFailure => "could not be started",
+                Self::RunnerStopped => "stopped before it finished",
+            })
+        }
+    }
+
     pub struct HookDiagnostics {
         receiver: broadcast::Receiver<HookDiagnostic>,
     }
@@ -164,6 +177,13 @@ mod runner {
 
         pub fn try_recv(&mut self) -> Result<HookDiagnostic, broadcast::error::TryRecvError> {
             self.receiver.try_recv()
+        }
+
+        #[must_use]
+        pub fn resubscribe(&self) -> Self {
+            Self {
+                receiver: self.receiver.resubscribe(),
+            }
         }
     }
 
@@ -667,7 +687,7 @@ mod runner {
 /// Start the configured hooks, or `None` when there are none or they cannot
 /// run. Hooks never affect lifecycle correctness. Must run inside a tokio
 /// runtime.
-pub(crate) fn start(config_dir: &Path) -> Option<HookRunner> {
+pub(crate) fn start(config_dir: &Path) -> Option<(HookRunner, HookDiagnostics)> {
     let started = (|| {
         let settings =
             crate::config::Settings::load(config_dir, crate::config::EngineSettings::default())
@@ -682,7 +702,6 @@ pub(crate) fn start(config_dir: &Path) -> Option<HookRunner> {
             owner,
             crate::process::global_runner().clone(),
         )
-        .map(|started| started.map(|(runner, _)| runner))
         .map_err(|error| error.to_string())
     })();
     started.unwrap_or_else(|error: String| {

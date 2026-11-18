@@ -70,6 +70,45 @@ pub struct OvpnParsedProfile {
     pub dns_search_domains: Vec<String>,
     /// The first `cipher` directive.
     pub cipher: Option<String>,
+    /// Which pushed options the profile takes.
+    pub pull: PullPolicy,
+}
+
+/// `route-nopull` and `pull-filter`: which pushed options `OpenVPN` takes.
+#[derive(Debug, Default, Clone)]
+pub struct PullPolicy {
+    /// Pushed routes and DNS are not taken.
+    pub route_nopull: bool,
+    /// `pull-filter` as (accepts, text), in profile order; the first one that
+    /// matches wins. `reject` counts as not accepting: `OpenVPN` restarts the
+    /// connection instead, so no completed session holds such an option.
+    pub filters: Vec<(bool, String)>,
+}
+
+impl PullPolicy {
+    /// Whether `OpenVPN` takes this pushed option, as `pull-filter` and
+    /// `route-nopull` decide.
+    #[must_use]
+    pub fn pulls(&self, option: &str) -> bool {
+        let filtered = self
+            .filters
+            .iter()
+            .find(|(_, text)| option.starts_with(text.as_str()))
+            .is_some_and(|(accepts, _)| !accepts);
+        let words = option_words(option);
+        let directive = words.first().map_or("", String::as_str);
+        let route_or_dns = [
+            "route",
+            "route-ipv6",
+            "redirect-gateway",
+            "redirect-gateway-ipv6",
+            "redirect-private",
+            "dhcp-option",
+            "dns",
+        ]
+        .contains(&directive);
+        !(filtered || self.route_nopull && route_or_dns)
+    }
 }
 
 impl OvpnParsedProfile {
@@ -139,6 +178,21 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
                 "OpenVPN TAP (`dev tap`) is not supported: Vortix routes on a layer-3 tunnel device. Use `dev tun`.".into(),
             ));
         }
+        // OpenVPN runs as root, so a path here can overwrite any file.
+        if matches!(
+            directive.as_str(),
+            "status"
+                | "log"
+                | "log-append"
+                | "writepid"
+                | "replay-persist"
+                | "ifconfig-pool-persist"
+        ) {
+            let target = arguments.first().map_or("", String::as_str);
+            return Err(ParseError::Unsupported(format!(
+                "This profile tells OpenVPN to write a file: `{directive} {target}`. Vortix runs OpenVPN as root, so that line could overwrite any file on this computer. Vortix keeps OpenVPN's log itself: delete that line from the file, then import it again."
+            )));
+        }
 
         match directive.as_str() {
             "auth-user-pass" => {
@@ -154,6 +208,8 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             "remote-random" => {
                 profile.remote_random = true;
             }
+            "route-nopull" => profile.pull.route_nopull = true,
+            "pull-filter" => profile.pull.filters.push(parse_pull_filter(arguments)?),
             "cipher" if profile.cipher.is_none() => {
                 profile.cipher = tokens.next().map(str::to_string);
             }
@@ -165,19 +221,10 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             | "route-metric"
             | "route"
             | "route-ipv6" => apply_route_directive(&mut profile, &directive, &mut tokens, line),
-            "dhcp-option" => match tokens.next() {
-                Some(kind) if kind.eq_ignore_ascii_case("DNS") => {
-                    if let Some(server) = tokens.next().and_then(|value| value.parse().ok()) {
-                        profile.dns_servers.push(server);
-                    }
-                }
-                Some(kind)
-                    if kind.eq_ignore_ascii_case("DOMAIN")
-                        || kind.eq_ignore_ascii_case("DOMAIN-SEARCH") =>
-                {
-                    profile
-                        .dns_search_domains
-                        .extend(tokens.map(str::to_string));
+            "dhcp-option" | "dns" => match dns_setting(&directive, tokens) {
+                Ok(Some(DnsSetting::Servers(servers))) => profile.dns_servers.extend(servers),
+                Ok(Some(DnsSetting::Domains(domains))) => {
+                    profile.dns_search_domains.extend(domains);
                 }
                 _ => {}
             },
@@ -193,6 +240,75 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     }
 
     Ok(profile)
+}
+
+/// Resolvers or search domains one option sets.
+pub(super) enum DnsSetting {
+    Servers(Vec<IpAddr>),
+    Domains(Vec<String>),
+}
+
+/// The DNS an option sets: `dhcp-option DNS|DOMAIN|DOMAIN-SEARCH`, or
+/// `OpenVPN` 2.6's `dns server N address` and `dns search-domains`. `Ok(None)`
+/// for any other option, a dashed one included; `Err` for one of these that is
+/// malformed.
+pub(super) fn dns_setting<'a>(
+    directive: &str,
+    mut tokens: impl Iterator<Item = &'a str>,
+) -> Result<Option<DnsSetting>, ()> {
+    let domains = |tokens: &mut dyn Iterator<Item = &'a str>| {
+        let domains = tokens.map(str::to_string).collect::<Vec<_>>();
+        if domains.is_empty() {
+            Err(())
+        } else {
+            Ok(Some(DnsSetting::Domains(domains)))
+        }
+    };
+    match (directive, tokens.next()) {
+        ("dhcp-option", Some("DNS")) => {
+            let server = tokens
+                .next()
+                .and_then(|value| value.parse().ok())
+                .ok_or(())?;
+            Ok(Some(DnsSetting::Servers(vec![server])))
+        }
+        ("dhcp-option", Some("DOMAIN" | "DOMAIN-SEARCH")) | ("dns", Some("search-domains")) => {
+            domains(&mut tokens)
+        }
+        ("dns", Some("server")) if tokens.next().is_some() && tokens.next() == Some("address") => {
+            let servers = tokens
+                .map(|address| {
+                    address.parse().ok().or_else(|| {
+                        address
+                            .parse::<std::net::SocketAddr>()
+                            .ok()
+                            .map(|socket| socket.ip())
+                    })
+                })
+                .collect::<Option<Vec<IpAddr>>>()
+                .filter(|servers| !servers.is_empty())
+                .ok_or(())?;
+            Ok(Some(DnsSetting::Servers(servers)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_pull_filter(arguments: &[String]) -> Result<(bool, String), ParseError> {
+    let [action, text] = arguments else {
+        return Err(pull_filter_error());
+    };
+    match action.as_str() {
+        "accept" => Ok((true, text.clone())),
+        "ignore" | "reject" => Ok((false, text.clone())),
+        _ => Err(pull_filter_error()),
+    }
+}
+
+fn pull_filter_error() -> ParseError {
+    ParseError::Unsupported(
+        "OpenVPN `pull-filter` must be `pull-filter accept|ignore|reject \"text\"`: quote text that has spaces".into(),
+    )
 }
 
 fn apply_route_directive<'a, I>(
@@ -369,12 +485,23 @@ fn effective_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
 
 /// Tokenize the security-relevant prefix using `OpenVPN`'s config-file quoting
 /// rules. `None` means `OpenVPN` would reject the malformed line itself.
+/// The words of one pushed option, split as `OpenVPN` splits it; none for one
+/// it cannot parse.
+pub(crate) fn option_words(option: &str) -> Vec<String> {
+    openvpn_option_tokens(option, 128).unwrap_or_default()
+}
+
+/// `OpenVPN`'s word separator: C `isspace`, never other Unicode spaces.
+pub(crate) fn openvpn_space(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
+}
+
 fn openvpn_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
     let mut chars = line.chars().peekable();
     let mut tokens = Vec::with_capacity(limit.min(8));
 
     while tokens.len() < limit {
-        while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
+        while chars.next_if(|ch| openvpn_space(*ch)).is_some() {}
         if chars.peek().is_none_or(|ch| matches!(ch, '#' | ';')) {
             break;
         }
@@ -394,7 +521,7 @@ fn openvpn_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
                 break;
             } else if ch == '\\' {
                 token.push(chars.next()?);
-            } else if quote.is_none() && ch.is_whitespace() {
+            } else if quote.is_none() && openvpn_space(ch) {
                 break;
             } else {
                 token.push(ch);
@@ -493,7 +620,7 @@ where
     I: Iterator<Item = &'a str>,
 {
     let flags = tokens
-        .map(|token| match token.to_ascii_lowercase().as_str() {
+        .map(|token| match token {
             "local" => Some(OpenVpnRedirectFlag::Local),
             "autolocal" => Some(OpenVpnRedirectFlag::AutoLocal),
             "def1" => Some(OpenVpnRedirectFlag::Def1),
@@ -921,6 +1048,34 @@ mod tests {
     }
 
     /// Vortix routes on the tunnel device, which is wrong for a layer-2 TAP
+    /// A profile line that makes root `OpenVPN` write a file is refused, and the
+    /// message names the line so the user can fix the file themselves.
+    #[test]
+    fn a_profile_that_writes_files_is_refused_with_the_line() {
+        for line in [
+            "status /etc/passwd",
+            "log-append /var/log/x",
+            "writepid run.pid",
+            "setenv opt status /etc/shadow",
+        ] {
+            let text = format!("client\ndev tun\nremote 192.0.2.1 1194\n{line}\n");
+            let Err(ParseError::Unsupported(message)) = parse_ovpn_conf(&text) else {
+                panic!("{line} was accepted");
+            };
+            assert!(message.contains("could overwrite any file"), "{message}");
+            assert!(message.contains("delete that line"), "{message}");
+        }
+        let Err(ParseError::Unsupported(message)) =
+            parse_ovpn_conf("client\ndev tun\nremote 192.0.2.1 1194\nstatus /etc/passwd\n")
+        else {
+            unreachable!()
+        };
+        assert!(message.contains("`status /etc/passwd`"), "{message}");
+        assert!(
+            parse_ovpn_conf("client\ndev tun\nremote 192.0.2.1 1194\nstatus-version 2\n").is_ok()
+        );
+    }
+
     /// (the host would ARP for every destination), so TAP is refused.
     #[test]
     fn tap_profiles_are_refused_with_a_reason() {
@@ -933,5 +1088,19 @@ mod tests {
             assert!(error.contains("TAP"), "{body}: {error}");
         }
         assert!(parse_ovpn_conf("client\ndev tun\n").is_ok());
+    }
+    #[test]
+    fn a_pull_filter_openvpn_would_refuse_is_refused() {
+        for line in [
+            "pull-filter ignore\n",
+            "pull-filter drop \"route\"\n",
+            "pull-filter ignore route 10.0.0.0\n",
+        ] {
+            let error = parse_ovpn_conf(&format!("client\n{line}")).unwrap_err();
+            assert!(error.to_string().contains("pull-filter"), "{line}");
+        }
+        let parsed = parse_ovpn_conf("client\npull-filter ignore \"dhcp-option DNS\"\n").unwrap();
+        assert!(!parsed.pull.pulls("dhcp-option DNS 10.8.0.1"));
+        assert!(parsed.pull.pulls("dhcp-option DOMAIN corp.example"));
     }
 }

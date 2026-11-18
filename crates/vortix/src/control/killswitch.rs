@@ -587,6 +587,10 @@ pub struct PersistedState {
     /// during the emergency release.
     #[serde(default)]
     pub emergency_release_fence: bool,
+    /// The `pfctl -E` reference Vortix holds on macOS, released with `-X`.
+    /// Every save keeps it; files from older releases have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_token: Option<u64>,
 }
 
 impl PersistedState {
@@ -855,10 +859,61 @@ fn save_state_at(
         vpn_server_ip: None,
         active_tunnels,
         emergency_release_fence,
+        enable_token: stored_enable_token(path),
     };
 
     let content = serde_json::to_string_pretty(&persisted).map_err(io::Error::other)?;
 
+    atomic_write(path, content.as_bytes())?;
+    Ok(())
+}
+
+fn stored_enable_token(path: &std::path::Path) -> Option<u64> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<PersistedState>(&content)
+        .ok()?
+        .enable_token
+}
+
+/// The firewall enable reference recorded in the state file, if any.
+#[must_use]
+pub fn enable_token() -> Option<u64> {
+    stored_enable_token(&get_state_path()?)
+}
+
+/// Record or clear the firewall enable reference, keeping the rest of the record.
+///
+/// # Errors
+///
+/// Returns [`KillswitchError::Io`] when the state cannot be read or replaced.
+pub fn set_enable_token(token: Option<u64>) -> Result<()> {
+    let Some(path) = get_state_path() else {
+        return Ok(());
+    };
+    set_enable_token_at(&path, token)
+}
+
+fn set_enable_token_at(path: &std::path::Path, token: Option<u64>) -> Result<()> {
+    // An unreadable record is replaced, as every save replaces it.
+    let mut persisted = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<PersistedState>(&content).ok())
+        .unwrap_or(PersistedState {
+            schema_version: PERSISTED_STATE_SCHEMA_V2,
+            mode: KillSwitchMode::default(),
+            state: KillSwitchState::default(),
+            effective_state: None,
+            vpn_interface: None,
+            vpn_server_ip: None,
+            active_tunnels: Vec::new(),
+            emergency_release_fence: false,
+            enable_token: None,
+        });
+    persisted.enable_token = token;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(&persisted).map_err(io::Error::other)?;
     atomic_write(path, content.as_bytes())?;
     Ok(())
 }
@@ -1043,6 +1098,7 @@ mod tests {
                 vpn_server_ip: None,
                 active_tunnels: Vec::new(),
                 emergency_release_fence: false,
+                enable_token: None,
             };
             assert_eq!(record.live_state(), state);
         }
@@ -1066,6 +1122,7 @@ mod tests {
                 is_primary: true,
             }],
             emergency_release_fence: false,
+            enable_token: None,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -1186,6 +1243,7 @@ mod tests {
                 },
             ],
             emergency_release_fence: false,
+            enable_token: None,
         };
         let live = vec!["lo".to_string(), "eth0".to_string()];
         filter_phantom_tunnels(&mut state, &live);
@@ -1213,6 +1271,7 @@ mod tests {
                 is_primary: true,
             }],
             emergency_release_fence: false,
+            enable_token: None,
         };
         filter_phantom_tunnels(&mut state, &[]);
         assert_eq!(state.active_tunnels.len(), 1);
@@ -1257,6 +1316,39 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"hello");
         assert_eq!(fs::read(&victim).unwrap(), b"must survive");
         assert!(legacy_temp.is_symlink());
+    }
+
+    /// The held pf reference survives every save, including the emergency
+    /// `off`, until release clears it; older files read as holding none.
+    #[test]
+    fn enable_token_survives_saves_until_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(constants::KILLSWITCH_STATE_FILE);
+        let save = |fence| {
+            save_state_at(
+                &path,
+                KillSwitchMode::AlwaysOn,
+                KillSwitchState::Blocking,
+                Vec::new(),
+                fence,
+            )
+            .unwrap();
+        };
+        save(false);
+        assert_eq!(stored_enable_token(&path), None);
+
+        set_enable_token_at(&path, Some(18_446_744_073_709_551_000)).unwrap();
+        save(false);
+        save(true);
+        assert_eq!(stored_enable_token(&path), Some(18_446_744_073_709_551_000));
+        let record: PersistedState =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(record.emergency_release_fence);
+        assert_eq!(record.mode, KillSwitchMode::AlwaysOn);
+
+        set_enable_token_at(&path, None).unwrap();
+        assert_eq!(stored_enable_token(&path), None);
+        assert!(!fs::read_to_string(&path).unwrap().contains("enable_token"));
     }
 
     #[test]
@@ -1327,6 +1419,7 @@ mod tests {
             vpn_server_ip: None,
             active_tunnels: Vec::new(),
             emergency_release_fence: false,
+            enable_token: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let old: V1PersistedState = serde_json::from_str(&json).unwrap();

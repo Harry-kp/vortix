@@ -278,6 +278,9 @@ impl Control {
         config_dir: &Path,
         profiles: Vec<VpnProfile>,
     ) -> Result<Self, String> {
+        // Dying mid-connect left a tunnel up that nothing owned; a signal now
+        // lets the caller roll back or finish first.
+        crate::process::handle_termination(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
         let (uid, gid) = crate::config::config_owner(config_dir)?;
         let credentials = Arc::new(Mutex::new(FsOpenVpnCredentialStore::for_standard_owner(
             config_dir, uid, gid,
@@ -379,7 +382,8 @@ impl Control {
                 Some(Outcome::Failed(reason)) => return Err(reason.clone()),
                 _ => {}
             }
-            if Instant::now() >= deadline {
+            let interrupted = crate::process::termination_requested();
+            if interrupted || Instant::now() >= deadline {
                 // Rolling back can clear the error that made the connect fail.
                 let net_error = snapshot.net_error.clone();
                 // Exiting mid-start left half a tunnel on the host.
@@ -390,6 +394,9 @@ impl Control {
                 let snapshot = self.snapshot();
                 if snapshot.outcomes.get(&ticket) == Some(&Outcome::Done) {
                     return Ok(());
+                }
+                if interrupted {
+                    return Err("interrupted".into());
                 }
                 return Err(net_error.as_ref().map_or_else(
                     || "timed out waiting for the VPN".into(),

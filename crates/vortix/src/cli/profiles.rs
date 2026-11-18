@@ -54,18 +54,23 @@ pub(super) fn handle_list(
     }
 
     if let Some(proto) = protocol_filter {
-        let proto_lower = proto.to_lowercase();
-        profiles.retain(|p| format!("{}", p.protocol).to_lowercase() == proto_lower);
+        profiles.retain(|p| p.protocol.to_string().eq_ignore_ascii_case(proto));
     }
 
     if profiles.is_empty() {
         match mode {
-            OutputMode::Human => println!("No profiles found. Import one: vortix import <PATH>"),
+            OutputMode::Human => match protocol_filter.filter(|_| !all.is_empty()) {
+                Some(proto) => println!("No profiles match --protocol {proto}."),
+                None => println!("No profiles found. Import one: vortix import <PATH>"),
+            },
             OutputMode::Json => print_success(
                 mode,
                 "list",
                 &Vec::<ProfileEntry>::new(),
-                vec!["vortix import <PATH> --json".into()],
+                vec![format!(
+                    "{} <PATH> --json",
+                    crate::cli::output::vortix_command(&["import"])
+                )],
             ),
             OutputMode::Quiet => {}
         }
@@ -106,18 +111,8 @@ pub(super) fn handle_list(
     match mode {
         OutputMode::Human => {
             // Calculate column widths
-            let max_name = entries
-                .iter()
-                .map(|e| e.name.len())
-                .max()
-                .unwrap_or(4)
-                .max(4);
-            let max_proto = entries
-                .iter()
-                .map(|e| e.protocol.len())
-                .max()
-                .unwrap_or(8)
-                .max(8);
+            let max_name = entries.iter().map(|e| e.name.len()).fold(4, usize::max);
+            let max_proto = entries.iter().map(|e| e.protocol.len()).fold(8, usize::max);
             println!(
                 "  {:<width_n$}  {:<width_p$}  LAST USED",
                 "NAME",
@@ -143,8 +138,14 @@ pub(super) fn handle_list(
                 "list",
                 &entries,
                 vec![
-                    "vortix show <PROFILE> --json".into(),
-                    "sudo vortix up <PROFILE> --json".into(),
+                    format!(
+                        "{} <PROFILE> --json",
+                        crate::cli::output::vortix_command(&["show"])
+                    ),
+                    format!(
+                        "{} <PROFILE> --json",
+                        crate::cli::output::sudo_command(&["up"])
+                    ),
                 ],
             );
         }
@@ -326,7 +327,7 @@ pub(super) fn handle_import(
                     crate::config::import::cleanup_temp_download(&downloaded_path);
                     match result {
                         Ok(profile) => {
-                            print_import_success(&profile, mode);
+                            print_import_success(&profile, &downloaded_path, mode);
                             0
                         }
                         Err(e) => {
@@ -363,7 +364,7 @@ pub(super) fn handle_import(
             crate::config::import::cleanup_temp_download(&path);
             match imported {
                 Ok(profile) => {
-                    print_import_success(&profile, mode);
+                    print_import_success(&profile, &path, mode);
                     0
                 }
                 Err(e) => {
@@ -418,7 +419,11 @@ struct ImportData {
     config_path: String,
 }
 
-fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: OutputMode) {
+fn print_import_success(
+    profile: &crate::config::profiles::VpnProfile,
+    source: &Path,
+    mode: OutputMode,
+) {
     let data = ImportData {
         name: profile.name.clone(),
         protocol: format!("{}", profile.protocol),
@@ -428,6 +433,16 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
     match mode {
         OutputMode::Human => {
             println!("✓ Imported '{}'", profile.name);
+            if let Some(requested) = source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| *stem != profile.name)
+            {
+                println!(
+                    "  A profile named '{requested}' already exists, so this one is '{}'.",
+                    profile.name
+                );
+            }
             println!("  Protocol:  {}", profile.protocol);
             println!("  Location:  {}", profile.location);
             println!("  Config:    {}", profile.config_path.display());
@@ -444,8 +459,8 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
                     .and_then(|text| crate::mesh::MeshProfile::parse(&text).ok())
                     .is_some_and(|mesh| mesh.auth_key.is_none() && mesh.identity.is_none());
                 println!(
-                    "\nNext: sudo vortix up {}{}",
-                    profile.name,
+                    "\nNext: {}{}",
+                    super::output::sudo_command(&["up", &profile.name]),
                     if signs_in {
                         "  (it shows a link to sign in)"
                     } else {
@@ -459,8 +474,8 @@ fn print_import_success(profile: &crate::config::profiles::VpnProfile, mode: Out
             "import",
             &data,
             vec![
-                format!("sudo vortix up {} --json", profile.name),
-                "vortix list --json".into(),
+                super::output::sudo_command(&["up", &profile.name, "--json"]),
+                crate::cli::output::vortix_command(&["list", "--json"]),
             ],
         ),
         OutputMode::Quiet => {}
@@ -546,7 +561,12 @@ fn import_from_directory(
             );
         }
         OutputMode::Json => {
-            print_success(mode, "import", &imported, vec!["vortix list --json".into()]);
+            print_success(
+                mode,
+                "import",
+                &imported,
+                vec![crate::cli::output::vortix_command(&["list", "--json"])],
+            );
         }
         OutputMode::Quiet => {}
     }
@@ -617,7 +637,11 @@ pub(super) fn handle_show(profile_name: &str, raw: bool, mode: OutputMode) -> i3
             mode,
             "show",
             &data,
-            vec![format!("sudo vortix up {} --json", profile.name)],
+            vec![super::output::sudo_command(&[
+                "up",
+                &profile.name,
+                "--json",
+            ])],
         ),
         OutputMode::Quiet => {}
     }
@@ -634,7 +658,6 @@ pub(super) fn require_profile_inactive(
     active_name: &str,
     requested_name: &str,
     command: &str,
-    retry_command: &str,
     mode: OutputMode,
 ) {
     let active = crate::control::scanner::get_active_profiles(profiles);
@@ -647,7 +670,11 @@ pub(super) fn require_profile_inactive(
                 message: format!(
                     "Cannot {command} active profile '{requested_name}' — disconnect first"
                 ),
-                hint: Some(format!("sudo vortix down && {retry_command}")),
+                hint: Some(format!(
+                    "{} && {}",
+                    super::output::sudo_command(&["down", active_name]),
+                    super::output::this_command()
+                )),
             },
             ExitCode::StateConflict,
         );
@@ -672,14 +699,7 @@ pub(super) fn handle_delete(
     };
     let profile_id = profiles[idx].id.clone();
 
-    require_profile_inactive(
-        &profiles,
-        profile_name,
-        profile_name,
-        "delete",
-        &format!("vortix delete {profile_name}"),
-        mode,
-    );
+    require_profile_inactive(&profiles, profile_name, profile_name, "delete", mode);
 
     if !yes && !matches!(mode, OutputMode::Json | OutputMode::Quiet) {
         use std::io::Write;
@@ -712,14 +732,7 @@ pub(super) fn handle_delete(
         );
     };
     let fresh_name = fresh_profile.name.clone();
-    require_profile_inactive(
-        &fresh_profiles,
-        &fresh_name,
-        profile_name,
-        "delete",
-        &format!("vortix delete {profile_name}"),
-        mode,
-    );
+    require_profile_inactive(&fresh_profiles, &fresh_name, profile_name, "delete", mode);
 
     if let Err(error) =
         FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME)).delete(&profile_id)
@@ -745,7 +758,12 @@ pub(super) fn handle_delete(
 
     match mode {
         OutputMode::Human => println!("Deleted '{profile_name}'"),
-        OutputMode::Json => print_success(mode, "delete", &data, vec!["vortix list --json".into()]),
+        OutputMode::Json => print_success(
+            mode,
+            "delete",
+            &data,
+            vec![crate::cli::output::vortix_command(&["list", "--json"])],
+        ),
         OutputMode::Quiet => {}
     }
     0
@@ -769,28 +787,16 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
     };
     let profile_id = profiles[idx].id.clone();
 
-    require_profile_inactive(
-        &profiles,
-        old,
-        old,
-        "rename",
-        &format!("vortix rename {old} {new}"),
-        mode,
-    );
+    require_profile_inactive(&profiles, old, old, "rename", mode);
 
     let trimmed = new.trim();
-    if trimmed.is_empty()
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains("..")
-        || trimmed.starts_with('.')
-    {
+    if let Err(message) = crate::profile::validate_profile_name(trimmed) {
         print_error_and_exit(
             mode,
             "rename",
             CliError {
                 code: "invalid_name",
-                message: "Invalid name: must not contain path separators or '..'".into(),
+                message,
                 hint: None,
             },
             ExitCode::GeneralError,
@@ -820,31 +826,8 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
     else {
         print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
     };
-    require_profile_inactive(
-        &fresh_profiles,
-        &fresh_profile.name,
-        old,
-        "rename",
-        &format!("vortix rename {old} {new}"),
-        mode,
-    );
+    require_profile_inactive(&fresh_profiles, &fresh_profile.name, old, "rename", mode);
 
-    if fresh_profile.protocol == crate::profile::ProtocolKind::WireGuard
-        && crate::profile::validate_wireguard_interface_name(trimmed).is_err()
-    {
-        print_error_and_exit(
-            mode,
-            "rename",
-            CliError {
-                code: "invalid_name",
-                message: format!(
-                    "'{trimmed}' is not a usable profile name. WireGuard names must be 1–15 characters using only letters, numbers, _, ., or -."
-                ),
-                hint: None,
-            },
-            ExitCode::GeneralError,
-        );
-    }
     if let Err(error) = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME))
         .rename(&profile_id, trimmed)
     {
@@ -853,6 +836,11 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
                 "already_exists",
                 format!("A profile named '{trimmed}' already exists"),
                 ExitCode::StateConflict,
+            ),
+            crate::config::profile_store::ProfileStoreError::InvalidWireGuardName(reason) => (
+                "invalid_name",
+                format!("'{trimmed}' is not a usable profile name. {reason}."),
+                ExitCode::GeneralError,
             ),
             crate::config::profile_store::ProfileStoreError::InvalidName(_) => (
                 "invalid_name",
@@ -884,7 +872,12 @@ pub(super) fn handle_rename(old: &str, new: &str, config_dir: &Path, mode: Outpu
 
     match mode {
         OutputMode::Human => println!("Renamed '{old}' → '{trimmed}'"),
-        OutputMode::Json => print_success(mode, "rename", &data, vec!["vortix list --json".into()]),
+        OutputMode::Json => print_success(
+            mode,
+            "rename",
+            &data,
+            vec![crate::cli::output::vortix_command(&["list", "--json"])],
+        ),
         OutputMode::Quiet => {}
     }
     0

@@ -39,6 +39,8 @@ struct ReportInfo {
     config_toml_status: String,
     profile_counts: (u32, u32, u32),
     killswitch_state: String,
+    /// The newest session journal and its events.
+    journal: Option<(String, Vec<crate::journal::JournalEvent>)>,
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────
@@ -53,9 +55,14 @@ pub fn run(config_dir: &Path, config_source: &str) {
     print_preview(&info);
 
     // 2. Privacy notice
+    let (dim, reset) = if io::IsTerminal::is_terminal(&io::stdout()) {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
     println!(
-        "  \x1b[2mNOT included: IP addresses, server endpoints, profile\n  \
-         names, auth credentials, DNS servers, log contents\x1b[0m\n"
+        "  {dim}NOT included: IP addresses, server endpoints, profile\n  \
+         names, auth credentials, DNS servers, log contents{reset}\n"
     );
 
     // 3. Read user description
@@ -180,6 +187,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
         config_toml_status,
         profile_counts,
         killswitch_state: ks_state,
+        journal: latest_journal(&config_dir.join("sessions")),
     }
 }
 
@@ -482,26 +490,21 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     let _ = writeln!(body, "Kill switch: {}", info.killswitch_state);
     let _ = writeln!(body, "```\n");
 
-    // Diagnostic Journal — surface the JSONL session path
-    // and the in-memory tail so triagers can replay locally.
-    if let Some(journal) = crate::journal::global_journal() {
-        let _ = writeln!(body, "## Diagnostic Journal\n");
-        let _ = writeln!(body, "```");
-        if let Some(path) = &journal.session_path {
-            let _ = writeln!(body, "Session file: {}", crate::config::home_relative(path));
-        } else {
-            let _ = writeln!(body, "Session file: (disk persistence disabled)");
+    let _ = writeln!(body, "## Diagnostic Journal\n");
+    let _ = writeln!(body, "```");
+    match &info.journal {
+        Some((path, events)) => {
+            let _ = writeln!(body, "Session file: {path}");
+            let _ = writeln!(body, "Recent events: {}", events.len());
+            for event in events.iter().rev().take(10).rev() {
+                let _ = writeln!(body, "  {}", event_summary(event));
+            }
         }
-        let tail = journal.tail();
-        let _ = writeln!(body, "Recent events: {}", tail.len());
-        for env in tail.iter().rev().take(10).rev() {
-            // Render the event as a compact one-liner for the bug report.
-            let kind = format!("{:?}", env.event);
-            let kind = kind.split('{').next().unwrap_or(&kind).trim();
-            let _ = writeln!(body, "  {kind}");
+        None => {
+            let _ = writeln!(body, "Session file: none");
         }
-        let _ = writeln!(body, "```\n");
     }
+    let _ = writeln!(body, "```\n");
 
     // Additional Context
     let _ = writeln!(body, "## Additional Context\n");
@@ -511,6 +514,36 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     );
 
     body
+}
+
+/// The most recently written session journal in `dir`.
+fn latest_journal(dir: &Path) -> Option<(String, Vec<crate::journal::JournalEvent>)> {
+    let path = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())?;
+    let events = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<crate::journal::EventEnvelope>(line).ok())
+        .map(|envelope| envelope.event)
+        .collect();
+    Some((crate::config::home_relative(&path), events))
+}
+
+/// One line per journal event, without names, addresses or text.
+fn event_summary(event: &crate::journal::JournalEvent) -> String {
+    use crate::journal::JournalEvent;
+    match event {
+        JournalEvent::Notice { level, .. } => format!("{level} notice"),
+        JournalEvent::IpChanged { .. } => "public IP changed".into(),
+        JournalEvent::ConnectionHealthChanged { .. } => "connection health changed".into(),
+        JournalEvent::JournalRetentionApplied { deleted } => {
+            format!("{deleted} old journal(s) removed")
+        }
+    }
 }
 
 // ── GitHub URL construction ─────────────────────────────────────────────────
@@ -600,6 +633,16 @@ fn print_fallback(body: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// The journal lines printed enum variant names such as
+    /// `JournalRetentionApplied`.
+    #[test]
+    fn journal_events_read_as_plain_words() {
+        let line = super::event_summary(&crate::journal::JournalEvent::JournalRetentionApplied {
+            deleted: 2,
+        });
+        assert_eq!(line, "2 old journal(s) removed");
+    }
+
     use super::*;
 
     /// `PersistedState::live_state` owns the "a durable request is not kernel
@@ -738,6 +781,7 @@ mod tests {
             config_toml_status: "found".to_string(),
             profile_counts: (2, 1, 0),
             killswitch_state: "off".to_string(),
+            journal: None,
         };
 
         let body = format_issue_body(&info, "WireGuard shows connected but no traffic");
@@ -767,6 +811,7 @@ mod tests {
             config_toml_status: "not found (using defaults)".to_string(),
             profile_counts: (0, 0, 0),
             killswitch_state: "off".to_string(),
+            journal: None,
         };
 
         let body = format_issue_body(&info, "");

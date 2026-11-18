@@ -99,7 +99,7 @@ fn parse_one_line(
             Some(remote)
         },
         protocol: proto,
-        interface: None, // /proc/net/tcp doesn't carry interface; resolution is left to a future hardening pass
+        interface: None,
     })
 }
 

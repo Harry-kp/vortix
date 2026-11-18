@@ -23,13 +23,14 @@ pub(super) fn lifecycle_progress_message(
         return None;
     }
     let protocol = protocol.map_or_else(String::new, |value| format!(" ({value})"));
-    // Nothing here installs a SIGINT handler, so Ctrl-C only stops this
-    // process waiting — the admitted operation carries on and can still
-    // bring the tunnel up. Saying "cancels" left people believing an
-    // interrupted connect had been called off while it was completing.
+    // Ctrl-C rolls a connect back; a disconnect finishes either way.
+    let cancel = if action == "Disconnecting" {
+        ""
+    } else {
+        " (Ctrl-C cancels)"
+    };
     Some(format!(
-        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s (Ctrl-C stops waiting, not the {action_lower})…",
-        action_lower = action.to_lowercase()
+        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s{cancel}…"
     ))
 }
 
@@ -171,26 +172,16 @@ pub(super) fn handle_up(
                     CliError {
                         code: "no_profile",
                         message: "No profile specified and no previously used profile found".into(),
-                        hint: Some("Specify a profile: sudo vortix up <PROFILE>".into()),
+                        hint: Some(format!(
+                            "Specify a profile: {} <PROFILE>",
+                            crate::cli::output::sudo_command(&["up"])
+                        )),
                     },
                     ExitCode::GeneralError,
                 );
             }
         }
     };
-
-    if !crate::platform::is_root() {
-        print_error_and_exit(
-            mode,
-            "up",
-            err_permission_denied(&format!("vortix up {profile_name}")),
-            ExitCode::PermissionDenied,
-        );
-    }
-
-    if let Some(profile) = profiles.iter().find(|p| p.name == profile_name) {
-        exit_if_missing_dependencies(mode, "up", profile);
-    }
 
     let target = profiles
         .iter()
@@ -199,6 +190,15 @@ pub(super) fn handle_up(
         .unwrap_or_else(|| {
             print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
         });
+    if !crate::platform::is_root() {
+        print_error_and_exit(
+            mode,
+            "up",
+            err_permission_denied(),
+            ExitCode::PermissionDenied,
+        );
+    }
+    exit_if_missing_dependencies(mode, "up", &target);
     let engine_config = timeout_secs.map(|secs| config.with_connect_budget(target.protocol, secs));
     let timeout_secs = connect_operation_timeout_secs(timeout_secs, target.protocol, config);
     let protocol = target.protocol.to_string();
@@ -256,8 +256,8 @@ pub(super) fn handle_up(
             "up",
             &data,
             vec![
-                "vortix status --json".into(),
-                "sudo vortix down --json".into(),
+                crate::cli::output::vortix_command(&["status", "--json"]),
+                super::output::sudo_command(&["down", "--json"]),
             ],
         ),
         OutputMode::Quiet => {}
@@ -302,7 +302,8 @@ fn refuse_conflict(
             code,
             message,
             hint: Some(format!(
-                "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
+                "Pass --yes to bypass the conflict gate: {}",
+                super::output::sudo_command(&["up", profile_name, "--yes"])
             )),
         },
         ExitCode::StateConflict,
@@ -342,7 +343,7 @@ pub(super) fn handle_down(
         print_error_and_exit(
             mode,
             "down",
-            err_permission_denied("vortix down"),
+            err_permission_denied(),
             ExitCode::PermissionDenied,
         );
     }
@@ -439,7 +440,10 @@ pub(super) fn handle_down(
             mode,
             "down",
             &data,
-            vec!["vortix status --json".into(), "vortix list --json".into()],
+            vec![
+                crate::cli::output::vortix_command(&["status", "--json"]),
+                crate::cli::output::vortix_command(&["list", "--json"]),
+            ],
         ),
         OutputMode::Quiet => {}
     }
@@ -475,7 +479,7 @@ pub(super) fn handle_reconnect(
         print_error_and_exit(
             mode,
             "reconnect",
-            err_permission_denied("vortix reconnect"),
+            err_permission_denied(),
             ExitCode::PermissionDenied,
         );
     }
@@ -511,7 +515,10 @@ pub(super) fn handle_reconnect(
                     CliError {
                         code: "no_profile",
                         message: "No previously used profile found".into(),
-                        hint: Some("Connect to a profile first: sudo vortix up <PROFILE>".into()),
+                        hint: Some(format!(
+                            "Connect to a profile first: {} <PROFILE>",
+                            crate::cli::output::sudo_command(&["up"])
+                        )),
                     },
                     ExitCode::NotFound,
                 );
@@ -597,8 +604,8 @@ pub(super) fn handle_reconnect(
                 "reconnect",
                 &ReconnectData { reconnected },
                 vec![
-                    "vortix status --json".into(),
-                    "sudo vortix down --json".into(),
+                    crate::cli::output::vortix_command(&["status", "--json"]),
+                    super::output::sudo_command(&["down", "--json"]),
                 ],
             );
         }

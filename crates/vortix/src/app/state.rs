@@ -223,6 +223,8 @@ pub enum InputMode {
         query: String,
         /// Cursor position in the query.
         cursor: usize,
+        /// The selection before the search, restored by Esc.
+        before: Option<crate::profile::ProfileId>,
     },
     /// Confirm switching to a profile that conflicts with a running tunnel:
     /// both want all traffic, or both want the same networks.
@@ -276,8 +278,8 @@ pub enum InputMode {
         connect_after: bool,
         /// Prompt text from the .ovpn's `static-challenge` directive. When
         /// `Some`, the overlay renders a third (OTP) field labelled with
-        /// this text and the submit handler embeds the OTP in the
-        /// SCRV1 envelope. When `None`, the
+        /// this text and the connect answers it as the static challenge.
+        /// When `None`, the
         /// overlay renders the two-field layout unchanged.
         static_challenge_prompt: Option<String>,
         /// Show the password and OTP in the clear. Off by default and never

@@ -24,10 +24,14 @@ profiles it manages and refuses to act while `profiles/` holds a file it did not
 the named file out of `~/.config/vortix/profiles/` and import it with `vortix import`; never
 copy files into that directory by hand.
 
-**Files in `~/.config/vortix` owned by root.** Give them back:
+**"config directory … is not a directory".** `-C`/`--config-dir` or `VORTIX_CONFIG_DIR` names a
+file. Point it at a directory, or at a path that does not exist yet for Vortix to create.
+
+**Files in `~/.config/vortix` owned by root, or "must be a file owned by you that no other user
+can open".** Every file there must be yours and private. Give them back:
 
 ```bash
-sudo chown -R "$(id -un):$(id -gn)" ~/.config/vortix
+sudo chown -R "$(id -un):$(id -gn)" ~/.config/vortix && chmod -R go-rwx ~/.config/vortix
 ```
 
 ## Connecting
@@ -42,10 +46,11 @@ left running. The rest of the message names what failed.
 **"This profile needs saved credentials".** The CLI cannot type an OpenVPN username and
 password. Save them once in the dashboard (`a` on the profile).
 
-**"Not started by Vortix, left running".** `down` found a tunnel Vortix did not start: another
-VPN tool's, or one an earlier Vortix version left behind. Stop it with the tool that started
-it; for a leftover from Vortix 0.4.3, restart the computer once (see
-[Upgrading](MIGRATION.md)).
+**"Not started by Vortix, left running"** or **"… is up but Vortix did not start it"**. `down`
+found, or a connect would stack on, a tunnel Vortix did not start: another VPN tool's, or one an
+earlier Vortix version or a crashed Vortix left behind. A full tunnel like that also blocks
+connecting another full tunnel (exit 4). Stop it with the tool that started it, or restart the
+computer once (see [Upgrading](MIGRATION.md) for a leftover from Vortix 0.4.3).
 
 **A split tunnel connects but the public IP does not change.** Expected: it carries only its
 own routes. Security Guard shows `split-route — no exit`. Check a routed address instead:
@@ -61,6 +66,11 @@ letters, numbers, `_`, `.` or `-`. Rename the file (`work.conf`) and import it a
 **A profile with scripts is refused.** `PreUp`/`PostUp`/`PreDown`/`PostDown` and OpenVPN
 `up`/`down`-style directives never run; move the commands to
 [hooks](configuration.md#hooks).
+
+**"This profile tells OpenVPN to write a file".** The `.ovpn` has a `status`, `log`,
+`log-append`, `writepid`, `replay-persist` or `ifconfig-pool-persist` line. OpenVPN runs as root,
+so that line could overwrite any file, such as `/etc/passwd`. Vortix keeps OpenVPN's log itself
+(`f` in the Logs panel): delete the line the message quotes and import the file again.
 
 ## WireGuard
 
@@ -90,10 +100,21 @@ sudo systemctl reload NetworkManager
 Each profile's daemon log is `~/.config/vortix/run/<profile-id>.log`, also shown in the
 dashboard's Logs panel (`f` until the title names the profile).
 
-- `AUTH_FAILED`: the server rejected the credentials or the one-time code. A saved password
-  that is rejected is removed.
+- `the server rejected the credentials`: the server refused the credentials or the one-time
+  code; its reason follows when it gives one. A saved password that is rejected is removed. If
+  the notice says it could not be removed, clear it with `A` in the dashboard; until then every
+  connect tries it again. Any other failure keeps the saved password.
+- `remembered credentials must be non-empty, without tabs, line breaks or other control
+  characters`: OpenVPN cannot be handed such a username or password, so it is not saved.
+- `the OpenVPN server refused the connection for now`: the server sent a temporary refusal
+  (`AUTH_FAILED,TEMP`), often while busy. Connect again later; a saved password is kept.
+- `OpenVPN requested an unsupported interactive challenge`: the server asks for a dynamic
+  (CRV1) or push challenge, or the profile's key needs a passphrase. Vortix answers only a
+  `static-challenge` one-time code; a saved password is kept.
 - TLS timeout: the server is unreachable, or the certificates or protocol do not match.
 - Connected but no traffic: the server's pushed routes, forwarding or NAT.
+- ``OpenVPN `pull-filter` must be …`` at import: write `pull-filter accept|ignore|reject "text"`, with
+  the text quoted when it has spaces; `openvpn` refuses any other form too.
 
 ## NetBird
 

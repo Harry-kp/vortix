@@ -21,9 +21,21 @@ fn main() -> Result<()> {
 
     // Wrap Rust's default panic hook with terminal restoration and recovery
     // instructions. Drop glue on App will still run to release kill switch
-    // rules and VPN processes.
+    // rules and VPN processes, except on a closed output pipe: that exits
+    // at once, so CLI output must come after the engine work has settled.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // `vortix status | head`: the reader left, which is not a crash.
+        // 141 is what a shell reports for a process ended by SIGPIPE.
+        if info
+            .payload()
+            .downcast_ref::<String>()
+            .is_some_and(|message| {
+                message.starts_with("failed printing to std") && message.contains("Broken pipe")
+            })
+        {
+            std::process::exit(141);
+        }
         restore_terminal();
         eprintln!();
         eprintln!("Vortix crashed unexpectedly.");
@@ -34,6 +46,13 @@ fn main() -> Result<()> {
 
     // Parse arguments
     let args = Args::parse();
+    let output_mode = if args.json {
+        cli::output::OutputMode::Json
+    } else if args.quiet {
+        cli::output::OutputMode::Quiet
+    } else {
+        cli::output::OutputMode::Human
+    };
 
     // Determine how config_dir was provided (for `info` command)
     let config_dir_source = if args.config_dir.is_some() {
@@ -61,21 +80,24 @@ fn main() -> Result<()> {
 
     // Resolve config directory (CLI flag > SUDO_USER > XDG > default)
     let explicit_override = args.config_dir.is_some();
-    let mut config_dir = config::resolve_config_dir(args.config_dir.as_ref())
-        .map_err(|e| eyre::eyre!("Failed to resolve config directory: {e}"))?;
+    let mut config_dir = config::resolve_config_dir(args.config_dir.as_ref()).unwrap_or_else(|e| {
+        cli::output::print_error_and_exit(
+            output_mode,
+            "config",
+            cli::output::CliError {
+                code: "config_dir_invalid",
+                message: e.to_string(),
+                hint: None,
+            },
+            cli::output::ExitCode::GeneralError,
+        )
+    });
 
     // Emergency release must remain available when settings, journals,
     // profile migrations, or the normal control service cannot start. The
     // authoritative config directory is the only startup input it needs.
     if matches!(args.command, Some(cli::args::Commands::ReleaseKillSwitch)) {
         config::set_config_dir(config_dir.clone());
-        let output_mode = if args.json {
-            cli::output::OutputMode::Json
-        } else if args.quiet {
-            cli::output::OutputMode::Quiet
-        } else {
-            cli::output::OutputMode::Human
-        };
         std::process::exit(cli::commands::handle_release_killswitch(
             &config_dir,
             output_mode,
@@ -134,7 +156,7 @@ fn main() -> Result<()> {
     // available without administrator access.
     if args.command.is_none() && !vortix::platform::is_root() {
         eprintln!("Vortix needs administrator access to manage VPN connections.");
-        eprintln!("Try again with: sudo vortix");
+        eprintln!("Try again with: {}", cli::output::rerun_with_sudo());
         std::process::exit(cli::output::ExitCode::PermissionDenied.code());
     }
 
@@ -160,16 +182,10 @@ fn main() -> Result<()> {
     // config.toml. Resolve this only after clap/env/sudo-user selection so an
     // old default-path settings file can never silently override
     // `--config-dir` or `VORTIX_CONFIG_DIR`.
-    let settings = match vortix::config::Settings::load(
-        &config_dir,
-        vortix::config::EngineSettings::default(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("warning: failed to load settings ({e}); using defaults");
-            vortix::config::Settings::default()
-        }
-    };
+    // An invalid file stops startup below, in `load_effective_config`, with its path.
+    let settings =
+        vortix::config::Settings::load(&config_dir, vortix::config::EngineSettings::default())
+            .unwrap_or_default();
 
     // Journal — open the per-session JSONL writer using the runner's own
     // tokio runtime after the authoritative settings path is known.
@@ -195,11 +211,9 @@ fn main() -> Result<()> {
         }
     }
 
-    // Clear any SCRV1 envelopes left on
-    // disk by a previous crash mid-connect. Runs once at startup before
-    // the CLI/TUI fork so both paths see a clean auth dir. Cheap O(N)
-    // scan; failures are swallowed.
+    // Plaintext credentials files older versions left in the auth dir.
     vortix::openvpn::scrub_stale_scrv1_auth_files();
+    vortix::config::remove_retired_files(&config_dir);
 
     // Hold a process-lifetime scratch lease before sweeping. Concurrent CLI
     // and TUI processes intentionally have different journal session IDs;
@@ -292,12 +306,12 @@ fn main() -> Result<()> {
                         cli::output::CliError {
                             code: "profiles_not_readable",
                             message: format!(
-                                "Vortix cannot read its own profile directory: {}",
+                                "Vortix cannot use its own profile directory {}: {e}",
                                 profiles_dir.display()
                             ),
                             hint: Some(format!(
-                                "Some files there are owned by another user. Run: sudo chown -R $(id -u):$(id -g) {}",
-                                profiles_dir.display()
+                                "Every file there must be yours and private. Run: sudo chown -R $(id -u):$(id -g) {dir} && chmod -R go-rwx {dir}",
+                                dir = profiles_dir.display()
                             )),
                         },
                         cli::output::ExitCode::PermissionDenied,
@@ -393,22 +407,16 @@ fn main() -> Result<()> {
     // Load config.toml (or use defaults)
     let app_config = match config::load_effective_config(&config_dir) {
         Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            eprintln!();
-            eprintln!("Fix the file or remove it to use defaults:");
-            eprintln!("  nano {}/config.toml", config_dir.display());
-            eprintln!("  rm {}/config.toml", config_dir.display());
-            std::process::exit(1);
-        }
-    };
-    // Determine output mode from global flags
-    let output_mode = if args.json {
-        cli::output::OutputMode::Json
-    } else if args.quiet {
-        cli::output::OutputMode::Quiet
-    } else {
-        cli::output::OutputMode::Human
+        Err(e) => cli::output::print_error_and_exit(
+            output_mode,
+            "config",
+            cli::output::CliError {
+                code: "config_invalid",
+                message: e,
+                hint: Some("Fix the setting it names, or remove it to use the default.".into()),
+            },
+            cli::output::ExitCode::GeneralError,
+        ),
     };
 
     let history = vortix::whats_new::status(&config_dir, constants::APP_VERSION);
@@ -606,7 +614,9 @@ fn run_tui(
             // render frame is the difference between smooth-scrolling and
             // the TUI feeling wedged for tens of seconds while it grinds
             // through a backlog the user already left behind.
-            dispatch_event(&mut app, events.next()?);
+            if let Some(event) = events.next_within(std::time::Duration::from_secs(1))? {
+                dispatch_event(&mut app, event);
+            }
             while let Some(event) = events.try_next()? {
                 dispatch_event(&mut app, event);
             }
@@ -627,6 +637,9 @@ fn run_tui(
                     return Err(eyre::eyre!("TUI control service stopped during startup"));
                 }
             }
+        }
+        if vortix::process::termination_requested() {
+            app.handle_message(vortix::message::Message::Quit);
         }
         app.process_external();
         let frame = terminal.draw(|frame| ui::render(frame, &mut app))?;

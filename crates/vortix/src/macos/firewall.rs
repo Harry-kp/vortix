@@ -36,6 +36,10 @@ pub(crate) const PF_ANCHOR: &str = "com.apple/vortix.killswitch";
 pub(crate) const PF_APPLY_ARGS: [&str; 6] = ["-o", "none", "-a", PF_ANCHOR, "-f", "-"];
 pub(crate) const PF_RELEASE_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-F", "rules"];
 const POLICY_LABEL_PREFIX: &str = "vortix-policy:";
+/// Without these the IPv6 next hop of a VPN server becomes unreachable. ND
+/// only addresses link-local and link-scope multicast destinations.
+const ND_TYPES: [&str; 3] = ["routersol", "neighbrsol", "neighbradv"];
+const ND_DESTINATIONS: [&str; 2] = ["fe80::/10", "ff02::/16"];
 const PF_RULE_LABEL_MAX_BYTES: usize = 63;
 
 fn pfctl(args: &[&str]) -> io::Result<crate::process::CommandOutcome> {
@@ -115,7 +119,7 @@ impl PfFirewall {
     ///   2. RFC1918 pass-out rules, with secondaries' declared CIDRs
     ///      carved out so traffic claimed by a secondary cannot escape
     ///      onto the underlay
-    ///   3. DHCP pass rules
+    ///   3. DHCP and IPv6 neighbour-discovery pass rules
     ///   4. Per-tunnel: `pass out quick on <interface>` + one
     ///      `pass out quick to <server_ip>` per server IP, so the tunnel
     ///      can reconnect after a transport drop
@@ -130,7 +134,7 @@ impl PfFirewall {
         writeln!(rules, "# DO NOT EDIT - Will be overwritten").unwrap();
         writeln!(rules).unwrap();
         writeln!(rules, "# Allow loopback").unwrap();
-        writeln!(rules, "pass out quick on lo0 all").unwrap();
+        writeln!(rules, "pass out quick on lo0 all flags any").unwrap();
         writeln!(rules).unwrap();
 
         let rfc1918 = lan_allowance(active);
@@ -148,7 +152,7 @@ impl PfFirewall {
         writeln!(rules, "# Allow DHCP").unwrap();
         writeln!(
             rules,
-            "pass out quick proto udp from any port 68 to any port 67"
+            "pass out quick proto udp from any port 68 to 255.255.255.255 port 67"
         )
         .unwrap();
         writeln!(
@@ -156,6 +160,17 @@ impl PfFirewall {
             "pass in quick proto udp from any port 67 to any port 68"
         )
         .unwrap();
+        writeln!(rules).unwrap();
+        writeln!(rules, "# Allow IPv6 neighbour discovery").unwrap();
+        for to in ND_DESTINATIONS {
+            for kind in ND_TYPES {
+                writeln!(
+                    rules,
+                    "pass out quick inet6 proto icmp6 from any to {to} icmp6-type {kind} no state"
+                )
+                .unwrap();
+            }
+        }
 
         // Per-tunnel rules. Order is preserved from the caller — typically
         // primary first, then secondaries by attach order.
@@ -323,15 +338,21 @@ impl PfFirewall {
 /// Unknown syntax is not accepted, and comparison remains exact after
 /// normalization so an appended label/state/action cannot hide drift.
 fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
-    if rule == "pass out quick proto udp from any port 68 to any port 67" {
+    if rule == "pass out quick proto udp from any port 68 to 255.255.255.255 port 67" {
         return Some(
-            "pass out quick proto udp from any port = 68 to any port = 67 keep state".into(),
+            "pass out quick inet proto udp from any port = 68 to 255.255.255.255 port = 67 keep state"
+                .into(),
         );
     }
     if rule == "pass in quick proto udp from any port 67 to any port 68" {
         return Some(
             "pass in quick proto udp from any port = 67 to any port = 68 keep state".into(),
         );
+    }
+    if let Some(rest) = rule.strip_prefix("pass out quick inet6 proto icmp6 from any to ") {
+        return Some(format!(
+            "pass out quick inet6 proto ipv6-icmp from any to {rest}"
+        ));
     }
     if let Some(group) = rule
         .strip_prefix("pass out quick proto tcp group ")
@@ -345,9 +366,6 @@ fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
         return Some(format!(
             "pass out quick proto udp all group = {group} keep state"
         ));
-    }
-    if rule == "pass out quick on lo0 all" {
-        return Some("pass out quick on lo0 all flags S/SA keep state".into());
     }
     if let Some(interface) = rule
         .strip_prefix("pass out quick on ")
@@ -391,9 +409,8 @@ impl PfFirewall {
     /// there's never a window where the previous rules are gone but the
     /// new rules haven't landed yet.
     ///
-    /// `pfctl -e` is called after the load to ensure pf is enabled.
-    /// `pfctl -e` is idempotent (returns "already enabled" on the second
-    /// call), so the refresh path leaves the enabled state alone.
+    /// After the load pf is enabled through a held reference; a refresh
+    /// that still holds a live one takes no new reference.
     pub fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
         info!(
             target: "vortix::killswitch",
@@ -442,16 +459,7 @@ impl PfFirewall {
             return Err(KillswitchError::CommandFailed(err));
         }
 
-        // Ensure pf is enabled. Idempotent — emits "pf already enabled" on
-        // refresh, which we treat as success.
-        let output = pfctl(&["-e"])?;
-        if !output.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("enabled") {
-                error!(target: "vortix::killswitch", stderr = %stderr, "pfctl -e failed");
-                return Err(KillswitchError::CommandFailed(stderr.to_string()));
-            }
-        }
+        Self::hold_enable_reference()?;
 
         // Success is the complete effective-state postcondition, not merely
         // the content of the owned anchor. Root traversal or PF enabled state
@@ -464,6 +472,56 @@ impl PfFirewall {
             "kill switch ACTIVE — blocking non-VPN traffic"
         );
         Ok(())
+    }
+
+    /// Enable pf through a reference (`-E`) kept until release. pf turns
+    /// itself off when its last reference is released, and a plain `-e`
+    /// holds none, so another app's `-X` would silently drop the kill switch.
+    fn hold_enable_reference() -> Result<()> {
+        let held = crate::control::killswitch::enable_token();
+        if let Some(token) = held {
+            let references = pfctl(&["-s", "References"])?;
+            let status = pfctl(&["-s", "info"])?;
+            if references.success()
+                && lists_token(&String::from_utf8_lossy(&references.stdout), token)
+                && status.success()
+                && pf_is_enabled(&String::from_utf8_lossy(&status.stdout))
+            {
+                return Ok(());
+            }
+            let _ = pfctl(&["-X", &token.to_string()]);
+        }
+        let output = pfctl(&["-E"])?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let token = parse_enable_token(&text)
+            .filter(|_| output.success())
+            .ok_or_else(|| {
+                error!(target: "vortix::killswitch", output = %text, "pfctl -E failed");
+                KillswitchError::CommandFailed(format!("pfctl -E failed: {text}"))
+            })?;
+        crate::control::killswitch::set_enable_token(Some(token))
+    }
+
+    /// Give back the reference [`Self::hold_enable_reference`] took; a record
+    /// from an older release has none, and pf then stays on as it did.
+    fn release_enable_reference() {
+        let Some(token) = crate::control::killswitch::enable_token() else {
+            return;
+        };
+        match pfctl(&["-X", &token.to_string()]) {
+            Ok(output) if output.success() => {}
+            Ok(output) => {
+                tracing::warn!(target: "vortix::killswitch", stderr = %String::from_utf8_lossy(&output.stderr), "pfctl -X failed");
+            }
+            Err(error) => tracing::warn!(target: "vortix::killswitch", %error, "pfctl -X failed"),
+        }
+        if let Err(error) = crate::control::killswitch::set_enable_token(None) {
+            tracing::warn!(target: "vortix::killswitch", %error, "pf reference not cleared from the state file");
+        }
     }
 
     /// Disable only Vortix's anchor. pf may have been enabled before Vortix
@@ -500,6 +558,7 @@ impl PfFirewall {
         }
         let _ = fs::remove_file(PF_CONF_PATH);
         let _ = fs::remove_file(PF_CONF_PATH_LEGACY);
+        Self::release_enable_reference();
 
         info!(target: "vortix::killswitch", "kill switch DISABLED — normal traffic restored");
         Ok(())
@@ -539,6 +598,24 @@ impl PfFirewall {
     }
 }
 
+/// The token `pfctl -E` prints as `Token : <n>`.
+fn parse_enable_token(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "Token")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+/// Whether `pfctl -s References` lists `token` among the live references.
+fn lists_token(references: &str, token: u64) -> bool {
+    let token = token.to_string();
+    references
+        .split_ascii_whitespace()
+        .any(|word| word == token)
+}
+
 pub(crate) fn pf_is_enabled(status: &str) -> bool {
     status.lines().any(|line| {
         line.split_once(':').is_some_and(|(key, value)| {
@@ -575,6 +652,21 @@ mod tests {
     }
 
     #[test]
+    fn the_enable_reference_token_is_read_from_pfctl_output() {
+        let output = "No ALTQ support in kernel\nALTQ related functions disabled\n\
+                      pf enabled\nToken : 13950598588297253391\n";
+        assert_eq!(parse_enable_token(output), Some(13_950_598_588_297_253_391));
+        assert_eq!(parse_enable_token("pf already enabled\n"), None);
+        assert_eq!(parse_enable_token("Token : not-a-number\n"), None);
+
+        let references =
+            "TOKENS:\nPID      Process Name                TOKEN                     TIMESTAMP\n\
+                          412      vortix                      13950598588297253391      12 sec\n";
+        assert!(lists_token(references, 13_950_598_588_297_253_391));
+        assert!(!lists_token(references, 1_395_059_858_829_725_339));
+    }
+
+    #[test]
     fn pf_mutations_are_scoped_to_the_vortix_anchor() {
         assert_eq!(&PF_APPLY_ARGS[2..], ["-a", PF_ANCHOR, "-f", "-"]);
         assert_eq!(PF_RELEASE_ARGS, ["-a", PF_ANCHOR, "-F", "rules"]);
@@ -587,8 +679,8 @@ mod tests {
             "pass out quick inet from any to 10.0.0.0/8 flags any keep state",
             "pass out quick inet from any to 172.16.0.0/12 flags any keep state",
             "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
-            "pass out quick on lo0 all flags S/SA keep state",
-            "pass out quick proto udp from any port = 68 to any port = 67 keep state",
+            "pass out quick on lo0 all flags any keep state",
+            "pass out quick inet proto udp from any port = 68 to 255.255.255.255 port = 67 keep state",
             "pass in quick proto udp from any port = 67 to any port = 68 keep state",
         ];
         default_optimizer_output.push(
@@ -703,12 +795,18 @@ mod tests {
             is_primary: true,
         }];
         let normalized = [
-            "pass out quick on lo0 all flags S/SA keep state",
+            "pass out quick on lo0 all flags any keep state",
             "pass out quick inet from any to 10.0.0.0/8 flags any keep state",
             "pass out quick inet from any to 172.16.0.0/12 flags any keep state",
             "pass out quick inet from any to 192.168.0.0/16 flags any keep state",
-            "pass out quick proto udp from any port = 68 to any port = 67 keep state",
+            "pass out quick inet proto udp from any port = 68 to 255.255.255.255 port = 67 keep state",
             "pass in quick proto udp from any port = 67 to any port = 68 keep state",
+            "pass out quick inet6 proto ipv6-icmp from any to fe80::/10 icmp6-type routersol no state",
+            "pass out quick inet6 proto ipv6-icmp from any to fe80::/10 icmp6-type neighbrsol no state",
+            "pass out quick inet6 proto ipv6-icmp from any to fe80::/10 icmp6-type neighbradv no state",
+            "pass out quick inet6 proto ipv6-icmp from any to ff02::/16 icmp6-type routersol no state",
+            "pass out quick inet6 proto ipv6-icmp from any to ff02::/16 icmp6-type neighbrsol no state",
+            "pass out quick inet6 proto ipv6-icmp from any to ff02::/16 icmp6-type neighbradv no state",
             "pass out quick on utun4 all flags any keep state",
             "pass out quick inet from any to 198.51.100.7 flags any keep state",
         ];
@@ -722,8 +820,48 @@ mod tests {
         );
         assert!(PfFirewall::canonical_snapshot_matches(&active, &observed));
 
-        observed[0] = "pass out quick on lo0 all flags S/SA keep state label \"foreign\"";
+        observed[0] = "pass out quick on lo0 all flags any keep state label \"foreign\"";
         assert!(!PfFirewall::canonical_snapshot_matches(&active, &observed));
+    }
+
+    /// Any process may bind source port 68, so the exception must not reach
+    /// arbitrary hosts; a LAN DHCP server is already covered by RFC1918.
+    #[test]
+    fn dhcp_exception_reaches_only_the_broadcast_address() {
+        let rules = PfFirewall::generate_pf_rules(&[]);
+        assert!(!rules.contains("to any port 67"));
+        assert!(rules.contains("port 68 to 255.255.255.255 port 67"));
+    }
+
+    /// Router and neighbour solicitations and adverts reach the IPv6 next
+    /// hop of a VPN server; blocking them cuts the tunnel's own transport.
+    #[test]
+    fn ipv6_neighbour_discovery_passes_before_the_block() {
+        let rules = PfFirewall::generate_pf_rules(&[]);
+        let block = rules.find("block drop out quick all").unwrap();
+        for to in ["fe80::/10", "ff02::/16"] {
+            for kind in ["routersol", "neighbrsol", "neighbradv"] {
+                let rule = format!(
+                    "pass out quick inet6 proto icmp6 from any to {to} icmp6-type {kind} no state\n"
+                );
+                assert!(rules.find(&rule).is_some_and(|at| at < block), "{rule}");
+            }
+        }
+        // Scoped: nothing lets ICMPv6 out to an arbitrary address.
+        assert!(rules
+            .lines()
+            .filter(|line| line.contains("icmp6"))
+            .all(|line| line.contains(" to fe80::/10 ") || line.contains(" to ff02::/16 ")));
+    }
+
+    /// Without `flags any`, pf matches only SYNs, so a localhost TCP flow
+    /// opened before the kill switch engaged falls through to the block.
+    #[test]
+    fn loopback_keeps_flows_opened_before_the_kill_switch() {
+        let rules = PfFirewall::generate_pf_rules(&[]);
+        assert!(rules
+            .lines()
+            .any(|line| line == "pass out quick on lo0 all flags any"));
     }
 
     #[test]
@@ -736,7 +874,7 @@ mod tests {
         assert!(rules.contains("pass out quick to 172.16.0.0/12"));
         assert!(rules.contains("pass out quick to 192.168.0.0/16"));
         // DHCP present.
-        assert!(rules.contains("port 68 to any port 67"));
+        assert!(rules.contains("port 68 to 255.255.255.255 port 67"));
         assert!(rules.contains("port 67 to any port 68"));
         // No per-tunnel rules.
         assert!(!rules.contains("pass out quick on utun"));
@@ -949,7 +1087,7 @@ mod tests {
 # DO NOT EDIT - Will be overwritten
 
 # Allow loopback
-pass out quick on lo0 all
+pass out quick on lo0 all flags any
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
 pass out quick to 10.0.0.0/8 flags any
@@ -957,8 +1095,16 @@ pass out quick to 172.16.0.0/12 flags any
 pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
-pass out quick proto udp from any port 68 to any port 67
+pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
+
+# Allow IPv6 neighbour discovery
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbradv no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbradv no state
 
 # Default: block all remaining egress
 block drop out quick all
@@ -983,7 +1129,7 @@ block drop out quick all
 # DO NOT EDIT - Will be overwritten
 
 # Allow loopback
-pass out quick on lo0 all
+pass out quick on lo0 all flags any
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
 pass out quick to 10.0.0.0/8 flags any
@@ -991,8 +1137,16 @@ pass out quick to 172.16.0.0/12 flags any
 pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
-pass out quick proto udp from any port 68 to any port 67
+pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
+
+# Allow IPv6 neighbour discovery
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbradv no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbradv no state
 
 # Tunnel: utun3 (primary=true)
 pass out quick on utun3 all flags any
@@ -1029,15 +1183,23 @@ block drop out quick all
 # DO NOT EDIT - Will be overwritten
 
 # Allow loopback
-pass out quick on lo0 all
+pass out quick on lo0 all flags any
 
 # Allow local network (RFC1918, minus secondaries' claimed CIDRs)
 pass out quick to 172.16.0.0/12 flags any
 pass out quick to 192.168.0.0/16 flags any
 
 # Allow DHCP
-pass out quick proto udp from any port 68 to any port 67
+pass out quick proto udp from any port 68 to 255.255.255.255 port 67
 pass in quick proto udp from any port 67 to any port 68
+
+# Allow IPv6 neighbour discovery
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to fe80::/10 icmp6-type neighbradv no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type routersol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbrsol no state
+pass out quick inet6 proto icmp6 from any to ff02::/16 icmp6-type neighbradv no state
 
 # Tunnel: utun3 (primary=true)
 pass out quick on utun3 all flags any

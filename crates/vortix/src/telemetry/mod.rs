@@ -297,6 +297,12 @@ pub fn spawn_telemetry_worker(
         while let Ok(next) = nudge_rx.try_recv() {
             epoch = epoch.max(next);
         }
+        if epoch != tx.epoch {
+            // The app drops messages from the old epoch, announcements included.
+            ip_success_log.reset();
+            identity_state.egress_unavailable_announced = false;
+            identity_state.primary_unavailable_announced = false;
+        }
     });
 
     (rx, nudge_tx)
@@ -753,9 +759,6 @@ fn fetch_security_info(tx: &Tx, cfg: &std::sync::Arc<TelemetryConfig>) {
         let _ = tx_clone.send(TelemetryUpdate::PublicIpv6(public_v6));
     });
 }
-
-// Network stats delta calculation is now handled directly in App::poll_network_stats()
-// using last_bytes_in / last_bytes_out fields on the App struct.
 
 #[cfg(test)]
 mod tests {

@@ -51,7 +51,7 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
                 ("j/k", "Navigate"),
                 ("v", "View Config"),
                 ("R", "Rename"),
-                ("DEL", "Delete"),
+                ("Del", "Delete"),
             ]);
         }
         crate::app::FocusedPanel::Logs => {
@@ -66,7 +66,12 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         | crate::app::FocusedPanel::Security
         | crate::app::FocusedPanel::ConnectionDetails) => {
             if panel.flips() {
-                context_hints.push(("f", panel.flip_label()));
+                let label = if app.is_flipped(panel) {
+                    "Flip back"
+                } else {
+                    panel.flip_label()
+                };
+                context_hints.push(("f", label));
             }
             context_hints.push(("z", "Zoom"));
         }
@@ -196,9 +201,11 @@ fn render_hints(
 ) {
     use ratatui::layout::{Constraint, Layout};
 
+    // The version gives way to the hints on narrow terminals.
+    let branding_width = if area.width >= 80 { 16 } else { 0 };
     let chunks = Layout::default()
         .direction(ratatui::layout::Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(16)])
+        .constraints([Constraint::Min(0), Constraint::Length(branding_width)])
         .split(area);
 
     let max_width = chunks[0].width as usize;
@@ -264,7 +271,7 @@ fn render_hints(
             crate::constants::APP_NAME,
             crate::constants::APP_VERSION
         ),
-        Style::default().fg(crate::ui::theme::current().nord_polar_night_4),
+        Style::default().fg(crate::ui::theme::current().inactive),
     )]);
     frame.render_widget(
         Paragraph::new(branding).alignment(ratatui::layout::Alignment::Right),
@@ -293,6 +300,29 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(text.contains("i Add VPN"), "{text}");
+    }
+
+    #[test]
+    fn a_flipped_panel_offers_flip_back() {
+        let mut app = App::new_test();
+        app.focused_panel = crate::app::FocusedPanel::Security;
+        app.handle_message(crate::message::Message::ToggleFlip);
+        while app.has_active_animation() {
+            app.advance_animation();
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(97, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_dashboard(frame, &app, frame.area()))
+            .expect("footer");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("f Flip back"), "{text}");
     }
 
     #[test]

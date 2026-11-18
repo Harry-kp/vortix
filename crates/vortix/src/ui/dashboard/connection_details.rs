@@ -37,7 +37,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // user is browsing other panels).
     let focused_profile_id = app.focused_profile_id();
 
-    if app.effective_flipped(&crate::app::FocusedPanel::ConnectionDetails) {
+    if app.is_flipped(&crate::app::FocusedPanel::ConnectionDetails) {
         render_back(frame, app, focused_profile_id.as_ref(), area, border_style);
         return;
     }
@@ -154,7 +154,7 @@ fn quality_rows(app: &App, is_focused_primary: bool) -> Vec<Line<'static>> {
         ) {
             QualityLevel::Unknown => ("UNKNOWN", theme::current().text_secondary),
             QualityLevel::Poor => ("POOR", theme::current().error),
-            QualityLevel::Fair => ("FAIR", theme::current().yellow),
+            QualityLevel::Fair => ("FAIR", theme::current().warning),
             QualityLevel::Excellent => ("EXCELLENT", theme::current().success),
         };
 
@@ -174,12 +174,14 @@ fn quality_rows(app: &App, is_focused_primary: bool) -> Vec<Line<'static>> {
         let jitter_color = if app.runtime.jitter_ms < 5 {
             theme::current().success
         } else if app.runtime.jitter_ms < 15 {
-            theme::current().yellow
+            theme::current().warning
         } else {
             theme::current().error
         };
         let loss_color = if app.runtime.packet_loss < 1.0 {
             theme::current().success
+        } else if app.runtime.packet_loss < 5.0 {
+            theme::current().warning
         } else {
             theme::current().error
         };
@@ -330,7 +332,7 @@ fn render_connected(
         } else {
             crypto
         },
-        theme::current().yellow,
+        theme::current().text_primary,
     ));
 
     // Any degraded reason, in the words the CLI uses.
@@ -381,11 +383,11 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelV
                     "Connecting"
                 }
                 .to_string(),
-                theme::current().yellow,
+                theme::current().warning,
             )
         }
-        Phase::Waiting { .. } => ("Reconnecting".to_string(), theme::current().yellow),
-        Phase::Stopping => ("Disconnecting".to_string(), theme::current().text_secondary),
+        Phase::Waiting { .. } => ("Reconnecting".to_string(), theme::current().warning),
+        Phase::Stopping => ("Disconnecting".to_string(), theme::current().warning),
         Phase::AwaitingCredentials => ("Awaiting input".to_string(), theme::current().warning),
         Phase::Up => ("Pending".to_string(), theme::current().text_secondary),
     };
@@ -419,10 +421,10 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelV
         text.push(awaiting_input_hint());
     }
 
-    // Tab-cycle hint when N>1 .
+    // With several tunnels, say how to show another one here.
     if app.tunnel_count() > 1 {
         text.push(Line::from(vec![Span::styled(
-            "Press [Tab] to cycle focused tunnel",
+            "Select another tunnel in Profiles (j/k)",
             Style::default().fg(theme::current().text_secondary),
         )]));
     }
@@ -594,7 +596,7 @@ fn role_line(role: &Role, phase: Phase) -> Line<'static> {
         return helpers::detail_row(
             "Role    : ",
             format!("Reconnecting via {}", role_kind_label(role)),
-            theme::current().yellow,
+            theme::current().warning,
         );
     }
     let (value, color) = match role {
@@ -620,7 +622,7 @@ fn role_line(role: &Role, phase: Phase) -> Line<'static> {
             } else {
                 format!("Split tunnel ({}, yielded)", format_role_cidrs(allowed_ips))
             },
-            theme::current().yellow,
+            theme::current().warning,
         ),
     };
     helpers::detail_row("Role    : ", value, color)
@@ -1178,8 +1180,9 @@ mod tests {
             "{top}"
         );
         for _ in 0..20 {
-            app.handle_message(crate::message::Message::Scroll(
-                crate::message::ScrollMove::Down,
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
             ));
         }
         let scrolled = back_at(&mut app, 100, 16);

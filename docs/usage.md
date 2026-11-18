@@ -10,7 +10,7 @@ Every command takes `-j`/`--json` (see [JSON and exit codes](#json-and-exit-code
 ## Root and the one-instance rule
 
 Tunnel, route, DNS and firewall changes need root, so the dashboard and every command that
-changes state need `sudo`. `list`, `show`, `status`, `info`, and `killswitch` and `autoconnect` without an argument,
+changes them need `sudo`; `import`, `rename` and `delete` only change your profiles and do not. `list`, `show`, `status`, `info`, and `killswitch` and `autoconnect` without an argument,
 work unprivileged; `status` without root says the state is unknown when it cannot see
 WireGuard, rather than reporting Disconnected.
 
@@ -26,10 +26,10 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 |---|---|
 | `1`–`9` | Connect profile N from the list; on a connected profile, disconnect it |
 | `c` / `Enter` | Connect or disconnect the focused profile; on a connect in progress, cancel it |
-| `d` | Disconnect the focused tunnel, or cancel it if it is still connecting |
-| `D` | Sidebar focused: disconnect every tunnel (asks `y`/`n` when two or more are up). Elsewhere: disconnect |
+| `d` | In Profiles: disconnect the focused tunnel, or cancel it if it is still connecting. Elsewhere: disconnect the primary tunnel |
+| `D` | Sidebar focused: disconnect every tunnel (asks `y`/`n` when two or more are up). Elsewhere: disconnect the primary tunnel |
 | `r` | Sidebar focused: reconnect the focused profile, or connect it if it is down. Elsewhere: reconnect |
-| `y` | Copy the VPN IP through the terminal (works over SSH) |
+| `y` | Copy your current public IPv4 (the VPN's exit address while one is up) through the terminal (works over SSH) |
 | Mouse drag | Select any text on screen; releasing the button copies it through the terminal (works over SSH; needs a terminal with OSC 52 clipboard support, such as Ghostty, iTerm2, kitty or WezTerm) |
 | Click a link | Links are underlined; a click opens one in your browser (as you, never as root), or copies it where no browser opens, such as over SSH |
 | `i` | Add a VPN: a file, folder, link, or `netbird` ([NetBird networks](#netbird-networks)) |
@@ -39,7 +39,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `z` | Zoom the focused panel |
 | `f` | Flip Details to the focused tunnel's routes and peers, or Security to why its verdict says that ([Flip side](#flip-side)); in the Logs panel, cycle the source |
 | `x` / `b` | Action menu / bulk actions |
-| `R` / `v` / `Del` | Rename / view config (a NetBird profile adds its client's settings from the server, private key masked) / delete the focused profile |
+| `R` / `v` / `Del` | Rename / view config (keys, passwords and inline OpenVPN secrets masked; a NetBird profile adds its client's settings from the server) / delete the focused profile |
 | `a` / `A` | Save / clear OpenVPN credentials |
 | `s` / `/` / `p` | Sort / search / switch theme |
 | `q` | Quit |
@@ -128,22 +128,24 @@ vortix import ./work.conf          # WireGuard .conf, OpenVPN .ovpn or .conf, Ne
 vortix import ./profiles/          # every supported file in a directory
 vortix import https://example.com/work.ovpn
 vortix import netbird https://nb.example.com   # a NetBird network (see NetBird networks)
-vortix list                        # --sort, --reverse, --protocol, --names-only
-vortix show work                   # parsed, secrets masked; --raw for the file
+vortix list                        # --sort name|protocol|last-used, --reverse, --protocol wireguard|openvpn|netbird, --names-only
+vortix show work                   # name, protocol, location and file; --raw prints the file, secrets included
 vortix rename work work-eu
 vortix delete work-eu --yes
 ```
 
 Import copies the profile into the config directory; later edits to the source file do not
 apply until you import it again. A WireGuard profile name becomes the interface name, so it must be 1–15 characters of
-letters, numbers, `_`, `.` or `-`. Profiles may hold up to 1024 routes. Profiles that run
+letters, numbers, `_`, `.` or `-`. A name already taken gets `_1`, `_2`, … (a long WireGuard
+name is shortened to fit), and `vortix import <file>` says so. WireGuard profiles may hold up to 1024 routes; OpenVPN up to 256, counting routes the server pushes. Profiles that run
 commands (`PreUp`/`PostUp`/`PreDown`/`PostDown`, OpenVPN `up`/`down` and similar) are refused;
-use [hooks](configuration.md#hooks) instead.
+use [hooks](configuration.md#hooks) instead. An OpenVPN profile's `route-nopull` and
+`pull-filter` decide which pushed routes and DNS Vortix applies, as they do for `openvpn`.
 
 ### NetBird networks
 
 NetBird's `netbird` command must be installed (`brew install netbirdio/tap/netbird` on macOS;
-on Linux, NetBird's installer). Add a network from Add a VPN (`i`, or `sudo vortix import`):
+on Linux, NetBird's installer). Add a network from Add a VPN (`i`, or `vortix import`):
 
 | Type | Network |
 |---|---|
@@ -190,7 +192,8 @@ connected on top takes the internet over on Linux (on macOS this is not yet veri
 Security Guard shows the exit actually in use.
 NetBird sets up its own routes and DNS on `wt0` (macOS: `utun100`). One NetBird network can be
 up at a time. Connection Details shows how many peers are up (connected or idle); its back (focus Details with `F2`, press
-`f`) lists the networks it routes to (in use or not, and which is an exit node), then the peers. `status --json` adds them under
+`f`) lists the networks it routes to (in use or not, and which is an exit node), then the peers. When NetBird is the tunnel
+`status --json` describes in `network` (the primary, else the first), it adds them under
 `network.networks` (`name`, `range`, `selected`) and `network.peers` (`name`, `address`,
 `connected`, `idle`, `relayed`, `latency_ms`). Choosing networks and the exit node stays in NetBird's
 dashboard or `netbird networks select`.
@@ -206,7 +209,9 @@ sudo vortix reconnect work         # no profile: every tunnel; nothing up: the l
 
 `up` waits 22 s for WireGuard and 37 s for OpenVPN. `--timeout <seconds>` sets both the wait
 and the time the connect may take. A connect or reconnect that runs out of time is rolled
-back: nothing is left running. `down` on a tunnel Vortix did not start exits 4 and leaves it alone.
+back: nothing is left running, and Ctrl-C (or `kill`) during the connect does the same. A
+dashboard that gets `kill` or loses its terminal (a dropped SSH session) quits as with `q`.
+`down` on a tunnel Vortix did not start exits 4 and leaves it alone.
 
 OpenVPN profiles that need a username and password connect from the CLI only with saved
 credentials: save them once in the dashboard (`a`). A one-time code (static challenge) is
@@ -269,8 +274,11 @@ sudo vortix release-killswitch     # emergency: remove Vortix's rules and set th
 
 The mode is saved and re-applied whenever Vortix next runs as root. A reboot clears the rules,
 so between boot and that first run nothing is blocked; [connecting at boot](#connecting-at-boot)
-shortens that gap to the time the network takes to come up. macOS uses a `pf` anchor of its own,
-Linux an `nftables` table.
+shortens that gap to the time the network takes to come up. macOS uses a `pf` anchor of its own
+and holds its own `pf` enable reference, so another app releasing its reference does not turn
+`pf` off; Linux uses an `nftables` table. While the rules block, Vortix reads them back every
+10 seconds and puts them back if other software removed or changed them, with one warning in
+the Event Log.
 
 A NetBird network reaches its peers and relays at addresses nobody knows in advance, so the
 blocking modes let NetBird's own daemon out to any address, while it connects and while it is
@@ -325,9 +333,10 @@ is connected, otherwise `null`.
 | 1 | General error |
 | 2 | Needs root |
 | 3 | Profile not found |
-| 4 | State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start, a second NetBird network or the NetBird app's own service) |
+| 4 | State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start, a second NetBird network or the NetBird app's own service, a profile name already taken, or renaming or deleting a connected profile) |
 | 5 | Missing dependency (WireGuard tools, `openvpn`, `netbird`, or on Linux `resolvconf`/`systemd-resolved`) |
 | 6 | Timeout |
+| 141 | The output pipe closed early (`vortix report \| head`); nothing more is printed |
 
 See [Configuration](configuration.md) for files and settings, and
 [Troubleshooting](troubleshooting.md) when something fails.

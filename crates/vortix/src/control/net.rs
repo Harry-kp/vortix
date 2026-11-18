@@ -9,7 +9,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::cidr::Cidr;
-use crate::control::dns::{DnsEffectiveStatus, DnsOwnedResource, DnsPolicyCoordinator};
+use crate::control::dns::{
+    DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource, DnsPolicy, DnsPolicyCoordinator,
+};
 use crate::control::killswitch::{KillSwitchMode, KillSwitchState};
 use crate::platform::DefaultRouteObservation;
 use crate::wireguard::ownership::TunnelOwnershipStore;
@@ -32,6 +34,36 @@ struct HostState {
     routes: Vec<(Cidr, String)>,
     host_routes: BTreeSet<IpAddr>,
     dns: Vec<DnsOwnedResource>,
+}
+
+/// A read-back of applied host state, run off the engine thread.
+pub struct HostCheck {
+    pub plan: NetworkPlan,
+    dns: Option<(DnsPolicy, DnsEffectiveState)>,
+}
+
+impl HostCheck {
+    /// What the host no longer carries; a read-back only.
+    #[must_use]
+    pub fn drift(&self) -> Option<String> {
+        use crate::control::dns::DnsPolicyAdapter as _;
+        if let Firewall::Block(allow) = &self.plan.firewall {
+            if let Err(error) = crate::platform::Firewall::verify_blocking(allow) {
+                // The read-back error reads as a failed command; it is only detail.
+                crate::logger::log(
+                    crate::logger::LogLevel::Debug,
+                    "KILLSWITCH",
+                    format!("read-back: {error}"),
+                );
+                return Some("Kill switch rules were changed outside Vortix".to_string());
+            }
+        }
+        let (desired, effective) = self.dns.as_ref()?;
+        crate::platform::Dns
+            .verify(desired, effective)
+            .err()
+            .map(|errors| format!("DNS was changed outside Vortix ({})", errors.join("; ")))
+    }
 }
 
 impl Net {
@@ -98,11 +130,15 @@ impl Net {
         if tightening {
             self.apply_firewall(target, mode)?;
         }
+        // Routes that failed keep the stricter firewall: traffic would leave
+        // outside the tunnel. A DNS failure keeps the tunnel up (DNS reads
+        // Unverified), so it must not keep an older block either.
         self.apply_routes(target)?;
-        self.apply_dns(target)?;
+        let dns_result = self.apply_dns(target);
         if !tightening {
             self.apply_firewall(target, mode)?;
         }
+        dns_result?;
         let routes = std::mem::take(&mut self.applied.routes);
         self.applied = target.clone();
         self.applied.routes = routes;
@@ -227,6 +263,28 @@ impl Net {
         self.applied.kill_switch_state = target.kill_switch_state;
         self.saved_mode = Some(mode);
         Ok(())
+    }
+
+    /// What of `plan` to read back off the engine thread: the firewall while
+    /// it blocks, and the DNS Vortix applied. `None` when neither.
+    #[must_use]
+    pub fn host_check(&self, plan: &NetworkPlan) -> Option<HostCheck> {
+        let dns = self
+            .dns
+            .desired()
+            .filter(|_| self.dns.effective().status == DnsEffectiveStatus::Applied)
+            .map(|desired| (desired.clone(), self.dns.effective().clone()));
+        (matches!(plan.firewall, Firewall::Block(_)) || dns.is_some()).then(|| HostCheck {
+            plan: plan.clone(),
+            dns,
+        })
+    }
+
+    /// Make the next [`Self::apply`] reapply the firewall and DNS even if the
+    /// plan is unchanged.
+    pub fn forget_applied(&mut self) {
+        self.saved_mode = None;
+        self.dns.invalidate_effective("changed outside Vortix");
     }
 
     fn verify_routes(target: &NetworkPlan) -> Result<(), String> {

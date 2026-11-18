@@ -30,14 +30,17 @@ Reporters are credited in the release notes unless they prefer not to be.
   `cargo install` copy, the user who owns it) gets root at the next boot, the same trust as
   running `sudo vortix`, without the prompt.
 - **Nothing runs from a profile.** Script directives (`PreUp`/`PostUp`/`PreDown`/`PostDown`,
-  OpenVPN `up`, `down`, plugins and similar) are refused at import. [Hooks](docs/configuration.md#hooks)
+  OpenVPN `up`, `down`, plugins and similar) are refused at import, and so are OpenVPN lines that
+  make it write a file (`status`, `log`, `writepid` and similar), since root OpenVPN could overwrite
+  any file through them. [Hooks](docs/configuration.md#hooks)
   run as the invoking user, never root, from an absolute path without a shell.
 - **Your files stay yours.** Everything under `~/.config/vortix` is owned by the invoking user
   and private (`0600` files, `0700` directories), also under `sudo`. Writes are atomic and never
   follow symlinks.
 - **Credentials.** Saved OpenVPN credentials live in `~/.config/vortix/auth/`, one owner-only
   file per profile. Keys and passwords are masked in `show`, never passed on a command line, and
-  kept out of logs and JSON output.
+  kept out of logs and JSON output. A profile URL's user name, password and query reach `curl`
+  on its standard input and are left out of the log.
 - **NetBird.** A `.netbird` profile's setup key is a credential like a WireGuard private key:
   the file is owner-only, only `show --raw` prints it, and it reaches `netbird` through a
   root-only file that is deleted after each connect. Each network's identity lives in `/var/lib/vortix/netbird/` (root

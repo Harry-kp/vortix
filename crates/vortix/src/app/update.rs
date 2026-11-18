@@ -47,7 +47,13 @@ impl App {
             // Navigation
             Message::NextPanel => self.next_panel(),
             Message::PreviousPanel => self.previous_panel(),
-            Message::FocusPanel(panel) => self.focused_panel = panel,
+            Message::FocusPanel(panel) => {
+                // Focus never lands on a panel hidden behind the zoom.
+                if self.zoomed_panel.is_some() {
+                    self.zoomed_panel = Some(panel.clone());
+                }
+                self.focused_panel = panel;
+            }
 
             // Imports
             Message::Import(path) => self.import_profile_from_path(&path),
@@ -125,11 +131,8 @@ impl App {
             Message::ProfileMove(mv) => match mv {
                 SelectionMove::Next => self.profile_next(),
                 SelectionMove::Prev => self.profile_previous(),
-                SelectionMove::First => self.profile_list_state.select(Some(0)),
-                SelectionMove::Last => {
-                    let last = self.runtime.profiles.len().saturating_sub(1);
-                    self.profile_list_state.select(Some(last));
-                }
+                SelectionMove::First => self.select_profile(0),
+                SelectionMove::Last => self.select_profile(usize::MAX),
             },
 
             // Connection
@@ -267,6 +270,7 @@ impl App {
                 self.input_mode = InputMode::Search {
                     query: String::new(),
                     cursor: 0,
+                    before: self.selected_profile_id(),
                 };
             }
             Message::OpenHelp => {
@@ -455,8 +459,8 @@ impl App {
                             Default::default()
                         }
                     };
-                    let username_cursor = username.len();
-                    let password_cursor = password.len();
+                    let username_cursor = username.expose().chars().count();
+                    let password_cursor = password.expose().chars().count();
                     self.input_mode = InputMode::AuthPrompt {
                         profile_id,
                         profile_name,
@@ -689,10 +693,15 @@ impl App {
                 // As for IPv4: only a tunnel that carries the internet should change it.
                 if self.primary_id().is_some() {
                     if let (Some(real), Some(public)) = (&self.runtime.real_ipv6, &observed) {
-                        if real == public {
-                            self.log(&format!(
-                                "WARN: IPv6 leak detected — public {public} matches real {real}"
-                            ));
+                        // Once per leak, not on every poll that still sees it.
+                        if real == public && self.runtime.public_ipv6.as_ref() != Some(public) {
+                            self.log_as(
+                                logger::LogLevel::Warning,
+                                "NET",
+                                &format!(
+                                    "IPv6 leak detected — public {public} matches real {real}"
+                                ),
+                            );
                         }
                     }
                 }
@@ -759,7 +768,7 @@ impl App {
         let carries_internet = self.primary_id().is_some();
         let old_ip = self.runtime.public_ip.clone();
 
-        if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
+        if old_ip != ip && !constants::is_unknown(&old_ip) {
             if let Some(journal) = crate::journal::global_journal() {
                 let _ = journal.append(crate::journal::JournalEvent::IpChanged {
                     old: Some(old_ip.clone()),
@@ -779,8 +788,7 @@ impl App {
             if first_detection || changed {
                 crate::telemetry::ip_cache::save(&self.runtime.config_dir, &ip);
             }
-        } else if self.runtime.public_ip != ip && self.runtime.public_ip != constants::MSG_FETCHING
-        {
+        } else if self.runtime.public_ip != ip && !constants::is_unknown(&self.runtime.public_ip) {
             self.runtime.ip_unchanged_warned = false;
             self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
         }
@@ -789,9 +797,13 @@ impl App {
             && !self.runtime.ip_unchanged_warned
         {
             self.runtime.ip_unchanged_warned = true;
-            self.log(&format!(
-                "WARN: Public IPv4 matches the pre-VPN address ({ip}) — possible leak or split-tunnel"
-            ));
+            self.log_as(
+                logger::LogLevel::Warning,
+                "NET",
+                &format!(
+                    "Public IPv4 matches the pre-VPN address ({ip}) — possible leak or split-tunnel"
+                ),
+            );
         }
         self.runtime.public_ip = ip;
         let checked_at = Instant::now();
@@ -812,10 +824,28 @@ impl App {
         }
         self.last_logged_network_quality = quality;
         match quality {
-            QualityLevel::Unknown => self.log("WARN: Network quality unavailable"),
+            QualityLevel::Unknown => {
+                self.log_as(
+                    logger::LogLevel::Warning,
+                    "NET",
+                    "Network quality unavailable",
+                );
+            }
             QualityLevel::Excellent => self.log("NET: Network quality: excellent"),
-            QualityLevel::Fair => self.log("WARN: Network quality degraded: fair"),
-            QualityLevel::Poor => self.log("WARN: Network quality degraded: poor"),
+            QualityLevel::Fair => {
+                self.log_as(
+                    logger::LogLevel::Warning,
+                    "NET",
+                    "Network quality degraded: fair",
+                );
+            }
+            QualityLevel::Poor => {
+                self.log_as(
+                    logger::LogLevel::Warning,
+                    "NET",
+                    "Network quality degraded: poor",
+                );
+            }
         }
     }
 

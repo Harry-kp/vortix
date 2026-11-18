@@ -334,6 +334,29 @@ pub enum ConnectionHealth {
 }
 
 impl ConnectionHealth {
+    /// Equal apart from how long a handshake has been stale, which grows every scan.
+    #[must_use]
+    pub fn same_state(&self, other: &Self) -> bool {
+        let without_age = |health: &Self| {
+            let mut health = health.clone();
+            if let Self::Degraded {
+                reason:
+                    DegradedReason::HandshakeStale {
+                        seconds_since_last_handshake,
+                    }
+                    | DegradedReason::WireGuardPeerStale {
+                        seconds_since_last_handshake,
+                        ..
+                    },
+            } = &mut health
+            {
+                *seconds_since_last_handshake = 0;
+            }
+            health
+        };
+        without_age(self) == without_age(other)
+    }
+
     /// The health in plain words, as the CLI and the dashboard show it.
     #[must_use]
     pub fn describe(&self) -> String {

@@ -2,10 +2,11 @@
 //! transaction so IPv4 and IPv6 change together. iptables code remains only
 //! to clean up rules older releases installed.
 //!
-//! The output chain drops by default and accepts: loopback; the RFC1918
-//! ranges minus every secondary tunnel's routes (a primary's `0.0.0.0/0` is
-//! never subtracted, its interface rule covers it); DHCP; and per tunnel its
-//! interface plus each server address, so it can reconnect after a drop.
+//! The output and forward chains (containers and VMs use forward) drop by
+//! default and accept: loopback; the RFC1918 ranges minus every secondary
+//! tunnel's routes (a primary's `0.0.0.0/0` is never subtracted, its
+//! interface rule covers it); DHCP; IPv6 neighbour discovery; and per tunnel
+//! its interface plus each server address, so it can reconnect after a drop.
 
 use crate::control::killswitch::{
     ActiveTunnelInfo, KillswitchError, Result, FIREWALL_COMMAND_TIMEOUT, FIREWALL_OUTPUT_LIMIT,
@@ -526,7 +527,21 @@ mod nft_policy {
         Group(u32),
         Mark(u32),
         Dhcp,
+        NeighbourDiscovery,
     }
+
+    /// Without these the IPv6 next hop of a VPN server becomes unreachable.
+    /// ND only addresses link-local and link-scope multicast with hop limit
+    /// 255 (RFC 4861), so nothing else can leave this way.
+    const NEIGHBOUR_DISCOVERY: &str = "ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 \
+        icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept";
+    /// The same rule as `nft -n` prints it.
+    const NEIGHBOUR_DISCOVERY_NUMERIC: &str =
+        "ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 icmpv6 type { 133, 135, 136 } accept";
+
+    /// Forwarded traffic (containers, VMs) never passes the output hook, so
+    /// both hooks carry the same policy.
+    const CHAINS: [&str; 2] = ["output", "forward"];
 
     pub(super) struct ExpectedPolicy {
         ruleset: String,
@@ -537,32 +552,31 @@ mod nft_policy {
     impl ExpectedPolicy {
         pub(super) fn new(active: &[ActiveTunnelInfo], mode: BatchMode) -> Self {
             let digest = crate::control::killswitch::policy_digest(active);
-            let ruleset = render(active, mode, &digest);
-            let accept_rules = parse_accept_rules(&ruleset)
+            let accept_rules = parse_accept_rules(&render_chain(active, CHAINS[0], &digest))
                 .expect("the package-owned nft renderer emits canonical accept rules");
             Self {
-                ruleset,
+                ruleset: render(active, mode, &digest),
                 accept_rules,
                 digest,
             }
         }
 
-        pub(super) fn matches(&self, observed: &ObservedPolicy) -> bool {
+        fn matches(&self, observed: &ObservedPolicy) -> bool {
             observed.accept_rules.as_ref() == Some(&self.accept_rules)
                 && observed.policy_drop
                 && observed.terminal_digest.as_deref() == Some(self.digest.as_str())
         }
     }
 
-    pub(super) struct ObservedPolicy {
+    struct ObservedPolicy {
         accept_rules: Option<Vec<AcceptRule>>,
         policy_drop: bool,
         terminal_digest: Option<String>,
     }
 
     impl ObservedPolicy {
-        pub(super) fn parse(snapshot: &str) -> Self {
-            let terminal_lines: Vec<&str> = snapshot
+        fn parse(chain: &str) -> Self {
+            let terminal_lines: Vec<&str> = chain
                 .lines()
                 .map(str::trim)
                 .filter(|line| line.contains(POLICY_COMMENT_PREFIX))
@@ -577,11 +591,26 @@ mod nft_policy {
             })
             .flatten();
             Self {
-                accept_rules: parse_accept_rules(snapshot),
-                policy_drop: snapshot.contains("policy drop"),
+                accept_rules: parse_accept_rules(chain),
+                policy_drop: chain.contains("policy drop"),
                 terminal_digest,
             }
         }
+    }
+
+    /// Each `chain <name>` block of a table listing, keyed by name.
+    fn chains(snapshot: &str) -> Vec<(String, String)> {
+        let mut chains: Vec<(String, String)> = Vec::new();
+        for line in snapshot.lines() {
+            if let Some(name) = line.trim().strip_prefix("chain ") {
+                let name = name.split_whitespace().next().unwrap_or_default();
+                chains.push((name.to_string(), String::new()));
+            } else if let Some((_, body)) = chains.last_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        chains
     }
 
     pub(super) fn ruleset(active: &[ActiveTunnelInfo], mode: BatchMode) -> String {
@@ -589,30 +618,51 @@ mod nft_policy {
     }
 
     pub(super) fn snapshot_matches(active: &[ActiveTunnelInfo], snapshot: &str) -> bool {
-        ExpectedPolicy::new(active, BatchMode::Create).matches(&ObservedPolicy::parse(snapshot))
+        let expected = ExpectedPolicy::new(active, BatchMode::Create);
+        let observed = chains(snapshot);
+        observed.len() == CHAINS.len()
+            && CHAINS.iter().all(|hook| {
+                observed.iter().any(|(name, body)| {
+                    name == hook
+                        && body.contains(&format!("hook {hook} "))
+                        && expected.matches(&ObservedPolicy::parse(body))
+                })
+            })
     }
 
     fn render(active: &[ActiveTunnelInfo], mode: BatchMode, digest: &str) -> String {
-        let local_ranges = lan_allowance(active);
-
         let mut ruleset = String::new();
         if matches!(mode, BatchMode::Replace) {
             writeln!(ruleset, "delete table inet {NFT_TABLE_NAME}").unwrap();
         }
+        writeln!(ruleset, "table inet {NFT_TABLE_NAME} {{").unwrap();
+        for hook in CHAINS {
+            ruleset.push_str(&render_chain(active, hook, digest));
+        }
+        ruleset.push_str("}\n");
+        ruleset
+    }
+
+    fn render_chain(active: &[ActiveTunnelInfo], hook: &str, digest: &str) -> String {
+        let mut ruleset = String::new();
         write!(
             ruleset,
-            r#"table inet {NFT_TABLE_NAME} {{
-  chain output {{
-    type filter hook output priority 0; policy drop;
+            r#"  chain {hook} {{
+    type filter hook {hook} priority 0; policy drop;
 
     oifname "lo" accept
 "#,
         )
         .unwrap();
-        for range in local_ranges {
+        for range in lan_allowance(active) {
             writeln!(ruleset, "    ip daddr {range} accept").unwrap();
         }
-        writeln!(ruleset, "    udp sport 68 udp dport 67 accept").unwrap();
+        writeln!(
+            ruleset,
+            "    ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"
+        )
+        .unwrap();
+        writeln!(ruleset, "    {NEIGHBOUR_DISCOVERY}").unwrap();
         for tunnel in active {
             if !tunnel.is_endpoint_allowlist() {
                 writeln!(ruleset, "    oifname \"{}\" accept", tunnel.interface).unwrap();
@@ -636,7 +686,7 @@ mod nft_policy {
             "    counter drop comment \"{POLICY_COMMENT_PREFIX}{digest}\""
         )
         .unwrap();
-        ruleset.push_str("  }\n}\n");
+        ruleset.push_str("  }\n");
         ruleset
     }
 
@@ -645,8 +695,11 @@ mod nft_policy {
     }
 
     fn parse_accept_rule(line: &str) -> Option<AcceptRule> {
-        if line == "udp sport 68 udp dport 67 accept" {
+        if line == "ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept" {
             return Some(AcceptRule::Dhcp);
+        }
+        if line == NEIGHBOUR_DISCOVERY || line == NEIGHBOUR_DISCOVERY_NUMERIC {
+            return Some(AcceptRule::NeighbourDiscovery);
         }
         if let Some(group) = line
             .strip_prefix("meta skgid ")
@@ -773,8 +826,59 @@ mod tests {
         assert!(rules.contains("ip daddr 10.0.0.0/8 accept"));
         assert!(rules.contains("ip daddr 172.16.0.0/12 accept"));
         assert!(rules.contains("ip daddr 192.168.0.0/16 accept"));
-        assert!(rules.contains("udp sport 68 udp dport 67 accept"));
+        assert!(rules.contains("ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"));
         assert!(!rules.contains("oifname \"wg"));
+    }
+
+    /// Containers and VMs reach the network through the forward hook, which
+    /// the output chain never sees.
+    #[test]
+    fn forwarded_traffic_gets_the_same_policy_and_reads_back() {
+        let active = [tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true)];
+        let rules = nft(&active);
+        let forward = rules.find("  chain forward {\n").expect("forward chain");
+        assert!(
+            rules[forward..].contains("    type filter hook forward priority 0; policy drop;\n")
+        );
+        assert!(rules[forward..].contains("    oifname \"wg0\" accept\n"));
+        assert!(nft_policy::snapshot_matches(&active, &rules));
+
+        let output_only = format!("{}}}\n", &rules[..forward]);
+        assert!(!nft_policy::snapshot_matches(&active, &output_only));
+        let leaky_forward = format!(
+            "{}{}",
+            &rules[..forward],
+            rules[forward..].replace("policy drop", "policy accept")
+        );
+        assert!(!nft_policy::snapshot_matches(&active, &leaky_forward));
+    }
+
+    #[test]
+    fn ipv6_neighbour_discovery_is_let_out_and_reads_back_numerically() {
+        let rules = nft(&[]);
+        let nd = "    ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 \
+                  icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept\n";
+        assert!(rules.contains(nd));
+        let numeric = rules.replace(
+            nd,
+            "    ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 icmpv6 type { 133, 135, 136 } accept\n",
+        );
+        assert!(nft_policy::snapshot_matches(&[], &numeric));
+        assert!(!nft_policy::snapshot_matches(&[], &rules.replace(nd, "")));
+        // Scoped: nothing lets ICMPv6 out to an arbitrary address.
+        assert!(rules
+            .lines()
+            .filter(|line| line.contains("icmpv6"))
+            .all(|line| line.contains("ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 ")));
+        let unscoped = rules.replace("ip6 daddr { fe80::/10, ff02::/16 } ip6 hoplimit 255 ", "");
+        assert!(!nft_policy::snapshot_matches(&[], &unscoped));
+    }
+
+    #[test]
+    fn dhcp_exception_reaches_only_the_broadcast_address() {
+        let rules = nft(&[]);
+        assert!(!rules.contains("    udp sport 68 udp dport 67 accept"));
+        assert!(rules.contains("    ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"));
     }
 
     #[test]
@@ -826,7 +930,7 @@ mod tests {
             tunnel("wg5", &[], &[], true),
             tunnel("wg6", &["1.2.3.4", "5.6.7.8", "2001:db8::1"], &[], false),
         ]);
-        assert_eq!(rules.matches("wg5").count(), 1);
+        assert_eq!(rules.matches("wg5").count(), 2);
         assert!(rules.contains("ip daddr 1.2.3.4 accept"));
         assert!(rules.contains("ip daddr 5.6.7.8 accept"));
         assert!(rules.contains("ip6 daddr 2001:db8::1 accept"));
@@ -854,7 +958,7 @@ mod tests {
             let rules = nft(&active);
             assert_eq!(
                 rules.matches("meta skgid 51820 accept").count(),
-                1,
+                2,
                 "{rules}"
             );
             assert!(nft_policy::snapshot_matches(&active, &rules));
@@ -982,23 +1086,29 @@ mod tests {
             tunnel("wg1", &["5.6.7.8"], &["10.0.0.0/8"], false),
         ];
         let digest = crate::control::killswitch::policy_digest(&active);
-        let expected = format!(
-            "table inet {NFT_TABLE_NAME} {{
-  chain output {{
-    type filter hook output priority 0; policy drop;
+        let chain = |hook: &str| {
+            format!(
+                "  chain {hook} {{
+    type filter hook {hook} priority 0; policy drop;
 
     oifname \"lo\" accept
     ip daddr 172.16.0.0/12 accept
     ip daddr 192.168.0.0/16 accept
-    udp sport 68 udp dport 67 accept
+    ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept
+    ip6 daddr {{ fe80::/10, ff02::/16 }} ip6 hoplimit 255 icmpv6 type {{ nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert }} accept
     oifname \"wg0\" accept
     ip daddr 1.2.3.4 accept
     oifname \"wg1\" accept
     ip daddr 5.6.7.8 accept
     counter drop comment \"{POLICY_COMMENT_PREFIX}{digest}\"
   }}
-}}
 "
+            )
+        };
+        let expected = format!(
+            "table inet {NFT_TABLE_NAME} {{\n{}{}}}\n",
+            chain("output"),
+            chain("forward")
         );
         assert_eq!(nft(&active), expected);
     }

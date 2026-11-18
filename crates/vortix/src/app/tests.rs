@@ -600,6 +600,7 @@ fn test_search_mode_opens() {
     app.input_mode = InputMode::Search {
         query: String::new(),
         cursor: 0,
+        before: None,
     };
     assert!(matches!(app.input_mode, InputMode::Search { .. }));
 }
@@ -610,7 +611,7 @@ fn test_search_filter_selects_matching_profile() {
     add_profiles(&mut app, &["amsterdam", "berlin", "chicago"]);
     app.profile_list_state.select(Some(0));
 
-    app.apply_search_filter("ber");
+    app.apply_search_filter("ber", None);
 
     assert_eq!(
         app.profile_list_state.selected(),
@@ -620,17 +621,17 @@ fn test_search_filter_selects_matching_profile() {
 }
 
 #[test]
-fn test_search_filter_empty_resets_to_first() {
+fn test_search_filter_empty_returns_to_the_selection_before_the_search() {
     let mut app = test_app();
     add_profiles(&mut app, &["amsterdam", "berlin"]);
-    app.profile_list_state.select(Some(1));
+    app.profile_list_state.select(Some(0));
 
-    app.apply_search_filter("");
+    app.apply_search_filter("", Some(&crate::profile::ProfileId::new("berlin")));
 
     assert_eq!(
         app.profile_list_state.selected(),
-        Some(0),
-        "Empty query should reset to first profile"
+        Some(1),
+        "Empty query should return to the selection before the search"
     );
 }
 
@@ -640,7 +641,7 @@ fn test_search_filter_no_match_keeps_selection() {
     add_profiles(&mut app, &["amsterdam", "berlin"]);
     app.profile_list_state.select(Some(0));
 
-    app.apply_search_filter("zzzzz");
+    app.apply_search_filter("zzzzz", None);
 
     assert_eq!(
         app.profile_list_state.selected(),
@@ -708,16 +709,16 @@ fn test_search_match_count_updated() {
     add_profiles(&mut app, &["amsterdam", "ankara", "berlin"]);
     app.profile_list_state.select(Some(0));
 
-    app.apply_search_filter("an");
+    app.apply_search_filter("an", None);
     assert_eq!(app.search_match_count, 1, "Should match ankara");
 
-    app.apply_search_filter("a");
+    app.apply_search_filter("a", None);
     assert_eq!(
         app.search_match_count, 2,
         "Should match amsterdam and ankara"
     );
 
-    app.apply_search_filter("");
+    app.apply_search_filter("", None);
     assert_eq!(app.search_match_count, 3, "Empty query should match all");
 }
 #[test]
@@ -922,7 +923,7 @@ fn test_help_scroll_down_clamps_at_max() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
@@ -968,7 +969,7 @@ fn test_help_scroll_clamps_after_resize_before_key_handling() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: max_scroll.saturating_add(10),
@@ -990,7 +991,7 @@ fn test_help_end_jumps_to_max_scroll() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
@@ -1012,7 +1013,7 @@ fn test_help_mouse_scroll_down_clamps_at_max() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: 0,
@@ -1041,7 +1042,7 @@ fn test_help_mouse_scroll_up_clamps_after_resize() {
     let mut app = test_app();
     let max_scroll = crate::app::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys),
+        crate::ui::help_total_lines(crate::app::state::HelpTab::Keys, app.terminal_size.0),
     );
     app.input_mode = InputMode::Help {
         scroll: max_scroll.saturating_add(9),
@@ -1500,10 +1501,10 @@ fn flip_multiple_panels_independently() {
 fn flip_effective_state_at_midpoint() {
     let mut app = test_app();
     app.focused_panel = FocusedPanel::Security;
-    assert!(!app.effective_flipped(&FocusedPanel::Security));
+    assert!(!app.is_flipped(&FocusedPanel::Security));
     app.handle_message(Message::ToggleFlip);
     // Just-started animation hasn't passed the midpoint yet.
-    assert!(!app.effective_flipped(&FocusedPanel::Security));
+    assert!(!app.is_flipped(&FocusedPanel::Security));
 }
 
 #[test]
@@ -1544,14 +1545,14 @@ fn advance_animation_noop_when_still_running() {
 }
 
 #[test]
-fn effective_flipped_shows_target_after_midpoint() {
+fn flip_shows_target_after_midpoint() {
     use std::time::Duration;
     let mut app = test_app();
     let mut state = crate::app::state::FlipState::new(Duration::from_millis(100));
     state.flip();
     app.flip_states.insert(FocusedPanel::Security, state);
     std::thread::sleep(Duration::from_millis(75));
-    assert!(app.effective_flipped(&FocusedPanel::Security));
+    assert!(app.is_flipped(&FocusedPanel::Security));
 }
 
 // ====================================================================
@@ -1916,6 +1917,10 @@ fn routine_packet_loss_and_jitter_samples_do_not_flood_the_event_log() {
         1,
         "recovery and subsequent healthy samples must emit one transition"
     );
+    assert!(crate::logger::get_logs()
+        .iter()
+        .filter(|entry| entry.message.starts_with("Network quality"))
+        .all(|entry| entry.category == "NET"));
 }
 
 #[test]
@@ -1953,7 +1958,7 @@ fn theme_toggle_persists_restyles_cached_content_and_reports_success() {
         app.cached_config.as_ref().unwrap().highlighted_lines[0].spans[0]
             .style
             .fg,
-        Some(crate::ui::theme::TERMINAL.yellow)
+        Some(crate::ui::theme::TERMINAL.accent_secondary)
     );
     let toast = app.toast.as_ref().unwrap();
     assert_eq!(toast.toast_type, ToastType::Success);
@@ -2812,4 +2817,376 @@ fn the_startup_tool_check_covers_the_vpns_the_user_has() {
     } else {
         assert!(toast.is_some_and(|text| text.contains("netbird")));
     }
+}
+
+mod zoom {
+    use super::*;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn draw(app: &mut App) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn a_dialog_opened_while_zoomed_is_drawn_on_top() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["alpha"]);
+        app.profile_list_state.select(Some(0));
+        app.handle_key(key(KeyCode::Char('z')));
+        app.handle_key(key(KeyCode::Delete));
+        assert!(text(&draw(&mut app)).contains("Are you sure"));
+    }
+
+    #[test]
+    fn a_click_in_the_zoomed_sidebar_selects_the_clicked_row() {
+        let mut app = test_app();
+        let names: Vec<String> = (0..18).map(|i| format!("prof-{i:02}")).collect();
+        add_profiles(
+            &mut app,
+            &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        app.profile_list_state.select(Some(0));
+        app.handle_key(key(KeyCode::Char('z')));
+        let buffer = draw(&mut app);
+        let (column, row) = (0..24u16)
+            .find_map(|y| {
+                let line: String = (0..80u16)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect();
+                line.find("prof-14")
+                    .map(|x| (u16::try_from(line[..x].chars().count()).unwrap(), y))
+            })
+            .unwrap();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        let selected = app.profile_list_state.selected().unwrap();
+        assert_eq!(app.runtime.profiles[selected].name, "prof-14");
+        assert_eq!(app.focused_panel, FocusedPanel::Sidebar);
+    }
+
+    #[test]
+    fn a_function_key_while_zoomed_zooms_the_panel_it_focuses() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["alpha"]);
+        app.focused_panel = FocusedPanel::Logs;
+        app.handle_key(key(KeyCode::Char('z')));
+        app.handle_key(key(KeyCode::F(1)));
+        assert_eq!(app.zoomed_panel, Some(app.focused_panel.clone()));
+    }
+}
+
+mod overlay_keys {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn q_closes_the_action_menu_and_config_viewer_without_quitting() {
+        for open in ['x', 'v'] {
+            let mut app = test_app();
+            add_profiles(&mut app, &["alpha"]);
+            app.profile_list_state.select(Some(0));
+            app.handle_key(key(KeyCode::Char(open)));
+            app.handle_key(key(KeyCode::Char('q')));
+            assert!(!app.should_quit, "q after {open} quit the app");
+        }
+    }
+
+    #[test]
+    fn editing_saved_credentials_backspaces_the_last_character() {
+        let mut app = test_app();
+        let username = crate::app::state::SecretText::from("josé".to_string());
+        let username_cursor = username.expose().chars().count();
+        app.input_mode = InputMode::AuthPrompt {
+            profile_id: crate::profile::ProfileId::new("a"),
+            profile_name: "a".into(),
+            username,
+            username_cursor,
+            password: crate::app::state::SecretText::default(),
+            password_cursor: 0,
+            otp: crate::app::state::SecretText::default(),
+            otp_cursor: 0,
+            focused_field: AuthField::Username,
+            save_credentials: true,
+            connect_after: false,
+            static_challenge_prompt: None,
+            reveal_secrets: false,
+        };
+        app.handle_key(key(KeyCode::Backspace));
+        let InputMode::AuthPrompt { username, .. } = &app.input_mode else {
+            panic!("the prompt closed");
+        };
+        assert_eq!(username.expose(), "jos");
+    }
+
+    #[test]
+    fn details_c_cancels_a_connect_waiting_to_retry() {
+        let mut app = test_app();
+        set_phase(
+            &mut app,
+            "a",
+            crate::control::Phase::Waiting { retry_at: None },
+        );
+        app.profile_list_state.select(Some(0));
+        app.focused_panel = FocusedPanel::ConnectionDetails;
+        app.toast = None;
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn a_blank_rename_keeps_the_dialog_open_and_says_why() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["alpha"]);
+        app.profile_list_state.select(Some(0));
+        app.handle_key(key(KeyCode::Char('R')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.input_mode, InputMode::Rename { .. }));
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn config_viewer_end_on_a_very_tall_terminal_does_not_overflow() {
+        let mut app = test_app();
+        app.terminal_size = (200, 800);
+        app.show_config = true;
+        app.cached_config = Some(crate::app::CachedConfigView::from_content(
+            "x\n".repeat(10),
+            app.runtime.config.theme,
+        ));
+        app.handle_key(key(KeyCode::Char('G')));
+    }
+}
+
+mod directory_import {
+    use super::*;
+
+    /// Both tests import into the shared test config dir, whose profile store
+    /// refuses a second writer instead of waiting.
+    static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_profile(dir: &std::path::Path, name: &str) {
+        std::fs::write(
+            dir.join(format!("{name}.conf")),
+            "[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\nEndpoint = 192.0.2.1:51820\nAllowedIPs = 0.0.0.0/0\n",
+        )
+        .unwrap();
+    }
+
+    fn unique() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 100_000_000
+    }
+
+    #[test]
+    fn importing_a_folder_into_an_empty_list_selects_a_profile() {
+        let _store = STORE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let id = unique();
+        write_profile(dir.path(), &format!("a{id}x"));
+        write_profile(dir.path(), &format!("a{id}y"));
+        app.handle_message(crate::message::Message::Import(
+            dir.path().display().to_string(),
+        ));
+        assert!(!app.runtime.profiles.is_empty());
+        assert!(app.profile_list_state.selected().is_some());
+    }
+
+    #[test]
+    fn importing_a_folder_keeps_the_selected_profile() {
+        let _store = STORE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut app = test_app();
+        add_profiles(&mut app, &["zz-mine"]);
+        app.profile_list_state.select(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let id = unique();
+        write_profile(dir.path(), &format!("b{id}x"));
+        write_profile(dir.path(), &format!("b{id}y"));
+        app.handle_message(crate::message::Message::Import(
+            dir.path().display().to_string(),
+        ));
+        let selected = app.profile_list_state.selected().unwrap();
+        assert_eq!(app.runtime.profiles[selected].name, "zz-mine");
+    }
+}
+
+mod selection {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn moving_through_an_empty_list_selects_nothing() {
+        let mut app = test_app();
+        for code in [KeyCode::Char('j'), KeyCode::Char('G'), KeyCode::PageDown] {
+            app.handle_key(key(code));
+            assert_eq!(app.profile_list_state.selected(), None, "{code:?}");
+        }
+        app.handle_key(key(KeyCode::Char('v')));
+        assert!(!app.show_config);
+    }
+
+    #[test]
+    fn the_next_profile_starts_its_routes_at_the_top() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["a", "b"]);
+        app.profile_list_state.select(Some(0));
+        app.routes_scroll = 7;
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.routes_scroll, 0);
+    }
+}
+
+#[test]
+fn the_first_public_address_is_not_logged_as_a_change() {
+    use crate::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    set_connected(&mut app, "test");
+    app.runtime.public_ip = crate::constants::MSG_DETECTING.to_string();
+    app.handle_message(Message::Telemetry(TelemetryUpdate::EgressIdentity(
+        crate::telemetry::EgressIdentity {
+            public_ip: "198.51.100.77".to_string(),
+            isp: None,
+            location: None,
+        },
+    )));
+    assert!(
+        !crate::logger::get_logs()
+            .iter()
+            .any(|entry| entry.message.contains("Detecting... -> 198.51.100.77")),
+        "a placeholder was logged as an address"
+    );
+}
+
+#[test]
+fn the_footer_keeps_quit_at_sixty_columns() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["alpha"]);
+    app.profile_list_state.select(Some(0));
+    for width in 60..=80 {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let footer: String = (0..width)
+            .map(|x| buffer[(x, 23)].symbol().to_string())
+            .collect();
+        assert!(footer.contains("q Quit"), "{width}: {footer}");
+    }
+}
+
+#[test]
+fn the_header_keeps_the_protocol_of_a_long_name_at_80_columns() {
+    let mut app = test_app();
+    set_connected(&mut app, "mullvad-se-sto-wg-001");
+    let mut snapshot = (*app.control_snapshot).clone();
+    snapshot.primary = Some(crate::profile::ProfileId::new("mullvad-se-sto-wg-001"));
+    snapshot.version += 1;
+    app.apply_control_snapshot(std::sync::Arc::new(snapshot));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let header: String = (0..80)
+        .map(|x| buffer[(x, 0)].symbol().to_string())
+        .collect();
+    let tag = app.control_snapshot.tunnels[0].protocol.short();
+    assert!(header.contains(&format!("/{tag})")), "{header}");
+}
+
+#[test]
+fn a_long_rename_keeps_its_cursor_on_screen() {
+    let name = "a-very-long-company-vpn-profile-name-for-the-frankfurt-region-01";
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| crate::ui::overlays::rename::render(f, name, name.chars().count()))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(screen.contains('\u{2588}'), "the cursor is off screen");
+}
+
+#[test]
+fn selection_keys_do_nothing_outside_the_profile_list() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    add_profiles(&mut app, &["a", "b", "c"]);
+    app.profile_list_state.select(Some(0));
+    for panel in [
+        FocusedPanel::Logs,
+        FocusedPanel::Chart,
+        FocusedPanel::Security,
+    ] {
+        app.focused_panel = panel;
+        for code in [KeyCode::PageDown, KeyCode::Char('G'), KeyCode::End] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert_eq!(app.profile_list_state.selected(), Some(0), "{code:?}");
+        }
+    }
+}
+
+#[test]
+fn escape_from_search_restores_the_selection() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    add_profiles(&mut app, &["alpha", "beta", "gamma"]);
+    app.profile_list_state.select(Some(2));
+    for code in [KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Esc] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    assert_eq!(app.profile_list_state.selected(), Some(2));
+    for code in [KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Backspace] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    assert_eq!(
+        app.profile_list_state.selected(),
+        Some(2),
+        "clearing the query"
+    );
 }

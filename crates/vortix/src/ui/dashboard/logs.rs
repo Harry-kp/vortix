@@ -58,7 +58,12 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if all_logs.is_empty() {
         frame.render_widget(
-            Paragraph::new("No activity yet").alignment(Alignment::Center),
+            Paragraph::new(if app.log_level_filter.is_some() {
+                "Nothing at this level · f for more"
+            } else {
+                "No activity yet"
+            })
+            .alignment(Alignment::Center),
             inner,
         );
         return;
@@ -104,7 +109,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(format!("{level_tag} "), level_style),
                 Span::styled(
                     format!("{cat}  "),
-                    Style::default().fg(theme::current().nord_polar_night_4),
+                    Style::default().fg(theme::current().inactive),
                 ),
                 Span::styled(entry.message.clone(), msg_style),
             ])
