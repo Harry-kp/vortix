@@ -67,6 +67,11 @@ letters, numbers, `_`, `.` or `-`. Rename the file (`work.conf`) and import it a
 `up`/`down`-style directives never run; move the commands to
 [hooks](configuration.md#hooks).
 
+**"This profile tells OpenVPN to write a file".** The `.ovpn` has a `status`, `log`,
+`log-append`, `writepid`, `replay-persist` or `ifconfig-pool-persist` line. OpenVPN runs as root,
+so that line could overwrite any file, such as `/etc/passwd`. Vortix keeps OpenVPN's log itself
+(`f` in the Logs panel): delete the line the message quotes and import the file again.
+
 ## WireGuard
 
 **No handshake.** The server never answered. Check the endpoint address and port, both keys

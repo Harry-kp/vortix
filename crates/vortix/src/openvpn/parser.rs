@@ -178,6 +178,21 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
                 "OpenVPN TAP (`dev tap`) is not supported: Vortix routes on a layer-3 tunnel device. Use `dev tun`.".into(),
             ));
         }
+        // OpenVPN runs as root, so a path here can overwrite any file.
+        if matches!(
+            directive.as_str(),
+            "status"
+                | "log"
+                | "log-append"
+                | "writepid"
+                | "replay-persist"
+                | "ifconfig-pool-persist"
+        ) {
+            let target = arguments.first().map_or("", String::as_str);
+            return Err(ParseError::Unsupported(format!(
+                "This profile tells OpenVPN to write a file: `{directive} {target}`. Vortix runs OpenVPN as root, so that line could overwrite any file on this computer. Vortix keeps OpenVPN's log itself: delete that line from the file, then import it again."
+            )));
+        }
 
         match directive.as_str() {
             "auth-user-pass" => {
@@ -1033,6 +1048,34 @@ mod tests {
     }
 
     /// Vortix routes on the tunnel device, which is wrong for a layer-2 TAP
+    /// A profile line that makes root `OpenVPN` write a file is refused, and the
+    /// message names the line so the user can fix the file themselves.
+    #[test]
+    fn a_profile_that_writes_files_is_refused_with_the_line() {
+        for line in [
+            "status /etc/passwd",
+            "log-append /var/log/x",
+            "writepid run.pid",
+            "setenv opt status /etc/shadow",
+        ] {
+            let text = format!("client\ndev tun\nremote 192.0.2.1 1194\n{line}\n");
+            let Err(ParseError::Unsupported(message)) = parse_ovpn_conf(&text) else {
+                panic!("{line} was accepted");
+            };
+            assert!(message.contains("could overwrite any file"), "{message}");
+            assert!(message.contains("delete that line"), "{message}");
+        }
+        let Err(ParseError::Unsupported(message)) =
+            parse_ovpn_conf("client\ndev tun\nremote 192.0.2.1 1194\nstatus /etc/passwd\n")
+        else {
+            unreachable!()
+        };
+        assert!(message.contains("`status /etc/passwd`"), "{message}");
+        assert!(
+            parse_ovpn_conf("client\ndev tun\nremote 192.0.2.1 1194\nstatus-version 2\n").is_ok()
+        );
+    }
+
     /// (the host would ARP for every destination), so TAP is refused.
     #[test]
     fn tap_profiles_are_refused_with_a_reason() {
