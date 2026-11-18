@@ -297,6 +297,12 @@ pub fn spawn_telemetry_worker(
         while let Ok(next) = nudge_rx.try_recv() {
             epoch = epoch.max(next);
         }
+        if epoch != tx.epoch {
+            // The app drops messages from the old epoch, announcements included.
+            ip_success_log.reset();
+            identity_state.egress_unavailable_announced = false;
+            identity_state.primary_unavailable_announced = false;
+        }
     });
 
     (rx, nudge_tx)
