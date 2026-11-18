@@ -289,23 +289,15 @@ fn check_wireguard_by_name(
         ..Default::default()
     };
 
-    // 1. Attempt to find PID (wireguard-go or similar)
+    // The runtime file's age needs no subprocess; `ps` only where none exists.
+    session.started_at = crate::platform::wireguard_started_at(name);
     if let Some(pid) = crate::platform::Interface::get_wireguard_pid(&interface_name) {
         session.details.pid = Some(pid);
-
-        // Primary method: Get start time from process (works cross-platform)
-        if let Some(output) = cmd_output("ps", &["-p", &pid.to_string(), "-o", "etime="]) {
-            let etime = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !etime.is_empty() {
-                if let Some(duration) = parse_ps_etime(&etime) {
-                    session.started_at = SystemTime::now().checked_sub(duration);
-                }
-            }
+        if session.started_at.is_none() {
+            session.started_at = cmd_output("ps", &["-p", &pid.to_string(), "-o", "etime="])
+                .and_then(|output| parse_ps_etime(&String::from_utf8_lossy(&output.stdout)))
+                .and_then(|elapsed| SystemTime::now().checked_sub(elapsed));
         }
-    }
-
-    if session.started_at.is_none() {
-        session.started_at = crate::platform::wireguard_started_at(name);
     }
 
     // Log if we couldn't determine start time
