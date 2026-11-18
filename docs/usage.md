@@ -10,7 +10,7 @@ Every command takes `-j`/`--json` (see [JSON and exit codes](#json-and-exit-code
 ## Root and the one-instance rule
 
 Tunnel, route, DNS and firewall changes need root, so the dashboard and every command that
-changes state need `sudo`. `list`, `show`, `status`, `info`, and `killswitch` and `autoconnect` without an argument,
+changes them need `sudo`; `import`, `rename` and `delete` only change your profiles and do not. `list`, `show`, `status`, `info`, and `killswitch` and `autoconnect` without an argument,
 work unprivileged; `status` without root says the state is unknown when it cannot see
 WireGuard, rather than reporting Disconnected.
 
@@ -27,7 +27,7 @@ with code 4 and "Another Vortix process is managing VPN state". Quit the dashboa
 | `1`–`9` | Connect profile N from the list; on a connected profile, disconnect it |
 | `c` / `Enter` | Connect or disconnect the focused profile; on a connect in progress, cancel it |
 | `d` | In Profiles: disconnect the focused tunnel, or cancel it if it is still connecting. Elsewhere: disconnect the primary tunnel |
-| `D` | Sidebar focused: disconnect every tunnel (asks `y`/`n` when two or more are up). Elsewhere: disconnect |
+| `D` | Sidebar focused: disconnect every tunnel (asks `y`/`n` when two or more are up). Elsewhere: disconnect the primary tunnel |
 | `r` | Sidebar focused: reconnect the focused profile, or connect it if it is down. Elsewhere: reconnect |
 | `y` | Copy your current public IPv4 (the VPN's exit address while one is up) through the terminal (works over SSH) |
 | Mouse drag | Select any text on screen; releasing the button copies it through the terminal (works over SSH; needs a terminal with OSC 52 clipboard support, such as Ghostty, iTerm2, kitty or WezTerm) |
@@ -145,7 +145,7 @@ use [hooks](configuration.md#hooks) instead. An OpenVPN profile's `route-nopull`
 ### NetBird networks
 
 NetBird's `netbird` command must be installed (`brew install netbirdio/tap/netbird` on macOS;
-on Linux, NetBird's installer). Add a network from Add a VPN (`i`, or `sudo vortix import`):
+on Linux, NetBird's installer). Add a network from Add a VPN (`i`, or `vortix import`):
 
 | Type | Network |
 |---|---|
@@ -192,7 +192,8 @@ connected on top takes the internet over on Linux (on macOS this is not yet veri
 Security Guard shows the exit actually in use.
 NetBird sets up its own routes and DNS on `wt0` (macOS: `utun100`). One NetBird network can be
 up at a time. Connection Details shows how many peers are up (connected or idle); its back (focus Details with `F2`, press
-`f`) lists the networks it routes to (in use or not, and which is an exit node), then the peers. `status --json` adds them under
+`f`) lists the networks it routes to (in use or not, and which is an exit node), then the peers. When NetBird is the tunnel
+`status --json` describes in `network` (the primary, else the first), it adds them under
 `network.networks` (`name`, `range`, `selected`) and `network.peers` (`name`, `address`,
 `connected`, `idle`, `relayed`, `latency_ms`). Choosing networks and the exit node stays in NetBird's
 dashboard or `netbird networks select`.
@@ -330,7 +331,7 @@ is connected, otherwise `null`.
 | 1 | General error |
 | 2 | Needs root |
 | 3 | Profile not found |
-| 4 | State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start, a second NetBird network or the NetBird app's own service) |
+| 4 | State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start, a second NetBird network or the NetBird app's own service, a profile name already taken, or renaming or deleting a connected profile) |
 | 5 | Missing dependency (WireGuard tools, `openvpn`, `netbird`, or on Linux `resolvconf`/`systemd-resolved`) |
 | 6 | Timeout |
 | 141 | The output pipe closed early (`vortix report \| head`); nothing more is printed |

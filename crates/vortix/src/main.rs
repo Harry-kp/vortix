@@ -46,6 +46,13 @@ fn main() -> Result<()> {
 
     // Parse arguments
     let args = Args::parse();
+    let output_mode = if args.json {
+        cli::output::OutputMode::Json
+    } else if args.quiet {
+        cli::output::OutputMode::Quiet
+    } else {
+        cli::output::OutputMode::Human
+    };
 
     // Determine how config_dir was provided (for `info` command)
     let config_dir_source = if args.config_dir.is_some() {
@@ -74,8 +81,16 @@ fn main() -> Result<()> {
     // Resolve config directory (CLI flag > SUDO_USER > XDG > default)
     let explicit_override = args.config_dir.is_some();
     let mut config_dir = config::resolve_config_dir(args.config_dir.as_ref()).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(cli::output::ExitCode::GeneralError.code());
+        cli::output::print_error_and_exit(
+            output_mode,
+            "config",
+            cli::output::CliError {
+                code: "config_dir_invalid",
+                message: e.to_string(),
+                hint: None,
+            },
+            cli::output::ExitCode::GeneralError,
+        )
     });
 
     // Emergency release must remain available when settings, journals,
@@ -83,13 +98,6 @@ fn main() -> Result<()> {
     // authoritative config directory is the only startup input it needs.
     if matches!(args.command, Some(cli::args::Commands::ReleaseKillSwitch)) {
         config::set_config_dir(config_dir.clone());
-        let output_mode = if args.json {
-            cli::output::OutputMode::Json
-        } else if args.quiet {
-            cli::output::OutputMode::Quiet
-        } else {
-            cli::output::OutputMode::Human
-        };
         std::process::exit(cli::commands::handle_release_killswitch(
             &config_dir,
             output_mode,
@@ -398,20 +406,16 @@ fn main() -> Result<()> {
     // Load config.toml (or use defaults)
     let app_config = match config::load_effective_config(&config_dir) {
         Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            eprintln!();
-            eprintln!("Fix the file it names, or remove it to use defaults.");
-            std::process::exit(1);
-        }
-    };
-    // Determine output mode from global flags
-    let output_mode = if args.json {
-        cli::output::OutputMode::Json
-    } else if args.quiet {
-        cli::output::OutputMode::Quiet
-    } else {
-        cli::output::OutputMode::Human
+        Err(e) => cli::output::print_error_and_exit(
+            output_mode,
+            "config",
+            cli::output::CliError {
+                code: "config_invalid",
+                message: e,
+                hint: Some("Fix the setting it names, or remove it to use the default.".into()),
+            },
+            cli::output::ExitCode::GeneralError,
+        ),
     };
 
     let history = vortix::whats_new::status(&config_dir, constants::APP_VERSION);

@@ -67,8 +67,9 @@ EXIT CODES:
     1  General error
     2  Permission denied (needs sudo)
     3  Not found (profile doesn't exist)
-    4  State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix did not start)
-    5  Missing dependency (wg-quick, openvpn, netbird)
+    4  State conflict (a conflicting tunnel, another Vortix running, a tunnel Vortix
+       did not start, NetBird already in use, a taken name, a connected profile)
+    5  Missing dependency (wg-quick, openvpn, netbird, resolvconf/systemd-resolved)
     6  Timeout
     141 The output pipe closed early (for example, piped into head)";
 

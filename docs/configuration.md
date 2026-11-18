@@ -59,7 +59,7 @@ auto_reconnect = true                    # a profile that needs a password stops
 auto_reconnect_delay_secs = 3
 
 # Event log
-log_level = "info"
+log_level = "info"                       # debug, info, warning or error
 max_log_entries = 1000
 log_rotation_size = 5242880
 log_retention_days = 7

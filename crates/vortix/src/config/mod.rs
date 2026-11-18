@@ -490,7 +490,7 @@ pub fn load_effective_config(config_dir: &Path) -> Result<AppConfig, String> {
     })?;
     validate_engine_settings(&settings.engine).map_err(|error| {
         format!(
-            "Invalid engine setting in {} or {}: {error}",
+            "Invalid engine setting (in {}, {} or a VORTIX_ENGINE__ variable): {error}",
             config_dir.join("settings.toml").display(),
             config_dir.join(CONFIG_FILE).display()
         )
