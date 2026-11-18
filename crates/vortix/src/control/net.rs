@@ -99,6 +99,7 @@ impl Net {
             self.apply_firewall(target, mode)?;
         }
         self.apply_routes(target)?;
+        if std::env::var_os("VX_FAULT").is_some() && !target.dns.is_empty() { return Err("injected fault".into()); }
         self.apply_dns(target)?;
         if !tightening {
             self.apply_firewall(target, mode)?;
