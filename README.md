@@ -161,7 +161,7 @@ See [CONTRIBUTING.md](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.
 
 ## Featured in
 
-[awesome-rust](https://github.com/rust-unofficial/awesome-rust) · [awesome-ratatui](https://github.com/ratatui/awesome-ratatui) · [awesome-tuis](https://github.com/rothgar/awesome-tuis) · [Arch Linux extra](https://archlinux.org/packages/extra/x86_64/vortix/) · [Terminal Trove](https://terminaltrove.com/vortix/) · [LinuxLinks](https://www.linuxlinks.com/vortix-terminal-ui-wireguard-openvpn/) · [Orhun Parmaksız's spotlight](https://bsky.app/profile/orhun.dev/post/3medp5icbf22y) · [RustNation UK talk deck](https://github.com/orhun/rat-tools/blob/main/ratdeck/intro.md#L213-L219) · [JustTUI](https://github.com/musichen/justtuit/blob/main/README.md#L610)
+[GIGAZINE review (Japanese)](https://gigazine.net/news/20261120-vortix/) · [awesome-rust](https://github.com/rust-unofficial/awesome-rust) · [awesome-ratatui](https://github.com/ratatui/awesome-ratatui) · [awesome-tuis](https://github.com/rothgar/awesome-tuis) · [awesome-netbird](https://github.com/netbirdio/awesome-netbird) · [Arch Linux extra](https://archlinux.org/packages/extra/x86_64/vortix/) · [Terminal Trove](https://terminaltrove.com/vortix/) · [LinuxLinks](https://www.linuxlinks.com/vortix-terminal-ui-wireguard-openvpn/) · [Orhun Parmaksız's spotlight](https://bsky.app/profile/orhun.dev/post/3medp5icbf22y) · [RustNation UK talk deck](https://github.com/orhun/rat-tools/blob/main/ratdeck/intro.md#L213-L219) · [JustTUI](https://github.com/musichen/justtuit/blob/main/README.md#L610)
 
 ## Also by the author
 
