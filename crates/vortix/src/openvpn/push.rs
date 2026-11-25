@@ -10,12 +10,13 @@ use crate::openvpn::routes::{
 };
 
 use super::parser::{
-    merge_redirect_gateways, parse_default_route_metric, parse_ipv4_default_gateway,
-    parse_ipv6_default_gateway, parse_redirect_gateway, parse_route, OvpnParsedProfile, OvpnRoute,
+    merge_redirect_gateways, openvpn_space, option_words, parse_default_route_metric,
+    parse_ipv4_default_gateway, parse_ipv6_default_gateway, parse_redirect_gateway, parse_route,
+    OvpnParsedProfile, OvpnRoute,
 };
 
 const COMPLETED: &str = "Initialization Sequence Completed";
-const PUSH_REPLY: &str = "PUSH_REPLY";
+const PUSH_REPLY: &str = "PUSH: Received control message: 'PUSH_REPLY,";
 
 /// Route intent authenticated by the latest completed `OpenVPN` negotiation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +104,7 @@ pub(crate) fn openvpn_route_evidence(
         .iter()
         .map(canonical_openvpn_route)
         .collect::<Result<Vec<_>, _>>()?;
-    let pushed = pushed_route_evidence(log)?;
+    let pushed = pushed_route_evidence(parsed, log)?;
     if log_truncated && !pushed.push_reply_present() {
         return Err(OpenVpnRouteEvidenceError::Truncated);
     }
@@ -179,9 +180,10 @@ fn canonical_openvpn_route(route: &OvpnRoute) -> Result<OpenVpnRoute, OpenVpnRou
 /// being misreported as current. Physical gateway roles are preserved and
 /// resolved only at the authenticated OS-effect boundary.
 pub(crate) fn pushed_route_evidence(
+    parsed: &OvpnParsedProfile,
     log: &str,
 ) -> Result<PushedRouteEvidence, PushedRouteEvidenceError> {
-    let push_reply = latest_completed_push_reply(log)?;
+    let push_reply = latest_completed_push_options(parsed, log)?;
     let mut routes = Vec::new();
     let mut seen_routes = HashSet::new();
     let mut redirect_gateway = None;
@@ -197,13 +199,13 @@ pub(crate) fn pushed_route_evidence(
         });
     };
 
-    for option in push_reply.split(',') {
-        let option = option.trim().trim_matches(['\'', '"']);
-        let mut tokens = option.split_whitespace();
+    for option in push_reply {
+        let words = option_words(option);
+        let mut tokens = words.iter().map(String::as_str);
         let Some(directive) = tokens.next() else {
             continue;
         };
-        if directive.eq_ignore_ascii_case("route") || directive.eq_ignore_ascii_case("route-ipv6") {
+        if directive == "route" || directive == "route-ipv6" {
             let route = parse_route(&mut tokens).ok_or(PushedRouteEvidenceError::MalformedRoute)?;
             if seen_routes.insert(route.clone()) {
                 routes.push(route);
@@ -211,11 +213,11 @@ pub(crate) fn pushed_route_evidence(
             if routes.len() > MAX_ROUTES {
                 return Err(PushedRouteEvidenceError::CollectionLimit);
             }
-        } else if directive.eq_ignore_ascii_case("redirect-gateway") {
+        } else if directive == "redirect-gateway" {
             let parsed = parse_redirect_gateway(&mut tokens)
                 .ok_or(PushedRouteEvidenceError::MalformedRedirect)?;
             redirect_gateway = Some(merge_redirect_gateways(redirect_gateway.as_ref(), &parsed));
-        } else if directive.eq_ignore_ascii_case("redirect-gateway-ipv6") {
+        } else if directive == "redirect-gateway-ipv6" {
             if tokens.next().is_some() {
                 return Err(PushedRouteEvidenceError::MalformedRedirect);
             }
@@ -228,17 +230,17 @@ pub(crate) fn pushed_route_evidence(
                 redirect_gateway.as_ref(),
                 &ipv6_only,
             ));
-        } else if directive.eq_ignore_ascii_case("route-gateway") {
+        } else if directive == "route-gateway" {
             ipv4_gateway = Some(
                 parse_ipv4_default_gateway(&mut tokens)
                     .ok_or(PushedRouteEvidenceError::MalformedGateway)?,
             );
-        } else if directive.eq_ignore_ascii_case("route-ipv6-gateway") {
+        } else if directive == "route-ipv6-gateway" {
             ipv6_gateway = Some(
                 parse_ipv6_default_gateway(&mut tokens)
                     .ok_or(PushedRouteEvidenceError::MalformedGateway)?,
             );
-        } else if directive.eq_ignore_ascii_case("route-metric") {
+        } else if directive == "route-metric" {
             default_route_metric = Some(
                 parse_default_route_metric(&mut tokens)
                     .ok_or(PushedRouteEvidenceError::MalformedRoute)?,
@@ -257,19 +259,34 @@ pub(crate) fn pushed_route_evidence(
     })
 }
 
-pub(super) fn latest_completed_push_reply(
-    log: &str,
-) -> Result<Option<&str>, PushReplySelectionError> {
+/// Every option the latest completed negotiation pushed that the profile
+/// pulls. A long push arrives as several `PUSH_REPLY` messages, each but the
+/// last marked `push-continuation 2`.
+pub(super) fn latest_completed_push_options<'a>(
+    parsed: &OvpnParsedProfile,
+    log: &'a str,
+) -> Result<Option<Vec<&'a str>>, PushReplySelectionError> {
     let session_log = latest_completed_session(log)?;
-    let Some(push_at) = session_log.rfind(PUSH_REPLY) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        session_log[push_at + PUSH_REPLY.len()..]
-            .lines()
-            .next()
-            .unwrap_or_default(),
-    ))
+    let mut options: Option<Vec<&str>> = None;
+    let mut continued = false;
+    for message in session_log.lines().filter_map(push_reply) {
+        let message = message
+            .split(',')
+            .map(|option| option.trim_matches(|ch| openvpn_space(ch) || matches!(ch, '\'' | '"')))
+            .filter(|option| !option.is_empty())
+            .collect::<Vec<_>>();
+        if !continued {
+            options = Some(Vec::new());
+        }
+        continued = message.contains(&"push-continuation 2");
+        options.get_or_insert_default().extend(message);
+    }
+    Ok(options.map(|options| {
+        options
+            .into_iter()
+            .filter(|option| parsed.pull.pulls(option))
+            .collect()
+    }))
 }
 
 /// Return the transport address selected by the latest successful `OpenVPN`
@@ -298,7 +315,9 @@ fn latest_completed_session(log: &str) -> Result<&str, PushReplySelectionError> 
         .rfind(COMPLETED)
         .ok_or(PushReplySelectionError::NoCompletedNegotiation)?;
     let suffix = &log[completed_at + COMPLETED.len()..];
-    if suffix.contains(PUSH_REPLY) || contains_remote_transport_line(suffix) {
+    if suffix.lines().any(|line| push_reply(line).is_some())
+        || contains_remote_transport_line(suffix)
+    {
         return Err(PushReplySelectionError::NewerIncompleteNegotiation);
     }
     let completed_log = &log[..completed_at];
@@ -306,6 +325,13 @@ fn latest_completed_session(log: &str) -> Result<&str, PushReplySelectionError> 
         .rfind(COMPLETED)
         .map_or(0, |previous| previous + COMPLETED.len());
     Ok(&completed_log[session_start..])
+}
+
+/// The options of a `PUSH_REPLY` `OpenVPN` received, from its own log line;
+/// the text anywhere else, an unknown control message included, is not one.
+fn push_reply(line: &str) -> Option<&str> {
+    let at = line.find(PUSH_REPLY)?;
+    valid_openvpn_log_prefix(line[..at].trim()).then(|| &line[at + PUSH_REPLY.len()..])
 }
 
 fn contains_remote_transport_line(log: &str) -> bool {
@@ -326,15 +352,23 @@ fn remote_line_parts(line: &str) -> Option<(&str, &str)> {
     Some((protocol, line[marker_at + MARKER.len()..].trim()))
 }
 
+/// `OpenVPN` 2.6 stamps `2026-01-29 15:03:26`; 2.4 and 2.5 stamp
+/// `Thu Jan 29 15:03:26 2026`.
 fn valid_openvpn_log_prefix(prefix: &str) -> bool {
+    const NAMES: [&str; 19] = [
+        "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     prefix.is_empty()
         || prefix.split_whitespace().all(|token| {
-            token.strip_prefix("us=").is_some_and(|micros| {
-                !micros.is_empty() && micros.bytes().all(|byte| byte.is_ascii_digit())
-            }) || token.bytes().all(|byte| {
-                byte.is_ascii_digit()
-                    || matches!(byte, b'-' | b':' | b'+' | b'.' | b',' | b'T' | b'Z')
-            })
+            NAMES.contains(&token)
+                || token.strip_prefix("us=").is_some_and(|micros| {
+                    !micros.is_empty() && micros.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                || token.bytes().all(|byte| {
+                    byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b':' | b'+' | b'.' | b',' | b'T' | b'Z')
+                })
         })
 }
 
@@ -364,6 +398,7 @@ fn parse_selected_remote(remote: &str) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::parser::OvpnParsedProfile;
     use super::{
         openvpn_route_evidence, pushed_route_evidence, selected_remote_address,
         PushReplySelectionError, PushedRouteEvidenceError, SelectedRemoteEvidenceError,
@@ -378,7 +413,7 @@ mod tests {
         let evidence = openvpn_route_evidence(
             &parsed,
             "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
-             PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 1.1.1.1\n\
+             PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 1.1.1.1\n\
              Initialization Sequence Completed\n",
             false,
         )
@@ -401,7 +436,7 @@ mod tests {
         let error = openvpn_route_evidence(
             &parsed,
             "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
-             PUSH_REPLY,route 192.0.2.0 255.255.255.0 net_gateway\n\
+             PUSH: Received control message: 'PUSH_REPLY,route 192.0.2.0 255.255.255.0 net_gateway\n\
              Initialization Sequence Completed\n",
             false,
         )
@@ -416,6 +451,7 @@ mod tests {
     #[test]
     fn completed_push_reply_preserves_routes_gateways_metrics_and_redirects() {
         let evidence = pushed_route_evidence(
+            &OvpnParsedProfile::default(),
             "PUSH: Received control message: 'PUSH_REPLY,route 10.20.0.0 255.255.0.0 vpn_gateway 7,route-ipv6 2001:db8:42::/48 2001:db8::1 9,redirect-gateway def1,redirect-gateway-ipv6'\nInitialization Sequence Completed\n",
         )
         .unwrap();
@@ -441,7 +477,8 @@ mod tests {
     #[test]
     fn completed_push_reply_preserves_default_gateway_directives() {
         let evidence = pushed_route_evidence(
-            "PUSH_REPLY,route-gateway 10.8.0.1,route-ipv6-gateway 2001:db8::1,route-metric 31\nInitialization Sequence Completed\n",
+            &OvpnParsedProfile::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,route-gateway 10.8.0.1,route-ipv6-gateway 2001:db8::1,route-metric 31\nInitialization Sequence Completed\n",
         )
         .unwrap();
 
@@ -456,7 +493,8 @@ mod tests {
         assert_eq!(evidence.route_defaults().metric(), Some(31));
         assert!(matches!(
             pushed_route_evidence(
-                "PUSH_REPLY,route-gateway vpn.example.test\nInitialization Sequence Completed\n"
+                &OvpnParsedProfile::default(),
+                "PUSH: Received control message: 'PUSH_REPLY,route-gateway vpn.example.test\nInitialization Sequence Completed\n"
             ),
             Err(PushedRouteEvidenceError::MalformedGateway)
         ));
@@ -465,7 +503,8 @@ mod tests {
     #[test]
     fn route_evidence_uses_only_latest_complete_negotiation() {
         let evidence = pushed_route_evidence(
-            "PUSH_REPLY,route 10.1.0.0 255.255.0.0\nInitialization Sequence Completed\nPUSH_REPLY,route 10.2.0.0 255.255.0.0\nInitialization Sequence Completed\n",
+            &OvpnParsedProfile::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,route 10.1.0.0 255.255.0.0\nInitialization Sequence Completed\nPUSH: Received control message: 'PUSH_REPLY,route 10.2.0.0 255.255.0.0\nInitialization Sequence Completed\n",
         )
         .unwrap();
 
@@ -479,12 +518,17 @@ mod tests {
     #[test]
     fn incomplete_push_never_becomes_empty_route_truth() {
         assert_eq!(
-            pushed_route_evidence("PUSH_REPLY,route 10.0.0.0 255.0.0.0\n").unwrap_err(),
+            pushed_route_evidence(
+                &OvpnParsedProfile::default(),
+                "PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0 255.0.0.0\n"
+            )
+            .unwrap_err(),
             PushedRouteEvidenceError::Selection(PushReplySelectionError::NoCompletedNegotiation)
         );
         assert_eq!(
             pushed_route_evidence(
-                "PUSH_REPLY,route 10.0.0.0 255.0.0.0\nInitialization Sequence Completed\nPUSH_REPLY,route 192.0.2.0 255.255.255.0\n",
+            &OvpnParsedProfile::default(),
+                "PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0 255.0.0.0\nInitialization Sequence Completed\nPUSH: Received control message: 'PUSH_REPLY,route 192.0.2.0 255.255.255.0\n",
             )
             .unwrap_err(),
             PushedRouteEvidenceError::Selection(
@@ -492,7 +536,8 @@ mod tests {
             )
         );
         let physical = pushed_route_evidence(
-            "PUSH_REPLY,route 10.0.0.0 255.0.0.0 net_gateway\nInitialization Sequence Completed\n",
+            &OvpnParsedProfile::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0 255.0.0.0 net_gateway\nInitialization Sequence Completed\n",
         )
         .unwrap();
         assert_eq!(
@@ -503,7 +548,7 @@ mod tests {
 
     #[test]
     fn selected_remote_comes_from_the_latest_completed_session() {
-        let log = "UDPv4 link remote: [AF_INET]198.51.100.6:1194\nPUSH_REPLY,ping 10\nInitialization Sequence Completed\nUDPv4 link remote: [AF_INET]198.51.100.7:443\nPUSH_REPLY,ping 10\nInitialization Sequence Completed\n";
+        let log = "UDPv4 link remote: [AF_INET]198.51.100.6:1194\nPUSH: Received control message: 'PUSH_REPLY,ping 10\nInitialization Sequence Completed\nUDPv4 link remote: [AF_INET]198.51.100.7:443\nPUSH: Received control message: 'PUSH_REPLY,ping 10\nInitialization Sequence Completed\n";
 
         assert_eq!(
             selected_remote_address(log).unwrap(),
@@ -511,7 +556,7 @@ mod tests {
         );
         assert_eq!(
             selected_remote_address(
-                "TCPv6_CLIENT link remote: [AF_INET6]2001:db8::7:443\nPUSH_REPLY,ping 10\nInitialization Sequence Completed\n"
+                "TCPv6_CLIENT link remote: [AF_INET6]2001:db8::7:443\nPUSH: Received control message: 'PUSH_REPLY,ping 10\nInitialization Sequence Completed\n"
             )
             .unwrap(),
             Some("2001:db8::7".parse().unwrap())
@@ -522,13 +567,13 @@ mod tests {
     fn selected_remote_rejects_malformed_or_newer_incomplete_sessions() {
         assert_eq!(
             selected_remote_address(
-                "UDPv4 link remote: [AF_INET]198.51.100.7:not-a-port\nPUSH_REPLY,ping 10\nInitialization Sequence Completed\n"
+                "UDPv4 link remote: [AF_INET]198.51.100.7:not-a-port\nPUSH: Received control message: 'PUSH_REPLY,ping 10\nInitialization Sequence Completed\n"
             ),
             Err(SelectedRemoteEvidenceError::MalformedRemote)
         );
         assert_eq!(
             selected_remote_address(
-                "UDPv4 link remote: [AF_INET]198.51.100.7:1194\nPUSH_REPLY,ping 10\nInitialization Sequence Completed\nUDPv4 link remote: [AF_INET]192.0.2.8:1194\n"
+                "UDPv4 link remote: [AF_INET]198.51.100.7:1194\nPUSH: Received control message: 'PUSH_REPLY,ping 10\nInitialization Sequence Completed\nUDPv4 link remote: [AF_INET]192.0.2.8:1194\n"
             ),
             Err(SelectedRemoteEvidenceError::Selection(
                 PushReplySelectionError::NewerIncompleteNegotiation
@@ -540,6 +585,121 @@ mod tests {
             )
             .unwrap(),
             None
+        );
+    }
+    #[test]
+    fn a_push_split_by_push_continuation_keeps_every_part() {
+        let log = "2026-01-01 00:00:01 UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+                   2026-01-01 00:00:02 PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,route 10.1.0.0 255.255.0.0,push-continuation 2'\n\
+                   2026-01-01 00:00:02 PUSH: Received control message: 'PUSH_REPLY,route 10.2.0.0 255.255.0.0,push-continuation 1'\n\
+                   2026-01-01 00:00:03 Initialization Sequence Completed\n";
+        let evidence = pushed_route_evidence(&OvpnParsedProfile::default(), log).unwrap();
+        assert!(evidence.redirect_gateway().is_some());
+        assert_eq!(evidence.routes().len(), 2);
+    }
+
+    #[test]
+    fn a_restarted_push_replaces_the_earlier_attempt() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route 10.1.0.0 255.255.0.0\n\
+                   PUSH: Received control message: 'PUSH_REPLY,route 10.2.0.0 255.255.0.0\n\
+                   Initialization Sequence Completed\n";
+        assert_eq!(
+            pushed_route_evidence(&OvpnParsedProfile::default(), log)
+                .unwrap()
+                .routes()
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn openvpn_2_5_timestamps_still_name_the_selected_remote() {
+        let parsed =
+            crate::openvpn::parser::parse_ovpn_conf("client\nremote vpn.example 1194 udp\n")
+                .unwrap();
+        let log = "Thu Apr 29 15:03:26 2021 UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+                   Thu Apr 29 15:03:27 2021 PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1'\n\
+                   Thu Apr 29 15:03:28 2021 Initialization Sequence Completed\n";
+        let evidence = openvpn_route_evidence(&parsed, log, false).unwrap();
+        assert_eq!(
+            evidence.selected_remote(),
+            Some("198.51.100.7".parse().unwrap())
+        );
+    }
+    #[test]
+    fn route_nopull_takes_no_pushed_routes_or_redirect() {
+        let parsed = crate::openvpn::parser::parse_ovpn_conf(
+            "client\nremote 198.51.100.7 1194 udp\nroute-nopull\n",
+        )
+        .unwrap();
+        let evidence = openvpn_route_evidence(
+            &parsed,
+            "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+             PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,route 10.9.0.0 255.255.0.0\n\
+             Initialization Sequence Completed\n",
+            false,
+        )
+        .unwrap();
+        assert!(evidence.pushed().redirect_gateway().is_none());
+        assert!(evidence.pushed().routes().is_empty());
+    }
+
+    #[test]
+    fn the_first_matching_pull_filter_decides() {
+        let parsed = crate::openvpn::parser::parse_ovpn_conf(
+            "client\npull-filter ignore \"redirect-gateway\"\npull-filter accept \"route 10.9.\"\npull-filter ignore \"route \"\n",
+        )
+        .unwrap();
+        let evidence = pushed_route_evidence(
+            &parsed,
+            "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,route 10.9.0.0 255.255.0.0,route 10.8.0.0 255.255.0.0\n\
+             Initialization Sequence Completed\n",
+        )
+        .unwrap();
+        assert!(evidence.redirect_gateway().is_none());
+        assert_eq!(evidence.routes().len(), 1);
+        assert_eq!(evidence.routes()[0].destination.to_string(), "10.9.0.0/16");
+    }
+    #[test]
+    fn a_pushed_option_in_another_case_is_ignored_like_openvpn_does() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,Redirect-Gateway def1,ROUTE 10.9.0.0 255.255.0.0'\n\
+                   Initialization Sequence Completed\n";
+        let evidence = pushed_route_evidence(&OvpnParsedProfile::default(), log).unwrap();
+        assert!(evidence.redirect_gateway().is_none());
+        assert!(evidence.routes().is_empty());
+    }
+
+    #[test]
+    fn only_a_received_push_reply_line_is_read() {
+        let log = "2026-01-01 00:00:01 WARNING: Received unknown control message: XPUSH_REPLY,route 10.66.0.0 255.255.0.0,push-continuation 2\n\
+                   2026-01-01 00:00:02 PUSH: Received control message: 'PUSH_REPLY,route 10.2.0.0 255.255.0.0'\n\
+                   2026-01-01 00:00:03 Initialization Sequence Completed\n\
+                   2026-01-01 00:00:04 PUSH: Received control message: 'XPUSH_REPLY,route 10.67.0.0 255.255.0.0'\n";
+        let evidence = pushed_route_evidence(&OvpnParsedProfile::default(), log).unwrap();
+        assert_eq!(evidence.routes().len(), 1);
+        assert_eq!(evidence.routes()[0].destination.to_string(), "10.2.0.0/16");
+    }
+
+    #[test]
+    fn pushed_options_split_only_on_openvpn_whitespace() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway\u{a0}def1,route\u{a0}10.9.0.0 255.255.0.0,route\u{2003}10.8.0.0 255.255.0.0'\n\
+                   Initialization Sequence Completed\n";
+        let evidence = pushed_route_evidence(&OvpnParsedProfile::default(), log).unwrap();
+        assert!(evidence.redirect_gateway().is_none());
+        assert!(evidence.routes().is_empty());
+        // C `isspace`, which OpenVPN splits on, includes the vertical tab.
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route\x0b10.9.0.0 255.255.0.0'\n\
+                   Initialization Sequence Completed\n";
+        let nopull = crate::openvpn::parser::parse_ovpn_conf("client\nroute-nopull\n").unwrap();
+        assert!(pushed_route_evidence(&nopull, log)
+            .unwrap()
+            .routes()
+            .is_empty());
+        assert_eq!(
+            pushed_route_evidence(&OvpnParsedProfile::default(), log)
+                .unwrap()
+                .routes()
+                .len(),
+            1
         );
     }
 }

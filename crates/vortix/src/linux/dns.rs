@@ -1118,8 +1118,10 @@ pub(crate) fn parse_nmcli_dns_server(text: &str) -> Option<String> {
 
 /// Try to get DNS from resolvectl (systemd-resolved, most modern distros).
 fn try_get_dns_resolvectl() -> Option<String> {
-    let output =
-        crate::process::run(CommandSpec::oneshot("resolvectl", vec!["status".into()])).ok()?;
+    let output = crate::process::run(
+        CommandSpec::oneshot("resolvectl", vec!["status".into()]).timeout(Duration::from_secs(2)),
+    )
+    .ok()?;
 
     if !output.success() {
         return None;
@@ -1130,10 +1132,10 @@ fn try_get_dns_resolvectl() -> Option<String> {
 
 /// Try to get DNS from `nmcli` (`NetworkManager` distros).
 fn try_get_dns_nmcli() -> Option<String> {
-    let output = crate::process::run(CommandSpec::oneshot(
-        "nmcli",
-        vec!["dev".into(), "show".into()],
-    ))
+    let output = crate::process::run(
+        CommandSpec::oneshot("nmcli", vec!["dev".into(), "show".into()])
+            .timeout(Duration::from_secs(2)),
+    )
     .ok()?;
 
     if !output.success() {

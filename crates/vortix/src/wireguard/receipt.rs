@@ -198,7 +198,7 @@ pub fn update_health(
     if current.generation != receipt.generation || current.handshake != receipt.handshake {
         return Ok(None);
     }
-    if current.last_health == health {
+    if current.last_health.same_state(&health) {
         return Ok(None);
     }
     let prior = std::mem::replace(&mut current.last_health, health);
@@ -367,7 +367,7 @@ pub fn health_from_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tunnel::TunnelPeerStatus;
+    use crate::tunnel::{DegradedReason, TunnelPeerStatus};
     use std::time::Duration;
 
     fn evidence(generation: u64, at: SystemTime) -> HandshakeEvidence {
@@ -378,6 +378,41 @@ mod tests {
             observed_at: at,
             allowed_routes: vec!["0.0.0.0/0".into()],
         }
+    }
+
+    /// A stale peer's age grows every scan; only a change of state is a new health.
+    #[test]
+    fn a_growing_stale_age_is_not_a_health_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = ProfileId::new("stale");
+        let at = SystemTime::now() - Duration::from_secs(10);
+        let mut receipt = issue(
+            dir.path(),
+            &profile,
+            "wg0".into(),
+            3,
+            evidence(3, at),
+            vec![],
+        )
+        .unwrap();
+        let stale = |age| ConnectionHealth::Degraded {
+            reason: DegradedReason::WireGuardPeerStale {
+                peer_public_key: "peer-a".into(),
+                allowed_routes: vec!["0.0.0.0/0".into()],
+                seconds_since_last_handshake: age,
+            },
+        };
+        assert!(update_health(dir.path(), &mut receipt, stale(200))
+            .unwrap()
+            .is_some());
+        assert!(update_health(dir.path(), &mut receipt, stale(201))
+            .unwrap()
+            .is_none());
+        assert!(
+            update_health(dir.path(), &mut receipt, ConnectionHealth::Healthy)
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A receipt copies the peer's routes for the handshake and its probe; at

@@ -824,7 +824,7 @@ impl std::fmt::Display for SocketProtocol {
             Self::Tcp6 => "tcp6",
             Self::Udp6 => "udp6",
         };
-        f.write_str(s)
+        f.pad(s)
     }
 }
 
@@ -849,10 +849,8 @@ pub struct SocketSnapshot {
     pub remote: Option<SocketAddr>,
     /// Transport protocol.
     pub protocol: SocketProtocol,
-    /// Routing interface (e.g. `en0`, `wg0`, `tun0`). `None` when the
-    /// platform impl can't resolve it for this socket; the audit CLI
-    /// renders this as a useful hint for "is this traffic going
-    /// through the tunnel?"
+    /// Interface that routes the remote end (e.g. `en0`, `utun4`); filled
+    /// by `vortix audit`, `None` for sockets with no remote.
     pub interface: Option<String>,
 }
 
@@ -860,9 +858,7 @@ pub struct SocketSnapshot {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SocketAuditError {
-    /// The platform impl is a stub (Windows in v0.3.0). The CLI
-    /// surfaces this as "socket audit not available on this platform"
-    /// without a panic.
+    /// No socket audit on this platform.
     #[error("socket audit is not available on this platform")]
     Unsupported,
     /// The underlying tool (`ps`, `lsof`, file read) failed.
@@ -1095,6 +1091,7 @@ mod tests {
     fn socket_protocol_display() {
         assert_eq!(format!("{}", SocketProtocol::Tcp), "tcp");
         assert_eq!(format!("{}", SocketProtocol::Udp6), "udp6");
+        assert_eq!(format!("{:<5}|", SocketProtocol::Tcp), "tcp  |");
     }
 
     #[test]

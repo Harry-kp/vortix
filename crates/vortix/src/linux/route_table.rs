@@ -225,10 +225,12 @@ fn run_ip_route_show_default(v4: bool) -> Option<String> {
 }
 
 /// The `via` gateway of a default route; an IPv6 one gets `%<dev>`, since a
-/// link-local next hop means nothing without its device.
+/// link-local next hop means nothing without its device. Both come from the
+/// same line: an earlier `default dev ppp0` has a device but no gateway.
 fn parse_default_gateway(text: &str) -> Option<String> {
-    let gateway = parse_gateway(text)?;
-    let device = text
+    let line = text.lines().find(|line| parse_gateway(line).is_some())?;
+    let gateway = parse_gateway(line)?;
+    let device = line
         .split_whitespace()
         .skip_while(|token| *token != "dev")
         .nth(1);
@@ -383,6 +385,22 @@ mod tests {
         assert_eq!(
             parse_default_gateway("default via 192.168.1.1 dev wlp3s0 proto dhcp\n").as_deref(),
             Some("192.168.1.1")
+        );
+    }
+
+    #[test]
+    fn the_gateway_and_its_device_come_from_the_same_default_row() {
+        let text = "default dev ppp0 proto static metric 512 pref medium\n\
+                    default via fe80::1 dev wlan0 proto ra metric 600 pref medium\n";
+        assert_eq!(
+            parse_default_gateway(text).as_deref(),
+            Some("fe80::1%wlan0")
+        );
+        let multipath = "default proto ra metric 600 pref medium\n\
+                         \tnexthop via fe80::1 dev wlan0 weight 1\n";
+        assert_eq!(
+            parse_default_gateway(multipath).as_deref(),
+            Some("fe80::1%wlan0")
         );
     }
 

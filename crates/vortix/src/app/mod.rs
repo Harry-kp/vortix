@@ -71,10 +71,7 @@ impl CachedConfigView {
     #[must_use]
     pub fn from_content(content: String, choice: crate::ui::theme::ThemeChoice) -> Self {
         let highlighted_lines = crate::ui::theme::with_choice(choice, || {
-            content
-                .lines()
-                .map(crate::ui::overlays::config_viewer::highlight_config_line)
-                .collect::<Vec<Line<'static>>>()
+            crate::ui::overlays::config_viewer::highlight_config(&content)
         });
         let total_lines = u16::try_from(highlighted_lines.len()).unwrap_or(u16::MAX);
         Self {
@@ -354,12 +351,6 @@ impl App {
         for state in self.flip_states.values_mut() {
             state.tick();
         }
-    }
-
-    /// Effective flip state for rendering, accounting for mid-animation view swap.
-    #[must_use]
-    pub fn effective_flipped(&self, panel: &FocusedPanel) -> bool {
-        self.is_flipped(panel)
     }
 
     /// Borrow the flip state for `panel`, creating a default one if missing.

@@ -83,7 +83,6 @@ pub struct VpnRuntime {
     pub telemetry_epoch: u64,
     pub(crate) cmd_tx: mpsc::Sender<Message>,
     pub(crate) cmd_rx: mpsc::Receiver<Message>,
-    pub(crate) netstats_rx: Option<mpsc::Receiver<(u64, u64)>>,
     pub(crate) last_bytes_in: u64,
     pub(crate) last_bytes_out: u64,
 }
@@ -150,7 +149,6 @@ impl VpnRuntime {
             telemetry_epoch: 0,
             cmd_tx,
             cmd_rx,
-            netstats_rx: None,
             last_bytes_in: 0,
             last_bytes_out: 0,
         }
@@ -279,41 +277,15 @@ impl App {
             let _ = nudge.send(self.runtime.telemetry_epoch);
         }
     }
-    /// Poll the network stats channel and kick off a new fetch if idle.
-    ///
-    /// The background thread just reads raw byte totals from the OS.
-    /// Delta calculation (bytes/sec) stays here in the App, keeping state local.
+    /// Bytes moved since the last tick, from the OS's interface counters.
     pub(crate) fn poll_network_stats(&mut self) {
-        // 1. Try to collect a result from the previous fetch
-        if let Some(rx) = &self.runtime.netstats_rx {
-            match rx.try_recv() {
-                Ok((total_in, total_out)) => {
-                    if self.runtime.last_bytes_in > 0 {
-                        self.runtime.current_down =
-                            total_in.saturating_sub(self.runtime.last_bytes_in);
-                        self.runtime.current_up =
-                            total_out.saturating_sub(self.runtime.last_bytes_out);
-                    }
-                    self.runtime.last_bytes_in = total_in;
-                    self.runtime.last_bytes_out = total_out;
-                    self.runtime.netstats_rx = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    return;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.runtime.netstats_rx = None;
-                }
-            }
+        let (total_in, total_out) = crate::platform::NetworkStats::get_total_bytes();
+        if self.runtime.last_bytes_in > 0 {
+            self.runtime.current_down = total_in.saturating_sub(self.runtime.last_bytes_in);
+            self.runtime.current_up = total_out.saturating_sub(self.runtime.last_bytes_out);
         }
-
-        // 2. Kick off a new fetch via the platform aggregate.
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let totals = crate::platform::NetworkStats::get_total_bytes();
-            let _ = tx.send(totals);
-        });
-        self.runtime.netstats_rx = Some(rx);
+        self.runtime.last_bytes_in = total_in;
+        self.runtime.last_bytes_out = total_out;
     }
 }
 

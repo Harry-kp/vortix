@@ -28,6 +28,7 @@ Every file Vortix writes there is owned by you and private, including under `sud
 ├── state-version      the Vortix version that last ran here (for the upgrade notes)
 ├── endpoints.json     each server hostname's last address, used when DNS gives no answer within 2 s
 ├── killswitch.state   the saved kill-switch mode
+├── lifecycle.lock     held while a Vortix session or command manages VPN state
 ├── real-ip.cache      last seen address without a VPN
 └── real-ipv6.cache
 ```
@@ -47,18 +48,18 @@ api_timeout = 5
 ping_timeout = 2
 
 # Connecting and reconnecting (seconds)
-connect_timeout = 35                     # OpenVPN and NetBird, including a NetBird login
+connect_timeout = 35                     # 1–600; OpenVPN and NetBird, including a NetBird login
 wireguard_handshake_timeout_secs = 20
 wireguard_handshake_stale_secs = 180
 disconnect_timeout = 30
 connect_max_retries = 3
 connect_retry_base_delay_secs = 2
 connect_retry_max_delay_secs = 300
-auto_reconnect = true
+auto_reconnect = true                    # a profile that needs a password stops and waits for `r`
 auto_reconnect_delay_secs = 3
 
 # Event log
-log_level = "info"
+log_level = "info"                       # debug, info, warning or error
 max_log_entries = 1000
 log_rotation_size = 5242880
 log_retention_days = 7
@@ -82,15 +83,15 @@ designed for dark backgrounds.
 ```toml
 [engine]
 openvpn_verbosity = "3"
-connect_timeout_secs = 35                # OpenVPN and NetBird, including a NetBird login
+connect_timeout_secs = 35                # 1–600; OpenVPN and NetBird, including a NetBird login
 wireguard_handshake_timeout_secs = 20    # 1–300
 wireguard_handshake_stale_secs = 180     # 1–86400
-wireguard_health_targets = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]   # up to 64 addresses
+wireguard_health_targets = ["1.1.1.1"]   # default: config.toml's ping_targets; up to 64 addresses
 
 [journal]
 disk = true              # false: keep no session journals on disk
 retention_days = 30
-retention_count = 30
+retention_count = 30     # at most this many; a run that records no event writes none
 ```
 
 The five `[engine]` keys also exist in `config.toml` (under slightly different names for
@@ -117,11 +118,14 @@ timeout_secs = 5          # default 5, at most 60
 Hooks run as you, not root, after the change has happened, with a clean environment plus
 `VORTIX_EVENT`, `VORTIX_EVENT_ID`, `VORTIX_PROFILE_ID`, `VORTIX_PROFILE_NAME` and
 `VORTIX_PROTOCOL` (`wireguard`, `openvpn` or `netbird`). They cannot block or delay a connect, run at most once per event, and can be
-lost if Vortix crashes. Up to 64 hooks.
+lost if Vortix crashes. `reconnecting` fires on a reconnect (`r`) and when Vortix will
+reconnect a dropped tunnel by itself. `VORTIX_EVENT_ID` is unique per event, across runs too.
+A hook that fails, times out or prints too much shows a warning in the Event Log. Up to 64 hooks.
 
 ## DNS
 
-When a tunnel carries DNS (WireGuard `DNS =`, or DNS an OpenVPN server pushes), Vortix applies
+When a tunnel carries DNS (WireGuard `DNS =`, or OpenVPN `dhcp-option` and `dns`, set in the
+profile or pushed by the server), Vortix applies
 it and restores the previous resolvers on disconnect. A NetBird network's own client sets its
 DNS, and Vortix leaves it alone.
 
@@ -130,10 +134,13 @@ DNS, and Vortix leaves it alone.
   not an IP address, or an OpenVPN `DOMAIN`), on macOS and with systemd-resolved; otherwise
   they are not used.
 
-- **macOS:** System Configuration.
+- **macOS:** System Configuration, on the primary network service. When another service
+  becomes primary (Wi-Fi to Ethernet), the DNS moves to it and the old service gets its own back.
 - **Linux:** systemd-resolved (per-link, through `resolvectl`), else `resolvconf`. With
   neither, a profile that carries DNS is refused as a missing dependency. NetworkManager and
   `/etc/resolv.conf` are only read, to show the current resolver.
 
 If the resolvers cannot be applied, the tunnel stays up, Security Guard shows DNS `Unverified`
-and the kill switch `Degraded`, and Vortix keeps retrying.
+and, unless the kill switch is off, the kill switch `Degraded`, and Vortix keeps retrying.
+Every 10 seconds Vortix reads the applied resolvers back and reapplies them if other software
+changed them, with one warning in the Event Log.

@@ -17,7 +17,7 @@ use crate::profile::{ProfileId, ProtocolKind};
 use crate::tunnel::{TunnelCancellation, TunnelExecutionContext};
 use crate::wireguard::ownership::TunnelOwnershipStore;
 
-use super::net::Net;
+use super::net::{HostCheck, Net};
 use super::plan::{plan, NetworkPlan};
 use super::specs::{self, Entry};
 use super::state::{Phase, Refusal, State};
@@ -28,6 +28,8 @@ use super::{
 
 const SCAN_EVERY: Duration = Duration::from_secs(1);
 const APPLY_RETRY: Duration = Duration::from_secs(2);
+/// How often a scan also reads back the firewall and DNS Vortix applied.
+const HOST_CHECK_EVERY: Duration = Duration::from_secs(10);
 const KEPT_NOTICES: usize = 64;
 const KEPT_OUTCOMES: usize = 256;
 
@@ -45,9 +47,14 @@ pub(super) enum Event {
     Scanned {
         result: ScannerResult,
         started: Instant,
+        /// The plan read back with this scan, and what no longer matches it.
+        checked: Option<(NetworkPlan, Option<String>)>,
     },
     /// A dropped tunnel's teardown finished.
-    Drained { profile_id: ProfileId },
+    Drained {
+        profile_id: ProfileId,
+        result: Result<(), (Live, String)>,
+    },
     /// A connect in progress needs the user, e.g. to log in.
     Progress { profile_id: ProfileId, text: String },
 }
@@ -83,6 +90,8 @@ pub(super) struct Engine {
     outcomes: BTreeMap<u64, Outcome>,
     notices: VecDeque<Notice>,
     seq: u64,
+    /// Start time; prefixes hook event ids so they differ between runs.
+    started_ms: u64,
     drops: u32,
     net: Net,
     applied: Option<NetworkPlan>,
@@ -96,10 +105,17 @@ pub(super) struct Engine {
     scan: Option<ScannerResult>,
     scanning: bool,
     next_scan: Instant,
+    host_checked_at: Instant,
+    /// A drift was announced; quiet until a read-back matches again.
+    host_drifted: bool,
     external: Vec<String>,
     last_connected: BTreeMap<ProfileId, SystemTime>,
     last_generation: u64,
-    hooks: Option<(tokio::runtime::Runtime, crate::hooks::HookRunner)>,
+    hooks: Option<(
+        tokio::runtime::Runtime,
+        crate::hooks::HookRunner,
+        crate::hooks::HookDiagnostics,
+    )>,
     health: BTreeMap<
         ProfileId,
         (
@@ -194,6 +210,7 @@ impl Engine {
             outcomes: BTreeMap::new(),
             notices: VecDeque::new(),
             seq: 0,
+            started_ms: super::dns::now_unix_ms(),
             drops: 0,
             applied: None,
             apply_error: None,
@@ -206,6 +223,8 @@ impl Engine {
             scan: None,
             scanning: false,
             next_scan: Instant::now() + SCAN_EVERY,
+            host_checked_at: Instant::now(),
+            host_drifted: false,
             external: Vec::new(),
             last_connected,
             last_generation: 0,
@@ -256,7 +275,7 @@ impl Engine {
             }
         }
         self.finish_transitions(rx);
-        if let Some((runtime, hooks)) = self.hooks.take() {
+        if let Some((runtime, hooks, _)) = self.hooks.take() {
             runtime.block_on(hooks.shutdown_bounded(Duration::from_secs(2)));
         }
     }
@@ -335,8 +354,17 @@ impl Engine {
                     used_saved,
                 } => self.started(&profile_id, result, remember, used_saved),
                 Event::Stopped { profile_id, result } => self.stopped(&profile_id, result),
-                Event::Scanned { result, started } => self.scanned(result, started),
-                Event::Drained { profile_id } => self.drained(&profile_id),
+                Event::Scanned {
+                    result,
+                    started,
+                    checked,
+                } => {
+                    self.scanned(result, started);
+                    if let Some((plan, drift)) = checked {
+                        self.host_checked(&plan, drift);
+                    }
+                }
+                Event::Drained { profile_id, result } => self.drained(&profile_id, result),
                 Event::Progress { profile_id, text } => {
                     self.actions.insert(profile_id, text);
                 }
@@ -412,6 +440,27 @@ impl Engine {
                 return;
             }
         };
+        // A tunnel Vortix did not start cannot be stopped or switched away
+        // from; a full tunnel stacked on top of one broke the host's routing.
+        let blocking = self.external.iter().find(|name| {
+            **name == entry.profile.name
+                || (crate::cidr::is_full(&spec.routes)
+                    && self.entries.values().any(|other| {
+                        other.profile.name == **name
+                            && other
+                                .spec
+                                .as_ref()
+                                .is_ok_and(|other| crate::cidr::is_full(&other.routes))
+                    }))
+        });
+        if let Some(name) = blocking {
+            let text = format!(
+                "'{name}' is up but Vortix did not start it; stop it with the tool that started it, or restart the computer"
+            );
+            self.notice(Level::Error, text.clone());
+            self.outcomes.insert(ticket, Outcome::Failed(text));
+            return;
+        }
         // A running tunnel knows the routes its server pushed.
         let known = self
             .state
@@ -428,10 +477,12 @@ impl Engine {
             // Linux refuses a second identical route, so a tunnel cannot come
             // up beside one with the same split routes: stop those first.
             if !overlapping.is_empty() {
+                // Registered first: a peer with nothing running stops at once.
+                self.after_stop
+                    .insert(profile_id, (ticket, overlapping.clone()));
                 for peer in &overlapping {
                     self.stop(peer);
                 }
-                self.after_stop.insert(profile_id, (ticket, overlapping));
                 return;
             }
         }
@@ -547,7 +598,14 @@ impl Engine {
                 if let Err(error) = store.touch(profile_id) {
                     tracing::warn!(%error, "could not record last-used time");
                 }
+                // Move the shared routes and DNS to this tunnel before the old
+                // one's teardown runs: `wg-quick down` on macOS deletes routes
+                // by destination, so a retarget racing it left no VPN route.
+                if !replaced.is_empty() {
+                    self.reconcile();
+                }
                 for peer in replaced {
+                    self.hook(HookEvent::DisconnectStarted, &peer);
                     self.begin_stop(&peer);
                 }
                 if let Some((username, password)) = remember {
@@ -559,14 +617,24 @@ impl Engine {
             }
             Ok(live) => self.spawn_stop(profile_id, live),
             Err(error) => {
-                if error == StartError::AuthFailed && used_saved {
-                    if let Ok(store) = self.credentials.lock() {
-                        let _ = store.clear(profile_id, &name);
-                    }
-                    self.notice(
-                        Level::Warning,
-                        format!("Saved credentials for '{name}' were rejected and removed"),
-                    );
+                if matches!(error, StartError::AuthFailed(_)) && used_saved {
+                    let cleared = self
+                        .credentials
+                        .lock()
+                        .map_err(|_| "credential store is unavailable".to_owned())
+                        .and_then(|store| {
+                            store
+                                .clear(profile_id, &name)
+                                .map(drop)
+                                .map_err(|error| error.to_string())
+                        });
+                    let text = match cleared {
+                        Ok(()) => format!("Saved credentials for '{name}' were rejected and removed"),
+                        Err(error) => format!(
+                            "Saved credentials for '{name}' were rejected but could not be removed: {error}"
+                        ),
+                    };
+                    self.notice(Level::Warning, text);
                 }
                 if phase == Some(Phase::Stopping) {
                     self.finish_stop(profile_id);
@@ -743,16 +811,9 @@ impl Engine {
         self.drops = self.drops.saturating_add(1);
         let name = self.name(profile_id);
         let draining = if let Some(live) = self.live.remove(profile_id) {
-            let settings = self.config.tunnels.clone();
-            let ownership = Arc::clone(&self.ownership);
-            let tx = self.tx.clone();
-            let profile_id = profile_id.clone();
-            std::thread::spawn(move || {
-                // Drained must arrive even if the stop panics, or the retry never runs.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tunnels::stop(&settings, &ownership, live)
-                }));
-                let _ = tx.send(Msg::Event(Box::new(Event::Drained { profile_id })));
+            self.spawn_teardown(profile_id, live, |profile_id, result| Event::Drained {
+                profile_id,
+                result,
             });
             true
         } else {
@@ -773,7 +834,9 @@ impl Engine {
             (false, false) => format!("'{name}' dropped. Reconnect or disconnect it."),
         };
         self.notice(Level::Warning, text);
-        self.hook(HookEvent::Reconnecting, profile_id);
+        if retry_at.is_some() {
+            self.hook(HookEvent::Reconnecting, profile_id);
+        }
     }
 
     // ── stopping ────────────────────────────────────────────────────────
@@ -805,9 +868,15 @@ impl Engine {
         }
     }
 
-    fn drained(&mut self, profile_id: &ProfileId) {
+    fn drained(&mut self, profile_id: &ProfileId, result: Result<(), (Live, String)>) {
         // The teardown may have removed routes the plan needs, as in `stopped`.
         self.applied = None;
+        if result.is_err() {
+            // What is left of it must not run beside a retry.
+            self.state.drained(profile_id);
+            self.stopped(profile_id, result);
+            return;
+        }
         let stopping = self
             .state
             .get(profile_id)
@@ -945,6 +1014,21 @@ impl Engine {
     }
 
     fn spawn_stop(&self, profile_id: &ProfileId, live: Live) {
+        self.spawn_teardown(profile_id, live, |profile_id, result| Event::Stopped {
+            profile_id,
+            result,
+        });
+    }
+
+    /// Tear `live` down off the engine thread and report it as `event`. The
+    /// event arrives even if the teardown panics, or the tunnel would stay
+    /// stopping (or its retry never run).
+    fn spawn_teardown(
+        &self,
+        profile_id: &ProfileId,
+        live: Live,
+        event: fn(ProfileId, Result<(), (Live, String)>) -> Event,
+    ) {
         let settings = self.config.tunnels.clone();
         let ownership = Arc::clone(&self.ownership);
         let tx = self.tx.clone();
@@ -954,15 +1038,20 @@ impl Engine {
                 kind: live.kind.clone(),
                 handle: live.handle.clone(),
             };
-            let result =
-                tunnels::stop(&settings, &ownership, live).map_err(|error| (backup, error));
-            let _ = tx.send(Msg::Event(Box::new(Event::Stopped { profile_id, result })));
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tunnels::stop(&settings, &ownership, live)
+            })) {
+                Ok(result) => result.map_err(|error| (backup, error)),
+                Err(_) => Err((backup, "the teardown panicked".into())),
+            };
+            let _ = tx.send(Msg::Event(Box::new(event(profile_id, result))));
         });
     }
 
     // ── loop steps ──────────────────────────────────────────────────────
 
     fn tick(&mut self) {
+        self.report_hook_failures();
         let now = Instant::now();
         let due = self
             .state
@@ -984,6 +1073,13 @@ impl Engine {
                 // A recovery cannot stop to ask; it waits for the user.
                 Need::Prompt(_) => {
                     self.state.start_failed(&profile_id, None);
+                    let name = self.name(&profile_id);
+                    let text = format!(
+                        "Gave up reconnecting '{name}': it needs your password. Reconnect to enter it."
+                    );
+                    self.errors.insert(profile_id.clone(), text.clone());
+                    self.notice(Level::Warning, text);
+                    self.hook(HookEvent::ConnectFailed, &profile_id);
                 }
             }
         }
@@ -994,13 +1090,53 @@ impl Engine {
                 .values()
                 .map(|entry| entry.profile.clone())
                 .collect::<Vec<_>>();
+            let check = self.host_check_due(now);
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let started = Instant::now();
                 let result = crate::control::scanner::gather_system_state(&catalog);
-                let _ = tx.send(Msg::Event(Box::new(Event::Scanned { result, started })));
+                let checked = check.map(|check| {
+                    let drift = check.drift();
+                    (check.plan, drift)
+                });
+                let _ = tx.send(Msg::Event(Box::new(Event::Scanned {
+                    result,
+                    started,
+                    checked,
+                })));
             });
         }
+    }
+
+    /// The applied plan to read back with this scan, at most every
+    /// [`HOST_CHECK_EVERY`] and only while it holds something others can undo.
+    fn host_check_due(&mut self, now: Instant) -> Option<HostCheck> {
+        if self.apply_error.is_some() || now < self.host_checked_at + HOST_CHECK_EVERY {
+            return None;
+        }
+        let check = self.net.host_check(self.applied.as_ref()?)?;
+        self.host_checked_at = now;
+        Some(check)
+    }
+
+    /// Something outside Vortix changed what it applied: forget the applied
+    /// state so the next reconcile puts it back. A result for a plan that has
+    /// since changed is stale and dropped.
+    fn host_checked(&mut self, plan: &NetworkPlan, drift: Option<String>) {
+        if self.applied.as_ref() != Some(plan) {
+            return;
+        }
+        let Some(drift) = drift else {
+            self.host_drifted = false;
+            return;
+        };
+        tracing::warn!(target: "vortix::engine", %drift, "applied network state drifted");
+        if !self.host_drifted {
+            self.host_drifted = true;
+            self.notice(Level::Warning, format!("{drift}; restoring it"));
+        }
+        self.net.forget_applied();
+        self.applied = None;
     }
 
     fn reconcile(&mut self) {
@@ -1364,6 +1500,20 @@ impl Engine {
         )
     }
 
+    fn report_hook_failures(&mut self) {
+        let mut failures = Vec::new();
+        if let Some((_, _, diagnostics)) = &mut self.hooks {
+            while let Ok(diagnostic) = diagnostics.try_recv() {
+                if let crate::hooks::HookDiagnosticKind::Failed(failure) = diagnostic.kind {
+                    failures.push((diagnostic.attempt_id.hook_index + 1, failure));
+                }
+            }
+        }
+        for (hook, failure) in failures {
+            self.notice(Level::Warning, format!("Hook {hook} failed: {failure}"));
+        }
+    }
+
     fn notice(&mut self, level: Level, text: String) {
         tracing::info!(target: "vortix::engine", ?level, %text);
         if let Some(journal) = crate::journal::global_journal() {
@@ -1384,7 +1534,7 @@ impl Engine {
     }
 
     fn hook(&mut self, event: HookEvent, profile_id: &ProfileId) {
-        let Some((_, hooks)) = &self.hooks else {
+        let Some((_, hooks, _)) = &self.hooks else {
             return;
         };
         let Some(entry) = self.entries.get(profile_id) else {
@@ -1392,7 +1542,7 @@ impl Engine {
         };
         self.seq += 1;
         hooks.dispatcher().dispatch(&LifecycleFact {
-            event_id: HookEventId::from_parts(1, self.seq),
+            event_id: HookEventId::from_parts(self.started_ms, self.seq),
             event,
             profile_id: profile_id.clone(),
             display_name: entry.profile.name.clone(),
@@ -1408,18 +1558,22 @@ fn session<'a>(sessions: &'a [ActiveSession], name: &str) -> Option<&'a ActiveSe
 
 fn start_hooks(
     config_dir: &std::path::Path,
-) -> Option<(tokio::runtime::Runtime, crate::hooks::HookRunner)> {
+) -> Option<(
+    tokio::runtime::Runtime,
+    crate::hooks::HookRunner,
+    crate::hooks::HookDiagnostics,
+)> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("vortix-hooks")
         .enable_all()
         .build()
         .ok()?;
-    let runner = {
+    let (runner, diagnostics) = {
         let _guard = runtime.enter();
         crate::hooks::start(config_dir)?
     };
-    Some((runtime, runner))
+    Some((runtime, runner, diagnostics))
 }
 
 #[cfg(test)]
@@ -1433,6 +1587,448 @@ mod tests {
             range: range.into(),
             selected,
         }
+    }
+
+    fn ovpn(dir: &std::path::Path, name: &str, server: u8) -> crate::config::profiles::VpnProfile {
+        let path = dir.join(format!("{name}.ovpn"));
+        std::fs::write(
+            &path,
+            format!("client\ndev tun\nremote 203.0.113.{server} 1194\nroute 10.250.0.0 255.255.255.0\nauth-user-pass\n"),
+        )
+        .unwrap();
+        crate::config::profiles::VpnProfile {
+            id: ProfileId::new(name),
+            name: name.into(),
+            protocol: ProtocolKind::OpenVpn,
+            location: String::new(),
+            config_path: path,
+            last_used: None,
+            group: None,
+        }
+    }
+
+    fn test_engine(
+        dir: &std::path::Path,
+        profiles: Vec<crate::config::profiles::VpnProfile>,
+    ) -> (Engine, mpsc::Receiver<Msg>) {
+        let (uid, gid) = crate::platform::effective_user_group_ids();
+        let ownership =
+            Arc::new(TunnelOwnershipStore::new(dir.join("runtime"), uid, uid, "boot").unwrap());
+        let (tx, rx) = mpsc::channel();
+        let config = Config {
+            config_dir: dir.to_path_buf(),
+            tunnels: tunnels::Settings {
+                config_dir: dir.to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 5,
+                wireguard_handshake_timeout_secs: 5,
+                wireguard_health_targets: Vec::new(),
+            },
+            openvpn_timeout: Duration::from_secs(5),
+            mesh_timeout: Duration::from_secs(5),
+            wireguard_timeout: Duration::from_secs(5),
+            auto_reconnect: true,
+            reconnect_delay: Duration::ZERO,
+            max_retries: 3,
+            retry_base: Duration::from_secs(1),
+            retry_max: Duration::from_secs(8),
+            wireguard_stale_after: Duration::from_secs(180),
+        };
+        let engine = Engine {
+            net: Net::new(
+                dir.to_path_buf(),
+                NetworkPlan::default(),
+                Arc::clone(&ownership),
+            ),
+            hooks: None,
+            health: BTreeMap::new(),
+            entries: specs::load(dir, profiles),
+            config,
+            state: State::new(KillSwitchMode::Auto),
+            live: BTreeMap::new(),
+            up_at: BTreeMap::new(),
+            cancel: BTreeMap::new(),
+            errors: BTreeMap::new(),
+            actions: BTreeMap::new(),
+            prompts: BTreeMap::new(),
+            waits: BTreeMap::new(),
+            after_stop: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
+            notices: VecDeque::new(),
+            seq: 0,
+            started_ms: 0,
+            drops: 0,
+            applied: None,
+            apply_error: None,
+            applied_at: Instant::now(),
+            ownership,
+            credentials: Arc::new(Mutex::new(FsOpenVpnCredentialStore::for_owner(
+                dir, uid, gid,
+            ))),
+            tx,
+            shared: Arc::new(super::super::Shared::default()),
+            published: Snapshot::default(),
+            scan: None,
+            scanning: false,
+            next_scan: Instant::now() + Duration::from_secs(3600),
+            host_checked_at: Instant::now(),
+            host_drifted: false,
+            external: Vec::new(),
+            last_connected: BTreeMap::new(),
+            last_generation: 0,
+        };
+        (engine, rx)
+    }
+
+    /// Bring `id` up in the tunnel list without starting a process.
+    fn up(engine: &mut Engine, id: &str, rank: u64) {
+        let spec = engine.entries[&ProfileId::new(id)].spec.clone().unwrap();
+        engine.state.begin(spec, rank, None, false).unwrap();
+        engine
+            .state
+            .came_up(&ProfileId::new(id), format!("utun{rank}"), [], [], None);
+        engine.up_at.insert(ProfileId::new(id), Instant::now());
+    }
+
+    fn openvpn_live(engine: &Engine, id: &str, pid: Option<u32>) -> Live {
+        Live {
+            kind: tunnels::TunnelKind::new(ProtocolKind::OpenVpn, &engine.config.tunnels),
+            handle: crate::tunnel::TunnelHandle {
+                profile_id: ProfileId::new(id),
+                display_name: id.into(),
+                interface_name: "utun9".into(),
+                pid,
+                started_at: SystemTime::now(),
+                kind: crate::tunnel::TunnelKindTag::OpenVpn,
+                generation: 1,
+                handshake: None,
+                probe_receipts: Vec::new(),
+                process_ownership: None,
+                teardown_config: None,
+                dns_request: crate::control::dns::DnsRequest::default(),
+                openvpn_routes: None,
+            },
+        }
+    }
+
+    fn blocking_plan() -> NetworkPlan {
+        NetworkPlan {
+            firewall: crate::control::plan::Firewall::Block(Vec::new()),
+            ..NetworkPlan::default()
+        }
+    }
+
+    /// The firewall is read back at most every ten seconds, and only while it
+    /// blocks.
+    #[test]
+    fn the_host_is_read_back_only_while_blocking_and_not_every_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), Vec::new());
+        let start = Instant::now();
+        engine.host_checked_at = start;
+        let due = start + HOST_CHECK_EVERY;
+        engine.applied = Some(NetworkPlan::default());
+        assert!(engine.host_check_due(due).is_none(), "nothing to check");
+
+        engine.applied = Some(blocking_plan());
+        assert_eq!(
+            engine.host_check_due(due).map(|check| check.plan),
+            Some(blocking_plan())
+        );
+        assert!(
+            engine.host_check_due(due + SCAN_EVERY).is_none(),
+            "too soon"
+        );
+        assert!(engine.host_check_due(due + HOST_CHECK_EVERY).is_some());
+    }
+
+    /// Rules removed by someone else are put back by the next reconcile, and
+    /// the user hears about it once, not every ten seconds.
+    #[test]
+    fn a_drifted_kill_switch_is_reapplied_and_announced_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), Vec::new());
+        let plan = blocking_plan();
+        let before = engine.notices.len();
+
+        engine.applied = Some(NetworkPlan::default());
+        engine.host_checked(&plan, Some("rules gone".into()));
+        assert_eq!(engine.applied, Some(NetworkPlan::default()), "stale result");
+        assert_eq!(engine.notices.len(), before);
+
+        engine.applied = Some(plan.clone());
+        engine.host_checked(&plan, Some("rules gone".into()));
+        assert_eq!(engine.applied, None, "next reconcile reapplies");
+        assert_eq!(engine.notices.len(), before + 1);
+
+        engine.applied = Some(plan.clone());
+        engine.host_checked(&plan, Some("rules gone".into()));
+        assert_eq!(engine.notices.len(), before + 1, "announced once");
+
+        engine.applied = Some(plan.clone());
+        engine.host_checked(&plan, None);
+        engine.host_checked(&plan, Some("rules gone".into()));
+        assert_eq!(engine.notices.len(), before + 2, "a new drift is announced");
+    }
+
+    /// A split tunnel waiting to reconnect stops at once; the switch to a
+    /// profile with the same routes must still start.
+    #[test]
+    fn a_switch_past_a_waiting_split_tunnel_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = vec![ovpn(dir.path(), "a", 5), ovpn(dir.path(), "b", 6)];
+        let (mut engine, _rx) = test_engine(dir.path(), profiles);
+        up(&mut engine, "a", 1);
+        engine.lost(&ProfileId::new("a"), false);
+
+        engine.command(7, Command::Switch(ProfileId::new("b")));
+
+        assert!(
+            engine.state.get(&ProfileId::new("a")).is_none(),
+            "a stopped"
+        );
+        assert!(
+            engine.state.get(&ProfileId::new("b")).is_some(),
+            "b never starts; pending switches: {:?}",
+            engine.after_stop.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A drop says "reconnecting"; when the retry finds it needs a password it
+    /// cannot ask for, it gives up, and block-on-drop blocks. Say so.
+    #[test]
+    fn a_retry_that_needs_a_password_says_it_gave_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
+        up(&mut engine, "a", 1);
+        engine.lost(&ProfileId::new("a"), false);
+        let before = engine.notices.len();
+
+        engine.tick();
+
+        let tunnel = engine.state.get(&ProfileId::new("a")).unwrap();
+        assert_eq!(tunnel.phase, Phase::Waiting { retry_at: None }, "gave up");
+        assert!(engine.state.plan_input().dropped, "block-on-drop blocks");
+        assert!(
+            engine.notices.len() > before,
+            "no notice after {:?}",
+            engine.notices.back().map(|notice| &notice.text)
+        );
+    }
+
+    /// A dropped tunnel's teardown that fails leaves its process behind, and
+    /// the retry starts beside it. The failure must reach the user.
+    #[test]
+    fn a_failed_teardown_of_a_dropped_tunnel_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
+        up(&mut engine, "a", 1);
+        // A live process without an ownership receipt: `down` refuses it.
+        let probe = openvpn_live(&engine, "a", Some(std::process::id()));
+        let stop = tunnels::stop(&engine.config.tunnels, &engine.ownership, probe);
+        assert!(stop.is_err(), "this teardown fails: {stop:?}");
+        let live = openvpn_live(&engine, "a", Some(std::process::id()));
+        engine.live.insert(ProfileId::new("a"), live);
+        engine.lost(&ProfileId::new("a"), false);
+        let drained = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        engine.handle(drained);
+
+        assert_eq!(
+            engine.state.get(&ProfileId::new("a")).unwrap().phase,
+            Phase::Waiting { retry_at: None },
+            "no retry beside what is left of it"
+        );
+
+        let texts = engine
+            .notices
+            .iter()
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.iter().any(|text| text.contains("OpenVPN")),
+            "teardown error dropped; notices: {texts:?}"
+        );
+    }
+
+    fn with_hooks(engine: &mut Engine) -> crate::hooks::HookDiagnostics {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let specs = HOOK_EVENTS
+            .iter()
+            .map(|event| crate::config::settings::HookSpec {
+                event: *event,
+                executable: "/usr/bin/true".into(),
+                args: Vec::new(),
+                timeout_secs: 5,
+            })
+            .collect();
+        let (runner, diagnostics) = {
+            let _guard = runtime.enter();
+            crate::hooks::HookRunner::start(
+                specs,
+                crate::config::owned_file::VerifiedOwner::from_ids(501, 20),
+                crate::process::CommandRunner::mock_default_success(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        engine.hooks = Some((runtime, runner, diagnostics.resubscribe()));
+        diagnostics
+    }
+
+    const HOOK_EVENTS: [HookEvent; 6] = [
+        HookEvent::ConnectStarted,
+        HookEvent::Connected,
+        HookEvent::DisconnectStarted,
+        HookEvent::Disconnected,
+        HookEvent::ConnectFailed,
+        HookEvent::Reconnecting,
+    ];
+
+    fn fired(diagnostics: &mut crate::hooks::HookDiagnostics) -> Vec<HookEvent> {
+        let mut events = Vec::new();
+        while let Ok(diagnostic) = diagnostics.try_recv() {
+            if diagnostic.kind == crate::hooks::HookDiagnosticKind::Queued {
+                events.push(HOOK_EVENTS[diagnostic.attempt_id.hook_index]);
+            }
+        }
+        events
+    }
+
+    /// With auto-reconnect off nothing reconnects, so `reconnecting` must not fire.
+    #[test]
+    fn a_drop_without_auto_reconnect_is_not_reconnecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
+        engine.config.auto_reconnect = false;
+        let mut diagnostics = with_hooks(&mut engine);
+        up(&mut engine, "a", 1);
+        engine.lost(&ProfileId::new("a"), false);
+        assert_eq!(
+            engine.state.get(&ProfileId::new("a")).unwrap().phase,
+            Phase::Waiting { retry_at: None }
+        );
+        assert_eq!(fired(&mut diagnostics), Vec::<HookEvent>::new());
+    }
+
+    /// A tunnel a switch replaces gets `disconnected`; it must get
+    /// `disconnect_started` first, like every other stop.
+    #[test]
+    fn a_tunnel_replaced_by_a_switch_fires_disconnect_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = vec![ovpn(dir.path(), "a", 5), ovpn(dir.path(), "b", 6)];
+        let (mut engine, _rx) = test_engine(dir.path(), profiles);
+        up(&mut engine, "a", 1);
+        let spec = engine.entries[&ProfileId::new("b")].spec.clone().unwrap();
+        engine
+            .state
+            .begin(spec, 2, Some(BTreeSet::from([ProfileId::new("a")])), false)
+            .unwrap();
+        let mut diagnostics = with_hooks(&mut engine);
+        let live = openvpn_live(&engine, "b", None);
+        engine.started(&ProfileId::new("b"), Ok(live), None, false);
+        // `a` has no process here, so its stop finishes at once.
+        assert!(engine.state.get(&ProfileId::new("a")).is_none());
+        assert_eq!(
+            fired(&mut diagnostics),
+            [
+                HookEvent::DisconnectStarted,
+                HookEvent::Disconnected,
+                HookEvent::Connected
+            ]
+        );
+    }
+
+    /// A full tunnel Vortix did not start cannot be switched away from, so
+    /// another full tunnel is refused rather than stacked on top of it.
+    #[test]
+    fn a_full_tunnel_vortix_did_not_start_blocks_another_full_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = vec![ovpn(dir.path(), "a", 5), ovpn(dir.path(), "b", 6)];
+        for profile in &profiles {
+            let mut text = std::fs::read_to_string(&profile.config_path).unwrap();
+            text.push_str("redirect-gateway def1\n");
+            std::fs::write(&profile.config_path, text).unwrap();
+        }
+        let (mut engine, _rx) = test_engine(dir.path(), profiles);
+        engine.external = vec!["a".into()];
+        engine.connect(7, ProfileId::new("b"), true);
+        assert!(
+            matches!(&engine.outcomes[&7], Outcome::Failed(text) if text.contains("'a' is up but Vortix did not start it")),
+            "{:?}",
+            engine.outcomes.get(&7)
+        );
+        assert!(engine.state.get(&ProfileId::new("b")).is_none());
+    }
+
+    /// The routes move to the new tunnel before the old one's teardown starts:
+    /// macOS `wg-quick down` deletes routes by destination, so a teardown that
+    /// races the retarget leaves no VPN route for a moment.
+    #[test]
+    fn a_switch_moves_routes_to_the_new_tunnel_before_stopping_the_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = vec![ovpn(dir.path(), "a", 5), ovpn(dir.path(), "b", 6)];
+        let (mut engine, _rx) = test_engine(dir.path(), profiles);
+        up(&mut engine, "a", 1);
+        let spec = engine.entries[&ProfileId::new("b")].spec.clone().unwrap();
+        engine
+            .state
+            .begin(spec, 2, Some(BTreeSet::from([ProfileId::new("a")])), false)
+            .unwrap();
+        let mut live = openvpn_live(&engine, "b", None);
+        live.handle.interface_name = "utun2".into();
+        engine.started(&ProfileId::new("b"), Ok(live), None, false);
+        let applied = engine.applied.as_ref().expect("reconciled before the stop");
+        assert_eq!(
+            applied.routes.values().collect::<Vec<_>>(),
+            vec!["utun2"],
+            "{:?}",
+            applied.routes
+        );
+    }
+
+    /// Rejected saved credentials that could not be removed are retried on
+    /// the next connect; the notice must not say they were removed.
+    #[test]
+    fn rejected_credentials_that_stay_are_not_called_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = test_engine(dir.path(), vec![ovpn(dir.path(), "a", 5)]);
+        let (uid, gid) = crate::platform::effective_user_group_ids();
+        // A store that cannot open its directory: every clear fails.
+        engine.credentials = Arc::new(Mutex::new(FsOpenVpnCredentialStore::for_owner(
+            dir.path(),
+            uid + 1,
+            gid,
+        )));
+        assert!(engine
+            .credentials
+            .lock()
+            .unwrap()
+            .clear(&ProfileId::new("a"), "a")
+            .is_err());
+        let spec = engine.entries[&ProfileId::new("a")].spec.clone().unwrap();
+        engine.state.begin(spec, 1, None, false).unwrap();
+
+        engine.started(
+            &ProfileId::new("a"),
+            Err(StartError::AuthFailed(String::new())),
+            None,
+            true,
+        );
+
+        let texts = engine
+            .notices
+            .iter()
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("rejected and removed")),
+            "{texts:?}"
+        );
     }
 
     /// A failed read keeps the last networks; a list read empty (the admin

@@ -167,47 +167,38 @@ mod writer {
         failure_count: Arc<AtomicU64>,
         failure_events: watch::Sender<u64>,
     ) {
-        let mut file = match crate::config::owned_file::open_user_file(&path, true) {
-            Ok(f) => tokio::fs::File::from_std(f),
-            Err(e) => {
-                record_failure(&failure_count, &failure_events);
-                warn!(
-                    target: "vortix::journal",
-                    path = %path.display(),
-                    error = %e,
-                    "failed to open journal file; events will be dropped"
-                );
-                // Closing the receiver makes subsequent producer loss explicit as
-                // WriterGone instead of accepting and silently discarding events.
-                return;
-            }
-        };
-
+        // Created on the first event other than the retention record, so a
+        // command that records nothing leaves no session file behind.
+        let mut file: Option<tokio::fs::File> = None;
+        let mut pending = Vec::new();
         while let Some(env) = mpsc_rx.recv().await {
-            // 1. Persist.
-            match serde_json::to_vec(&env) {
-                Ok(mut bytes) => {
-                    bytes.push(b'\n');
-                    if let Err(e) = file.write_all(&bytes).await {
-                        record_failure(&failure_count, &failure_events);
-                        warn!(
-                            target: "vortix::journal",
-                            path = %path.display(),
-                            error = %e,
-                            "journal write failed"
-                        );
-                    } else if let Err(e) = file.flush().await {
-                        record_failure(&failure_count, &failure_events);
-                        warn!(target: "vortix::journal", error = %e, "journal flush failed");
+            if file.is_none() {
+                if matches!(
+                    env.event,
+                    super::JournalEvent::JournalRetentionApplied { .. }
+                ) {
+                    pending.push(env.clone());
+                } else {
+                    match crate::config::owned_file::open_user_file(&path, true) {
+                        Ok(f) => file = Some(tokio::fs::File::from_std(f)),
+                        Err(e) => {
+                            record_failure(&failure_count, &failure_events);
+                            warn!(
+                                target: "vortix::journal",
+                                path = %path.display(),
+                                error = %e,
+                                "failed to open journal file; events will be dropped"
+                            );
+                            // Closing the receiver makes later producer loss
+                            // explicit as WriterGone instead of silent.
+                            return;
+                        }
                     }
                 }
-                Err(e) => {
-                    record_failure(&failure_count, &failure_events);
-                    warn!(
-                        target: "vortix::journal",
-                        error = %e,
-                        "failed to serialise journal record"
-                    );
+            }
+            if let Some(file) = &mut file {
+                for record in pending.drain(..).chain(std::iter::once(env.clone())) {
+                    persist(file, &path, &record, &failure_count, &failure_events).await;
                 }
             }
 
@@ -216,6 +207,40 @@ mod writer {
 
             // 3. Tail buffer.
             tail.lock().unwrap().push(env);
+        }
+    }
+
+    async fn persist(
+        file: &mut tokio::fs::File,
+        path: &std::path::Path,
+        env: &EventEnvelope,
+        failure_count: &AtomicU64,
+        failure_events: &watch::Sender<u64>,
+    ) {
+        match serde_json::to_vec(env) {
+            Ok(mut bytes) => {
+                bytes.push(b'\n');
+                if let Err(e) = file.write_all(&bytes).await {
+                    record_failure(failure_count, failure_events);
+                    warn!(
+                        target: "vortix::journal",
+                        path = %path.display(),
+                        error = %e,
+                        "journal write failed"
+                    );
+                } else if let Err(e) = file.flush().await {
+                    record_failure(failure_count, failure_events);
+                    warn!(target: "vortix::journal", error = %e, "journal flush failed");
+                }
+            }
+            Err(e) => {
+                record_failure(failure_count, failure_events);
+                warn!(
+                    target: "vortix::journal",
+                    error = %e,
+                    "failed to serialise journal record"
+                );
+            }
         }
     }
 
@@ -453,7 +478,13 @@ impl Journal {
         // Retention runs synchronously at startup so the first journal event
         // can record what was pruned.
         let retention_stats = if let Some(dir) = &journal_dir {
-            retention::prune(dir, config.retention_days, config.retention_count).unwrap_or_default()
+            // One fewer than the limit: this session's file is still to come.
+            retention::prune(
+                dir,
+                config.retention_days,
+                config.retention_count.saturating_sub(1),
+            )
+            .unwrap_or_default()
         } else {
             RetentionStats::default()
         };
@@ -750,13 +781,43 @@ mod tests {
         })
         .unwrap();
 
-        // The current-thread writer has not run yet. Removing its parent
-        // deterministically injects an asynchronous open failure.
+        // The file is opened for the first real event; removing its parent
+        // first makes that open fail.
         std::fs::remove_dir_all(journal_dir).unwrap();
+        journal.append(sample_event()).unwrap();
         assert_eq!(journal.wait_for_writer_failure().await.unwrap(), 1);
         assert!(matches!(
             journal.append(sample_event()),
             Err(JournalError::WriterGone)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_session_without_events_leaves_no_file_and_retention_keeps_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        for n in 0..3 {
+            std::fs::write(tmp.path().join(format!("old-{n}.jsonl")), "").unwrap();
+        }
+        let config = || JournalConfig {
+            disk: true,
+            retention_count: 2,
+            journal_dir: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let quiet = Journal::open(config()).unwrap();
+        tokio::task::yield_now().await;
+        drop(quiet);
+        let busy = Journal::open(config()).unwrap();
+        busy.append(sample_event()).unwrap();
+        let path = busy.session_path.clone().unwrap();
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let files = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(files, 2, "the limit, this session's file included");
+        assert!(path.exists());
     }
 }

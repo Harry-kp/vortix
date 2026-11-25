@@ -38,9 +38,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    // 1. Technical Header (1 row)
-    // 2. Main Content (Flexible)
-    // 3. Command Footer (1 row)
+    // Header, content, footer.
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -51,8 +49,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     header::render(frame, app, chunks[0]);
     super::footer::render_dashboard(frame, app, chunks[2]);
 
-    // Main Content: Left Sidebar (Profiles + Details) | Right Workspace
-    // Expanded sidebar from 25% to 32% for better Connection Details display
+    // Sidebar (profiles over details) | workspace.
     let main_layout = Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(chunks[1]);
 
@@ -116,36 +113,39 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.panel_areas
         .insert(crate::app::FocusedPanel::Logs, dash_chunks[1]);
 
+    render_zoomed(frame, app);
     render_overlays(frame, app);
+}
 
-    // Auto-promote notification surfaces as a top-right toast (set in
-    // `detect_primary_change_for_banner`). No central banner widget,
-    // no [u] revert hotkey — the user decides what action to take.
+/// The zoomed panel, drawn over the dashboard.
+fn render_zoomed(frame: &mut Frame, app: &mut App) {
+    let Some(panel) = app.zoomed_panel.clone() else {
+        return;
+    };
+    let zoom_area = centered_rect(90, 90, frame.area());
+    crate::ui::helpers::clear_area(frame, zoom_area);
+    // Clicks reach only the zoomed panel.
+    app.panel_areas.clear();
+    app.panel_areas.insert(panel.clone(), zoom_area);
 
-    // Render Zoomed Panel Overlay (if active)
-    if let Some(panel) = &app.zoomed_panel {
-        let zoom_area = centered_rect(90, 90, frame.area());
-        crate::ui::helpers::clear_area(frame, zoom_area);
-
-        match panel {
-            FocusedPanel::Sidebar => sidebar::render(frame, app, zoom_area),
-            FocusedPanel::ConnectionDetails => {
-                render_animated_panel(frame, app, panel, zoom_area, |f, a, r| {
-                    connection_details::render(f, a, r);
-                });
-            }
-            FocusedPanel::Chart => {
-                render_animated_panel(frame, app, panel, zoom_area, |f, a, r| {
-                    chart::render(f, a, r);
-                });
-            }
-            FocusedPanel::Security => {
-                render_animated_panel(frame, app, panel, zoom_area, |f, a, r| {
-                    security::render(f, a, r);
-                });
-            }
-            FocusedPanel::Logs => logs::render(frame, app, zoom_area),
+    match panel {
+        FocusedPanel::Sidebar => sidebar::render(frame, app, zoom_area),
+        FocusedPanel::ConnectionDetails => {
+            render_animated_panel(frame, app, &panel, zoom_area, |f, a, r| {
+                connection_details::render(f, a, r);
+            });
         }
+        FocusedPanel::Chart => {
+            render_animated_panel(frame, app, &panel, zoom_area, |f, a, r| {
+                chart::render(f, a, r);
+            });
+        }
+        FocusedPanel::Security => {
+            render_animated_panel(frame, app, &panel, zoom_area, |f, a, r| {
+                security::render(f, a, r);
+            });
+        }
+        FocusedPanel::Logs => logs::render(frame, app, zoom_area),
     }
 }
 
@@ -230,7 +230,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             new_name, cursor, ..
         } => super::overlays::rename::render(frame, new_name, *cursor),
         InputMode::Help { scroll, tab } => super::overlays::help::render(frame, *scroll, *tab),
-        InputMode::Search { query, cursor } => {
+        InputMode::Search { query, cursor, .. } => {
             super::overlays::search::render(frame, app, query, *cursor, app.runtime.profiles.len());
         }
         InputMode::ConfirmSwitch {

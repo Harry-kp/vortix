@@ -20,8 +20,11 @@ use crate::tunnel::OperationId;
 use crate::tunnel::{TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag};
 use tracing::{debug, info, warn};
 
-use crate::openvpn::parser::{forbidden_effective_directive, parse_ovpn_conf};
-use crate::openvpn::push::{latest_completed_push_reply, PushReplySelectionError};
+use crate::openvpn::management::ManagementAuthError;
+use crate::openvpn::parser::{
+    dns_setting, forbidden_effective_directive, parse_ovpn_conf, DnsSetting,
+};
+use crate::openvpn::push::latest_completed_push_options;
 
 /// Quality of the DNS intent recovered from an `OpenVPN` session log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,11 +71,9 @@ fn sanitize_managed_config(text: &str) -> Result<String, TunnelError> {
         validate_managed_line(line).map_err(|error| TunnelError::Subprocess(error.to_string()))?;
         let directive = line.split(['#', ';']).next().unwrap_or_default();
         let mut tokens = directive.split_whitespace();
-        let first = tokens.next().map(|value| value.trim_start_matches('-'));
-        let is_dns = matches!(first, Some(value) if value.eq_ignore_ascii_case("dhcp-option"))
-            && matches!(tokens.next(), Some(value) if value.eq_ignore_ascii_case("DNS")
-                || value.eq_ignore_ascii_case("DOMAIN")
-                || value.eq_ignore_ascii_case("DOMAIN-SEARCH"));
+        let first = tokens.next().unwrap_or_default().trim_start_matches('-');
+        let is_dns =
+            first.eq_ignore_ascii_case("dns") || !matches!(dns_setting(first, tokens), Ok(None));
         if !is_dns {
             output.push_str(line);
         }
@@ -197,35 +198,6 @@ fn remove_stale_managed_configs(parent: &Path, profile: &Profile, keep: &Path) {
     }
 }
 
-/// Read the credentials bundle file written by the TUI/CLI auth flow
-///. Returns
-/// `Ok(Some((user, pass, otp)))` when the file exists and has the
-/// expected 3-line shape, `Ok(None)` when the file is absent
-/// (non-MFA connect path), `Err` when the file exists but is
-/// malformed.
-fn read_mgmt_credentials_bundle(path: &Path) -> std::io::Result<Option<(String, String, String)>> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let mut lines = content.lines();
-            let user = lines.next().unwrap_or("").to_string();
-            let pass = lines.next().unwrap_or("").to_string();
-            let otp = lines.next().unwrap_or("").to_string();
-            // Best-effort delete: keep the credentials surface tiny.
-            // If delete fails the startup scrub catches the residue.
-            let _ = std::fs::remove_file(path);
-            if user.is_empty() || pass.is_empty() || otp.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "mgmt credentials bundle: empty field(s)",
-                ));
-            }
-            Ok(Some((user, pass, otp)))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 /// Adapt the shared bounded management driver to the tunnel
 /// error vocabulary. A non-empty answer selects the supported SCRV1 static
 /// challenge; every other interactive challenge remains fail-closed.
@@ -239,17 +211,16 @@ fn drive_mgmt_auth(
     let challenge =
         (!answer.is_empty()).then_some(crate::openvpn::routes::OpenVpnChallengeKind::Static);
     crate::openvpn::management::authenticate(stream, user, pass, answer, challenge, timeout)
-        .map_err(|error| match error {
-            crate::openvpn::management::ManagementAuthError::AuthenticationRejected
-            | crate::openvpn::management::ManagementAuthError::UnsupportedChallenge
-            | crate::openvpn::management::ManagementAuthError::InvalidCredentials => {
-                TunnelError::AuthFailed(error.to_string())
-            }
-            crate::openvpn::management::ManagementAuthError::DaemonExited => {
-                TunnelError::DaemonExited(error.to_string())
-            }
-            _ => TunnelError::Subprocess(error.to_string()),
-        })
+        .map_err(management_error)
+}
+
+/// Only a server rejection is `AuthFailed`: it is what clears saved credentials.
+fn management_error(error: ManagementAuthError) -> TunnelError {
+    match error {
+        ManagementAuthError::AuthenticationRejected => TunnelError::AuthFailed(String::new()),
+        ManagementAuthError::DaemonExited => TunnelError::DaemonExited(error.to_string()),
+        _ => TunnelError::Subprocess(error.to_string()),
+    }
 }
 
 /// Wait for openvpn to create the management unix socket. Returns
@@ -470,20 +441,20 @@ impl OvpnTunnel {
         let profile_text = std::fs::read_to_string(&profile.config_path).map_err(|error| {
             TunnelError::Subprocess(format!("read OpenVPN profile for DNS intent: {error}"))
         })?;
-        let configured = parse_ovpn_conf(&profile_text)
-            .map_err(|error| TunnelError::Subprocess(format!("parse OpenVPN DNS intent: {error}")))?
-            .dns_request();
+        let parsed = parse_ovpn_conf(&profile_text).map_err(|error| {
+            TunnelError::Subprocess(format!("parse OpenVPN DNS intent: {error}"))
+        })?;
         let log_path = self.runtime_log_path(profile);
         let log = match std::fs::read_to_string(&log_path) {
             Ok(log) => log,
             Err(error) => {
                 return Ok(OvpnDnsEvidence::Unavailable {
-                    configured,
+                    configured: parsed.dns_request(),
                     reason: format!("read {}: {error}", log_path.display()),
                 });
             }
         };
-        Ok(pushed_dns_evidence(configured, &log))
+        Ok(pushed_dns_evidence(&parsed, &log))
     }
 
     fn runtime_log_path(&self, profile: &Profile) -> PathBuf {
@@ -507,7 +478,7 @@ impl OvpnTunnel {
                 log_path.display()
             ))
         })?;
-        let dns = pushed_dns_evidence(parsed.dns_request(), &log);
+        let dns = pushed_dns_evidence(&parsed, &log);
         let routes = crate::openvpn::push::openvpn_route_evidence(&parsed, &log, false).map_err(
             |error| TunnelError::Subprocess(format!("validate OpenVPN route evidence: {error}")),
         )?;
@@ -527,16 +498,6 @@ impl OvpnTunnel {
             .join(crate::config::openvpn_credentials::auth_file_name(
                 profile_id,
             ))
-    }
-
-    /// Path used by the static-challenge SCRV1 envelope. The connect path writes the
-    /// envelope to this sibling of the canonical auth file, hands it
-    /// to openvpn via `--auth-user-pass`, and deletes it immediately
-    /// after the daemon fork returns — keeping the canonical
-    /// `<safe>.auth` plain at all times, with no race window for the
-    /// async TUI worker thread to lose against.
-    fn scrv1_auth_path(&self, profile_id: &str) -> PathBuf {
-        self.auth_dir.join(format!("{profile_id}.scrv1.auth"))
     }
 
     fn management_socket_path(&self, profile_id: &str) -> PathBuf {
@@ -563,10 +524,6 @@ impl OvpnTunnel {
 
     fn existing_auth_path(&self, profile: &Profile) -> Option<PathBuf> {
         existing_artifact(profile, |key| self.auth_path(key))
-    }
-
-    fn existing_scrv1_auth_path(&self, profile: &Profile) -> Option<PathBuf> {
-        existing_artifact(profile, |key| self.scrv1_auth_path(key))
     }
 }
 
@@ -702,7 +659,21 @@ fn poll_log_until_ready(
                         .find(|l| l.contains(pattern))
                         .unwrap_or(pattern);
                     if pattern == &"AUTH_FAILED" {
-                        return Err(TunnelError::AuthFailed(error_line.to_string()));
+                        let reason = error_line
+                            .split_once("AUTH_FAILED")
+                            .map_or("", |(_, reason)| reason.trim_start_matches(',').trim());
+                        // OpenVPN retries a TEMP refusal; neither is a verdict on the password.
+                        let not_rejected = if reason.starts_with("TEMP") {
+                            Some(ManagementAuthError::TemporarilyRefused)
+                        } else if reason.starts_with("CRV1:") {
+                            Some(ManagementAuthError::UnsupportedChallenge)
+                        } else {
+                            None
+                        };
+                        if let Some(error) = not_rejected {
+                            return Err(TunnelError::Subprocess(error.to_string()));
+                        }
+                        return Err(TunnelError::AuthFailed(reason.to_string()));
                     }
                     return Err(TunnelError::DaemonExited(format!("OpenVPN: {error_line}")));
                 }
@@ -723,7 +694,20 @@ fn build_ovpn_args(
     log_path: &std::path::Path,
     verbosity: &str,
 ) -> Vec<String> {
-    let mut args = vec![
+    // Before `--config`: the first matching filter wins, so a profile's
+    // `pull-filter accept` cannot hand DNS back to OpenVPN.
+    let mut args = Vec::new();
+    for option in [
+        "dhcp-option DNS",
+        "dhcp-option DOMAIN",
+        "dhcp-option DOMAIN-SEARCH",
+        "dns",
+    ] {
+        args.push("--pull-filter".to_string());
+        args.push("ignore".to_string());
+        args.push(option.to_string());
+    }
+    args.extend([
         "--config".to_string(),
         config_path.to_string_lossy().into_owned(),
         "--writepid".to_string(),
@@ -736,18 +720,7 @@ fn build_ovpn_args(
         // harmless: the topology transaction installs the authenticated
         // route evidence after conflict admission succeeds.
         "--route-noexec".to_string(),
-    ];
-
-    for option in [
-        "dhcp-option DNS",
-        "dhcp-option DOMAIN",
-        "dhcp-option DOMAIN-SEARCH",
-    ] {
-        args.push("--pull-filter".to_string());
-        args.push("ignore".to_string());
-        args.push(option.to_string());
-    }
-
+    ]);
     args
 }
 
@@ -798,62 +771,50 @@ fn process_exists(pid: u32) -> bool {
 /// Missing, incomplete, or malformed runtime evidence is never interpreted
 /// as an authoritative empty request. The corresponding options are filtered
 /// from `OpenVPN` itself, so this is intent capture only.
-fn pushed_dns_evidence(mut request: crate::control::dns::DnsRequest, log: &str) -> OvpnDnsEvidence {
-    let push_reply = match latest_completed_push_reply(log) {
+fn pushed_dns_evidence(
+    parsed: &crate::openvpn::parser::OvpnParsedProfile,
+    log: &str,
+) -> OvpnDnsEvidence {
+    let mut request = parsed.dns_request();
+    let push_reply = match latest_completed_push_options(parsed, log) {
         Ok(Some(push_reply)) => push_reply,
         Ok(None) => return OvpnDnsEvidence::ExplicitlyEmpty(request),
-        Err(PushReplySelectionError::NoCompletedNegotiation) => {
+        Err(error) => {
             return OvpnDnsEvidence::Unavailable {
                 configured: request,
-                reason: "OpenVPN log has no completed negotiation marker".into(),
-            };
-        }
-        Err(PushReplySelectionError::NewerIncompleteNegotiation) => {
-            return OvpnDnsEvidence::Unavailable {
-                configured: request,
-                reason: "OpenVPN log contains a newer incomplete negotiation".into(),
+                reason: error.to_string(),
             };
         }
     };
     let mut observed = false;
-    for option in push_reply.split(',') {
-        let option = option.trim().trim_matches('\'');
-        let mut tokens = option.split_whitespace();
-        if !matches!(tokens.next(), Some(prefix) if prefix.eq_ignore_ascii_case("dhcp-option")) {
-            continue;
-        }
-        match tokens.next() {
-            Some(kind) if kind.eq_ignore_ascii_case("DNS") => {
-                let Some(server) = tokens.next().and_then(|value| value.parse().ok()) else {
-                    return OvpnDnsEvidence::Unavailable {
-                        configured: request,
-                        reason: "OpenVPN PUSH_REPLY contained malformed DNS evidence".into(),
-                    };
+    for option in push_reply {
+        let words = crate::openvpn::parser::option_words(option);
+        let mut tokens = words.iter().map(String::as_str);
+        let directive = tokens.next().unwrap_or_default();
+        match dns_setting(directive, tokens) {
+            Err(()) => {
+                return OvpnDnsEvidence::Unavailable {
+                    configured: request,
+                    reason: "OpenVPN PUSH_REPLY contained malformed DNS evidence".into(),
                 };
-                observed = true;
-                if !request.servers.contains(&server) {
-                    request.servers.push(server);
-                }
             }
-            Some(kind)
-                if kind.eq_ignore_ascii_case("DOMAIN")
-                    || kind.eq_ignore_ascii_case("DOMAIN-SEARCH") =>
-            {
-                let domains = tokens.collect::<Vec<_>>();
-                if domains.is_empty() {
-                    return OvpnDnsEvidence::Unavailable {
-                        configured: request,
-                        reason: "OpenVPN PUSH_REPLY contained malformed domain evidence".into(),
-                    };
-                }
+            Ok(Some(DnsSetting::Servers(servers))) => {
                 observed = true;
-                for domain in domains {
-                    if !request.search_domains.iter().any(|item| item == domain) {
-                        request.search_domains.push(domain.to_string());
+                for server in servers {
+                    if !request.servers.contains(&server) {
+                        request.servers.push(server);
                     }
                 }
             }
-            _ => {}
+            Ok(Some(DnsSetting::Domains(domains))) => {
+                observed = true;
+                for domain in domains {
+                    if !request.search_domains.contains(&domain) {
+                        request.search_domains.push(domain);
+                    }
+                }
+            }
+            Ok(None) => {}
         }
     }
     if observed {
@@ -936,18 +897,10 @@ impl OvpnTunnel {
             "ovpn.up: DNS mutation suppressed for coordinator-owned policy"
         );
 
-        // #191: if the
-        // credentials bundle file is present, this is a
-        // static-challenge connect. Read user/pass/otp out of the
-        // bundle (the file is consumed/deleted on read), spawn
-        // openvpn with `--management <sock> unix --management-hold
-        // --management-query-passwords --daemon`, and drive the auth
-        // dance over the socket on a worker thread while
-        // run_to_output waits for the parent to daemonize.
-        //
-        // Non-MFA profiles take the existing --auth-user-pass file
-        // path unchanged.
-        let service_creds = self
+        // A static-challenge connect gets its credentials in memory and
+        // answers OpenVPN over the management socket; every other profile
+        // uses `--auth-user-pass <file>`.
+        let mgmt_creds = self
             .static_challenge_credentials
             .as_ref()
             .map(|slot| {
@@ -965,25 +918,6 @@ impl OvpnTunnel {
                     })
             })
             .transpose()?;
-        let bundle_path = service_creds
-            .is_none()
-            .then(|| self.existing_scrv1_auth_path(profile))
-            .flatten();
-        let file_creds = if let Some(p) = &bundle_path {
-            read_mgmt_credentials_bundle(p)
-                .map_err(|e| TunnelError::Subprocess(format!("mgmt creds bundle: {e}")))?
-        } else {
-            None
-        };
-        let mgmt_creds = service_creds.or_else(|| {
-            file_creds.map(|(username, password, answer)| {
-                OpenVpnStaticChallengeCredentials::new(
-                    username,
-                    password,
-                    Secret::new(answer.into_bytes()),
-                )
-            })
-        });
 
         let mgmt_sock_path = if mgmt_creds.is_some() {
             let path = self.management_socket_path(artifact_key);
@@ -1267,10 +1201,6 @@ mod tests {
         assert_ne!(tunnel.log_path(&first), tunnel.log_path(&second));
         assert_ne!(tunnel.auth_path(&first), tunnel.auth_path(&second));
         assert_ne!(
-            tunnel.scrv1_auth_path(&first),
-            tunnel.scrv1_auth_path(&second)
-        );
-        assert_ne!(
             tunnel.management_socket_path(&first),
             tunnel.management_socket_path(&second)
         );
@@ -1396,11 +1326,15 @@ mod tests {
             args.iter()
                 .filter(|arg| arg.as_str() == "--pull-filter")
                 .count(),
-            3
+            4
         );
         assert!(args
             .windows(3)
             .any(|window| { window == ["--pull-filter", "ignore", "dhcp-option DOMAIN-SEARCH"] }));
+        assert!(args
+            .windows(3)
+            .any(|window| window == ["--pull-filter", "ignore", "dns"]));
+        assert!(pf_idx < args.iter().position(|arg| arg == "--config").unwrap());
         assert!(!args.iter().any(|arg| arg == "--daemon"));
         assert!(args.iter().any(|arg| arg == "--route-noexec"));
     }
@@ -1615,7 +1549,7 @@ mod tests {
     #[test]
     fn pushed_dns_is_captured_without_platform_mutation() {
         let evidence = pushed_dns_evidence(
-            crate::control::dns::DnsRequest::default(),
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
             "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example'\nInitialization Sequence Completed\n",
         );
         let OvpnDnsEvidence::Observed(request) = evidence else {
@@ -1641,7 +1575,7 @@ mod tests {
         );
         std::fs::write(
             temp.path().join(format!("{}.log", profile.id)),
-            "PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n",
+            "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n",
         )
         .unwrap();
         let evidence = test_tunnel(temp.path().to_path_buf())
@@ -1672,7 +1606,7 @@ mod tests {
         std::fs::write(
             temp.path().join(format!("{}.log", profile.id)),
             "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
-             PUSH_REPLY,redirect-gateway def1 bypass-dhcp,dhcp-option DNS 1.1.1.1\n\
+             PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1 bypass-dhcp,dhcp-option DNS 1.1.1.1\n\
              Initialization Sequence Completed\n",
         )
         .unwrap();
@@ -1691,13 +1625,14 @@ mod tests {
 
     #[test]
     fn completed_negotiation_without_pushed_dns_is_explicitly_empty() {
-        let configured = crate::control::dns::DnsRequest {
-            servers: vec!["1.1.1.1".parse().unwrap()],
-            search_domains: Vec::new(),
+        let parsed = crate::openvpn::parser::OvpnParsedProfile {
+            dns_servers: vec!["1.1.1.1".parse().unwrap()],
+            ..Default::default()
         };
+        let configured = parsed.dns_request();
         let evidence = pushed_dns_evidence(
-            configured.clone(),
-            "PUSH_REPLY,redirect-gateway def1,ping 10\nInitialization Sequence Completed\n",
+            &parsed,
+            "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,ping 10\nInitialization Sequence Completed\n",
         );
         assert_eq!(evidence, OvpnDnsEvidence::ExplicitlyEmpty(configured));
     }
@@ -1706,8 +1641,8 @@ mod tests {
     fn truncated_negotiation_is_unavailable_not_explicitly_empty() {
         let configured = crate::control::dns::DnsRequest::default();
         let evidence = pushed_dns_evidence(
-            configured.clone(),
-            "PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1\n",
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1\n",
         );
         assert!(matches!(
             evidence,
@@ -1721,8 +1656,8 @@ mod tests {
     #[test]
     fn newer_incomplete_negotiation_does_not_reuse_old_pushed_dns() {
         let evidence = pushed_dns_evidence(
-            crate::control::dns::DnsRequest::default(),
-            "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,redirect-gateway def1\n",
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1\n",
         );
         assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
     }
@@ -1730,8 +1665,8 @@ mod tests {
     #[test]
     fn latest_completed_negotiation_replaces_older_pushed_dns() {
         let evidence = pushed_dns_evidence(
-            crate::control::dns::DnsRequest::default(),
-            "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,dhcp-option DNS 10.9.0.1\nInitialization Sequence Completed\n",
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.9.0.1\nInitialization Sequence Completed\n",
         );
         let OvpnDnsEvidence::Observed(request) = evidence else {
             panic!("latest completed negotiation must be observed");
@@ -1744,10 +1679,9 @@ mod tests {
 
     #[test]
     fn malformed_pushed_dns_is_unavailable_not_explicitly_empty() {
-        let configured = crate::control::dns::DnsRequest::default();
         let evidence = pushed_dns_evidence(
-            configured,
-            "PUSH_REPLY,dhcp-option DNS not-an-address\nInitialization Sequence Completed\n",
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS not-an-address\nInitialization Sequence Completed\n",
         );
         assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
     }
@@ -1772,5 +1706,145 @@ mod tests {
             OvpnDnsEvidence::Unavailable { configured, .. }
                 if configured.servers == vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]
         ));
+    }
+    #[test]
+    fn route_nopull_and_pull_filter_drop_pushed_dns() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n";
+        for profile in [
+            "client\nroute-nopull\n",
+            "client\npull-filter ignore \"dhcp-option\"\n",
+        ] {
+            let parsed = parse_ovpn_conf(profile).unwrap();
+            assert_eq!(
+                pushed_dns_evidence(&parsed, log),
+                OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
+            );
+        }
+    }
+    #[test]
+    fn pushed_dns_in_another_case_is_ignored_like_openvpn_does() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,dhcp-option dns 10.8.0.1,DHCP-OPTION DNS 10.8.0.2'\nInitialization Sequence Completed\n";
+        assert_eq!(
+            pushed_dns_evidence(&crate::openvpn::parser::OvpnParsedProfile::default(), log),
+            OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
+        );
+    }
+
+    #[test]
+    fn openvpn_2_6_dns_options_are_captured() {
+        let evidence = pushed_dns_evidence(
+            &crate::openvpn::parser::OvpnParsedProfile::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,dns server 0 address 10.8.0.1 [2001:db8::53]:53,dns search-domains corp.example\nInitialization Sequence Completed\n",
+        );
+        let OvpnDnsEvidence::Observed(request) = evidence else {
+            panic!("pushed dns options must be observed");
+        };
+        assert_eq!(
+            request.servers,
+            ["10.8.0.1", "2001:db8::53"].map(|ip| ip.parse::<std::net::IpAddr>().unwrap())
+        );
+        assert_eq!(request.search_domains, ["corp.example"]);
+        assert!(matches!(
+            pushed_dns_evidence(
+                &crate::openvpn::parser::OvpnParsedProfile::default(),
+                "PUSH: Received control message: 'PUSH_REPLY,dns server 0 address nonsense\nInitialization Sequence Completed\n",
+            ),
+            OvpnDnsEvidence::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_profile_dns_option_is_captured_and_kept_from_openvpn() {
+        let profile =
+            "client\ndns server 0 address 10.8.0.1\ndns search-domains corp.example\nverb 3\n";
+        let parsed = parse_ovpn_conf(profile).unwrap();
+        assert_eq!(
+            parsed.dns_servers,
+            ["10.8.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(parsed.dns_search_domains, ["corp.example"]);
+        assert_eq!(
+            sanitize_managed_config(profile).unwrap(),
+            "client\nverb 3\n"
+        );
+    }
+    #[test]
+    fn only_a_server_rejection_is_an_auth_failure() {
+        use crate::openvpn::management::ManagementAuthError;
+        assert!(matches!(
+            management_error(ManagementAuthError::AuthenticationRejected),
+            TunnelError::AuthFailed(_)
+        ));
+        for error in [
+            ManagementAuthError::UnsupportedChallenge,
+            ManagementAuthError::InvalidCredentials,
+        ] {
+            assert!(!matches!(
+                management_error(error),
+                TunnelError::AuthFailed(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_dynamic_challenge_in_the_log_is_not_a_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("corp.log");
+        let poll = |line: &str| {
+            std::fs::write(&log, line).unwrap();
+            poll_log_until_ready(
+                &log,
+                &temp.path().join("corp.pid"),
+                Duration::from_secs(5),
+                None,
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(
+            poll("AUTH: Received control message: AUTH_FAILED,CRV1:R,E:c3RhdGU=:YWxpY2U=:Enter OTP\n"),
+            TunnelError::Subprocess(_)
+        ));
+        assert!(matches!(
+            poll("AUTH: Received control message: AUTH_FAILED,Account expired\n"),
+            TunnelError::AuthFailed(reason) if reason == "Account expired"
+        ));
+    }
+
+    #[test]
+    fn a_dashed_pushed_dns_option_is_not_read() {
+        let parsed = parse_ovpn_conf("client\nroute-nopull\n").unwrap();
+        let log = "PUSH: Received control message: 'PUSH_REPLY,--dns server 0 address 6.6.6.6,-dhcp-option DNS 6.6.6.7'\nInitialization Sequence Completed\n";
+        assert_eq!(
+            pushed_dns_evidence(&parsed, log),
+            OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
+        );
+    }
+
+    #[test]
+    fn a_temporary_refusal_in_the_log_is_not_a_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("corp.log");
+        std::fs::write(
+            &log,
+            "AUTH: Received control message: AUTH_FAILED,TEMP[backoff 30]:server busy\n",
+        )
+        .unwrap();
+        let error = poll_log_until_ready(
+            &log,
+            &temp.path().join("corp.pid"),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap_err();
+        assert!(!matches!(error, TunnelError::AuthFailed(_)), "{error}");
+    }
+
+    #[test]
+    fn pushed_dns_split_only_on_openvpn_whitespace() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,dhcp-option\u{a0}DNS 6.6.6.6,dns server 0 address\u{a0}6.6.6.7'\nInitialization Sequence Completed\n";
+        assert_eq!(
+            pushed_dns_evidence(&crate::openvpn::parser::OvpnParsedProfile::default(), log),
+            OvpnDnsEvidence::ExplicitlyEmpty(crate::control::dns::DnsRequest::default())
+        );
     }
 }

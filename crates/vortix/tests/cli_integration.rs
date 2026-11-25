@@ -197,7 +197,7 @@ fn err_not_found_helper() {
 
 #[test]
 fn err_permission_denied_helper() {
-    let err = vortix::cli::output::err_permission_denied("vortix up test");
+    let err = vortix::cli::output::err_permission_denied();
     assert_eq!(err.code, "permission_denied");
     assert!(err.hint.unwrap().contains("sudo"));
 }
@@ -315,21 +315,99 @@ fn autoconnect_changes_need_root_and_write_nothing_without_it() {
     }
     let before = vortix::platform::autoconnect::installed_profile();
     let config = tempfile::tempdir().unwrap();
-    for target in ["work", "off"] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box root gate
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box root gate
             .arg("--config-dir")
             .arg(config.path())
-            .args(["autoconnect", target])
+            .args(args)
             .output()
-            .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(ExitCode::PermissionDenied.code())
-        );
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains(&format!("sudo vortix autoconnect {target}")));
+            .unwrap()
+    };
+    let output = run(&["autoconnect", "off"]);
+    assert_eq!(
+        output.status.code(),
+        Some(ExitCode::PermissionDenied.code())
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "sudo vortix -C {} autoconnect off",
+            config.path().canonicalize().unwrap().display()
+        )),
+        "{stderr}"
+    );
+    // A typo is reported as one before asking for root.
+    for args in [["autoconnect", "nope"], ["up", "nope"]] {
+        assert_eq!(run(&args).status.code(), Some(ExitCode::NotFound.code()));
     }
     assert_eq!(vortix::platform::autoconnect::installed_profile(), before);
+}
+
+/// The root hint dropped the arguments and `-C`: `down work` said to run
+/// `sudo vortix down`, which disconnects every tunnel.
+#[cfg(unix)]
+#[test]
+fn the_root_hint_repeats_the_whole_command() {
+    if vortix::platform::is_root() {
+        return;
+    }
+    let config = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box root hint
+        .arg("--config-dir")
+        .arg(config.path())
+        .args(["killswitch", "block-on-drop", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "sudo vortix -C {} killswitch block-on-drop --json",
+            config.path().canonicalize().unwrap().display()
+        )),
+        "{stdout}"
+    );
+}
+
+/// The mode list offered `vortix killswitch vpn-only`, which needs root.
+#[cfg(unix)]
+#[test]
+fn killswitch_offers_other_modes_with_sudo() {
+    let config = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box mode list
+        .arg("--config-dir")
+        .arg(config.path())
+        .arg("killswitch")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "sudo vortix -C {} killswitch vpn-only",
+            config.path().canonicalize().unwrap().display()
+        )),
+        "{stdout}"
+    );
+}
+
+/// `vortix info | head -1` crashed with "Vortix crashed unexpectedly".
+#[cfg(unix)]
+#[test]
+fn a_closed_output_pipe_exits_quietly() {
+    let config = tempfile::tempdir().unwrap();
+    // The reader is gone before the child starts, so its first write fails.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box closed stdout
+        .arg("--config-dir")
+        .arg(config.path())
+        .arg("info")
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_ne!(output.status.code(), Some(101));
 }
 
 #[cfg(unix)]
@@ -366,10 +444,13 @@ fn emergency_release_reaches_root_gate_before_normal_startup() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("VPN operations require root privileges"));
-    assert!(stderr.contains("sudo vortix release-killswitch"));
+    assert!(stderr.contains(&format!(
+        "sudo vortix -C {} release-killswitch",
+        config.path().canonicalize().unwrap().display()
+    )));
     assert!(!stderr.contains("failed to load settings"));
     assert!(!stderr.contains("profile identity migration"));
-    assert!(!stderr.contains("Fix the file or remove it"));
+    assert!(!stderr.contains("Fix the file it names"));
 }
 
 // ============================================================================
@@ -442,6 +523,17 @@ fn clap_parses_list_with_filters() {
     } else {
         panic!("Expected List command");
     }
+}
+
+/// `--sort bogus` sorted by name and `--protocol wg` listed nothing, silently.
+#[test]
+fn clap_rejects_unknown_list_values() {
+    use clap::Parser;
+    use vortix::cli::args::Args;
+    for (flag, value) in [("--sort", "bogus"), ("--protocol", "wg")] {
+        assert!(Args::try_parse_from(["vortix", "list", flag, value]).is_err());
+    }
+    assert!(Args::try_parse_from(["vortix", "list", "--protocol", "NetBird"]).is_ok());
 }
 
 #[test]
@@ -813,7 +905,10 @@ fn tui_without_administrator_access_fails_before_terminal_startup() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.trim(),
-        "Vortix needs administrator access to manage VPN connections.\nTry again with: sudo vortix"
+        format!(
+            "Vortix needs administrator access to manage VPN connections.\nTry again with: sudo vortix -C {}",
+            config.path().canonicalize().unwrap().display()
+        )
     );
     assert!(!stderr.contains("Standard-mode"));
     assert!(!stderr.contains("invalid invoking owner"));

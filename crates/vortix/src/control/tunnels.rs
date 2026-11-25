@@ -69,7 +69,8 @@ impl Live {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartError {
-    AuthFailed,
+    /// The server refused the credentials; the adapter's reason, if any.
+    AuthFailed(String),
     Handshake(String),
     Timeout,
     Failed(String),
@@ -78,7 +79,10 @@ pub enum StartError {
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AuthFailed => f.write_str("the server rejected the credentials"),
+            Self::AuthFailed(detail) if detail.is_empty() => {
+                f.write_str("the server rejected the credentials")
+            }
+            Self::AuthFailed(detail) => write!(f, "the server rejected the credentials: {detail}"),
             Self::Handshake(detail) => write!(f, "no handshake from the server: {detail}"),
             Self::Timeout => f.write_str("the tunnel did not come up in time"),
             Self::Failed(detail) => f.write_str(detail),
@@ -86,15 +90,12 @@ impl std::fmt::Display for StartError {
     }
 }
 
-fn classify(error: &str) -> StartError {
-    if error.starts_with("authentication failed") || error.contains("AUTH_FAILED") {
-        StartError::AuthFailed
-    } else if error.to_ascii_lowercase().contains("handshake") {
-        StartError::Handshake(error.to_owned())
-    } else if error.contains("timed out") || error.contains("expired") {
-        StartError::Timeout
-    } else {
-        StartError::Failed(error.to_owned())
+fn classify(error: TunnelError) -> StartError {
+    match error {
+        TunnelError::AuthFailed(detail) => StartError::AuthFailed(detail),
+        TunnelError::HandshakeFailed(detail) => StartError::Handshake(detail),
+        TunnelError::Timeout(_) => StartError::Timeout,
+        other => StartError::Failed(other.to_string()),
     }
 }
 
@@ -124,7 +125,7 @@ pub fn start(
         let _ = kind.compensate_inflight();
         return Err(StartError::Failed("the protocol adapter panicked".into()));
     };
-    let mut handle = result.map_err(|error| classify(&error.to_string()))?;
+    let mut handle = result.map_err(classify)?;
     if handle.kind == TunnelKindTag::WireGuard {
         if let Err(error) = record_wireguard(settings, ownership, profile, generation, &mut handle)
         {
@@ -471,4 +472,23 @@ pub(crate) fn openvpn_owner(
         custody,
         protocol_pid: scanner_pid,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_failure_keeps_the_adapters_message() {
+        let no_sign_in = "this NetBird server has no sign-in page: ask its admin for a setup key";
+        assert!(classify(TunnelError::AuthFailed(no_sign_in.into()))
+            .to_string()
+            .ends_with(no_sign_in));
+        let timeout =
+            "the NetBird server nb.corp.example:443 timed out after 35s: check its address";
+        assert_eq!(
+            classify(TunnelError::Other(timeout.into())),
+            StartError::Failed(timeout.into())
+        );
+    }
 }

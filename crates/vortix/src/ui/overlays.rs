@@ -47,7 +47,7 @@ pub mod action_menu {
         let list_items: Vec<ListItem> = if items.is_empty() {
             vec![ListItem::new(Line::from(vec![Span::styled(
                 " No actions available ",
-                Style::default().fg(theme::current().nord_polar_night_4),
+                Style::default().fg(theme::current().inactive),
             )]))]
         } else {
             items
@@ -55,7 +55,7 @@ pub mod action_menu {
                 .map(|item| {
                     let line = Line::from(vec![
                         Span::styled(
-                            format!(" {} ", item.key),
+                            format!(" {:<3} ", item.key),
                             Style::default()
                                 .fg(theme::current().accent_primary)
                                 .add_modifier(Modifier::BOLD),
@@ -183,8 +183,8 @@ pub mod auth {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::current().accent_primary))
-            .title(format!(" {title} "))
-            .title_bottom(Line::from(format!(" {footer} ")).centered());
+            .title(title)
+            .title_bottom(Line::from(footer).centered());
 
         let inner = block.inner(popup_area);
         frame.render_widget(block, popup_area);
@@ -653,6 +653,45 @@ pub mod config_viewer {
         frame.render_stateful_widget(scrollbar, scroll_area, &mut scrollbar_state);
     }
 
+    /// Inline profile blocks whose body is a secret.
+    const SECRET_BLOCKS: [&str; 7] = [
+        "key",
+        "tls-auth",
+        "tls-crypt",
+        "tls-crypt-v2",
+        "secret",
+        "pkcs12",
+        "auth-user-pass",
+    ];
+
+    /// Highlight a whole config, replacing the body of each secret block with one masked line.
+    pub(crate) fn highlight_config(content: &str) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let mut secret: Option<&str> = None;
+        for line in content.lines() {
+            let tag = line
+                .trim()
+                .strip_prefix('<')
+                .and_then(|t| t.strip_suffix('>'));
+            match (secret, tag) {
+                (Some(open), Some(tag)) if tag.strip_prefix('/') == Some(open) => secret = None,
+                (Some(_), _) => continue,
+                (None, Some(tag)) if SECRET_BLOCKS.contains(&tag) => {
+                    secret = Some(tag);
+                    lines.push(highlight_config_line(line));
+                    lines.push(Line::from(Span::styled(
+                        "•••••••••••• (masked)",
+                        Style::default().fg(theme::current().inactive),
+                    )));
+                    continue;
+                }
+                (None, _) => {}
+            }
+            lines.push(highlight_config_line(line));
+        }
+        lines
+    }
+
     /// Apply syntax highlighting to config lines.
     ///
     /// Exposed `pub(crate)` so the App's open-config handler can build a
@@ -676,7 +715,7 @@ pub mod config_viewer {
             return Line::from(Span::styled(
                 line,
                 Style::default()
-                    .fg(theme::current().yellow)
+                    .fg(theme::current().accent_secondary)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -691,10 +730,10 @@ pub mod config_viewer {
 
             return Line::from(vec![
                 Span::styled(
-                    key.to_string(),
+                    key.trim_end().to_string(),
                     Style::default().fg(theme::current().accent_primary),
                 ),
-                Span::styled("=", Style::default().fg(theme::current().separator)),
+                Span::styled(" = ", Style::default().fg(theme::current().separator)),
                 Span::styled(
                     masked_value,
                     Style::default().fg(theme::current().text_primary),
@@ -788,6 +827,25 @@ pub mod config_viewer {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn inline_openvpn_secrets_are_masked() {
+            let config = "client\n<ca>\nCA-BODY\n</ca>\n<key>\nKEYBODY\n</key>\n<tls-crypt>\nSTATICBODY\n</tls-crypt>\nverb 3";
+            let shown: Vec<String> = super::highlight_config(config)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            let text = shown.join("\n");
+            assert!(text.contains("CA-BODY"), "{text}");
+            assert!(
+                !text.contains("KEYBODY") && !text.contains("STATICBODY"),
+                "{text}"
+            );
+            assert!(
+                text.contains("<key>") && text.contains("</tls-crypt>") && text.contains("verb 3"),
+                "{text}"
+            );
+        }
+
         #[test]
         fn a_mesh_auth_key_is_masked() {
             let shown =
@@ -920,13 +978,13 @@ pub mod help {
     //!   Guard explains the semantics.
 
     use crate::app::{state, state::HelpTab};
-    use crate::ui::sigils::{Sigil, SigilCategory, CATALOG};
+    use crate::ui::sigils::{SigilCategory, CATALOG};
     use crate::ui::theme;
     use ratatui::{
         layout::{Constraint, Direction, Layout, Rect},
         style::{Modifier, Style},
         text::{Line, Span},
-        widgets::{Block, Borders, Paragraph, Tabs, Wrap},
+        widgets::{Block, Borders, Paragraph, Tabs},
         Frame,
     };
 
@@ -938,14 +996,14 @@ pub mod help {
             &[
                 ("1-9", "Quick connect to profile N"),
                 ("d", "Disconnect focused tunnel / Cancel"),
-                ("D", "Sidebar: disconnect all (asks if 2+); else: focused"),
+                ("D", "Sidebar: disconnect all (asks if 2+); else: primary"),
                 ("r", "Reconnect"),
                 ("i", "Add a VPN (file, folder, link, netbird)"),
                 ("K", "Cycle kill switch mode"),
-                ("y", "Copy VPN IP to clipboard"),
+                ("y", "Copy public IPv4 to clipboard"),
                 ("Mouse drag", "Select text; release copies it"),
                 ("Click link", "Open it in your browser"),
-                ("Tab/S-Tab,l/h", "Next / Previous panel"),
+                ("Tab/S-Tab, l/h", "Next / Previous panel"),
                 ("F1-F5", "Jump to panel (Prof/Det/Chart/Sec/Log)"),
                 ("z", "Zoom focused panel"),
                 ("f", "Flip: Details routes & peers, Security why"),
@@ -1060,23 +1118,23 @@ pub mod help {
     const GUARD_GLOSSARY: &[(&str, &str)] = &[
     (
         "EXPOSED",
-        "No tunnel is up, or no tunnel claims your kernel default route. All internet traffic flows via your normal ISP — websites see your real IPv4 (and IPv6 if you have it). If you intended a VPN, this is the alarm state: connect a profile or check why your tunnel dropped.",
+        "No tunnel is up. All internet traffic flows via your normal ISP — websites see your real IPv4 (and IPv6 if you have it). If you intended a VPN, this is the alarm state: connect a profile or check why your tunnel dropped.",
     ),
     (
         "PARTIAL",
-        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (killswitch off, cipher weak, or DNS policy not verified). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
+        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (kill switch off, a broken cipher, or DNS policy not verified). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
     ),
     (
         "PROTECTED",
-        "A tunnel owns your kernel default route, the cipher is modern AEAD, the kill switch is engaged, and the current DNS policy has been applied and read back. New outbound connections flow through the tunnel. This is the goal state for a full-tunnel VPN.",
+        "A tunnel owns your kernel default route, the cipher is not broken, the kill switch is engaged, and the current DNS policy has been applied and read back. New outbound connections flow through the tunnel. This is the goal state for a full-tunnel VPN.",
     ),
     (
         "Identity → Real IPv4 / Real IPv6",
-        "Your cached pre-VPN public addresses — what your ISP would expose you as if no tunnel were up. Always informational (no safety verdict on these rows): they're what you'd revert to if the VPN dropped. When your host has no IPv6 connectivity the row collapses to a single `Real IP` line; with v6 present, `Real IPv4` and `Real IPv6` render as separate rows. `Real IPv6` reads `checking…` until vortix can prove the v6 probe escaped any active tunnel (either a fully-disconnected sample or a tunnel whose AllowedIPs lack `::/0`).",
+        "Your cached pre-VPN public addresses — what your ISP would expose you as if no tunnel were up. Always informational (no safety verdict on these rows): they're what you'd revert to if the VPN dropped. When your host has no IPv6 connectivity the row collapses to a single `Real IP` line; with v6 present, `Real IPv4` and `Real IPv6` render as separate rows. `Real IPv6` reads `checking…` until Vortix can prove the v6 probe escaped any active tunnel (either a fully-disconnected sample or a tunnel whose AllowedIPs lack `::/0`).",
     ),
     (
         "Identity → Exit IPv4 / Exit IPv6",
-        "The public addresses the rest of the internet sees you as right now. With a working full-tunnel VPN these are the tunnel's exit addresses and the rows read ✓. When `Exit IPv4` matches `Real IPv4` the row goes ✗ with 'real IPv4 exposed' — IPv4 masking has failed. The `Exit IPv6` row carries the same per-family verdict: ✓ when `public_ipv6` differs from `real_ipv6`, ✗ with 'v6 exposed — matches real IPv6' when they match.",
+        "The public addresses the rest of the internet sees you as right now. With a working full-tunnel VPN these are the tunnel's exit addresses and the rows read ✓. When `Exit IPv4` matches `Real IPv4` the row goes ✗ with 'real IPv4 exposed' — IPv4 masking has failed. The `Exit IPv6` row carries the same per-family verdict: ✓ when it differs from `Real IPv6`, ✗ with 'v6 exposed — matches real IPv6' when they match.",
     ),
     (
         "Identity → Location",
@@ -1088,7 +1146,7 @@ pub mod help {
     ),
     (
         "Defense → Killswitch",
-        "Current killswitch mode and runtime state. Modes: {off} (no firewall), {block_on_drop} (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops — also reads 'VPN dropped' with 'press r to reconnect' sub-line during the drop window), {vpn_only} (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K.",
+        "Current kill switch mode and runtime state. Modes: {off} (no firewall), {block_on_drop} (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops — also reads 'VPN dropped' with 'press r to reconnect' sub-line during the drop window), {vpn_only} (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K.",
     ),
     (
         "Defense → Encryption",
@@ -1104,37 +1162,59 @@ pub mod help {
     const OVERLAY_MAX_WIDTH: u16 = 120;
     const TAB_STRIP_HEIGHT: u16 = 2;
 
+    /// The overlay's width on a terminal `terminal_width` columns wide.
+    fn overlay_width(terminal_width: u16) -> u16 {
+        terminal_width.saturating_sub(4).min(OVERLAY_MAX_WIDTH)
+    }
+
+    /// How many lines `tab` has on a terminal `terminal_width` columns wide.
     #[must_use]
-    pub fn total_lines(tab: HelpTab) -> u16 {
-        let lines = match tab {
-            HelpTab::Keys => HELP_TEXT
-                .iter()
-                .enumerate()
-                .map(|(section_idx, (_, bindings))| {
-                    bindings.len() + 2 + usize::from(section_idx > 0)
-                })
-                .sum::<usize>(),
+    pub fn total_lines(tab: HelpTab, terminal_width: u16) -> u16 {
+        let width = usize::from(overlay_width(terminal_width).saturating_sub(2));
+        u16::try_from(tab_lines(tab, width).len()).unwrap_or(u16::MAX)
+    }
+
+    /// A tab's content, already wrapped to `width`.
+    fn tab_lines(tab: HelpTab, width: usize) -> Vec<Line<'static>> {
+        match tab {
+            HelpTab::Keys => build_keys_lines(width),
             HelpTab::Roles => {
-                // ~6 lines per entry (header + ~4 wrapped + blank) + leading blank + footer
-                1 + ROLE_GLOSSARY.len() * 6 + 2
+                build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER), width)
             }
-            HelpTab::Sigils => {
-                // 1 header per category + ~2 lines per entry. Conservative upper bound.
-                let entries = CATALOG.len();
-                2 + entries * 2 + 4
-            }
-            HelpTab::Guard => {
-                // Same shape as Roles — ~6 lines per entry (header + wrapped
-                // body + blank) + leading blank + footer.
-                1 + GUARD_GLOSSARY.len() * 6 + 2
-            }
-        };
-        u16::try_from(lines).unwrap_or(u16::MAX)
+            HelpTab::Sigils => build_sigils_lines(width),
+            HelpTab::Guard => build_guard_glossary_lines(width),
+        }
+    }
+
+    /// A label padded to `label_width`, then `description` wrapped beneath itself.
+    fn labelled_rows(
+        lead: Vec<Span<'static>>,
+        label: Span<'static>,
+        label_width: usize,
+        description: &str,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let indent: usize = lead.iter().map(Span::width).sum::<usize>() + label_width;
+        let style = Style::default().fg(theme::current().text_secondary);
+        let pad = " ".repeat(label_width.saturating_sub(label.width()));
+        let mut rows =
+            crate::ui::helpers::wrap_to_width(description, width.saturating_sub(indent + 1))
+                .into_iter();
+        let mut first = lead;
+        first.extend([label, Span::raw(pad)]);
+        first.push(Span::styled(rows.next().unwrap_or_default(), style));
+        std::iter::once(Line::from(first))
+            .chain(
+                rows.map(|row| {
+                    Line::from(Span::styled(format!("{}{row}", " ".repeat(indent)), style))
+                }),
+            )
+            .collect()
     }
 
     pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {
         let area = frame.area();
-        let width = area.width.saturating_sub(4).min(OVERLAY_MAX_WIDTH);
+        let width = overlay_width(area.width);
         let height = area
             .height
             .saturating_sub(2)
@@ -1183,7 +1263,6 @@ pub mod help {
         render_tab_strip(frame, chunks[0], tab);
         render_divider(frame, chunks[1]);
 
-        let active_tab = HelpTab::ALL.iter().position(|t| *t == tab).unwrap_or(0);
         // Clamp scroll against the ACTUAL content-paragraph height
         // (chunks[2]), not the full inner area. The tab strip + divider
         // eat 3 rows from the top of inner; without accounting for that
@@ -1191,20 +1270,11 @@ pub mod help {
         // each tab would be unreachable.
         let content_height = chunks[2].height;
         let content_width = usize::from(chunks[2].width);
-        let max_scroll = total_lines(tab).saturating_sub(content_height);
-        let clamped_scroll = scroll.min(max_scroll);
-
-        let lines = match HelpTab::ALL[active_tab] {
-            HelpTab::Keys => build_keys_lines(),
-            HelpTab::Roles => {
-                build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER), content_width)
-            }
-            HelpTab::Sigils => build_sigils_lines(),
-            HelpTab::Guard => build_guard_glossary_lines(content_width),
-        };
-        let paragraph = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((clamped_scroll, 0));
+        let lines = tab_lines(tab, content_width);
+        let max_scroll = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_sub(content_height);
+        let paragraph = Paragraph::new(lines).scroll((scroll.min(max_scroll), 0));
         frame.render_widget(paragraph, chunks[2]);
     }
 
@@ -1241,7 +1311,13 @@ pub mod help {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    fn build_keys_lines() -> Vec<Line<'static>> {
+    fn build_keys_lines(width: usize) -> Vec<Line<'static>> {
+        let key_width = HELP_TEXT
+            .iter()
+            .flat_map(|(_, bindings)| bindings.iter())
+            .map(|(key, _)| key.chars().count() + 2)
+            .max()
+            .unwrap_or(0);
         let mut lines: Vec<Line> = Vec::new();
         for (section_idx, (section, bindings)) in HELP_TEXT.iter().enumerate() {
             if section_idx > 0 {
@@ -1256,15 +1332,19 @@ pub mod help {
             lines.push(Line::from(""));
 
             for (key, desc) in *bindings {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("    {key:<14}"),
-                        Style::default()
-                            .fg(theme::current().key_hint)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(*desc, Style::default().fg(theme::current().text_secondary)),
-                ]));
+                let key = Span::styled(
+                    (*key).to_string(),
+                    Style::default()
+                        .fg(theme::current().key_hint)
+                        .add_modifier(Modifier::BOLD),
+                );
+                lines.extend(labelled_rows(
+                    vec![Span::raw("    ")],
+                    key,
+                    key_width,
+                    desc,
+                    width,
+                ));
             }
         }
         lines
@@ -1308,7 +1388,7 @@ pub mod help {
                 ),
             ]));
             let description = description_for(label, desc);
-            for line in crate::ui::helpers::wrap_to_width(&description, width.saturating_sub(5)) {
+            for line in crate::ui::helpers::wrap_to_width(&description, width.saturating_sub(6)) {
                 lines.push(Line::from(Span::styled(
                     format!("     {line}"),
                     Style::default().fg(theme::current().text_secondary),
@@ -1317,12 +1397,14 @@ pub mod help {
             lines.push(Line::from(""));
         }
         if let Some(footer) = footer {
-            lines.push(Line::from(Span::styled(
-                format!("  {footer}"),
-                Style::default()
-                    .fg(theme::current().key_hint_desc)
-                    .add_modifier(Modifier::ITALIC),
-            )));
+            for line in crate::ui::helpers::wrap_to_width(footer, width.saturating_sub(3)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default()
+                        .fg(theme::current().key_hint_desc)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            }
         }
         lines
     }
@@ -1356,7 +1438,12 @@ pub mod help {
     /// 3-column grid for the Sigils tab. Each row:
     ///   <glyph in its real TUI color>  <label, bold>  <description, secondary>
     /// Grouped by [`SigilCategory`] with a category header above each group.
-    fn build_sigils_lines() -> Vec<Line<'static>> {
+    fn build_sigils_lines(width: usize) -> Vec<Line<'static>> {
+        let label_width = CATALOG
+            .iter()
+            .map(|entry| entry.label.chars().count() + 2)
+            .max()
+            .unwrap_or(0);
         let mut lines: Vec<Line> = Vec::with_capacity(CATALOG.len() * 2 + 6);
 
         for category in [
@@ -1374,7 +1461,20 @@ pub mod help {
             lines.push(Line::from(""));
 
             for entry in CATALOG.iter().filter(|s| s.category == category) {
-                lines.push(sigil_row(entry));
+                let label = Span::styled(
+                    entry.label,
+                    Style::default()
+                        .fg(theme::current().text_primary)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let glyph = Span::styled(format!("    {}   ", entry.glyph), entry.style());
+                lines.extend(labelled_rows(
+                    vec![glyph],
+                    label,
+                    label_width,
+                    entry.description,
+                    width,
+                ));
             }
         }
         lines
@@ -1386,29 +1486,6 @@ pub mod help {
             SigilCategory::SecurityGuard => "Security Guard (per-row sigils)",
             SigilCategory::RoutesAndPeers => "Routes & peers (Details' back)",
         }
-    }
-
-    /// One row of the Sigils tab. The glyph is rendered in its actual
-    /// TUI color (the one the renderer applies), so the help-overlay
-    /// swatch matches what users see on screen byte-for-byte.
-    fn sigil_row(entry: &'static Sigil) -> Line<'static> {
-        // Column widths chosen to fit comfortably at the 95-col overlay:
-        //   glyph column: 4 cells (1 glyph + 3 padding for visual gutter)
-        //   label column: 24 cells
-        //   description: rest, wraps naturally
-        Line::from(vec![
-            Span::styled(format!("    {}   ", entry.glyph), entry.style()),
-            Span::styled(
-                format!("{:<22}", entry.label),
-                Style::default()
-                    .fg(theme::current().text_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                entry.description,
-                Style::default().fg(theme::current().text_secondary),
-            ),
-        ])
     }
 
     #[cfg(test)]
@@ -1459,7 +1536,7 @@ pub mod help {
                 .find(|(section, _)| *section == "Global")
                 .map(|(_, bindings)| *bindings)
                 .expect("Global help section must exist");
-            assert!(global.contains(&("Tab/S-Tab,l/h", "Next / Previous panel")));
+            assert!(global.contains(&("Tab/S-Tab, l/h", "Next / Previous panel")));
         }
 
         #[test]
@@ -1484,7 +1561,7 @@ pub mod help {
             // EVERY entry produces a row. This is the drift-detection
             // backstop: adding a sigil to the catalog automatically makes
             // it appear in help; removing one from the catalog removes it.
-            let lines = build_sigils_lines();
+            let lines = build_sigils_lines(116);
             let blob: String = lines
                 .iter()
                 .flat_map(|l| l.spans.iter())
@@ -1521,8 +1598,17 @@ pub mod help {
 
         #[test]
         fn keys_total_lines_invariant_holds() {
-            let expected = u16::try_from(build_keys_lines().len()).expect("fits in u16");
-            assert_eq!(total_lines(HelpTab::Keys), expected);
+            for tab in HelpTab::ALL.iter().copied() {
+                for terminal_width in [80, 100, 200] {
+                    let width = usize::from(overlay_width(terminal_width) - 2);
+                    let lines = tab_lines(tab, width);
+                    assert_eq!(usize::from(total_lines(tab, terminal_width)), lines.len());
+                    assert!(
+                        lines.iter().all(|line| line.width() <= width),
+                        "{tab:?} at {terminal_width}"
+                    );
+                }
+            }
         }
 
         #[test]
@@ -1592,7 +1678,6 @@ pub mod help {
     }
 }
 pub mod import {
-    use crate::ui::helpers::display_character;
     use crate::{constants, ui::theme};
     use ratatui::{
         layout::Alignment,
@@ -1601,59 +1686,6 @@ pub mod import {
         widgets::{Block, Borders, Paragraph},
         Frame,
     };
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-    fn prefix_window(characters: &[char], budget: usize) -> String {
-        let mut width = 0;
-        let mut end = 0;
-        for (index, character) in characters.iter().enumerate() {
-            let character_width = display_character(*character).width().unwrap_or(1);
-            let ellipsis = usize::from(index + 1 < characters.len());
-            if width + character_width + ellipsis > budget {
-                break;
-            }
-            width += character_width;
-            end = index + 1;
-        }
-        let mut output = characters[..end]
-            .iter()
-            .copied()
-            .map(display_character)
-            .collect::<String>();
-        if end < characters.len() && budget > 0 {
-            output.push('…');
-        }
-        output
-    }
-
-    /// Window a long path around its insertion cursor so the cursor is always
-    /// visible without widening the compact import dialog.
-    fn visible_path(path: &str, cursor: usize, max_width: usize) -> (String, String, String) {
-        let characters = path.chars().collect::<Vec<_>>();
-        let cursor = cursor.min(characters.len());
-        let cursor_character = characters
-            .get(cursor)
-            .copied()
-            .map_or('█', display_character);
-        let cursor_text = cursor_character.to_string();
-        let remaining = max_width.saturating_sub(cursor_text.width());
-        let (left_budget, right_budget) = if cursor == characters.len() {
-            (remaining, 0)
-        } else if cursor == 0 {
-            (0, remaining)
-        } else {
-            (remaining.div_ceil(2), remaining / 2)
-        };
-        let after_start = cursor + usize::from(cursor < characters.len());
-        (
-            crate::ui::helpers::truncate_start_to_width(
-                &characters[..cursor].iter().collect::<String>(),
-                left_budget,
-            ),
-            cursor_text,
-            prefix_window(&characters[after_start..], right_budget),
-        )
-    }
 
     pub fn render(frame: &mut Frame, path: &str, cursor: usize) {
         let area = frame.area();
@@ -1674,8 +1706,11 @@ pub mod import {
         let inner = block.inner(popup_area);
         frame.render_widget(block, popup_area);
 
-        let (before, cursor_char, after) =
-            visible_path(path, cursor, usize::from(inner.width.saturating_sub(3)));
+        let (before, cursor_char, after) = crate::ui::helpers::text_window(
+            path,
+            cursor,
+            usize::from(inner.width.saturating_sub(3)),
+        );
 
         let mut text = vec![
             Line::from(Span::styled(
@@ -1770,8 +1805,10 @@ pub mod import {
 
         #[test]
         fn long_path_keeps_the_cursor_visible_inside_the_fixed_dialog() {
+            use unicode_width::UnicodeWidthStr;
             let path = "/Users/harshit/Library/Application Support/vortix/profiles/imports";
-            let (before, cursor, after) = visible_path(path, path.chars().count(), 20);
+            let (before, cursor, after) =
+                crate::ui::helpers::text_window(path, path.chars().count(), 20);
             assert!(before.starts_with('…'), "{before}");
             assert_eq!(cursor, "█");
             assert!(after.is_empty());
@@ -1780,7 +1817,7 @@ pub mod import {
 
         #[test]
         fn path_window_sanitizes_control_characters_without_changing_cursor_position() {
-            let (before, cursor, after) = visible_path("ab\u{1b}cd", 2, 20);
+            let (before, cursor, after) = crate::ui::helpers::text_window("ab\u{1b}cd", 2, 20);
             assert_eq!(before, "ab");
             assert_eq!(cursor, "�");
             assert_eq!(after, "cd");
@@ -1827,12 +1864,12 @@ pub mod rename {
         let inner = block.inner(overlay);
         frame.render_widget(block, overlay);
 
-        let before: String = name.chars().take(cursor).collect();
-        let cursor_char: String = name
-            .chars()
-            .nth(cursor)
-            .map_or_else(|| "\u{2588}".to_string(), |c| c.to_string());
-        let after: String = name.chars().skip(cursor + 1).collect();
+        // "> " leads the field; the window keeps the cursor on screen.
+        let (before, cursor_char, after) = crate::ui::helpers::text_window(
+            name,
+            cursor,
+            usize::from(inner.width.saturating_sub(3)),
+        );
 
         let mut spans = vec![Span::styled(
             "> ",
@@ -1864,9 +1901,9 @@ pub mod search {
     pub fn render(frame: &mut Frame, app: &App, query: &str, cursor: usize, total: usize) {
         let area = frame.area();
         let bar_area = Rect {
-            x: 1,
+            x: 0,
             y: area.height.saturating_sub(3),
-            width: area.width.saturating_sub(2).min(60),
+            width: area.width.min(60),
             height: 3,
         };
 
@@ -1899,12 +1936,12 @@ pub mod search {
         let inner = block.inner(bar_area);
         frame.render_widget(block, bar_area);
 
-        let before: String = query.chars().take(cursor).collect();
-        let cursor_char: String = query
-            .chars()
-            .nth(cursor)
-            .map_or_else(|| "\u{2588}".to_string(), |c| c.to_string());
-        let after: String = query.chars().skip(cursor + 1).collect();
+        // "/" leads the field; the window keeps the cursor on screen.
+        let (before, cursor_char, after) = crate::ui::helpers::text_window(
+            query,
+            cursor,
+            usize::from(inner.width.saturating_sub(2)),
+        );
 
         let mut spans = vec![Span::styled(
             "/",
@@ -1924,6 +1961,29 @@ pub mod search {
         }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        #[test]
+        fn the_bar_covers_the_footer_from_the_first_column() {
+            let app = crate::app::App::new_test();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(ratatui::widgets::Paragraph::new("[".repeat(80)), {
+                        let mut row = frame.area();
+                        row.y = 23;
+                        row.height = 1;
+                        row
+                    });
+                    super::render(frame, &app, "x", 1, 3);
+                })
+                .unwrap();
+            assert_eq!(terminal.backend().buffer()[(0, 23)].symbol(), "└");
+        }
     }
 }
 pub mod toast {

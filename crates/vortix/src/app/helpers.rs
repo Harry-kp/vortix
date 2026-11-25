@@ -85,8 +85,12 @@ impl App {
     /// Add a log message via centralized logger
     pub(crate) fn log(&mut self, message: &str) {
         let (category, content, level) = classify_log_message(message);
+        self.log_as(level, category, content);
+    }
 
-        // Log via centralized logger
+    /// [`Self::log`] with the level and category given, for a warning that
+    /// belongs to a category other than APP.
+    pub(crate) fn log_as(&mut self, level: LogLevel, category: &str, content: &str) {
         logger::log(level, category, content);
 
         if self.logs_auto_scroll {
@@ -124,17 +128,6 @@ impl App {
     pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
         self.profile_id_for_name(profile_name)
             .is_some_and(|id| self.tunnel(&id).is_some())
-    }
-
-    /// Whether the profile at `idx` is currently Connecting (in-flight).
-    /// Used by the `c` cancel keybinding.
-    #[must_use]
-    pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
-        let Some(profile) = self.runtime.profiles.get(idx) else {
-            return false;
-        };
-        self.tunnel(&profile.id)
-            .is_some_and(|tunnel| tunnel.phase == crate::control::Phase::Starting)
     }
 
     /// Resolve the profile index that the Connection Details panel is
@@ -210,8 +203,7 @@ impl App {
                 let current = self.profile_list_state.selected().unwrap_or(0);
                 let last = self.runtime.profiles.len().saturating_sub(1);
                 if current < last {
-                    self.profile_list_state.select(Some(current + 1));
-                    self.routes_scroll = 0;
+                    self.select_profile(current + 1);
                 }
             }
             FocusedPanel::Logs => {
@@ -238,8 +230,7 @@ impl App {
             FocusedPanel::Sidebar => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
                 if current > 0 {
-                    self.profile_list_state.select(Some(current - 1));
-                    self.routes_scroll = 0;
+                    self.select_profile(current - 1);
                 }
             }
             FocusedPanel::Logs => {
@@ -299,15 +290,19 @@ impl App {
         let Some(cached) = self.cached_config.as_ref() else {
             return 0;
         };
-        let viewport_height = (self.terminal_size.1 * constants::CONFIG_VIEWER_HEIGHT_PCT / 100)
-            .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
+        let viewport_height = u16::try_from(
+            u32::from(self.terminal_size.1) * u32::from(constants::CONFIG_VIEWER_HEIGHT_PCT) / 100,
+        )
+        .unwrap_or(u16::MAX)
+        .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
         cached.total_lines.saturating_sub(viewport_height)
     }
 
     /// Copy the current public IPv4 address to clipboard.
     pub(crate) fn copy_ip_to_clipboard(&mut self) {
         let ip_str = self.runtime.public_ip.clone();
-        if ip_str.is_empty() || ip_str == constants::MSG_FETCHING || ip_str.starts_with("Error") {
+        // Only an address: never a placeholder such as "Detecting...".
+        if ip_str.parse::<std::net::IpAddr>().is_err() {
             self.show_toast("No valid IPv4 available yet".to_string(), ToastType::Error);
             return;
         }
@@ -410,12 +405,13 @@ fn classify_log_message(message: &str) -> (&str, &str, LogLevel) {
     };
     let category = message[..idx].trim();
     let content = message[idx + 1..].trim();
-    let level = match category {
-        "ERR" | "CMD_ERR" => LogLevel::Error,
-        "WARN" => LogLevel::Warning,
-        _ => LogLevel::Info,
-    };
-    (category, content, level)
+    // A level used as the category would show twice: "WARN  WARN".
+    match category {
+        "ERR" => ("APP", content, LogLevel::Error),
+        "CMD_ERR" => (category, content, LogLevel::Error),
+        "WARN" => ("APP", content, LogLevel::Warning),
+        _ => (category, content, LogLevel::Info),
+    }
 }
 
 fn osc52_clipboard(text: &str) -> String {
@@ -424,6 +420,13 @@ fn osc52_clipboard(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_level_is_not_repeated_as_the_category() {
+        assert_eq!(super::classify_log_message("WARN: x").0, "APP");
+        assert_eq!(super::classify_log_message("ERR: x").0, "APP");
+        assert_eq!(super::classify_log_message("NET: x").0, "NET");
+    }
+
     #[test]
     fn clipboard_sequence_targets_terminal_host_clipboard() {
         assert_eq!(

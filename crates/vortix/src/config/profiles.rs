@@ -511,29 +511,25 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
         }
     }
 
-    let wg_count = profiles
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for profile in &profiles {
+        *counts.entry(profile.protocol.to_string()).or_default() += 1;
+    }
+    let mut parts = counts
         .iter()
-        .filter(|p| matches!(p.protocol, ProtocolKind::WireGuard))
-        .count();
-    let ovpn_count = profiles
-        .iter()
-        .filter(|p| matches!(p.protocol, ProtocolKind::OpenVpn))
-        .count();
-
+        .map(|(protocol, count)| format!("{count} {protocol}"))
+        .collect::<Vec<_>>();
+    if errors > 0 {
+        parts.push(format!("{errors} skipped"));
+    }
     logger::log(
         LogLevel::Info,
         "PROFILE",
-        format!(
-            "Loaded {} profiles ({} WireGuard, {} OpenVPN{})",
-            profiles.len(),
-            wg_count,
-            ovpn_count,
-            if errors > 0 {
-                format!(", {errors} skipped")
-            } else {
-                String::new()
-            }
-        ),
+        if parts.is_empty() {
+            "Loaded 0 profiles".to_string()
+        } else {
+            format!("Loaded {} profiles ({})", profiles.len(), parts.join(", "))
+        },
     );
 
     profiles
@@ -557,43 +553,36 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// Returns a unique path by appending (n) if the file already exists.
-///
-/// # Arguments
-///
-/// * `dir` - Directory to check in
-/// * `filename` - Desired filename
-///
-/// # Returns
-///
-/// A `PathBuf` that does not currently exist.
+/// `dir/filename`, or `dir/<stem>_<n>.<ext>` with the first free `n`. A
+/// `.conf` stem is the `WireGuard` interface name, so it is shortened to keep
+/// the suffixed name within the interface-name limit.
 #[must_use]
 pub fn get_unique_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
-    let mut path = dir.join(filename);
-    let mut counter = 1;
-
     let path_obj = std::path::Path::new(filename);
     let stem = path_obj
         .file_stem()
         .map_or(filename, |s| s.to_str().unwrap_or(filename));
-    let ext = path_obj.extension().map(|e| e.to_str().unwrap_or(""));
-
-    // Use underscores instead of parentheses to keep filenames valid as
-    // network interface names (wg-quick uses the filename as the interface).
+    let ext = path_obj
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty());
+    let mut path = dir.join(filename);
+    let mut counter = 1;
     while path.exists() {
-        let new_name = if let Some(e) = ext {
-            if e.is_empty() {
-                format!("{stem}_{counter}")
-            } else {
-                format!("{stem}_{counter}.{e}")
+        let suffix = format!("_{counter}");
+        let mut keep = stem.len();
+        if ext == Some("conf") {
+            keep = keep.min(
+                crate::profile::MAX_WIREGUARD_INTERFACE_NAME_BYTES.saturating_sub(suffix.len()),
+            );
+            while !stem.is_char_boundary(keep) {
+                keep -= 1;
             }
-        } else {
-            format!("{stem}_{counter}")
-        };
-        path = dir.join(new_name);
+        }
+        let base = format!("{}{suffix}", &stem[..keep]);
+        path = dir.join(ext.map_or(base.clone(), |e| format!("{base}.{e}")));
         counter += 1;
     }
-
     path
 }
 
@@ -972,6 +961,17 @@ MIIDqzCCApOgAwIB...
         std::fs::write(dir.path().join("test_1.conf"), "also existing").unwrap();
         let path2 = get_unique_path(dir.path(), "test.conf");
         assert_eq!(path2.file_name().unwrap(), "test_2.conf");
+    }
+
+    #[test]
+    fn a_duplicate_wireguard_name_stays_a_valid_interface_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("abcdefghijklmno.conf"), "").unwrap();
+        let path = get_unique_path(dir.path(), "abcdefghijklmno.conf");
+        assert_eq!(path.file_name().unwrap(), "abcdefghijklm_1.conf");
+        std::fs::write(dir.path().join("long-openvpn-name.ovpn"), "").unwrap();
+        let path = get_unique_path(dir.path(), "long-openvpn-name.ovpn");
+        assert_eq!(path.file_name().unwrap(), "long-openvpn-name_1.ovpn");
     }
 
     #[test]

@@ -43,7 +43,7 @@ VPN terminal UI (TUI) for WireGuard and OpenVPN with multi-tunnel control, real-
 
 ## Why Vortix?
 
-Vortix is a VPN TUI: it gives WireGuard and OpenVPN users one keyboard-driven view of their tunnels and the network around them. It is useful when plain `wg-quick` or `openvpn` provides too little visibility, while a full desktop VPN client is too heavy or tied to one provider.
+Vortix is a VPN TUI: it gives WireGuard, OpenVPN and NetBird users one keyboard-driven view of their tunnels and the network around them. It is useful when plain `wg-quick` or `openvpn` provides too little visibility, while a full desktop VPN client is too heavy or tied to one provider.
 
 - Connect multiple profiles and distinguish the default-route tunnel from split-route tunnels.
 - See throughput, latency, jitter, packet loss, exit identity, DNS policy, and encryption state.
@@ -51,7 +51,7 @@ Vortix is a VPN TUI: it gives WireGuard and OpenVPN users one keyboard-driven vi
 - Control the same engine from the TUI, CLI, or versioned JSON output.
 - Work locally, over SSH, and across macOS and Linux.
 
-Vortix orchestrates the system `wg`, `wg-quick`, and `openvpn` implementations; it does not implement either VPN protocol itself.
+Vortix orchestrates the system `wg`, `wg-quick`, `openvpn` and `netbird` tools; it implements no VPN protocol itself.
 
 ## Quick start
 
@@ -71,7 +71,7 @@ sudo pacman -S wireguard-tools openvpn
 sudo dnf install wireguard-tools openvpn
 ```
 
-Only the `.deb` and `.rpm` packages pull these in; with any other channel, install them first. Vortix drives
+The Homebrew formula and the `.deb`/`.rpm` packages pull these in; with any other channel, install them first. Vortix drives
 `wg-quick` and `openvpn` as subprocesses, so without them a profile imports but cannot
 connect. `vortix up` names the missing package and the install command for your distro.
 
@@ -109,7 +109,7 @@ Every command, key and panel is in the [usage guide](https://github.com/Harry-kp
 
 | Area | What Vortix provides |
 |---|---|
-| [Protocols](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#profiles) | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles, up to 1024 routes each; NetBird networks (`.netbird`), including moving from the NetBird app |
+| [Protocols](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#profiles) | WireGuard `.conf` and OpenVPN `.ovpn` / `.conf` profiles (up to 1024 routes for WireGuard, 256 for OpenVPN); NetBird networks (`.netbird`), including moving from the NetBird app |
 | [Multi-tunnel](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#several-tunnels-at-once) | Full and split tunnels side by side, one default-route owner, and a Switch or Cancel choice on conflicts |
 | [Telemetry](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#panels) | Throughput, latency, jitter, packet loss, public IP, ISP, and location |
 | [Security Guard](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md#security-guard) | IPv4/IPv6 exposure, DNS, encryption and kill-switch state, with one verdict |

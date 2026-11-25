@@ -66,6 +66,16 @@ fn handle_confirm_keys(key: KeyEvent, confirm_selected: &mut bool) -> ConfirmAct
 }
 
 impl App {
+    /// What a lifecycle shortcut does to the profile at `idx`.
+    fn tunnel_action_at(&self, idx: usize) -> FocusedTunnelAction {
+        focused_tunnel_action(
+            self.runtime
+                .profiles
+                .get(idx)
+                .and_then(|profile| self.tunnel(&profile.id).map(|tunnel| tunnel.phase)),
+        )
+    }
+
     /// Apply the sidebar disconnect shortcut to the focused profile only.
     ///
     /// An inactive row is deliberately a no-op: falling back to the engine snapshot
@@ -75,12 +85,7 @@ impl App {
         let Some(idx) = self.profile_list_state.selected() else {
             return;
         };
-        let phase = self
-            .runtime
-            .profiles
-            .get(idx)
-            .and_then(|profile| self.tunnel(&profile.id).map(|tunnel| tunnel.phase));
-        match focused_tunnel_action(phase) {
+        match self.tunnel_action_at(idx) {
             FocusedTunnelAction::Disconnect => {
                 self.handle_message(Message::DisconnectProfile { idx });
             }
@@ -98,7 +103,12 @@ impl App {
             return;
         }
         // 'q' in normal mode: exit immediately. Active VPN sessions persist.
-        if key.code == KeyCode::Char('q') && self.input_mode == InputMode::Normal {
+        if key.code == KeyCode::Char('q')
+            && self.input_mode == InputMode::Normal
+            && !self.show_config
+            && !self.show_action_menu
+            && !self.show_bulk_menu
+        {
             self.handle_message(Message::Quit);
             return;
         }
@@ -213,7 +223,7 @@ impl App {
             } => {
                 let max_scroll = help_max_scroll_for_terminal_height(
                     self.terminal_size.1,
-                    crate::ui::help_total_lines(tab),
+                    crate::ui::help_total_lines(tab, self.terminal_size.0),
                 );
                 scroll = scroll.min(max_scroll);
                 match key.code {
@@ -270,10 +280,15 @@ impl App {
             InputMode::Search {
                 mut query,
                 mut cursor,
+                before,
             } => {
-                self.handle_search_keys(key, &mut query, &mut cursor);
+                self.handle_search_keys(key, &mut query, &mut cursor, before.as_ref());
                 if let InputMode::Search { .. } = self.input_mode {
-                    self.input_mode = InputMode::Search { query, cursor };
+                    self.input_mode = InputMode::Search {
+                        query,
+                        cursor,
+                        before,
+                    };
                 }
             }
             InputMode::ConfirmDelete {
@@ -477,7 +492,7 @@ impl App {
                 (InputMode::Help { scroll, tab }, MouseEventKind::ScrollDown) => {
                     let max_scroll = help_max_scroll_for_terminal_height(
                         self.terminal_size.1,
-                        crate::ui::help_total_lines(*tab),
+                        crate::ui::help_total_lines(*tab, self.terminal_size.0),
                     );
                     *scroll = (*scroll).min(max_scroll);
                     *scroll = scroll.saturating_add(3).min(max_scroll);
@@ -485,7 +500,7 @@ impl App {
                 (InputMode::Help { scroll, tab }, MouseEventKind::ScrollUp) => {
                     let max_scroll = help_max_scroll_for_terminal_height(
                         self.terminal_size.1,
-                        crate::ui::help_total_lines(*tab),
+                        crate::ui::help_total_lines(*tab, self.terminal_size.0),
                     );
                     *scroll = (*scroll).min(max_scroll);
                     *scroll = scroll.saturating_sub(3);
@@ -771,7 +786,7 @@ impl crate::app::App {
         // the top of handle_key) and the panel-specific keys.
         if key.code == KeyCode::Char('c') && self.focused_panel == FocusedPanel::ConnectionDetails {
             if let Some(idx) = self.connection_details_focused_idx() {
-                if self.is_profile_connecting(idx) {
+                if self.tunnel_action_at(idx) == FocusedTunnelAction::Cancel {
                     self.handle_message(Message::CancelConnect { idx });
                     return;
                 }
@@ -810,22 +825,20 @@ impl crate::app::App {
                 }
             }
 
-            KeyCode::Home | KeyCode::Char('g') if self.focused_panel != FocusedPanel::Logs => {
+            // Selection keys act only where the selection is shown.
+            KeyCode::Home | KeyCode::Char('g') if self.focused_panel == FocusedPanel::Sidebar => {
                 self.handle_message(Message::ProfileMove(SelectionMove::First));
             }
-            KeyCode::End | KeyCode::Char('G') if self.focused_panel != FocusedPanel::Logs => {
+            KeyCode::End | KeyCode::Char('G') if self.focused_panel == FocusedPanel::Sidebar => {
                 self.handle_message(Message::ProfileMove(SelectionMove::Last));
             }
-            KeyCode::PageUp => {
+            KeyCode::PageUp if self.focused_panel == FocusedPanel::Sidebar => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let next = current.saturating_sub(constants::PROFILE_LIST_PAGE_SIZE);
-                self.profile_list_state.select(Some(next));
+                self.select_profile(current.saturating_sub(constants::PROFILE_LIST_PAGE_SIZE));
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown if self.focused_panel == FocusedPanel::Sidebar => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let last = self.runtime.profiles.len().saturating_sub(1);
-                let next = (current + constants::PROFILE_LIST_PAGE_SIZE).min(last);
-                self.profile_list_state.select(Some(next));
+                self.select_profile(current + constants::PROFILE_LIST_PAGE_SIZE);
             }
 
             // Quick Actions (always available)
@@ -849,7 +862,7 @@ impl crate::app::App {
                 self.handle_message(Message::Disconnect);
             }
             // Uppercase `D` disconnects every tunnel from the sidebar and the
-            // focused one elsewhere; the message layer asks only when 2+ are up.
+            // primary elsewhere; the message layer asks only when 2+ are up.
             KeyCode::Char('D') => {
                 if self.focused_panel == FocusedPanel::Sidebar {
                     self.handle_message(Message::RequestDisconnectAll);
@@ -901,11 +914,7 @@ impl crate::app::App {
                     let Some(idx) = self.profile_list_state.selected() else {
                         return;
                     };
-                    let phase =
-                        self.runtime.profiles.get(idx).and_then(|profile| {
-                            self.tunnel(&profile.id).map(|tunnel| tunnel.phase)
-                        });
-                    match focused_tunnel_action(phase) {
+                    match self.tunnel_action_at(idx) {
                         FocusedTunnelAction::Connect => {
                             self.handle_message(Message::ToggleConnect(Some(idx)));
                         }
@@ -957,8 +966,17 @@ impl crate::app::App {
                     _ => {}
                 }
             }
-            // Read-only panels
-            FocusedPanel::ConnectionDetails | FocusedPanel::Chart | FocusedPanel::Security => {}
+            // The routes and peers on its back side scroll.
+            FocusedPanel::ConnectionDetails => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.handle_message(Message::Scroll(ScrollMove::Down));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.handle_message(Message::Scroll(ScrollMove::Up));
+                }
+                _ => {}
+            },
+            FocusedPanel::Chart | FocusedPanel::Security => {}
         }
     }
 
@@ -1026,7 +1044,7 @@ impl crate::app::App {
                 }
             }
             KeyCode::Delete | KeyCode::Backspace => {
-                if let Some(item) = actions.iter().find(|a| a.key == "DEL") {
+                if let Some(item) = actions.iter().find(|a| a.key == "Del") {
                     let msg = item.message.clone();
                     self.show_action_menu = false;
                     self.show_bulk_menu = false;
@@ -1050,32 +1068,50 @@ impl crate::app::App {
             }
             KeyCode::Enter => {
                 let trimmed = new_name.trim().to_string();
-                if !trimmed.is_empty() {
-                    self.rename_profile_by_id(profile_id, &trimmed);
+                if trimmed.is_empty() {
+                    self.show_toast("Type a name first.".to_string(), ToastType::Warning);
+                    return;
                 }
+                self.rename_profile_by_id(profile_id, &trimmed);
                 self.input_mode = InputMode::Normal;
             }
             _ => Self::handle_text_field_input(key, new_name, cursor),
         }
     }
 
-    fn handle_search_keys(&mut self, key: KeyEvent, query: &mut String, cursor: &mut usize) {
+    fn handle_search_keys(
+        &mut self,
+        key: KeyEvent,
+        query: &mut String,
+        cursor: &mut usize,
+        before: Option<&crate::profile::ProfileId>,
+    ) {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Esc => {
+                self.apply_search_filter("", before);
                 self.input_mode = InputMode::Normal;
             }
+            KeyCode::Enter => self.input_mode = InputMode::Normal,
             KeyCode::Backspace | KeyCode::Delete | KeyCode::Char(_) => {
                 Self::handle_text_field_input(key, query, cursor);
-                self.apply_search_filter(query);
+                self.apply_search_filter(query, before);
             }
             _ => Self::handle_text_field_input(key, query, cursor),
         }
     }
 
-    pub(crate) fn apply_search_filter(&mut self, query: &str) {
+    /// Select the first profile matching `query`; an empty query goes back to
+    /// the selection from `before` the search.
+    pub(crate) fn apply_search_filter(
+        &mut self,
+        query: &str,
+        before: Option<&crate::profile::ProfileId>,
+    ) {
         if query.is_empty() {
             self.search_match_count = self.runtime.profiles.len();
-            self.profile_list_state.select(Some(0));
+            if let Some(index) = before.and_then(|id| self.profile_index(id)) {
+                self.select_profile(index);
+            }
             return;
         }
         let lower = query.to_lowercase();
@@ -1089,7 +1125,7 @@ impl crate::app::App {
             .collect();
         self.search_match_count = matches.len();
         if let Some(&first) = matches.first() {
-            self.profile_list_state.select(Some(first));
+            self.select_profile(first);
         }
     }
 }

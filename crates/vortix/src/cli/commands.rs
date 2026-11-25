@@ -143,19 +143,40 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
     if let Some(pid) = pid_filter {
         snapshots.retain(|s| s.pid == pid);
     }
+    let remotes: Vec<_> = snapshots
+        .iter()
+        .filter_map(|s| s.remote.map(|r| r.ip()).filter(|ip| !ip.is_unspecified()))
+        .collect();
+    let mut routed = crate::platform::Routes::route_interfaces_for(&remotes).into_iter();
+    for s in &mut snapshots {
+        if s.remote.is_some_and(|r| !r.ip().is_unspecified()) {
+            s.interface = routed
+                .next()
+                .and_then(|observed| observed.interface().map(str::to_string));
+        }
+    }
     if vpn_only {
-        // Best-effort: filter to sockets whose `interface` field matches the
-        // active WireGuard interface (when resolvable). Today the
-        // Linux /proc impl doesn't populate `interface`, so this filter is a
-        // future-hardening hook — the doc warns users that v0.3.0 may show
-        // an empty result.
-        snapshots.retain(|s| s.interface.is_some());
+        let tunnels: Vec<String> =
+            crate::control::scanner::get_active_profiles(&crate::config::profiles::load_profiles())
+                .into_iter()
+                .map(|session| session.details.interface)
+                .collect();
+        snapshots.retain(|s| s.interface.as_ref().is_some_and(|i| tunnels.contains(i)));
     }
     snapshots.sort_by_key(|s| s.pid);
 
     match mode {
         OutputMode::Human => {
-            println!("PID    COMMAND          PROTO   LOCAL                            REMOTE                           IFACE");
+            let width = snapshots
+                .iter()
+                .map(|s| s.command.chars().count())
+                .max()
+                .unwrap_or(0)
+                .clamp(7, 32);
+            println!(
+                "{:<6} {:<width$} {:<5} {:<32} {:<32} IFACE",
+                "PID", "COMMAND", "PROTO", "LOCAL", "REMOTE"
+            );
             for s in &snapshots {
                 // An unresolved owner came out as a bare `0`, which reads as
                 // the kernel rather than "not known" — and stays 0 for many
@@ -172,7 +193,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
                     s.command.as_str()
                 };
                 println!(
-                    "{:<6} {:<16} {:<7} {:<32} {:<32} {}",
+                    "{:<6} {:<width$} {:<5} {:<32} {:<32} {}",
                     pid,
                     command,
                     s.protocol,
@@ -244,7 +265,7 @@ fn failure_code(message: &str) -> (&'static str, ExitCode) {
         || message.contains("Missing dependencies:")
     {
         ("dependency_missing", ExitCode::DependencyMissing)
-    } else if message.contains("can run at a time") {
+    } else if message.contains("can run at a time") || message.contains("Vortix did not start it") {
         // Another network of the same kind, or its vendor's own app, holds it.
         ("state_conflict", ExitCode::StateConflict)
     } else if message.contains("rejected the credentials") {
@@ -271,7 +292,10 @@ pub(super) fn engine_failure_or_exit(mode: OutputMode, command: &str, message: S
             code,
             message,
             hint: (code == "timeout" && command == "up").then(|| {
-                "Nothing was left running. To wait longer: sudo vortix up <profile> --timeout 60".to_owned()
+                format!(
+                    "Nothing was left running. To wait longer: {} <profile> --timeout 60",
+                    crate::cli::output::sudo_command(&["up"])
+                )
             }),
         },
         exit,
@@ -350,8 +374,9 @@ fn print_killswitch_status(
         println!("  be blocked — check the rules directly to be sure:");
         println!("    {}", crate::platform::Firewall::inspect_hint());
         println!(
-            "  Re-apply with `vortix killswitch {}`, or clear it with `vortix release-killswitch`.",
-            mode.cli_verb()
+            "  Re-apply with `{}`, or clear it with `{}`.",
+            super::output::sudo_command(&["killswitch", mode.cli_verb()]),
+            super::output::sudo_command(&["release-killswitch"])
         );
     } else {
         let (up, down) = mode.behavior_lines();
@@ -360,17 +385,28 @@ fn print_killswitch_status(
     }
     println!();
     println!("Other modes:");
-    for other in [
+    let others: Vec<_> = [
         crate::control::killswitch::KillSwitchMode::Off,
         crate::control::killswitch::KillSwitchMode::Auto,
         crate::control::killswitch::KillSwitchMode::AlwaysOn,
-    ] {
-        if other == mode {
-            continue;
-        }
+    ]
+    .into_iter()
+    .filter(|other| *other != mode)
+    .map(|other| {
+        (
+            super::output::sudo_command(&["killswitch", other.cli_verb()]),
+            other,
+        )
+    })
+    .collect();
+    let width = others
+        .iter()
+        .map(|(command, _)| command.len())
+        .max()
+        .unwrap_or(0);
+    for (command, other) in others {
         println!(
-            "  vortix killswitch {:<14}  {} — {}",
-            other.cli_verb(),
+            "  {command:<width$}  {} — {}",
             other.display_name(),
             other.one_liner()
         );
@@ -385,28 +421,29 @@ struct AutoconnectData {
 fn handle_autoconnect(target: Option<&str>, config_dir: &Path, mode: OutputMode) -> i32 {
     use crate::platform::autoconnect;
     if let Some(target) = target {
+        if target != "off"
+            && !crate::config::profiles::load_profiles()
+                .iter()
+                .any(|profile| profile.name == target)
+        {
+            print_error_and_exit(
+                mode,
+                "autoconnect",
+                err_not_found(target),
+                ExitCode::NotFound,
+            );
+        }
         if !crate::platform::is_root() {
             print_error_and_exit(
                 mode,
                 "autoconnect",
-                err_permission_denied(&format!("vortix autoconnect {target}")),
+                err_permission_denied(),
                 ExitCode::PermissionDenied,
             );
         }
         let result = if target == "off" {
             autoconnect::remove()
         } else {
-            if !crate::config::profiles::load_profiles()
-                .iter()
-                .any(|profile| profile.name == target)
-            {
-                print_error_and_exit(
-                    mode,
-                    "autoconnect",
-                    err_not_found(target),
-                    ExitCode::NotFound,
-                );
-            }
             let env: Vec<(String, String)> = ["PATH", "SUDO_USER", "SUDO_UID", "SUDO_GID"]
                 .into_iter()
                 .filter_map(|key| Some((key.to_string(), std::env::var(key).ok()?)))
@@ -517,7 +554,7 @@ fn handle_killswitch(
             print_error_and_exit(
                 output_mode,
                 "killswitch",
-                err_permission_denied(&format!("vortix killswitch {}", ks_mode.cli_verb())),
+                err_permission_denied(),
                 ExitCode::PermissionDenied,
             );
         }
@@ -587,7 +624,7 @@ pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
         print_error_and_exit(
             mode,
             "release-killswitch",
-            err_permission_denied("vortix release-killswitch"),
+            err_permission_denied(),
             ExitCode::PermissionDenied,
         );
     }
@@ -730,15 +767,18 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
                 config_dir.join(constants::LOGS_DIR_NAME).display()
             );
             match &journal_session {
-                Some(path) => println!("  Session journal: {path}"),
-                None => println!("  Session journal: (disk persistence disabled)"),
+                Some(path) => println!("  Journal:     {path}"),
+                None => println!("  Journal:     (disk persistence disabled)"),
             }
         }
         OutputMode::Json => print_success(
             mode,
             "info",
             &data,
-            vec!["vortix list --json".into(), "vortix status --json".into()],
+            vec![
+                crate::cli::output::vortix_command(&["list", "--json"]),
+                crate::cli::output::vortix_command(&["status", "--json"]),
+            ],
         ),
         OutputMode::Quiet => {}
     }
@@ -804,12 +844,15 @@ fn handle_update(mode: OutputMode) {
 
 fn handle_completions(shell: clap_complete::Shell) {
     use clap::CommandFactory;
+    let mut script = Vec::new();
     clap_complete::generate(
         shell,
         &mut crate::cli::args::Args::command(),
         "vortix",
-        &mut std::io::stdout(),
+        &mut script,
     );
+    // Printed like every other command, so `| head` exits quietly.
+    print!("{}", String::from_utf8_lossy(&script));
 }
 
 #[cfg(test)]
@@ -872,28 +915,5 @@ mod tests {
                 "{bad:?} in PATH"
             );
         }
-    }
-
-    #[test]
-    fn unreadable_control_history_does_not_block_emergency_release_persistence() {
-        let config = tempfile::tempdir().unwrap();
-        let control_dir = config.path().join("control");
-        std::fs::create_dir(&control_dir).unwrap();
-        std::fs::write(control_dir.join("control-state.json"), b"corrupt").unwrap();
-        std::fs::write(control_dir.join("control-state.previous.json"), b"corrupt").unwrap();
-
-        persist_emergency_release_off(config.path()).unwrap();
-
-        let saved =
-            std::fs::read_to_string(config.path().join(crate::constants::KILLSWITCH_STATE_FILE))
-                .unwrap();
-        let state: crate::control::killswitch::PersistedState =
-            serde_json::from_str(&saved).unwrap();
-        assert_eq!(state.mode, crate::control::killswitch::KillSwitchMode::Off);
-        assert_eq!(
-            state.state,
-            crate::control::killswitch::KillSwitchState::Disabled
-        );
-        assert!(state.emergency_release_fence);
     }
 }

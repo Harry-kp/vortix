@@ -180,9 +180,12 @@ fn recv_matching_reply(
 
 /// Parse an Echo Reply packet's identifier + sequence. Returns
 /// `None` if the buffer doesn't decode as a Type-0 Code-0 ICMP echo
-/// reply. macOS hands us the raw ICMP packet; Linux `SOCK_DGRAM` also
-/// strips the IP header on receive.
+/// reply. macOS prefixes the IPv4 header; Linux strips it.
 fn parse_echo_reply(bytes: &[u8]) -> Option<(u16, u16)> {
+    let bytes = match bytes.first() {
+        Some(first) if first >> 4 == 4 => bytes.get(usize::from(first & 0x0f) * 4..)?,
+        _ => bytes,
+    };
     if bytes.len() < 8 {
         return None;
     }
@@ -286,6 +289,10 @@ mod tests {
         let (id, seq) = parse_echo_reply(&reply).expect("decode");
         assert_eq!(id, 0x1234);
         assert_eq!(seq, 0x5678);
+        let mut with_ip_header = vec![0x45u8, 0, 0, 28];
+        with_ip_header.resize(20, 0);
+        with_ip_header.extend_from_slice(&reply);
+        assert_eq!(parse_echo_reply(&with_ip_header), Some((0x1234, 0x5678)));
     }
 
     #[test]
